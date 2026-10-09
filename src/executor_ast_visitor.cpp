@@ -240,7 +240,10 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
                         int global_d = ol_start[d] + coord_d * ol_step[d];
                         dst_flat += (global_d - tgt_cs_arr2[d]) * tgt_s[d];
                         if (source_is_result_buffer) {
-                            int src_local = (global_d - ol_start[d]) / ol_step[d];
+                            // A size-1 result buffer (scalar RHS) broadcasts.
+                            int src_local = src_region_sizes[d] == 1
+                                                ? 0
+                                                : (global_d - ol_start[d]) / ol_step[d];
                             if (src_local < 0 || src_local >= src_region_sizes[d]) {
                                 src_valid = false;
                                 break;
@@ -277,7 +280,10 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
                 for (int d = 0; d < N; ++d) {
                     dst_flat += (idx[d] - tgt_chare.start[d]) * tgt_strides[d];
                     if (source_is_result_buffer) {
-                        int src_local = (idx[d] - overlap.start[d]) / overlap.step[d];
+                        // A size-1 result buffer (scalar RHS) broadcasts.
+                        int src_local = source->region.size(d) == 1
+                                            ? 0
+                                            : (idx[d] - overlap.start[d]) / overlap.step[d];
                         if (src_local < 0 || src_local >= source->region.size(d)) {
                             src_valid = false;
                             break;
@@ -598,6 +604,10 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
         return node->result_name;
     case Opcode::TILE:
         // TILE is always handled via the comm path (execute_tile_node).
+        return node->result_name;
+    case Opcode::REDUCTION:
+    case Opcode::BINCOUNT:
+        // Always handled by execute_reduction_node.
         return node->result_name;
     default:
         CkAbort("Unknown opcode in interpreter: %d", node->opcode);

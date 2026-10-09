@@ -1332,25 +1332,23 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                         partition->compute_stream_raw
 #endif
         );
+        // A SET_REGION whose right-hand side has only scalar/broadcast leaves
+        // (e.g. a[1:2] = b[0:1] + 1) produced a 1-element result buffer; write it
+        // into the target region like the fragment path does below.
+        if (n_inputs == 0)
+            for (ASTNode* root : node->ast->roots)
+                if (static_cast<Opcode>(root->opcode) == Opcode::SET_REGION)
+                    partition->executor->ast_visitor(root, dtype_of<T>());
         return;
     }
 
     // ---- Fragment path: align local input regions + remote buffers ----
     DBG_PRINT("[Chare %d]   -> fragment path (with comm)\n", chare_idx);
 
-    // Output decomp: use result array's decomp for output chare region
+    // Output decomp: the array r_out refers to (same choice as the comm planner)
     ArrayDecomp<N> out_decomp;
     {
-        auto root_output_name = [](ASTNode* root) {
-            if (root == nullptr)
-                return -1;
-            if (static_cast<Opcode>(root->opcode) == Opcode::SET_REGION &&
-                !root->operands.empty() && root->operands[0] != nullptr)
-                return root->operands[0]->result_name;
-            return root->result_name;
-        };
-
-        int result_name = root_output_name(outputRoots[0]);
+        int result_name = fused_output_decomp_name(node);
         auto arr_it = partition->arrays.find(result_name);
         if (arr_it != partition->arrays.end())
             out_decomp = arr_it->second->decomp;

@@ -201,6 +201,8 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
     bool is_cross_set_region = false;
     bool is_diag_node = false;
     bool is_tile_node = false;
+    bool is_reduction_node = false;
+    bool is_creation_node = false;
     // Broadcast operands: size-1 arrays from another partition used as scalars
     struct BroadcastInfo {
         int source_name;
@@ -248,6 +250,23 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
     for (ASTNode* root : node->ast->roots) {
         auto opc = static_cast<Opcode>(root->opcode);
         if (opc == Opcode::CREATE) {
+            if (root->ndims == N)
+                relevant = true;
+            continue;
+        }
+        if (is_reduction_op(opc)) {
+            // Every chare of the input and output partitions runs the node:
+            // input chares send partials, output chares wait for them.
+            is_reduction_node = true;
+            int input_ndims = root->operands[0]->ndims;
+            if (N == input_ndims || N == root->ndims)
+                relevant = true;
+            continue;
+        }
+        if (is_fill_creation(opc)) {
+            // UPLOAD / RANDOM / IOTA: every chare of the result's partition
+            // creates its tile and fills it locally.
+            is_creation_node = true;
             if (root->ndims == N)
                 relevant = true;
             continue;
@@ -351,6 +370,17 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
         return;
     }
 
+    // Check for REDUCTION/BINCOUNT nodes — partials sent to the output chares
+    if (is_reduction_node) {
+        execute_reduction_node(node);
+        return;
+    }
+
+    if (is_creation_node) {
+        execute_creation_node(node);
+        return;
+    }
+
     // Check for REDUCE nodes — 1D dot product with cross-chare reduction
     if (is_reduce_node) {
         execute_reduce_node(node);
@@ -396,32 +426,45 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
         // Compute broadcast input index for each broadcast op (shared logic).
         // Must match the receiver convention: n_memref_leaves + bcast_index.
         // First count all memref leaves, then find the broadcast index.
+        //
+        // The leaf walk mirrors collect_leaves_and_outputs() (execute_node.cpp)
+        // and MLIRJitCompiler::collectLeaves(): operands produced by a root of
+        // this fused node are internal (not inputs), and broadcast leaves are
+        // de-duplicated by name among broadcast leaves only.  Counting
+        // internal temps here shifted the index past the receiver's slot, so
+        // the receiver never found the value and used 0 instead.
         auto compute_bcast_input_idx = [&](int source_name) -> int {
+            std::unordered_set<int> internal;
+            for (ASTNode* root : node->ast->roots)
+                internal.insert(root->result_name);
+            auto is_leaf_use = [&](ASTNode* root, int op_idx) {
+                ASTNode* operand = root->operands[op_idx];
+                if (!operand || operand->is_scalar || internal.count(operand->result_name))
+                    return false;
+                if (static_cast<Opcode>(root->opcode) == Opcode::SET_REGION && op_idx == 0)
+                    return false;
+                auto opc = static_cast<Opcode>(operand->opcode);
+                return opc == Opcode::NOOP || opc == Opcode::CREATE;
+            };
+
             int n_memrefs = 0;
-            for (ASTNode* root : node->ast->roots) {
-                auto root_opc = static_cast<Opcode>(root->opcode);
-                for (ASTNode* operand : root->operands) {
-                    if (operand->is_scalar || operand->is_broadcast)
-                        continue;
-                    if (root_opc == Opcode::SET_REGION && operand == root->operands[0])
-                        continue;
-                    n_memrefs++;
-                }
-            }
+            for (ASTNode* root : node->ast->roots)
+                for (int i = 0; i < (int)root->operands.size(); ++i)
+                    if (is_leaf_use(root, i) && !root->operands[i]->is_broadcast)
+                        n_memrefs++;
 
             // Second pass: find the broadcast index for source_name
             std::unordered_set<int> seen;
             int bcast_idx = 0;
             for (ASTNode* root : node->ast->roots) {
-                for (ASTNode* operand : root->operands) {
-                    if (operand->is_scalar || seen.count(operand->result_name))
+                for (int i = 0; i < (int)root->operands.size(); ++i) {
+                    ASTNode* operand = root->operands[i];
+                    if (!is_leaf_use(root, i) || !operand->is_broadcast ||
+                        !seen.insert(operand->result_name).second)
                         continue;
-                    seen.insert(operand->result_name);
-                    if (operand->is_broadcast) {
-                        if (operand->result_name == source_name)
-                            return n_memrefs + bcast_idx;
-                        bcast_idx++;
-                    }
+                    if (operand->result_name == source_name)
+                        return n_memrefs + bcast_idx;
+                    bcast_idx++;
                 }
             }
             return n_memrefs;
@@ -436,11 +479,49 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
                 region_data[d * 3 + 1] = 1;
                 region_data[d * 3 + 2] = 1;
             }
-            char* send_buf = new char[elem_sz];
-            memcpy(send_buf, val_ptr, elem_sz);
 #ifndef NDEBUG
             partition->comm_bytes_sent += elem_sz;
 #endif
+#ifdef USE_KOKKOS
+            // receive_data takes a nocopydevice buffer: stage the scalar on the device and
+            // send it asynchronously; send_complete frees the buffer.
+            auto send_device = [&](auto& proxy, const auto& ci, auto nt) {
+                constexpr int NT = decltype(nt)::value;
+                char* dbuf = static_cast<char*>(Kokkos::kokkos_malloc<DeviceSpace>(elem_sz));
+                Kokkos::deep_copy(
+                    Kokkos::View<char*, DeviceSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>(
+                        dbuf, elem_sz),
+                    Kokkos::View<char*, HostSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>(
+                        val_ptr, elem_sz));
+                device_pack_send<N, NT>(partition, proxy, ci, node->id, bcast_input_idx,
+                                        source_name, region_data.data(), elem_sz, dbuf);
+            };
+            switch (tgt_nd) {
+            case 1: {
+                ChareIndex<1> ci;
+                ci.idx[0] = tgt_idx[0];
+                send_device(dag_group->partition_proxy_1, ci, std::integral_constant<int, 1>{});
+                break;
+            }
+            case 2: {
+                ChareIndex<2> ci;
+                ci.idx[0] = tgt_idx[0];
+                ci.idx[1] = tgt_idx[1];
+                send_device(dag_group->partition_proxy_2, ci, std::integral_constant<int, 2>{});
+                break;
+            }
+            case 3: {
+                ChareIndex<3> ci;
+                ci.idx[0] = tgt_idx[0];
+                ci.idx[1] = tgt_idx[1];
+                ci.idx[2] = tgt_idx[2];
+                send_device(dag_group->partition_proxy_3, ci, std::integral_constant<int, 3>{});
+                break;
+            }
+            }
+#else
+            char* send_buf = new char[elem_sz];
+            memcpy(send_buf, val_ptr, elem_sz);
             switch (tgt_nd) {
             case 1: {
                 ChareIndex<1> ci;
@@ -471,6 +552,7 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
             }
             }
             delete[] send_buf;
+#endif
         };
 
         for (auto& bcast : broadcast_ops) {
@@ -646,19 +728,13 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
         }
     }
 
-    // Output decomp: use the first non-temp root output, not the first AST root.
-    // Fused ASTs often keep temporary internal roots ahead of the real result,
-    // and those temps can legitimately have a different decomposition offset.
+    // Output decomp: the array r_out refers to (see fused_output_decomp_name):
+    // the last SET_REGION target, else the first non-temp root output (fused
+    // ASTs often keep temporary internal roots ahead of the real result, and
+    // those temps can legitimately have a different decomposition offset).
     ArrayDecomp<N> output_decomp;
     {
-        int result_name = root_output_name(node->ast->roots[0]);
-        for (ASTNode* root : node->ast->roots) {
-            auto opc = static_cast<Opcode>(root->opcode);
-            if (opc != Opcode::NOOP && opc != Opcode::CREATE && !root->is_temp) {
-                result_name = root_output_name(root);
-                break;
-            }
-        }
+        int result_name = fused_output_decomp_name(node);
         auto arr_it = partition->arrays.find(result_name);
         if (arr_it != partition->arrays.end()) {
             output_decomp = arr_it->second->decomp;

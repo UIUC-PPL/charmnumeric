@@ -1,17 +1,22 @@
+import math
 import numbers
+import struct
 
 import numpy as np
 
+from charmtyles.ast import InlineData, NonFusibleNode, get_execution_state
 from charmtyles.core import (
     OverlapType,
     Region,
     FrontendObject,
     FrontendObjectView,
     create_object,
+    create_result,
     execute,
     _shape_size,
 )
-from charmtyles.operation import Operation, fusible_op, nonfusible_op
+from charmtyles.operation import Operation, nonfusible_op
+from charmtyles.operation import fusible_op as _fusible_op
 from charmtyles.interface import to_bytes
 
 from ._native_region import NativeArrayRegion
@@ -148,6 +153,43 @@ class ArrayOperation(Operation):
     reduce = 8
     matmatmul = 9
     diag = 10
+    # elementwise math, comparisons and selection (20-49, see src/opcodes.hpp)
+    sqrt = 20
+    log = 21
+    log2 = 22
+    log10 = 23
+    log1p = 24
+    exp2 = 25
+    expm1 = 26
+    abs = 27
+    floor = 28
+    ceil = 29
+    rint = 30
+    isfinite = 31
+    sin = 32
+    cos = 33
+    sign = 34
+    isnan = 35
+    isinf = 36
+    power = 37
+    maximum = 38
+    minimum = 39
+    fmax = 40
+    fmin = 41
+    mod = 42
+    floor_divide = 43
+    less = 44
+    less_equal = 45
+    equal = 46
+    not_equal = 47
+    where = 48
+    clip = 49
+    # Array creation (opcodes 50-59): each node creates and fills a new array.
+    upload = 50  # bulk host data carried in the DAG (INLINE_DATA operand)
+    random = 51  # counter-based RNG (charmnumeric/random.py)
+    iota = 52    # arange / linspace / indices / eye
+    reduction = 60
+    bincount = 61
 
 
 class ArrayRegion(Region):
@@ -343,6 +385,26 @@ def _parse_key(key, shape, ndims):
     return ArrayRegion(start, stop, step)
 
 
+def _scalar_view_operand(value):
+    """Copy a size-1 view of a larger array into its own size-1 array.
+
+    Only whole size-1 arrays are broadcast as scalars by the backend (it reads
+    element 0 of the operand's array), so x[k:k+1] has to be materialized
+    before it is broadcast against a larger operand or assignment target.
+    """
+    if (isinstance(value, ArrayView) and value.size() == 1
+            and value._root_parent.size() > 1):
+        return value.copy()
+    return value
+
+
+def fusible_op(*operands, operation, **kwargs):
+    shape = kwargs.get("shape")
+    if shape is not None and _shape_size(shape) > 1:
+        operands = tuple(_scalar_view_operand(op) for op in operands)
+    return _fusible_op(*operands, operation=operation, **kwargs)
+
+
 def _broadcast_shape(lhs_shape, rhs):
     if isinstance(rhs, (Array, ArrayView)):
         rhs_shape = rhs.shape
@@ -366,10 +428,23 @@ def _operand_dtype(value):
     return None
 
 
+def _check_same_dtype(lhs_dtype, rhs_dtype, what):
+    # The backend runs each kernel in one element type and reinterprets every
+    # array operand's buffer in it; there is no dtype conversion op yet.  Mixed
+    # array dtypes therefore silently produced garbage (int32 + float64 -> the
+    # int buffer read as doubles); reject them instead.
+    if lhs_dtype is not None and rhs_dtype is not None and lhs_dtype != rhs_dtype:
+        raise TypeError(
+            f"{what} between arrays of different dtypes ({lhs_dtype} and {rhs_dtype}) "
+            "is not supported by the charmnumeric backend (no dtype conversion)"
+        )
+
+
 def _result_dtype(lhs, rhs):
     other_dtype = _operand_dtype(rhs)
     if other_dtype is None:
         return lhs.dtype
+    _check_same_dtype(_operand_dtype(lhs), other_dtype, "an operation")
     return _normalize_dtype(np.result_type(lhs.dtype, other_dtype))
 
 
@@ -487,6 +562,455 @@ def _array_rtruediv(self, other):
         shape=_broadcast_shape(self.shape, other),
         dtype=_result_dtype(self, other),
     )
+
+
+# ---------------------------------------------------------------------------
+# Elementwise math, comparisons and selection (opcodes 20-49).
+#
+# Comparisons and predicates (less, equal, isnan, logical_and, ...) return
+# 0/1 *masks in the operands' dtype*, not bool arrays: a fused kernel has a
+# single element type and there is no bool dtype. A mask works as the
+# condition of where(), in arithmetic (mask * x) and in further logical ops.
+#
+# One element type per kernel also means: array operands of these ops must
+# share a dtype (no int/float promotion), and a Python float scalar that is
+# not integral cannot be combined with an integer array (NumPy would promote
+# to float64; there is no in-kernel conversion). Float-only math (sqrt, log,
+# sin, ...) rejects integer arrays for the same reason. Integer arrays keep
+# their dtype through abs/floor/ceil/rint/sign/round.
+#
+# Broadcasting is limited to what the backend supports: every array operand
+# has the result shape or has size 1.
+# ---------------------------------------------------------------------------
+
+
+def _is_array(value):
+    return isinstance(value, (Array, ArrayView))
+
+
+def _is_int_dtype(dtype):
+    return np.issubdtype(dtype, np.integer)
+
+
+def _ew_operands(name, *operands):
+    """Coerce elementwise operands; return ``(operands, shape, dtype)``."""
+
+    operands = tuple(_coerce_operand(value) for value in operands)
+    arrays = [value for value in operands if _is_array(value)]
+    if not arrays:
+        raise TypeError(f"{name}: at least one operand must be a charmnumeric array")
+
+    dtype = arrays[0].dtype
+    for value in arrays[1:]:
+        if value.dtype != dtype:
+            raise TypeError(
+                f"{name}: operands have different dtypes ({dtype} and {value.dtype}); "
+                "fused charmnumeric kernels use a single element type"
+            )
+
+    full = [value for value in arrays if value.size != 1]
+    shape = full[0].shape if full else arrays[0].shape
+    for value in full[1:]:
+        if value.shape != shape:
+            raise ValueError(
+                f"{name}: operands could not be broadcast together with shapes "
+                f"{shape} and {value.shape} (only size-1 operands broadcast)"
+            )
+
+    for value in operands:
+        if _is_array(value):
+            continue
+        if not isinstance(value, numbers.Real):
+            raise TypeError(f"{name}: unsupported operand type {type(value).__name__}")
+        if _is_int_dtype(dtype) and isinstance(value, float) and not value.is_integer():
+            raise TypeError(
+                f"{name}: float scalar {value!r} with an {dtype} array would promote "
+                "to float64; charmnumeric has no int->float conversion"
+            )
+    return operands, shape, dtype
+
+
+def _ew_unary(x, operation, name, float_only=False):
+    (x,), shape, dtype = _ew_operands(name, x)
+    if float_only and _is_int_dtype(dtype):
+        raise TypeError(
+            f"{name}: integer input would give float64 in NumPy; charmnumeric has no "
+            "int->float conversion, so pass a float array"
+        )
+    return fusible_op(x, operation=operation, shape=shape, dtype=dtype)
+
+
+def _ew_binary(lhs, rhs, operation, name):
+    (lhs, rhs), shape, dtype = _ew_operands(name, lhs, rhs)
+    return fusible_op(lhs, rhs, operation=operation, shape=shape, dtype=dtype)
+
+
+def _ew_ternary(a, b, c, operation, name):
+    (a, b, c), shape, dtype = _ew_operands(name, a, b, c)
+    return fusible_op(a, b, c, operation=operation, shape=shape, dtype=dtype)
+
+
+# name -> (opcode, swap operands); greater* are less* with swapped operands
+_COMPARISONS = {
+    "less": (ArrayOperation.less, False),
+    "less_equal": (ArrayOperation.less_equal, False),
+    "greater": (ArrayOperation.less, True),
+    "greater_equal": (ArrayOperation.less_equal, True),
+    "equal": (ArrayOperation.equal, False),
+    "not_equal": (ArrayOperation.not_equal, False),
+}
+_MIRRORED = {
+    "less": "greater",
+    "less_equal": "greater_equal",
+    "greater": "less",
+    "greater_equal": "less_equal",
+    "equal": "equal",
+    "not_equal": "not_equal",
+}
+
+
+def _const_mask(x, value):
+    """All-ones (value=1) or all-zeros (value=0) mask shaped like integer array x."""
+
+    operation = ArrayOperation.equal if value else ArrayOperation.not_equal
+    return _ew_binary(x, x, operation, "mask")
+
+
+def _compare_int_float(x, value, name):
+    """``x <name> value`` for an integer array and a float scalar, exactly.
+
+    The kernel would truncate the scalar to the integer type, so rewrite the
+    comparison with an integer bound (or a constant mask) instead.
+    """
+
+    info = np.iinfo(x.dtype)
+    if np.isnan(value):
+        return _const_mask(x, name == "not_equal")
+    if value > info.max or value < info.min:
+        above = value > info.max  # the scalar exceeds every element
+        result = {
+            "less": above,
+            "less_equal": above,
+            "greater": not above,
+            "greater_equal": not above,
+            "equal": False,
+            "not_equal": True,
+        }[name]
+        return _const_mask(x, result)
+    if value.is_integer():
+        return _compare(x, int(value), name)
+    if name in ("equal", "not_equal"):
+        return _const_mask(x, name == "not_equal")
+    bound = {
+        "less": int(np.ceil(value)),
+        "less_equal": int(np.floor(value)),
+        "greater": int(np.floor(value)),
+        "greater_equal": int(np.ceil(value)),
+    }[name]
+    return _compare(x, bound, name)
+
+
+def _compare(lhs, rhs, name):
+    lhs = _coerce_operand(lhs)
+    rhs = _coerce_operand(rhs)
+    if not _is_array(lhs) and _is_array(rhs):
+        lhs, rhs, name = rhs, lhs, _MIRRORED[name]
+    if _is_array(lhs) and _is_int_dtype(lhs.dtype) and isinstance(rhs, float):
+        return _compare_int_float(lhs, rhs, name)
+    operation, swap = _COMPARISONS[name]
+    if swap:
+        lhs, rhs = rhs, lhs
+    return _ew_binary(lhs, rhs, operation, name)
+
+
+def _truth(value):
+    """0/1 mask (array) or 0/1 int (scalar) for value != 0."""
+
+    value = _coerce_operand(value)
+    if _is_array(value):
+        return _compare(value, 0, "not_equal")
+    return int(bool(value))
+
+
+def _logical_not(x):
+    x = _coerce_operand(x)
+    if not _is_array(x):
+        return not x
+    return _compare(x, 0, "equal")
+
+
+def _logical_and(a, b):
+    a, b = _truth(a), _truth(b)
+    if not _is_array(a) and not _is_array(b):
+        return bool(a and b)
+    return _array_mul(a, b) if _is_array(a) else _array_rmul(b, a)
+
+
+def _logical_or(a, b):
+    a, b = _truth(a), _truth(b)
+    if not _is_array(a) and not _is_array(b):
+        return bool(a or b)
+    return _ew_binary(a, b, ArrayOperation.maximum, "logical_or")
+
+
+def _logical_xor(a, b):
+    a, b = _truth(a), _truth(b)
+    if not _is_array(a) and not _is_array(b):
+        return bool(a) != bool(b)
+    return _compare(a, b, "not_equal")
+
+
+def _power(base, exponent):
+    base = _coerce_operand(base)
+    exponent = _coerce_operand(exponent)
+    if _is_array(base) and not _is_array(exponent) and isinstance(exponent, numbers.Real):
+        if _is_int_dtype(base.dtype) and isinstance(exponent, int) and exponent < 0:
+            raise ValueError("Integers to negative integer powers are not allowed.")
+        if exponent == 2:
+            # same fast path as NumPy (x**2 -> square); pow(x, 2) == x*x exactly
+            return _array_mul(base, base)
+    return _ew_binary(base, exponent, ArrayOperation.power, "power")
+
+
+def _reciprocal(x):
+    x = _coerce_operand(x)
+    if _is_array(x) and _is_int_dtype(x.dtype):
+        # integer 1/x truncates: 1 for 1, -1 for -1, else 0 (0 also for x == 0)
+        return _compare(x, 1, "equal") - _compare(x, -1, "equal")
+    return _ew_binary(1, x, ArrayOperation.div, "reciprocal")
+
+
+def _round(x, decimals=0):
+    """Round half to even, with NumPy's algorithm for ``decimals != 0``."""
+
+    (x,), _shape, dtype = _ew_operands("round", x)
+    decimals = int(decimals)
+    if _is_int_dtype(dtype):
+        if decimals >= 0:
+            return x.copy()
+        raise NotImplementedError("round of integer arrays with decimals < 0")
+    if decimals == 0:
+        return _ew_unary(x, ArrayOperation.rint, "round")
+    if decimals > 0:
+        factor = float(10.0**decimals)
+        return _ew_unary(x * factor, ArrayOperation.rint, "round") / factor
+    factor = float(10.0 ** (-decimals))
+    return _ew_unary(x / factor, ArrayOperation.rint, "round") * factor
+
+
+def _trunc(x):
+    (x,), _shape, dtype = _ew_operands("trunc", x)
+    if _is_int_dtype(dtype):
+        return x.copy()
+    return _where(
+        _compare(x, 0, "less"),
+        _ew_unary(x, ArrayOperation.ceil, "trunc"),
+        _ew_unary(x, ArrayOperation.floor, "trunc"),
+    )
+
+
+def _where(condition, x, y):
+    condition = _coerce_operand(condition)
+    if not _is_array(condition):
+        condition = int(bool(condition))
+    return _ew_ternary(condition, x, y, ArrayOperation.where, "where")
+
+
+def _clip(a, a_min=None, a_max=None):
+    if a_min is None and a_max is None:
+        raise ValueError("One of max or min must be given")
+    if a_min is None:
+        return _ew_binary(a, a_max, ArrayOperation.minimum, "clip")
+    if a_max is None:
+        return _ew_binary(a, a_min, ArrayOperation.maximum, "clip")
+    return _ew_ternary(a, a_min, a_max, ArrayOperation.clip, "clip")
+
+
+def _log(x, base=None):
+    if base is None or base == np.e:
+        return _ew_unary(x, ArrayOperation.log, "log", float_only=True)
+    if base == 2:
+        return _ew_unary(x, ArrayOperation.log2, "log2", float_only=True)
+    if base == 10:
+        return _ew_unary(x, ArrayOperation.log10, "log10", float_only=True)
+    return _ew_unary(x, ArrayOperation.log, "log", float_only=True) * float(1.0 / np.log(base))
+
+
+def _array_pow(self, other):
+    return _power(self, other)
+
+
+def _array_rpow(self, other):
+    return _power(other, self)
+
+
+def _array_mod(self, other):
+    return _ew_binary(self, other, ArrayOperation.mod, "remainder")
+
+
+def _array_rmod(self, other):
+    return _ew_binary(other, self, ArrayOperation.mod, "remainder")
+
+
+def _array_floordiv(self, other):
+    return _ew_binary(self, other, ArrayOperation.floor_divide, "floor_divide")
+
+
+def _array_rfloordiv(self, other):
+    return _ew_binary(other, self, ArrayOperation.floor_divide, "floor_divide")
+
+
+def _array_divmod(self, other):
+    return _array_floordiv(self, other), _array_mod(self, other)
+
+
+def _array_rdivmod(self, other):
+    return _array_rfloordiv(self, other), _array_rmod(self, other)
+
+
+def _array_lt(self, other):
+    return _compare(self, other, "less")
+
+
+def _array_le(self, other):
+    return _compare(self, other, "less_equal")
+
+
+def _array_gt(self, other):
+    return _compare(self, other, "greater")
+
+
+def _array_ge(self, other):
+    return _compare(self, other, "greater_equal")
+
+
+def _array_eq(self, other):
+    if other is None:
+        return False
+    return _compare(self, other, "equal")
+
+
+def _array_ne(self, other):
+    if other is None:
+        return True
+    return _compare(self, other, "not_equal")
+
+
+def _array_abs(self):
+    return _ew_unary(self, ArrayOperation.abs, "absolute")
+
+
+def _array_pos(self):
+    return self.copy()
+
+
+class _ElementwiseMethods(object):
+    """Elementwise methods shared by Array and ArrayView.
+
+    NumPy's ndarray methods (round, clip) plus the method API of the original
+    charmnumeric backend (branch fix-temporaries: sqrt, log(base), log2,
+    log10, abs, where, power, modulo, max/min(other), ...).
+    """
+
+    __slots__ = ()
+
+    # NumPy ndarray methods
+    def round(self, decimals=0):
+        return _round(self, decimals)
+
+    def clip(self, min=None, max=None):
+        return _clip(self, min, max)
+
+    # Methods of the fix-temporaries backend
+    def exp(self):
+        return fusible_op(self, operation=ArrayOperation.exp, shape=self.shape, dtype=self.dtype)
+
+    def tanh(self):
+        return fusible_op(self, operation=ArrayOperation.tanh, shape=self.shape, dtype=self.dtype)
+
+    def log(self, base=np.e):
+        return _log(self, base)
+
+    def log2(self):
+        return _log(self, 2)
+
+    def log10(self):
+        return _log(self, 10)
+
+    def sqrt(self):
+        return _ew_unary(self, ArrayOperation.sqrt, "sqrt", float_only=True)
+
+    def abs(self):
+        return _array_abs(self)
+
+    def absolute(self):
+        return _array_abs(self)
+
+    def negate(self):
+        return -self
+
+    def square(self):
+        return _array_mul(self, self)
+
+    def reciprocal(self):
+        return _reciprocal(self)
+
+    def sin(self):
+        return _ew_unary(self, ArrayOperation.sin, "sin", float_only=True)
+
+    def cos(self):
+        return _ew_unary(self, ArrayOperation.cos, "cos", float_only=True)
+
+    def relu(self):
+        return _ew_binary(self, 0, ArrayOperation.maximum, "relu")
+
+    def scale(self, scalar):
+        return self * scalar
+
+    def add_constant(self, constant):
+        return self + constant
+
+    def add(self, other):
+        return self + other
+
+    def subtract(self, other):
+        return self - other
+
+    def multiply(self, other):
+        return self * other
+
+    def divide(self, other):
+        return self / other
+
+    def modulo(self, other):
+        return _array_mod(self, other)
+
+    def power(self, other):
+        return _power(self, other)
+
+    # max/min (NumPy reductions, plus the old elementwise a.max(other) form) are
+    # installed on Array/ArrayView by reductions.py.
+
+    def greater_than(self, other):
+        return _compare(self, other, "greater")
+
+    def less_than(self, other):
+        return _compare(self, other, "less")
+
+    def equal(self, other, epsilon=None):
+        """Exact equality mask, or ``|self - other| <= epsilon`` when epsilon is given."""
+
+        if epsilon is None:
+            return _compare(self, other, "equal")
+        return _compare(_array_abs(self - other), epsilon, "less_equal")
+
+    def where(self, x, y):
+        """``where(self, x, y)``: self is the condition (old backend API)."""
+
+        return _where(self, x, y)
+
+    def weighted_average(self, other, w1, w2):
+        return self * w1 + other * w2
 
 
 def _array_matmul(self, other):
@@ -615,8 +1139,10 @@ def _matmatmul(lhs, rhs):
     )
 
 
-class Array(FrontendObject):
+class Array(FrontendObject, _ElementwiseMethods):
     __array_priority__ = 1000
+    # __eq__ is elementwise; keep FrontendObject's name-based hash
+    __hash__ = FrontendObject.__hash__
 
     def __init__(self, **kwargs):
         dtype = _normalize_dtype(kwargs.pop("dtype", None), allow_none=True)
@@ -720,6 +1246,27 @@ class Array(FrontendObject):
     __truediv__ = _array_truediv
     __rtruediv__ = _array_rtruediv
     __matmul__ = _array_matmul
+    __pow__ = _array_pow
+    __rpow__ = _array_rpow
+    __mod__ = _array_mod
+    __rmod__ = _array_rmod
+    __floordiv__ = _array_floordiv
+    __rfloordiv__ = _array_rfloordiv
+    __divmod__ = _array_divmod
+    __rdivmod__ = _array_rdivmod
+    __lt__ = _array_lt
+    __le__ = _array_le
+    __gt__ = _array_gt
+    __ge__ = _array_ge
+    __eq__ = _array_eq
+    __ne__ = _array_ne
+    __abs__ = _array_abs
+    __pos__ = _array_pos
+    # logical on 0/1 masks (there is no bool dtype; not bitwise on integers)
+    __and__ = __rand__ = _logical_and
+    __or__ = __ror__ = _logical_or
+    __xor__ = __rxor__ = _logical_xor
+    __invert__ = _logical_not
 
     def dot(self, other):
         return _array_matmul(self, other)
@@ -744,10 +1291,12 @@ class Array(FrontendObject):
         return self.copy() if copy else self
 
 
-class ArrayView(FrontendObjectView):
+class ArrayView(FrontendObjectView, _ElementwiseMethods):
     """Array-specific view with arithmetic operators and slicing."""
 
     __array_priority__ = 1000
+    # __eq__ is elementwise; keep identity hashing
+    __hash__ = object.__hash__
 
     @property
     def ndim(self):
@@ -824,6 +1373,27 @@ class ArrayView(FrontendObjectView):
     __truediv__ = _array_truediv
     __rtruediv__ = _array_rtruediv
     __matmul__ = _array_matmul
+    __pow__ = _array_pow
+    __rpow__ = _array_rpow
+    __mod__ = _array_mod
+    __rmod__ = _array_rmod
+    __floordiv__ = _array_floordiv
+    __rfloordiv__ = _array_rfloordiv
+    __divmod__ = _array_divmod
+    __rdivmod__ = _array_rdivmod
+    __lt__ = _array_lt
+    __le__ = _array_le
+    __gt__ = _array_gt
+    __ge__ = _array_ge
+    __eq__ = _array_eq
+    __ne__ = _array_ne
+    __abs__ = _array_abs
+    __pos__ = _array_pos
+    # logical on 0/1 masks (there is no bool dtype; not bitwise on integers)
+    __and__ = __rand__ = _logical_and
+    __or__ = __ror__ = _logical_or
+    __xor__ = __rxor__ = _logical_xor
+    __invert__ = _logical_not
 
     def dot(self, other):
         return _array_matmul(self, other)
@@ -860,22 +1430,65 @@ def create_array(shape, dtype=_DEFAULT_DTYPE, **kwargs):
     )
 
 
-def _assign_host_data(target, values):
-    host = np.asarray(values, dtype=target.dtype)
-    if host.shape != target.shape:
-        raise ValueError(f"cannot assign data with shape {host.shape} into shape {target.shape}")
+# ---------------------------------------------------------------------------
+# Array-creation nodes (UPLOAD / RANDOM / IOTA)
+#
+# Each creation op is a single non-fusible DAG node that creates a new array
+# and fills it on the backend, chare by chare, with no communication. Its
+# parameters travel as 64-bit words, each sent as two exact SCALAR operands
+# (high and low 32 bits), so int64 bounds and double bit patterns arrive
+# unchanged. UPLOAD carries the row-major host data as an INLINE_DATA operand.
+# ---------------------------------------------------------------------------
+_U64_MASK = (1 << 64) - 1
 
+
+def _u64_from_int(value):
+    return int(value) & _U64_MASK
+
+
+def _u64_from_double(value):
+    return struct.unpack("<Q", struct.pack("<d", float(value)))[0]
+
+
+def _u64_from_value(value, dtype):
+    """64-bit parameter word for a value of `dtype` (int64 or double bits)."""
+    if np.dtype(dtype).kind == "f":
+        return _u64_from_double(value)
+    return _u64_from_int(value)
+
+
+def _creation_op(operation, shape, dtype, words=(), payload=None):
+    shape = _normalize_shape(shape)
+    dtype = _normalize_dtype(dtype)
+    if len(shape) == 0:
+        raise NotImplementedError("0D charmnumeric arrays are not supported yet")
+    if len(shape) > 3:
+        raise NotImplementedError(
+            f"charmnumeric arrays have at most 3 dimensions, got shape {shape}"
+        )
+    region = _full_region(shape)
+    operands = [region]
+    for word in words:
+        word = int(word) & _U64_MASK
+        operands.append(float(word >> 32))
+        operands.append(float(word & 0xFFFFFFFF))
+    if payload is not None:
+        operands.append(InlineData(payload))
+    result = create_result(
+        Array, operation, operands, fusible=False, region=region, dtype=dtype, shape=shape
+    )
+    get_execution_state().add_node(NonFusibleNode(obj=result))
+    return result
+
+
+def _upload(host):
+    """Create an array holding the host ndarray `host` (bulk, one DAG node)."""
+    host = np.ascontiguousarray(host)
+    if host.ndim == 0:
+        raise NotImplementedError("0D charmnumeric arrays are not supported yet")
     if host.size == 0:
-        return target
-
-    first = host.reshape(-1)[0]
-    if host.size == 1 or np.all(host == first):
-        target[...] = _coerce_scalar(first)
-        return target
-
-    for index in np.ndindex(host.shape):
-        target[index] = _coerce_scalar(host[index])
-    return target
+        return create_array(host.shape, dtype=host.dtype)
+    return _creation_op(ArrayOperation.upload, host.shape, host.dtype, payload=host.tobytes())
 
 
 def _array_from_host_data(values, dtype=None, copy=True, ndmin=0):
@@ -893,8 +1506,19 @@ def _array_from_host_data(values, dtype=None, copy=True, ndmin=0):
         raise NotImplementedError("0D charmnumeric arrays are not supported yet")
 
     host_dtype = _normalize_dtype(host.dtype)
+    host = host.astype(host_dtype, copy=False)
+    if host.size == 0:
+        return create_array(host.shape, dtype=host_dtype)
+    # Constant data is cheaper as a scalar fill than as an upload, but scalars
+    # travel as doubles: int64 values beyond 2**53 must be uploaded.
+    first = host.reshape(-1)[0]
+    if (host.dtype.kind != "f" and int(float(first)) != int(first)) or (
+        host.size > 1 and not np.all(host == first)
+    ):
+        return _upload(host)
     result = create_array(host.shape, dtype=host_dtype)
-    return _assign_host_data(result, host)
+    result[...] = _coerce_scalar(first)
+    return result
 
 
 def _shape_dtype_from_like(obj):
@@ -909,6 +1533,9 @@ def _shape_dtype_from_like(obj):
 
 def _coerce_assignment_operand(rhs, shape, dtype):
     if isinstance(rhs, (Array, ArrayView)):
+        _check_same_dtype(_normalize_dtype(dtype, allow_none=True), rhs.dtype, "assignment")
+        if _shape_size(shape) > 1:
+            return _scalar_view_operand(rhs)
         return rhs
 
     if _is_scalar_like(rhs):
@@ -1039,23 +1666,188 @@ def copyto(dst, src):
     return dst
 
 
+# IOTA modes and LINSPACE flags (src/creation_kernels.hpp)
+_IOTA_ARANGE = 0
+_IOTA_LINSPACE = 1
+_IOTA_INDICES = 2
+_IOTA_EYE = 3
+_LINSPACE_ENDPOINT = 1
+_LINSPACE_STEP_ZERO = 2
+
+
+def _iota(shape, dtype, mode, axis=0, flags=0, num=0, div=0, v=(0, 0, 0, 0)):
+    words = [mode, axis, flags, _u64_from_int(num), _u64_from_int(div)] + list(v)
+    return _creation_op(ArrayOperation.iota, shape, dtype, words)
+
+
+def _arange_recipe(start, stop, step, dtype):
+    """(dtype, length, first, second) exactly as numpy.arange computes them."""
+    if step == 0:
+        raise ZeroDivisionError("arange: step must not be zero")
+    probe = np.arange(start, start, step, dtype=dtype)  # validates, infers dtype
+    dt = _normalize_dtype(probe.dtype)
+    length = max(0, int(math.ceil((stop - start) / step)))
+    first = dt.type(start)
+    second = dt.type(start + step) if length > 1 else first
+    return dt, length, first, second
+
+
 def arange(start, stop=None, step=1, dtype=None):
+    """numpy.arange, generated on the backend (bit-identical to NumPy).
+
+    NumPy fills ``out[i] = out[0] + i * (out[1] - out[0])`` in the output
+    dtype, with ``out[1] = start + step``; the backend uses the same formula.
+    """
+    if stop is None:
+        start, stop = 0, start
     requested_dtype = _normalize_dtype(dtype, allow_none=True)
-    host = np.arange(start, stop=stop, step=step, dtype=requested_dtype)
-    return _array_from_host_data(host, dtype=host.dtype, copy=False)
+    dt, length, first, second = _arange_recipe(start, stop, step, requested_dtype)
+    if length == 0:
+        return create_array((0,), dtype=dt)
+    result = _iota(
+        (length,), dt, _IOTA_ARANGE,
+        v=(_u64_from_value(first, dt), _u64_from_value(second, dt), 0, 0),
+    )
+    result._iota_recipe = ("arange", dt, length, first, second)
+    return result
+
+
+def linspace(start, stop, num=50, endpoint=True, retstep=False, dtype=None, axis=0):
+    """numpy.linspace for scalar start/stop, generated on the backend.
+
+    Python (or float64) start/stop are evaluated in float64 exactly as NumPy
+    does (``i * step + start``, last sample set to ``stop``, floor for integer
+    dtypes). Other inputs (float32 scalars, arrays) are computed with NumPy on
+    the host and uploaded.
+    """
+    num = int(num)
+    if num < 0:
+        raise ValueError(f"Number of samples, {num}, must be non-negative.")
+    out_dtype = _normalize_dtype(dtype, allow_none=True)
+    native = (
+        isinstance(start, (int, float, np.integer, np.float64))
+        and isinstance(stop, (int, float, np.integer, np.float64))
+        and not isinstance(start, bool)
+        and not isinstance(stop, bool)
+        and axis == 0
+    )
+    if not native or num == 0:
+        host, step = np.linspace(start, stop, num=num, endpoint=endpoint, retstep=True,
+                                 dtype=out_dtype, axis=axis)
+        result = array(host) if host.size else create_array(host.shape, dtype=host.dtype)
+        return (result, step) if retstep else result
+
+    if out_dtype is None:
+        out_dtype = np.dtype(np.float64)
+    div = (num - 1) if endpoint else num
+    start64 = np.float64(start)
+    stop64 = np.float64(stop)
+    delta = np.subtract(stop, start, dtype=np.float64)
+    flags = _LINSPACE_ENDPOINT if endpoint else 0
+    if div > 0:
+        step = delta / div
+        if step == 0:
+            flags |= _LINSPACE_STEP_ZERO
+    else:
+        step = np.nan
+    result = _iota(
+        (num,), out_dtype, _IOTA_LINSPACE, flags=flags, num=num, div=div,
+        v=(_u64_from_double(start64), _u64_from_double(stop64),
+           _u64_from_double(step), _u64_from_double(delta)),
+    )
+    result._iota_recipe = ("linspace", flags, num, div, start64, stop64, step, delta)
+    return (result, float(step)) if retstep else result
+
+
+def indices(dimensions, dtype=int, sparse=False):
+    """numpy.indices for 1-D/2-D grids (the dense result is at most 3-D)."""
+    dimensions = _normalize_shape(dimensions)
+    dtype = _normalize_dtype(dtype)
+    nd = len(dimensions)
+    if sparse:
+        out = []
+        for k in range(nd):
+            shape = tuple(dimensions[k] if d == k else 1 for d in range(nd))
+            out.append(_axis_range(shape, k, dimensions[k], dtype))
+        return tuple(out)
+    if nd + 1 > 3:
+        raise NotImplementedError("indices: the dense result would have more than 3 dims")
+    shape = (nd,) + dimensions
+    if _shape_size(shape) == 0:
+        return create_array(shape, dtype=dtype)
+    return _iota(shape, dtype, _IOTA_INDICES)
+
+
+def _axis_range(shape, axis, n, dtype, recipe=None):
+    """out[..., i_axis, ...] = recipe(i_axis): an arange/linspace laid along `axis`."""
+    if _shape_size(shape) == 0:
+        return create_array(shape, dtype=dtype)
+    if recipe is None:
+        recipe = ("arange", dtype, n, dtype.type(0), dtype.type(1))
+    if recipe[0] == "arange":
+        _, rdt, _, first, second = recipe
+        if np.dtype(rdt) != np.dtype(dtype):
+            raise TypeError("meshgrid: dtype changes need astype")
+        return _iota(shape, dtype, _IOTA_ARANGE, axis=axis,
+                     v=(_u64_from_value(first, dtype), _u64_from_value(second, dtype), 0, 0))
+    _, flags, num, div, start64, stop64, step, delta = recipe
+    return _iota(shape, dtype, _IOTA_LINSPACE, axis=axis, flags=flags, num=num, div=div,
+                 v=(_u64_from_double(start64), _u64_from_double(stop64),
+                    _u64_from_double(step), _u64_from_double(delta)))
+
+
+def meshgrid(*xi, copy=True, sparse=False, indexing="xy"):
+    """numpy.meshgrid for up to three 1-D inputs.
+
+    Inputs may be host sequences / NumPy arrays (uploaded) or charmnumeric
+    arrays made by arange/linspace (generated natively along each output
+    axis). Other device arrays would need broadcasting and are not supported.
+    """
+    if indexing not in ("xy", "ij"):
+        raise ValueError("Valid values for `indexing` are 'xy' and 'ij'.")
+    ndim = len(xi)
+    if ndim == 0:
+        return []
+    if ndim > 3:
+        raise NotImplementedError("meshgrid: at most 3 inputs (3-D outputs)")
+    lengths = []
+    for x in xi:
+        if isinstance(x, (Array, ArrayView)):
+            if getattr(x, "_iota_recipe", None) is None or x.ndims != 1:
+                raise NotImplementedError(
+                    "meshgrid of a device array needs general broadcasting; pass host "
+                    "data or an array made by cnp.arange/cnp.linspace"
+                )
+            lengths.append(x.shape[0])
+        else:
+            lengths.append(int(np.asarray(x).size))
+    axes = list(range(ndim))
+    if indexing == "xy" and ndim > 1:
+        axes[0], axes[1] = 1, 0
+    full_shape = [0] * ndim
+    for k in range(ndim):
+        full_shape[axes[k]] = lengths[k]
+    out = []
+    for k, x in enumerate(xi):
+        shape = tuple(full_shape) if not sparse else tuple(
+            lengths[k] if d == axes[k] else 1 for d in range(ndim))
+        if isinstance(x, (Array, ArrayView)):
+            out.append(_axis_range(shape, axes[k], lengths[k], x.dtype, x._iota_recipe))
+        else:
+            host = np.asarray(x).reshape(-1)
+            view_shape = [1] * ndim
+            view_shape[axes[k]] = lengths[k]
+            out.append(array(np.broadcast_to(host.reshape(view_shape), shape)))
+    return out
 
 
 def eye(N, M=None, k=0, dtype=_DEFAULT_DTYPE):
     rows = int(N)
     cols = rows if M is None else int(M)
-    result = zeros((rows, cols), dtype=dtype)
-
-    row = max(0, -int(k))
-    col = max(0, int(k))
-    length = max(0, min(rows - row, cols - col))
-    for offset in range(length):
-        result[row + offset, col + offset] = 1
-    return result
+    dtype = _normalize_dtype(dtype)
+    if rows == 0 or cols == 0:
+        return zeros((rows, cols), dtype=dtype)
+    return _iota((rows, cols), dtype, _IOTA_EYE, v=(_u64_from_int(k), 0, 0, 0))
 
 
 def identity(n, dtype=_DEFAULT_DTYPE):

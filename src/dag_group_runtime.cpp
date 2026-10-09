@@ -1,6 +1,6 @@
 #include "backend_internal.hpp"
 #include "decomposition_solver.hpp"
-#include "jit.hpp"
+#include "jit_api.hpp"
 
 #include <cstring>
 
@@ -10,7 +10,7 @@ ArrayDAGGroup::ArrayDAGGroup() : num_compile(0) {
         Kokkos::initialize();
 #endif
     register_reduce_dot_sum();
-    jit = new MLIRJitCompiler();
+    jit = jit_create();
     if (CkMyPe() == 0) {
         partition_proxy_1 = CProxy_Partition1D::ckNew();
         partition_proxy_2 = CProxy_Partition2D::ckNew();
@@ -32,7 +32,7 @@ void ArrayDAGGroup::proxies_ready() {
 }
 
 ArrayDAGGroup::~ArrayDAGGroup() {
-    delete jit;
+    jit_destroy(jit);
 #ifdef USE_KOKKOS
     if (Kokkos::is_initialized())
         Kokkos::finalize();

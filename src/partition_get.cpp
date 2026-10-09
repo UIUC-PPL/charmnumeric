@@ -25,7 +25,11 @@ void PartitionImpl<N>::process_get(int epoch) {
     {
         CTArrayBase<N>* arr = arrays[name];
         int esz = arr->elem_size();
-        auto global_region = arr->decomp.chare_region_global(nd_idx);
+        // Position in the gathered (array-local, row-major) result: the chare
+        // region is decomp-global, so remove the decomposition offset (nonzero
+        // when the solver shifted the array to align with a sliced use, e.g.
+        // X in lstm_forward); otherwise fragments land past the buffer end.
+        auto global_region = arr->decomp.chare_region_local(nd_idx);
 
         std::array<int64_t, N> global_strides;
         global_strides[N - 1] = 1;

@@ -22,44 +22,76 @@ CProxy_Partition3D& get_partition_proxy<3>(ArrayDAGGroup* dag_group) {
     return dag_group->partition_proxy_3;
 }
 
+/// Build the source->target lattice map of a cross-ndims SET_REGION from metadata.
+template <int N_src, int N_tgt>
+static CrossSetRegionMap<N_src, N_tgt>
+make_cross_set_region_map(const ArrayDAGGroup::ArrayMetadata& src_meta,
+                          const ArrayDAGGroup::ArrayMetadata& tgt_meta, ASTNode* sr_root) {
+    std::array<int, N_src> src_shape, src_off;
+    for (int d = 0; d < N_src; ++d) {
+        src_shape[d] = src_meta.global_shape[d];
+        src_off[d] = src_meta.offset[d];
+    }
+    std::array<int, N_tgt> tgt_shape, tgt_off;
+    for (int d = 0; d < N_tgt; ++d) {
+        tgt_shape[d] = tgt_meta.global_shape[d];
+        tgt_off[d] = tgt_meta.offset[d];
+    }
+    return CrossSetRegionMap<N_src, N_tgt>(sr_root->get_operand_region(1), src_shape, src_off,
+                                           sr_root->region, tgt_shape, tgt_off);
+}
+
 template <int N>
 static void dispatch_cross_send(DType dt, PartitionImpl<N>* partition, DAGNode* node, int source_name,
                                 int target_name, ASTNode* sr_root, ArrayDAGGroup* dag_group) {
     int target_ndims = sr_root->ndims;
-    Region* tgt_region = sr_root->region;
 
-    // Compute dimension mapping from source metadata
     auto src_it = partition->arrays.find(source_name);
     if (src_it == partition->arrays.end() || src_it->second->local_size() == 0)
         return;
 
-    int src_global_shape[3] = {};
-    for (int d = 0; d < N; ++d)
-        src_global_shape[d] = src_it->second->global_shape[d];
+    // The source array's physical decomposition is authoritative on the sender.
+    ArrayDAGGroup::ArrayMetadata src_meta{};
+    src_meta.ndims = N;
+    for (int d = 0; d < N; ++d) {
+        src_meta.global_shape[d] = src_it->second->global_shape[d];
+        src_meta.offset[d] = src_it->second->decomp.offset[d];
+    }
+    src_meta.tile = src_it->second->decomp.tile;
 
     // Look up target array decomposition from array_meta
     auto tgt_meta_it = dag_group->array_meta.find(target_name);
+    if (tgt_meta_it == dag_group->array_meta.end())
+        CkAbort("Cross-partition SET_REGION: no metadata for target name=%d", target_name);
+    const auto& tgt_meta = tgt_meta_it->second;
 
     // Dispatch to the correct N_tgt template
     if (target_ndims == 1) {
-        int dim_map[1];
-        compute_dim_map<N, 1>(src_global_shape, tgt_region, dim_map);
-        auto tgt_decomp = tgt_meta_it->second.template decomp<1>();
-        dispatch_cross_set_region_send<N, 1>(dt, partition, node, source_name, dim_map, tgt_region,
-                                             get_partition_proxy<1>(dag_group), tgt_decomp);
+        auto xmap = make_cross_set_region_map<N, 1>(src_meta, tgt_meta, sr_root);
+        dispatch_cross_set_region_send<N, 1>(dt, partition, node, source_name, xmap,
+                                             get_partition_proxy<1>(dag_group),
+                                             tgt_meta.template decomp<1>());
     } else if (target_ndims == 2) {
-        int dim_map[2];
-        compute_dim_map<N, 2>(src_global_shape, tgt_region, dim_map);
-        auto tgt_decomp = tgt_meta_it->second.template decomp<2>();
-        dispatch_cross_set_region_send<N, 2>(dt, partition, node, source_name, dim_map, tgt_region,
-                                             get_partition_proxy<2>(dag_group), tgt_decomp);
+        auto xmap = make_cross_set_region_map<N, 2>(src_meta, tgt_meta, sr_root);
+        dispatch_cross_set_region_send<N, 2>(dt, partition, node, source_name, xmap,
+                                             get_partition_proxy<2>(dag_group),
+                                             tgt_meta.template decomp<2>());
     } else if (target_ndims == 3) {
-        int dim_map[3];
-        compute_dim_map<N, 3>(src_global_shape, tgt_region, dim_map);
-        auto tgt_decomp = tgt_meta_it->second.template decomp<3>();
-        dispatch_cross_set_region_send<N, 3>(dt, partition, node, source_name, dim_map, tgt_region,
-                                             get_partition_proxy<3>(dag_group), tgt_decomp);
+        auto xmap = make_cross_set_region_map<N, 3>(src_meta, tgt_meta, sr_root);
+        dispatch_cross_set_region_send<N, 3>(dt, partition, node, source_name, xmap,
+                                             get_partition_proxy<3>(dag_group),
+                                             tgt_meta.template decomp<3>());
     }
+}
+
+/// Receiver side: number of fragments the source partition sends to my chare.
+template <int N_src, int N_tgt>
+static int expected_cross_set_region_msgs(const ArrayDAGGroup::ArrayMetadata& src_meta,
+                                          const ArrayDAGGroup::ArrayMetadata& tgt_meta,
+                                          ASTNode* sr_root, const ArrayRegion<N_tgt>& my_chare) {
+    auto xmap = make_cross_set_region_map<N_src, N_tgt>(src_meta, tgt_meta, sr_root);
+    return count_cross_set_region_msgs<N_src, N_tgt>(xmap, src_meta.template decomp<N_src>(),
+                                                     my_chare);
 }
 
 template <int N>
@@ -107,8 +139,10 @@ void ArrayDAGExecutorND<N>::execute_cross_set_region_node(DAGNode* node) {
         auto r_chare_global = tgt_decomp.chare_region_global(nd_idx);
         auto* tgt_region = static_cast<ArrayRegion<N>*>(sr_root->region);
 
-        // Preserve the target lattice for stepped target slices.
-        auto [my_input, has_overlap] = intersect(*tgt_region, r_chare_global);
+        // Preserve the target lattice for stepped target slices.  The wire
+        // region is array-local; chare regions are decomp-global.
+        auto [my_input, has_overlap] =
+            intersect(tgt_decomp.to_global(*tgt_region), r_chare_global);
         if (!has_overlap) {
             node_finished(node->id);
             return;
@@ -122,38 +156,30 @@ void ArrayDAGExecutorND<N>::execute_cross_set_region_node(DAGNode* node) {
             return;
         }
         int src_ndims = meta_it->second.ndims;
-        int src_tile = array_tile(dag_group->array_meta, source_name, src_ndims);
 
-        // Build dimension mapping (source dim → target dim)
-        int dim_map[3] = {}; // dim_map[td] = source dim
-        if (src_ndims > N) {
-            // Higher→lower: non-singleton source dims map to target dims
-            int td = 0;
-            for (int sd = 0; sd < src_ndims && td < N; ++sd) {
-                if (meta_it->second.global_shape[sd] > 1)
-                    dim_map[td++] = sd;
-            }
-        } else {
-            // Lower→higher: non-singleton target region dims receive source dims
-            int sd = 0;
-            for (int td = 0; td < N && sd < src_ndims; ++td) {
-                if (tgt_region->size(td) > 1)
-                    dim_map[td] = sd++;
-                else
-                    dim_map[td] = -1;
-            }
+        // Count exactly the source chares whose share of the source view maps
+        // onto this chare, using the same lattice map as the sender.
+        ArrayDAGGroup::ArrayMetadata tgt_meta{};
+        tgt_meta.ndims = N;
+        for (int d = 0; d < N; ++d) {
+            tgt_meta.global_shape[d] = tgt_decomp.global_shape[d];
+            tgt_meta.offset[d] = tgt_decomp.offset[d];
         }
-
-        // Count expected messages: for each target dim, how many source chares overlap
-        int expected_msgs = 1;
-        for (int td = 0; td < N; ++td) {
-            if (dim_map[td] < 0)
-                continue;
-            int range_start = my_input.start[td];
-            int range_stop = my_input.stop[td];
-            int src_chare_start = range_start / src_tile;
-            int src_chare_stop = (range_stop + src_tile - 1) / src_tile;
-            expected_msgs *= (src_chare_stop - src_chare_start);
+        tgt_meta.tile = tgt_decomp.tile;
+        int expected_msgs = 0;
+        switch (src_ndims) {
+        case 1:
+            expected_msgs = expected_cross_set_region_msgs<1, N>(meta_it->second, tgt_meta,
+                                                                 sr_root, r_chare_global);
+            break;
+        case 2:
+            expected_msgs = expected_cross_set_region_msgs<2, N>(meta_it->second, tgt_meta,
+                                                                 sr_root, r_chare_global);
+            break;
+        case 3:
+            expected_msgs = expected_cross_set_region_msgs<3, N>(meta_it->second, tgt_meta,
+                                                                 sr_root, r_chare_global);
+            break;
         }
 
         DBG_PRINT("[Chare %d]   target side: expected_msgs=%d\n", partition->index[0],

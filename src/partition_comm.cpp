@@ -4,12 +4,24 @@
 #include <cstring>
 
 #ifdef USE_KOKKOS
+static std::vector<int> recv_key(int node_id, int input_index, int name, int ndims,
+                                 const int* region_data) {
+    std::vector<int> key = {node_id, input_index, name, ndims};
+    key.insert(key.end(), region_data, region_data + ndims * 3);
+    return key;
+}
+#endif
+
+#ifdef USE_KOKKOS
 template <int N>
 void PartitionImpl<N>::receive_data(int& node_id, int& input_index, int& name, int& ndims,
                                     int*& region_data, int64_t& size, char*& data,
                                     CkDeviceBufferPost* devicePost) {
-    // Post entry method: allocate device buffer for incoming GPU data
+    // Post entry method: allocate device buffer for incoming GPU data. Charm++
+    // invokes the regular entry with a null data pointer once the transfer is
+    // done, so remember the buffer under the message's identity.
     data = static_cast<char*>(Kokkos::kokkos_malloc<DeviceSpace>(size));
+    posted_recv_bufs[recv_key(node_id, input_index, name, ndims, region_data)].push_back(data);
 }
 
 template <int N>
@@ -28,8 +40,19 @@ void PartitionImpl<N>::receive_data(int node_id, int input_index, int name, int 
     PendingComm<N>& comm = executor->pending[node_id];
 
 #ifdef USE_KOKKOS
-    // data is already a device pointer (allocated in post method, filled by GPU messaging)
+    // The payload landed in the device buffer allocated by the post entry above.
     char* buf = data;
+    if (buf == nullptr) {
+        auto key = recv_key(node_id, input_index, name, ndims, region_data);
+        auto it = posted_recv_bufs.find(key);
+        if (it == posted_recv_bufs.end() || it->second.empty())
+            CkAbort("receive_data: no posted device buffer for node=%d input=%d name=%d",
+                    node_id, input_index, name);
+        buf = it->second.front();
+        it->second.pop_front();
+        if (it->second.empty())
+            posted_recv_bufs.erase(it);
+    }
 #else
     char* buf = new char[size];
     memcpy(buf, data, size);

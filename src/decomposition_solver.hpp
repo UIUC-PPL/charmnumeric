@@ -248,9 +248,15 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
             return try_assign_tile(array_name, candidate_tile);
         };
 
+        // visited_temps: temps already expanded during this top-level walk.
+        // Fused chains reuse temps (e.g. Newton steps x' = f(x, x)), so
+        // re-expanding a temp per use is exponential in the chain length; one
+        // expansion yields the same proposals (operand regions come from the
+        // temp's own definition, not from the path that reached it).
         auto collect_tile_candidates =
             [&](auto&& self, int array_name, int ndims, ASTNode* node, Region* carried_region,
-                const std::unordered_map<int, ASTNode*>& temp_defs) -> bool {
+                const std::unordered_map<int, ASTNode*>& temp_defs,
+                std::unordered_set<int>& visited_temps) -> bool {
             if (node == nullptr || node->is_scalar || node->is_broadcast)
                 return false;
 
@@ -265,11 +271,14 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
             if (node->operands.empty()) {
                 auto def_it = temp_defs.find(node->result_name);
                 if (def_it != temp_defs.end()) {
+                    if (!visited_temps.insert(node->result_name).second)
+                        return false;
                     ASTNode* def_root = def_it->second;
                     bool changed = false;
                     for (int i = 0; i < (int)def_root->operands.size(); ++i) {
                         changed = self(self, array_name, ndims, def_root->operands[i],
-                                       def_root->get_operand_region(i), temp_defs) ||
+                                       def_root->get_operand_region(i), temp_defs,
+                                       visited_temps) ||
                                   changed;
                     }
                     return changed;
@@ -280,7 +289,7 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
             bool changed = false;
             for (int child_idx = 0; child_idx < (int)node->operands.size(); ++child_idx) {
                 changed = self(self, array_name, ndims, node->operands[child_idx],
-                               node->get_operand_region(child_idx), temp_defs) ||
+                               node->get_operand_region(child_idx), temp_defs, visited_temps) ||
                           changed;
             }
             return changed;
@@ -320,12 +329,13 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                         if (region_is_dense(ast_node->region, dst_it->second.ndims)) {
                             for (int op_idx = 1; op_idx < (int)ast_node->operands.size();
                                  ++op_idx) {
+                                std::unordered_set<int> visited_temps;
                                 tiles_changed =
                                     collect_tile_candidates(collect_tile_candidates, dst_name,
                                                             dst_it->second.ndims,
                                                             ast_node->operands[op_idx],
                                                             ast_node->get_operand_region(op_idx),
-                                                            temp_defs) ||
+                                                            temp_defs, visited_temps) ||
                                     tiles_changed;
                             }
                         }
@@ -360,13 +370,14 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                             continue;
 
                         for (int op_idx = 0; op_idx < (int)ast_node->operands.size(); ++op_idx) {
+                            std::unordered_set<int> visited_temps;
                             tiles_changed =
                                 collect_tile_candidates(collect_tile_candidates,
                                                         ast_node->result_name,
                                                         out_it->second.ndims,
                                                         ast_node->operands[op_idx],
                                                         ast_node->get_operand_region(op_idx),
-                                                        temp_defs) ||
+                                                        temp_defs, visited_temps) ||
                                 tiles_changed;
                         }
                     }
@@ -508,7 +519,7 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
 
         detail::for_each_node_topo(dag, [&](DAGNode* dag_node) {
             for (ASTNode* ast_node : dag_node->ast->roots)
-                if (static_cast<Opcode>(ast_node->opcode) == Opcode::CREATE)
+                if (is_creation(static_cast<Opcode>(ast_node->opcode)))
                     source_arrays.insert(ast_node->result_name);
         });
 
@@ -560,7 +571,7 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
             for (ASTNode* ast_node : dag_node->ast->roots) {
                 Opcode op = static_cast<Opcode>(ast_node->opcode);
 
-                if (op == Opcode::CREATE) {
+                if (is_creation(op)) {
                     continue;
                 }
 
@@ -592,6 +603,16 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                         if (operand != nullptr && !operand->is_scalar)
                             matmul_arrays.insert(operand->result_name);
                     matmul_arrays.insert(ast_node->result_name);
+                }
+
+                // Reduction results are routed by a zero-offset decomposition.
+                // BINCOUNT also needs x and weights laid out identically.
+                if (is_reduction_op(op)) {
+                    matmul_arrays.insert(ast_node->result_name);
+                    if (op == Opcode::BINCOUNT)
+                        for (ASTNode* operand : ast_node->operands)
+                            if (operand != nullptr && !operand->is_scalar)
+                                matmul_arrays.insert(operand->result_name);
                 }
             }
         });

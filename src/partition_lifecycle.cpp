@@ -97,6 +97,18 @@ void PartitionImpl<N>::run() {
         return;
     }
 
+    // A chare inserted by PE 0 can be constructed on another PE before that
+    // PE's receive_dag() has recorded the partition's start epoch, so init()
+    // left it at epoch -1 and it would wait forever for DAGs of epochs that
+    // predate this partition (flaky hang at +p2, e.g. diag.py).  The epoch
+    // is known by the time receive_dag() wakes the chares with run().
+    if (executor->dag == nullptr) {
+        auto* dag_group = static_cast<ArrayDAGGroup*>(dag_proxy.ckLocalBranch());
+        int se = dag_group->partition_grid[N].start_epoch;
+        if (se > 0 && executor->epoch < se - 1)
+            executor->epoch = se - 1;
+    }
+
 #ifndef NDEBUG
     // Print cumulative communication volume at the end of each DAG epoch
     if (executor->dag != nullptr &&

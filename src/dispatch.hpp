@@ -86,8 +86,11 @@ static void deferred_send_cb(void* param, void* msg) {
     ChareIndex<N_sender> self_ci;
     for (int d = 0; d < N_sender; ++d)
         self_ci.idx[d] = p->partition->index[d];
+    // The source callback fires on the receiver with an empty message, so the
+    // send_id rides along as the callback's refnum.
     CkCallback cb(PartitionTraits<N_sender>::CkIndexType::send_complete(nullptr),
                   proxy_at<N_sender>(p->partition->thisProxy, self_ci));
+    cb.setRefnum(static_cast<CMK_REFNUM_TYPE>(p->send_id));
     proxy_at<N_target>(p->target_proxy, p->target_ci).receive_data(
         p->node_id, p->input_index, p->inp_name, N_target, p->region_data, p->byte_size,
         CkDeviceBuffer(reinterpret_cast<char*>(p->send_buf), cb));
@@ -113,7 +116,7 @@ static void device_pack_send(PartitionImpl<N_sender>* partition,
     memcpy(ds->region_data, region_data, sizeof(int) * N_target * 3);
     ds->byte_size = byte_size;
     ds->send_buf = send_buf;
-    ds->send_id = partition->next_send_id++;
+    ds->send_id = static_cast<CMK_REFNUM_TYPE>(partition->next_send_id++);
 #ifdef USE_NVIDIA
     CkCallback hapi_cb(deferred_send_cb<N_sender, N_target>, ds);
     hapiAddCallback(partition->comm_stream_raw, &hapi_cb);
@@ -186,11 +189,44 @@ static void dispatch_kernel(void* func_ptr, int n_memrefs, std::vector<MemRef<N,
 
 #if defined(USE_NVIDIA)
     {
-        CUfunction cuFunc = reinterpret_cast<CUfunction>(func_ptr);
-        int64_t n_elements = total_elements();
-        int blockSize = 256;
-        int gridSize = ((int)n_elements + blockSize - 1) / blockSize;
-        cuLaunchKernel(cuFunc, gridSize, 1, 1, blockSize, 1, 1, 0, stream, args.data(), nullptr);
+        // func_ptr is the JIT'd host launcher (see MLIRJitCompiler::generateNVIDIAHost):
+        // it takes the same packed arguments as the CPU path and launches the
+        // kernels synchronously on its own stream, so first drain this chare's
+        // stream (inputs may still be in flight there).
+        cudaStreamSynchronize(stream);
+        static const bool check_memrefs = getenv("CNUM_CHECK_MEMREFS") != nullptr;
+        if (check_memrefs) {
+            // Debug aid: verify each descriptor's accessed range lies inside the
+            // device allocation its pointer belongs to.
+            for (int i = 0; i < n_memrefs; ++i) {
+                const auto& m = descs[i];
+                int64_t lo = m.offset, hi = m.offset;
+                for (int d = 0; d < N; ++d) {
+                    int64_t ext = (m.sizes[d] > 0 ? m.sizes[d] - 1 : 0) * m.strides[d];
+                    (ext < 0 ? lo : hi) += ext;
+                }
+                CUdeviceptr base = 0;
+                size_t bytes = 0;
+                CUresult r = cuMemGetAddressRange(
+                    &base, &bytes, reinterpret_cast<CUdeviceptr>(m.aligned + lo));
+                bool ok = (r == CUDA_SUCCESS) &&
+                          reinterpret_cast<CUdeviceptr>(m.aligned + hi + 1) <= base + bytes;
+                if (!ok) {
+                    CkPrintf("[PE %d] memref %d/%d (%s) BAD: res=%d ptr=%p off=%lld sizes=", CkMyPe(),
+                             i, n_memrefs, i < n_input_memrefs ? "in" : "out", (int)r,
+                             (void*)m.aligned, (long long)m.offset);
+                    for (int d = 0; d < N; ++d)
+                        CkPrintf("%lld,", (long long)m.sizes[d]);
+                    CkPrintf(" strides=");
+                    for (int d = 0; d < N; ++d)
+                        CkPrintf("%lld,", (long long)m.strides[d]);
+                    CkPrintf(" alloc=[%p,+%zu) need=[%lld,%lld] elems\n", (void*)base, bytes,
+                             (long long)lo, (long long)hi);
+                }
+            }
+        }
+        using PackedFunc = void (*)(void**);
+        reinterpret_cast<PackedFunc>(func_ptr)(args.data());
     }
 #elif defined(USE_AMD)
     {

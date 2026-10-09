@@ -90,6 +90,14 @@ struct UnaryOpEntry {
     Fn int_body; // nullptr if not supported for integers
 };
 
+/// Registry entry for a ternary elementwise op (where, clip).
+struct TernaryOpEntry {
+    using Fn = std::function<mlir::Value(mlir::OpBuilder&, mlir::Location, mlir::Value,
+                                         mlir::Value, mlir::Value)>;
+    Fn float_body;
+    Fn int_body; // nullptr if not supported for integers
+};
+
 struct LeafUse {
     ASTNode* operand;
     Region* region;
@@ -109,6 +117,13 @@ class MLIRJitCompiler {
                  void** moduleOut, void** functionOut);
     void dumpMLIR();
 
+#ifdef USE_NVIDIA
+    /// Lower the fused function to a host-side launcher (kernels embedded as PTX,
+    /// launched through the MLIR CUDA runtime wrappers) and JIT it. The packed
+    /// entry point takes the same arguments as the CPU path, with device pointers
+    /// in the memref descriptors; load it with loadCPU().
+    std::unique_ptr<mlir::ExecutionEngine> generateNVIDIAHost();
+#endif
 #ifdef JIT_ENABLE_GPU_BACKEND
     std::string generateNVIDIA();
     std::string generateAMD();
@@ -124,8 +139,12 @@ class MLIRJitCompiler {
     /// Op registries: map opcode → body builder lambdas.
     static const std::unordered_map<int, BinaryOpEntry>& binaryOpRegistry();
     static const std::unordered_map<int, UnaryOpEntry>& unaryOpRegistry();
+    static const std::unordered_map<int, TernaryOpEntry>& ternaryOpRegistry();
 
   private:
+#ifdef USE_NVIDIA
+    bool lowerToNVIDIAHost();
+#endif
     mlir::MLIRContext context;
     mlir::OwningOpRef<mlir::ModuleOp> module;
     std::unique_ptr<mlir::OpBuilder> builder;
@@ -200,6 +219,42 @@ class MLIRJitCompiler {
             loc, TypeRange{}, ValueRange(inputs), ValueRange(outputs), indexingMaps, iterTypes,
             [&](OpBuilder& nestedBuilder, Location nestedLoc, ValueRange args) {
                 Value result = bodyBuilder(nestedBuilder, nestedLoc, args[0], args[1]);
+                linalg::YieldOp::create(nestedBuilder, nestedLoc, result);
+            });
+    }
+
+    // N-ary element-wise op helper: any input may be a bare scalar (wrapped in
+    // a 0-d memref so it broadcasts); memref inputs use the identity map.
+    template <typename BodyBuilderFn>
+    void emitGenericNaryOp(mlir::ValueRange ins, mlir::Value out, BodyBuilderFn bodyBuilder) {
+        using namespace mlir;
+        auto loc = builder->getUnknownLoc();
+
+        auto outType = mlir::cast<MemRefType>(out.getType());
+        int64_t rank = outType.getRank();
+        auto identityMap = builder->getMultiDimIdentityMap(rank);
+        auto scalarMap0 = AffineMap::get(rank, /*symbolCount=*/0, /*results=*/{}, &context);
+
+        SmallVector<AffineMap> indexingMaps;
+        SmallVector<Value> inputs;
+        for (Value v : ins) {
+            if (mlir::isa<MemRefType>(v.getType())) {
+                indexingMaps.push_back(identityMap);
+                inputs.push_back(v);
+            } else {
+                auto mem = memref::AllocaOp::create(*builder, loc, MemRefType::get({}, v.getType()));
+                memref::StoreOp::create(*builder, loc, v, mem, ValueRange{});
+                indexingMaps.push_back(scalarMap0);
+                inputs.push_back(mem);
+            }
+        }
+        indexingMaps.push_back(identityMap); // output
+        SmallVector<utils::IteratorType> iterTypes(rank, utils::IteratorType::parallel);
+
+        linalg::GenericOp::create(
+            *builder, loc, TypeRange{}, ValueRange(inputs), ValueRange{out}, indexingMaps,
+            iterTypes, [&](OpBuilder& nestedBuilder, Location nestedLoc, ValueRange args) {
+                Value result = bodyBuilder(nestedBuilder, nestedLoc, args.drop_back());
                 linalg::YieldOp::create(nestedBuilder, nestedLoc, result);
             });
     }

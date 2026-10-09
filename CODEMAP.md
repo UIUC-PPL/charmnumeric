@@ -8,7 +8,7 @@ Distributed N-dimensional array DSL built on charmtyles. Supports up to 3D array
 | Symbol | Line | Description |
 |--------|------|-------------|
 | `DType` | 34 | Type encoding — FLOAT32=0, FLOAT64=1, INT32=2, INT64=3; `from_numpy()`, `to_numpy()`, `promote()` |
-| `ArrayOperation` | 139 | Opcodes: add=0, sub=1, mul=2, div=3, matmul=4, tanh=5, exp=6, tile=7, reduce=8, matmatmul=9, diag=10 |
+| `ArrayOperation` | 139 | Opcodes: add=0, sub=1, mul=2, div=3, matmul=4, tanh=5, exp=6, tile=7, reduce=8, matmatmul=9, diag=10; elementwise math/comparisons/where/clip 20-49 |
 | `ArrayRegion` | 153 | N-D region with start/stop/step per dim — `serialize()`:194, `shape()`:209, `compose()`:212, `overlaps()`:232, `covers()`:239, `intersect()`:246 |
 | `Array(FrontendObject)` | 618 | Main array class — `wire_dtype()`:639, `get()`:683, `get_region()`/`__getitem__()`:690/697, `__setitem__()`:708, `dot()`:724, `matvec()`:727, `copy()`:730, `fill()`:735, `astype()`:738; operators: +,-,*,/,@ at 713-722 |
 | `ArrayView(FrontendObjectView)` | 747 | View with same ops as Array — `get()`:796, `__getitem__()`:801, `__setitem__()`:812, `dot()`:828 |
@@ -16,6 +16,9 @@ Distributed N-dimensional array DSL built on charmtyles. Supports up to 3D array
 | `_expand_key()` | 272 | Normalize indexing keys (handles newaxis, ellipsis) |
 | `_parse_key()` | 308 | Convert key → ArrayRegion |
 | `_array_add/sub/mul/truediv()` | 394-489 | Binary elementwise operator implementations |
+| `_ew_operands()` / `_ew_unary/_binary/_ternary()` | 551-606 | Elementwise math, comparisons (0/1 masks in operand dtype), where/clip; dtype/broadcast checks |
+| `_compare()` / `_compare_int_float()` | 669, 635 | Comparisons; exact int-array vs float-scalar rewriting |
+| `_ElementwiseMethods` | 863 | Mixin for Array/ArrayView: round/clip and old-backend methods (sqrt, log(base), where, max(other), ...) |
 | `_array_matmul()` | 492 | Matrix multiply dispatch (dot for 1D×1D, matvec for 2D×1D, matmatmul for 2D×2D) |
 | `_matvec()` | 536 | Matrix-vector multiply |
 | `_matmatmul()` | 595 | Matrix-matrix multiply (SUMMA) |
@@ -37,6 +40,17 @@ Distributed N-dimensional array DSL built on charmtyles. Supports up to 3D array
 | `dot()` | 105 | Dot product |
 | `norm2()` | 116 | Squared L2 norm (1D) |
 | `diag()` | 125 | Diagonal extraction/construction |
+| `sqrt/log*/abs/floor/ceil/rint/round/sign/...` | 199-270 | Unary elementwise math (opcodes 20-36) |
+| `power/maximum/minimum/fmax/fmin/remainder/floor_divide` | 287-305 | Binary elementwise math (37-43) |
+| `less/.../not_equal`, `logical_*`, `where`, `clip` | 325-375 | Comparisons (44-47) as 0/1 masks, where (48), clip (49) |
+
+### `charmnumeric/reductions.py` — Native reductions
+| Symbol | Description |
+|--------|-------------|
+| `_reduce()` | Builds a REDUCTION (opcode 60) node: operands `x, kind, axis_mask, keepdims, ddof, in_dtype` |
+| `sum/prod/mean/var/std/amax/amin/argmax/argmin/count_nonzero/all/any` | NumPy-style API (`axis`, `keepdims`, `dtype`, `out`); also installed as `Array`/`ArrayView` methods |
+| `bincount()` | BINCOUNT (opcode 61) node; needs `minlength` or `interface=` |
+| `norm()` | `cnp.linalg.norm` subset (vector 2/1/inf/-inf/0, matrix fro/inf/-inf/1/-1, axis) |
 
 ### `charmnumeric/interface.py` — Cluster management (130 lines)
 | Symbol | Line | Description |
@@ -44,10 +58,18 @@ Distributed N-dimensional array DSL built on charmtyles. Supports up to 3D array
 | `CharmNumericInterface(CCSInterface)` | 12 | Subclass with `from_bytes()` deserializer |
 | `LocalCluster` | 26 | Local server launcher — `_run_server()`:74, `_connect_with_retry()`:94, `close()`:111 |
 
-### `charmnumeric/random.py` — Random arrays (6 lines)
-| Symbol | Line | Description |
-|--------|------|-------------|
-| `randn()` | 4 | Random normal array |
+### `charmnumeric/random.py` — Native RNG (numpy.random subset)
+| Symbol | Description |
+|--------|-------------|
+| `Generator` / `default_rng()` | random, uniform, normal, standard_normal, integers; one RANDOM node per draw |
+| `seed`, `rand`, `random`, `randn`, `uniform`, `normal`, `randint` | Legacy module-level API on a global Generator (fixed default seed 0) |
+| `transposed()` | Regenerate a draw with permuted indices (== x.T, no transpose op needed) |
+
+### `charmnumeric/_rng_reference.py` — Host model of the creation kernels
+Bit-exact NumPy mirror of `src/creation_kernels.hpp` (Philox4x32-10, software log/cos, iota). Used by the simulator and tests.
+
+### Array creation in `charmnumeric/charmnumeric.py`
+`_creation_op()` builds UPLOAD (50) / RANDOM (51) / IOTA (52) nodes: `[region, (hi, lo) scalar word pairs..., InlineData]`. `_upload()` (bulk host data), `arange`, `linspace`, `indices`, `meshgrid`, `eye` (all native).
 
 ## C++ Backend (`example/charmnumeric/src/`)
 
@@ -105,9 +127,10 @@ Distributed N-dimensional array DSL built on charmtyles. Supports up to 3D array
 ### `opcodes.hpp` — Operation codes (50 lines)
 | Symbol | Line | Description |
 |--------|------|-------------|
-| `Opcode` | 3 | COPY=-5..DIAG=10 |
+| `Opcode` | 3 | COPY=-5..DIAG=10; elementwise SQRT=20..CLIP=49 |
 | `is_binary_elementwise()` | 23 | ADD/SUB/MUL/DIV |
-| `is_unary_elementwise()` | 36 | TANH/EXP |
+| `is_unary_elementwise()` | 36 | TANH/EXP and unary math/predicates (20-36) |
+| `is_ternary_elementwise()` | 109 | WHERE/CLIP |
 | `is_elementwise()` | 47 | Binary or unary elementwise |
 
 ### `jit.hpp` / `jit.cpp` — MLIR JIT compiler (150+ lines each)
@@ -115,6 +138,7 @@ Distributed N-dimensional array DSL built on charmtyles. Supports up to 3D array
 |--------|------|-------------|
 | `BinaryOpEntry` | 80 | Registry: float_body, int_body function pointers |
 | `UnaryOpEntry` | 87 | Registry: float_body, int_body function pointers |
+| `TernaryOpEntry` | 94 | Registry for 3-input ops (where, clip); `emitGenericNaryOp` builds the N-input linalg.generic |
 | `MLIRJitCompiler` | 101 | AST → MLIR → executable — `buildFromAST()`, `optimizeAndFuse()`, `generateCPU()`, `loadCPU()`, `generateNVIDIA/AMD/Intel()` |
 
 ### `dispatch.hpp` — Kernel dispatch & GPU callbacks (200+ lines)
@@ -138,6 +162,7 @@ Distributed N-dimensional array DSL built on charmtyles. Supports up to 3D array
 | `executor_matmul.cpp` | Matrix-vector multiply execution |
 | `executor_matmatmul.cpp` | Matrix-matrix multiply (SUMMA) execution |
 | `executor_reduce.cpp` | Reduce node execution |
+| `executor_reduction.cpp` | REDUCTION/BINCOUNT: per-chare partials (Kokkos on GPU) sent point-to-point to the output chares (`receive_reduce_partial`) |
 | `executor_reducer.cpp` | Custom reduction operations |
 | `executor_transfer.cpp` | Cross-partition data transfer |
 | `executor_incremental.cpp` | Incremental computation |
@@ -145,6 +170,8 @@ Distributed N-dimensional array DSL built on charmtyles. Supports up to 3D array
 | `partition_lifecycle.cpp` | `init()`, `create()`, `run()`, destructor |
 | `partition_comm.cpp` | `receive_data()` inter-chare communication |
 | `partition_get.cpp` | `process_get()` — gather results to PE 0 |
+| `executor_creation.cpp` | UPLOAD/RANDOM/IOTA: `stage_uploads()` (cut payload into this PE's chare tiles), `execute_creation_node()` (create + fill locally) |
+| `creation_kernels.hpp` | Host/device element functions: Philox RNG, Box-Muller with software log/cos, arange/linspace/indices/eye |
 | `jit.cpp` | MLIRJitCompiler implementation — buildFromAST, emitOp |
 
 ## Standalone C++ Tests (`example/charmnumeric/tests/`)

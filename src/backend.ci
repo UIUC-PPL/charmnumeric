@@ -29,14 +29,11 @@ mainmodule charmnumeric
 #endif
                                 char data[size]);
 #ifdef USE_KOKKOS
-        entry void receive_data(int node_id, int input_index, int name,
-                                int ndims, int region_data[ndims*3],
-                                int64_t size, char data[size],
-                                CkDeviceBufferPost* devicePost);
-        entry void send_complete(int send_id);
+        entry void send_complete(CkDataMsg* msg);
 #endif
         entry void comm_done(int node_id);
         entry void reduce_result(CkReductionMsg* msg);
+        entry void receive_reduce_partial(int node_id, int64_t size, char data[size]);
     };
 
     array [2D] Partition2D
@@ -51,14 +48,11 @@ mainmodule charmnumeric
 #endif
                                 char data[size]);
 #ifdef USE_KOKKOS
-        entry void receive_data(int node_id, int input_index, int name,
-                                int ndims, int region_data[ndims*3],
-                                int64_t size, char data[size],
-                                CkDeviceBufferPost* devicePost);
-        entry void send_complete(int send_id);
+        entry void send_complete(CkDataMsg* msg);
 #endif
         entry void comm_done(int node_id);
         entry void reduce_result(CkReductionMsg* msg);
+        entry void receive_reduce_partial(int node_id, int64_t size, char data[size]);
     };
 
     array [3D] Partition3D
@@ -73,13 +67,10 @@ mainmodule charmnumeric
 #endif
                                 char data[size]);
 #ifdef USE_KOKKOS
-        entry void receive_data(int node_id, int input_index, int name,
-                                int ndims, int region_data[ndims*3],
-                                int64_t size, char data[size],
-                                CkDeviceBufferPost* devicePost);
-        entry void send_complete(int send_id);
+        entry void send_complete(CkDataMsg* msg);
 #endif
         entry void comm_done(int node_id);
         entry void reduce_result(CkReductionMsg* msg);
+        entry void receive_reduce_partial(int node_id, int64_t size, char data[size]);
     };
 }

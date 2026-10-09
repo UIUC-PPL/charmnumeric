@@ -143,11 +143,13 @@ set(BACKEND_EXECUTOR_SOURCES
     executor_reducer.cpp
     executor_core.cpp
     executor_reduce.cpp
+    executor_reduction.cpp
     executor_matmul.cpp
     executor_matmatmul.cpp
     executor_transfer.cpp
     executor_incremental.cpp
     executor_ast_visitor.cpp
+    executor_creation.cpp
 )
 
 set(BACKEND_PARTITION_SOURCES
@@ -164,6 +166,11 @@ add_library(backend_obj OBJECT
 )
 add_dependencies(backend_obj ci_headers)
 target_compile_options(backend_obj PRIVATE -O3 -g ${SIMPLE_ARRAY_DEFS})
+# RNG / iota kernels must evaluate the same IEEE operations as the GPU build
+# (which uses the _rn intrinsics), so no FMA contraction on the host either.
+if(NOT DEFINED GPU_BACKEND)
+    set_source_files_properties(executor_creation.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
+endif()
 
 # -- Server module (Main class, startup) --
 add_library(server_obj OBJECT server.cpp)
@@ -186,19 +193,30 @@ if(DEFINED GPU_BACKEND)
     # JIT dispatch still needs vendor driver APIs for kernel launch
     if(GPU_BACKEND_UPPER STREQUAL "NVIDIA")
         target_compile_definitions(jit_obj     PRIVATE USE_NVIDIA JIT_ENABLE_GPU_BACKEND)
+        find_library(MLIR_CUDA_RUNTIME_LIB mlir_cuda_runtime HINTS ${LLVM_LIBRARY_DIR} REQUIRED)
+        target_compile_definitions(jit_obj PRIVATE MLIR_CUDA_RUNTIME_LIB="${MLIR_CUDA_RUNTIME_LIB}")
         target_compile_definitions(backend_obj PRIVATE USE_NVIDIA JIT_ENABLE_GPU_BACKEND)
+        # server.cpp instantiates the chare classes (charmnumeric.def.h), so it must see
+        # the same class layout as the backend TUs.
+        target_compile_definitions(server_obj  PRIVATE USE_NVIDIA JIT_ENABLE_GPU_BACKEND)
         find_package(CUDAToolkit REQUIRED)
         target_link_libraries(jit_obj     PRIVATE CUDA::cuda_driver)
         target_link_libraries(backend_obj PRIVATE CUDA::cuda_driver)
     elseif(GPU_BACKEND_UPPER STREQUAL "AMD")
         target_compile_definitions(jit_obj     PRIVATE USE_AMD JIT_ENABLE_GPU_BACKEND)
         target_compile_definitions(backend_obj PRIVATE USE_AMD JIT_ENABLE_GPU_BACKEND)
+        # server.cpp instantiates the chare classes (charmnumeric.def.h), so it must see
+        # the same class layout as the backend TUs.
+        target_compile_definitions(server_obj  PRIVATE USE_AMD JIT_ENABLE_GPU_BACKEND)
         find_package(hip REQUIRED)
         target_link_libraries(jit_obj     PRIVATE hip::host)
         target_link_libraries(backend_obj PRIVATE hip::host)
     elseif(GPU_BACKEND_UPPER STREQUAL "INTEL")
         target_compile_definitions(jit_obj     PRIVATE USE_INTEL JIT_ENABLE_GPU_BACKEND)
         target_compile_definitions(backend_obj PRIVATE USE_INTEL JIT_ENABLE_GPU_BACKEND)
+        # server.cpp instantiates the chare classes (charmnumeric.def.h), so it must see
+        # the same class layout as the backend TUs.
+        target_compile_definitions(server_obj  PRIVATE USE_INTEL JIT_ENABLE_GPU_BACKEND)
         find_library(LEVEL_ZERO_LIB NAMES ze_loader)
         find_path(LEVEL_ZERO_INCLUDE_DIR NAMES level_zero/ze_api.h)
         if(LEVEL_ZERO_LIB AND LEVEL_ZERO_INCLUDE_DIR)
@@ -211,6 +229,21 @@ if(DEFINED GPU_BACKEND)
         endif()
     else()
         message(WARNING "Unknown GPU_BACKEND '${GPU_BACKEND}', building CPU-only.")
+    endif()
+
+    # The final executable is linked by charmc (custom command below), which
+    # does not see the OBJECT libraries' link interfaces, so pass the GPU
+    # runtime libraries explicitly (with rpaths for the shared ones).
+    set(GPU_LINK_ARGS
+        "-Wl,$<TARGET_FILE:Kokkos::kokkoskernels>"
+        "-Wl,$<TARGET_FILE:Kokkos::kokkoscontainers>"
+        "-Wl,$<TARGET_FILE:Kokkos::kokkoscore>"
+        "-Wl,-rpath,$<TARGET_FILE_DIR:Kokkos::kokkoskernels>"
+        "-Wl,-rpath,$<TARGET_FILE_DIR:Kokkos::kokkoscore>")
+    if(GPU_BACKEND_UPPER STREQUAL "NVIDIA")
+        list(APPEND GPU_LINK_ARGS
+            "-L${CUDAToolkit_LIBRARY_DIR}" "-L${CUDAToolkit_LIBRARY_DIR}/stubs"
+            "-Wl,-rpath,${CUDAToolkit_LIBRARY_DIR}" -lcudart -lcuda)
     endif()
 endif()
 
@@ -307,6 +340,7 @@ add_custom_command(
             "$<TARGET_OBJECTS:backend_obj>"
             "$<TARGET_OBJECTS:server_obj>"
             -Wl,@${LINK_RESPONSE_FILE}
+            ${GPU_LINK_ARGS}
             -ldl
     DEPENDS jit_obj backend_obj server_obj ci_headers
             ${CHARMTYLES_CORE_LIB}

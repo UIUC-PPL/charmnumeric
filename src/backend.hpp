@@ -1,5 +1,8 @@
 #pragma once
 
+#include <deque>
+#include <map>
+
 #include "array_region.hpp"
 #include "opcodes.hpp"
 #include <charmtyles/core/charmtyles.hpp>
@@ -234,6 +237,20 @@ struct PendingComm {
 template <int N>
 class PartitionImpl;
 
+/// Receive-side state of a REDUCTION/BINCOUNT node on one output chare
+/// (executor_reduction.cpp). Partials that arrive before the chare reaches the
+/// node wait in `stash`.
+template <int N>
+struct ReductionState {
+    DAGNode* node = nullptr;
+    bool started = false;
+    std::vector<std::vector<char>> stash;
+    ArrayRegion<N> mine;    // output elements owned by this chare (output array coords)
+    std::vector<char> acc;  // one accumulator per element of `mine`
+    int64_t covered = 0;    // input elements folded in, summed over `mine`
+    int64_t expected = 0;   // mine.size() * reduced extent
+};
+
 // ---- ArrayDAGGroup ----
 
 class ArrayDAGGroup : public CBase_ArrayDAGGroup {
@@ -287,6 +304,16 @@ class ArrayDAGGroup : public CBase_ArrayDAGGroup {
     // using freshly recomputed metadata unless the array is recreated.
     std::unordered_map<int, ArrayMetadata> live_array_meta;
 
+    // UPLOAD payloads cut into per-chare tiles by stage_uploads(), keyed by
+    // (array name, chare index). A chare takes (and frees) its tile when it
+    // executes the UPLOAD node; meta is the decomposition the tile was cut for.
+    struct UploadTile {
+        std::vector<char> data;
+        ArrayMetadata meta;
+    };
+    std::map<std::array<int, 4>, UploadTile> upload_tiles;
+    void stage_uploads(DAG* dag);
+
     MLIRJitCompiler* jit;
 
     ArrayDAGGroup();
@@ -317,6 +344,11 @@ class ArrayDAGGroup : public CBase_ArrayDAGGroup {
     void compile(DAG* dag);
 };
 
+/// Result ndims and shape of a REDUCTION/BINCOUNT root (executor_reduction.cpp).
+int reduction_result_meta(ASTNode* root,
+                          const std::unordered_map<int, ArrayDAGGroup::ArrayMetadata>& meta,
+                          std::array<int, 3>& shape_out);
+
 // ---- Unified Executor (templated on N only) ----
 
 template <int N>
@@ -326,6 +358,7 @@ class ArrayDAGExecutorND : public DAGExecutor {
 
   public:
     std::unordered_map<int, PendingComm<N>> pending;
+    std::unordered_map<int, ReductionState<N>> red_state;
 
     ArrayDAGExecutorND(ArrayDAGGroup* group_, PartitionImpl<N>* partition_)
         : DAGExecutor(group_, N), partition(partition_) {}
@@ -339,6 +372,9 @@ class ArrayDAGExecutorND : public DAGExecutor {
     void execute_cross_set_region_node(DAGNode* node);
     void execute_diag_node(DAGNode* node);
     void execute_tile_node(DAGNode* node);
+    void execute_reduction_node(DAGNode* node);
+    void on_reduce_partial(int node_id, char* data, int64_t size);
+    void execute_creation_node(DAGNode* node);
     void on_comm_done(int node_id);
     void on_matmatmul_receive(int node_id, int input_index);
     void on_matmul_partial(int node_id, RemoteBuffer<N>& partial_buf);
@@ -545,6 +581,10 @@ class PartitionImpl {
     }
 #ifdef USE_KOKKOS
     std::unordered_map<int, void*> pending_sends; // send_id → device ptr
+    // Device buffers handed out by the receive_data post entry, keyed by message
+    // identity (node_id, input_index, name, region_data...). Charm++ passes a null
+    // data pointer to the regular nocopydevice entry, so it looks the buffer up here.
+    std::map<std::vector<int>, std::deque<char*>> posted_recv_bufs;
     int next_send_id = 0;
 #ifdef USE_NVIDIA
     cudaStream_t compute_stream_raw;
@@ -578,6 +618,7 @@ class PartitionImpl {
 #endif
     void comm_done(int node_id);
     void reduce_result(CkReductionMsg* msg);
+    void receive_reduce_partial(int node_id, int64_t size, char* data);
     void process_get(int epoch);
 };
 
@@ -606,10 +647,16 @@ class Partition1D : public CBase_Partition1D {
                       int64_t& size, char*& data, CkDeviceBufferPost* devicePost) {
         impl.receive_data(node_id, input_index, name, ndims, region_data, size, data, devicePost);
     }
-    void send_complete(int send_id) { impl.send_complete(send_id); }
+    void send_complete(CkDataMsg* msg) {
+        impl.send_complete(CkGetRefNum(msg));
+        CkFreeMsg(msg);
+    }
 #endif
     void comm_done(int node_id) { impl.comm_done(node_id); }
     void reduce_result(CkReductionMsg* msg) { impl.reduce_result(msg); }
+    void receive_reduce_partial(int node_id, int64_t size, char* data) {
+        impl.receive_reduce_partial(node_id, size, data);
+    }
 };
 
 class Partition2D : public CBase_Partition2D {
@@ -635,10 +682,16 @@ class Partition2D : public CBase_Partition2D {
                       int64_t& size, char*& data, CkDeviceBufferPost* devicePost) {
         impl.receive_data(node_id, input_index, name, ndims, region_data, size, data, devicePost);
     }
-    void send_complete(int send_id) { impl.send_complete(send_id); }
+    void send_complete(CkDataMsg* msg) {
+        impl.send_complete(CkGetRefNum(msg));
+        CkFreeMsg(msg);
+    }
 #endif
     void comm_done(int node_id) { impl.comm_done(node_id); }
     void reduce_result(CkReductionMsg* msg) { impl.reduce_result(msg); }
+    void receive_reduce_partial(int node_id, int64_t size, char* data) {
+        impl.receive_reduce_partial(node_id, size, data);
+    }
 };
 
 class Partition3D : public CBase_Partition3D {
@@ -664,8 +717,14 @@ class Partition3D : public CBase_Partition3D {
                       int64_t& size, char*& data, CkDeviceBufferPost* devicePost) {
         impl.receive_data(node_id, input_index, name, ndims, region_data, size, data, devicePost);
     }
-    void send_complete(int send_id) { impl.send_complete(send_id); }
+    void send_complete(CkDataMsg* msg) {
+        impl.send_complete(CkGetRefNum(msg));
+        CkFreeMsg(msg);
+    }
 #endif
     void comm_done(int node_id) { impl.comm_done(node_id); }
     void reduce_result(CkReductionMsg* msg) { impl.reduce_result(msg); }
+    void receive_reduce_partial(int node_id, int64_t size, char* data) {
+        impl.receive_reduce_partial(node_id, size, data);
+    }
 };

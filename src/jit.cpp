@@ -1,4 +1,22 @@
 #include "jit.hpp"
+#include "jit_api.hpp"
+
+#include <limits>
+
+#ifdef JIT_ENABLE_GPU_BACKEND
+#include "llvm/IR/LegacyPassManager.h"
+#endif
+#ifdef USE_NVIDIA
+#include "mlir/Dialect/GPU/Pipelines/Passes.h"
+#include "mlir/InitAllExtensions.h"
+#include "mlir/Dialect/SCF/Transforms/Passes.h"
+#include "mlir/Target/LLVM/NVVM/Target.h"
+#include "mlir/Target/LLVMIR/Dialect/GPU/GPUToLLVMIRTranslation.h"
+#endif
+
+namespace {
+void declareExternalCallees(mlir::ModuleOp module);
+}
 
 MLIRJitCompiler::MLIRJitCompiler() {
     // 1. Load required dialects
@@ -18,6 +36,15 @@ MLIRJitCompiler::MLIRJitCompiler() {
     // 2. Register LLVM IR translation interfaces (needed by ExecutionEngine)
     mlir::DialectRegistry registry;
     mlir::registerAllToLLVMIRTranslations(registry);
+#ifdef USE_NVIDIA
+    // #nvvm.target serialization (gpu-module-to-binary) and gpu.binary/launch_func
+    // translation for the host-launcher path.
+    mlir::NVVM::registerNVVMTargetInterfaceExternalModels(registry);
+    // ConvertToLLVM interfaces: convert-gpu-to-nvvm lowers cf/arith/math/memref
+    // inside kernels through these.
+    mlir::registerAllExtensions(registry);
+    mlir::gpu::registerOffloadingLLVMTranslationInterfaceExternalModels(registry);
+#endif
     context.appendDialectRegistry(registry);
 
     // 3. Initialize Module
@@ -148,6 +175,9 @@ void MLIRJitCompiler::buildFromAST(void* astPtr) {
             linalg::FillOp::create(*builder, loc, result, outArg);
         }
     }
+
+    // --- 3c. Declare external math callees (fmod) used by op bodies ---
+    declareExternalCallees(*module);
 
     // --- 4. Deallocate temporaries (after all consumers have read) ---
     for (mlir::Value tmp : tempValues)
@@ -282,7 +312,8 @@ std::string MLIRJitCompiler::leafUseKey(ASTNode* operand, Region* region) const 
 }
 
 mlir::Value MLIRJitCompiler::lookupOperand(ASTNode* operand, Region* region) {
-    if (region != nullptr) {
+    // Broadcast uses are scalar block arguments seeded into nodeValues.
+    if (region != nullptr && !operand->is_broadcast) {
         auto leafIt = leafValues.find(leafUseKey(operand, region));
         if (leafIt != leafValues.end())
             return leafIt->second;
@@ -355,9 +386,21 @@ void MLIRJitCompiler::emitOp(ASTNode* node, mlir::Location loc) {
         auto unIt = unReg.find(node->opcode);
         if (unIt != unReg.end()) {
             Value input = lookupOperand(node->operands[0], node->get_operand_region(0));
+            bool inputIsScalar = !mlir::isa<MemRefType>(input.getType());
+            auto elemType = inputIsScalar ? input.getType()
+                                          : mlir::cast<MemRefType>(input.getType()).getElementType();
+            bool isInt = mlir::isa<IntegerType>(elemType);
+            const auto& entry = unIt->second;
+            const auto& bodyFn = (isInt && entry.int_body) ? entry.int_body : entry.float_body;
+
+            if (inputIsScalar) {
+                // Broadcast (size-1) or scalar input — emit a plain scalar op
+                result = bodyFn(*builder, loc, input);
+                break;
+            }
+
             auto srcType = mlir::cast<MemRefType>(input.getType());
             int64_t rank = srcType.getRank();
-            auto elemType = srcType.getElementType();
             SmallVector<int64_t> dynShape(rank, ShapedType::kDynamic);
             auto outType = MemRefType::get(dynShape, elemType);
 
@@ -366,10 +409,52 @@ void MLIRJitCompiler::emitOp(ASTNode* node, mlir::Location loc) {
                 dimSizes.push_back(memref::DimOp::create(*builder, loc, input, d).getResult());
             result = memref::AllocOp::create(*builder, loc, outType, ValueRange(dimSizes));
 
-            bool isInt = mlir::isa<IntegerType>(elemType);
-            const auto& entry = unIt->second;
-            const auto& bodyFn = (isInt && entry.int_body) ? entry.int_body : entry.float_body;
             emitGenericUnaryOp(input, result, bodyFn);
+
+            if (node->is_temp)
+                tempValues.push_back(result);
+            break;
+        }
+
+        // Ternary elementwise ops (where, clip); any operand may be a scalar
+        auto& terReg = ternaryOpRegistry();
+        auto terIt = terReg.find(node->opcode);
+        if (terIt != terReg.end()) {
+            SmallVector<Value, 3> ins;
+            Value arrayOperand;
+            for (int i = 0; i < 3; ++i) {
+                ins.push_back(lookupOperand(node->operands[i], node->get_operand_region(i)));
+                if (!arrayOperand && mlir::isa<MemRefType>(ins.back().getType()))
+                    arrayOperand = ins.back();
+            }
+            // Single element type per kernel: take it from the value operand
+            Value typeSrc = ins[1];
+            auto elemType = mlir::isa<MemRefType>(typeSrc.getType())
+                                ? mlir::cast<MemRefType>(typeSrc.getType()).getElementType()
+                                : typeSrc.getType();
+            bool isInt = mlir::isa<IntegerType>(elemType);
+            const auto& entry = terIt->second;
+            const auto& bodyFn = (isInt && entry.int_body) ? entry.int_body : entry.float_body;
+            auto naryBody = [&](OpBuilder& b, Location l, ValueRange args) {
+                return bodyFn(b, l, args[0], args[1], args[2]);
+            };
+
+            if (!arrayOperand) {
+                // All operands are scalars — emit a plain scalar op
+                result = naryBody(*builder, loc, ins);
+                break;
+            }
+
+            int64_t rank = mlir::cast<MemRefType>(arrayOperand.getType()).getRank();
+            SmallVector<int64_t> dynShape(rank, ShapedType::kDynamic);
+            auto outType = MemRefType::get(dynShape, elemType);
+            SmallVector<Value> dimSizes;
+            for (int64_t d = 0; d < rank; ++d)
+                dimSizes.push_back(
+                    memref::DimOp::create(*builder, loc, arrayOperand, d).getResult());
+            result = memref::AllocOp::create(*builder, loc, outType, ValueRange(dimSizes));
+
+            emitGenericNaryOp(ins, result, naryBody);
 
             if (node->is_temp)
                 tempValues.push_back(result);
@@ -406,7 +491,360 @@ bool MLIRJitCompiler::lowerToCPU() {
     return mlir::succeeded(pm.run(*module));
 }
 
+#ifdef USE_NVIDIA
+
+#ifndef MLIR_CUDA_RUNTIME_LIB
+#error "MLIR_CUDA_RUNTIME_LIB must point to libmlir_cuda_runtime.so"
+#endif
+
+bool MLIRJitCompiler::lowerToNVIDIAHost() {
+    using namespace mlir;
+
+    // 1. Every linalg op becomes one multi-dim scf.parallel (parallel by
+    //    construction, so nothing is left to run on the host), tiled so the
+    //    innermost tile maps to threads and the rest to blocks. Tile sizes keep
+    //    blockDim within limits (x,y <= 1024, z <= 64).
+    int64_t rank = 1;
+    module->walk([&](linalg::LinalgOp op) {
+        rank = std::max<int64_t>(rank, op.getNumLoops());
+    });
+    SmallVector<int64_t> tiles(rank, 1);
+    tiles.back() = (rank >= 3) ? 64 : 256;
+
+    PassManager pm(&context);
+    pm.addPass(createConvertLinalgToParallelLoopsPass());
+    pm.nest<func::FuncOp>().addPass(createParallelLoopTilingPass(tiles, /*noMinMaxBounds=*/true));
+    pm.nest<func::FuncOp>().addPass(createGpuMapParallelLoopsPass());
+    pm.addPass(createConvertParallelLoopToGpuPass());
+    if (failed(pm.run(*module)))
+        return false;
+
+    // 2. Temporaries (memref.alloc / host-side memref.alloca) are read by kernels,
+    //    and the host may initialize scalar buffers, so put them in managed
+    //    (host_shared) memory. The sync gpu.alloc lowering requires host_shared;
+    //    gpu.dealloc lowers only in async form, so wrap it in gpu.wait.
+    SmallVector<Operation*> allocs;
+    SmallVector<memref::DeallocOp> deallocs;
+    module->walk([&](Operation* op) {
+        if (op->getParentOfType<gpu::LaunchOp>())
+            return;
+        if (isa<memref::AllocOp, memref::AllocaOp>(op))
+            allocs.push_back(op);
+        else if (auto d = dyn_cast<memref::DeallocOp>(op))
+            deallocs.push_back(d);
+    });
+    OpBuilder b(&context);
+    auto emitDealloc = [&](Location loc, Value mem) {
+        Type tokTy = gpu::AsyncTokenType::get(&context);
+        Value t0 = gpu::WaitOp::create(b, loc, tokTy, ValueRange{}).getAsyncToken();
+        Value t1 = gpu::DeallocOp::create(b, loc, tokTy, ValueRange{t0}, mem).getAsyncToken();
+        gpu::WaitOp::create(b, loc, Type(), ValueRange{t1});
+    };
+    for (Operation* op : allocs) {
+        b.setInsertionPoint(op);
+        auto type = cast<MemRefType>(op->getResult(0).getType());
+        ValueRange dynSizes, symOps;
+        if (auto a = dyn_cast<memref::AllocOp>(op)) {
+            dynSizes = a.getDynamicSizes();
+            symOps = a.getSymbolOperands();
+        } else {
+            auto aa = cast<memref::AllocaOp>(op);
+            dynSizes = aa.getDynamicSizes();
+            symOps = aa.getSymbolOperands();
+        }
+        auto gpuAlloc = gpu::AllocOp::create(b, op->getLoc(), type, /*asyncToken=*/Type(),
+                                             ValueRange{}, dynSizes, symOps, /*hostShared=*/true);
+        op->getResult(0).replaceAllUsesWith(gpuAlloc.getMemref());
+        // allocas have no dealloc: free them before the function returns
+        if (isa<memref::AllocaOp>(op)) {
+            auto func = gpuAlloc->getParentOfType<func::FuncOp>();
+            func.walk([&](func::ReturnOp ret) {
+                b.setInsertionPoint(ret);
+                emitDealloc(ret.getLoc(), gpuAlloc.getMemref());
+            });
+        }
+        op->erase();
+    }
+    for (memref::DeallocOp op : deallocs) {
+        b.setInsertionPoint(op);
+        emitDealloc(op.getLoc(), op.getMemref());
+        op.erase();
+    }
+
+    // 3. Standard GPU pipeline: outline kernels, lower them to NVVM and embed
+    //    PTX (the driver JITs it for the actual device), lower the host side to
+    //    LLVM with mgpu* runtime calls.
+    PassManager pm2(&context);
+    gpu::GPUToNVVMPipelineOptions opts;
+    opts.cubinChip = "sm_80";
+    opts.cubinFeatures = "+ptx80";
+    opts.cubinFormat = "isa";
+    gpu::buildLowerToNVVMPassPipeline(pm2, opts);
+    if (failed(pm2.run(*module))) {
+        if (getenv("CNUM_JIT_DUMP"))
+            module->dump();
+        return false;
+    }
+    return true;
+}
+
+std::unique_ptr<mlir::ExecutionEngine> MLIRJitCompiler::generateNVIDIAHost() {
+    if (!lowerToNVIDIAHost()) {
+        llvm::errs() << "generateNVIDIAHost: GPU lowering failed\n";
+        return nullptr;
+    }
+
+    llvm::InitializeNativeTarget();
+    llvm::InitializeNativeTargetAsmPrinter();
+
+    mlir::ExecutionEngineOptions engineOptions;
+    static const llvm::StringRef runtimeLibs[] = {MLIR_CUDA_RUNTIME_LIB};
+    engineOptions.sharedLibPaths = runtimeLibs;
+    auto maybeEngine = mlir::ExecutionEngine::create(*module, engineOptions);
+    if (!maybeEngine) {
+        llvm::errs() << "generateNVIDIAHost: failed to create ExecutionEngine: "
+                     << llvm::toString(maybeEngine.takeError()) << "\n";
+        return nullptr;
+    }
+    // Run the global constructors that load the embedded PTX module (only
+    // invokePacked() does this implicitly; the dispatcher calls the packed
+    // function pointer directly).
+    (*maybeEngine)->initialize();
+    return std::move(*maybeEngine);
+}
+
+#endif // USE_NVIDIA
+
 // ---- Elementwise op registries ----
+
+namespace {
+using mlir::Location;
+using mlir::OpBuilder;
+using mlir::Value;
+namespace arith = mlir::arith;
+namespace math = mlir::math;
+
+/// Constant of the same (scalar) type as `like`.
+Value constLike(OpBuilder& b, Location loc, Value like, double v) {
+    mlir::Type t = like.getType();
+    mlir::TypedAttr attr;
+    if (mlir::isa<mlir::FloatType>(t))
+        attr = b.getFloatAttr(t, v);
+    else
+        attr = b.getIntegerAttr(t, static_cast<int64_t>(v));
+    return arith::ConstantOp::create(b, loc, attr).getResult();
+}
+
+Value fcmp(OpBuilder& b, Location loc, arith::CmpFPredicate p, Value x, Value y) {
+    return arith::CmpFOp::create(b, loc, p, x, y).getResult();
+}
+
+Value icmp(OpBuilder& b, Location loc, arith::CmpIPredicate p, Value x, Value y) {
+    return arith::CmpIOp::create(b, loc, p, x, y).getResult();
+}
+
+Value sel(OpBuilder& b, Location loc, Value c, Value t, Value f) {
+    return arith::SelectOp::create(b, loc, c, t, f).getResult();
+}
+
+/// i1 predicate -> 0/1 in element type `t` (masks: there is no bool dtype).
+Value toMask(OpBuilder& b, Location loc, Value pred, mlir::Type t) {
+    if (mlir::isa<mlir::FloatType>(t))
+        return arith::UIToFPOp::create(b, loc, t, pred).getResult();
+    return arith::ExtUIOp::create(b, loc, t, pred).getResult();
+}
+
+/// i1: v != 0 (NaN counts as true, like NumPy's bool(nan)).
+Value isNonzero(OpBuilder& b, Location loc, Value v) {
+    Value zero = constLike(b, loc, v, 0.0);
+    if (mlir::isa<mlir::FloatType>(v.getType()))
+        return fcmp(b, loc, arith::CmpFPredicate::UNE, v, zero);
+    return icmp(b, loc, arith::CmpIPredicate::ne, v, zero);
+}
+
+/// Float compare op producing a 0/1 mask in the operand type.
+BinaryOpEntry::Fn fcmpMask(arith::CmpFPredicate p) {
+    return [p](OpBuilder& b, Location loc, Value x, Value y) {
+        return toMask(b, loc, fcmp(b, loc, p, x, y), x.getType());
+    };
+}
+
+/// Integer compare op producing a 0/1 mask in the operand type.
+BinaryOpEntry::Fn icmpMask(arith::CmpIPredicate p) {
+    return [p](OpBuilder& b, Location loc, Value x, Value y) {
+        return toMask(b, loc, icmp(b, loc, p, x, y), x.getType());
+    };
+}
+
+/// Integer x**e by square-and-multiply over every exponent bit (branch-free,
+/// so it lowers the same on CPU and GPU). Wraps on overflow like NumPy. For
+/// e < 0 the result is 1 for x == 1, +-1 for x == -1 and 0 otherwise (NumPy
+/// raises instead).
+Value intPow(OpBuilder& b, Location loc, Value x, Value e) {
+    unsigned bits = mlir::cast<mlir::IntegerType>(x.getType()).getWidth();
+    Value one = constLike(b, loc, x, 1.0);
+    Value zero = constLike(b, loc, x, 0.0);
+    Value r = one, base = x;
+    for (unsigned i = 0; i + 1 < bits; ++i) {
+        Value sh = arith::ShRSIOp::create(b, loc, e, constLike(b, loc, e, i)).getResult();
+        Value bit = arith::TruncIOp::create(b, loc, b.getI1Type(), sh).getResult();
+        r = sel(b, loc, bit, arith::MulIOp::create(b, loc, r, base).getResult(), r);
+        if (i + 2 < bits)
+            base = arith::MulIOp::create(b, loc, base, base).getResult();
+    }
+    Value eOdd = arith::TruncIOp::create(b, loc, b.getI1Type(), e).getResult();
+    Value minusOne = constLike(b, loc, x, -1.0);
+    Value negRes = sel(b, loc, icmp(b, loc, arith::CmpIPredicate::eq, x, one), one,
+                       sel(b, loc, icmp(b, loc, arith::CmpIPredicate::eq, x, minusOne),
+                           sel(b, loc, eOdd, minusOne, one), zero));
+    return sel(b, loc, icmp(b, loc, arith::CmpIPredicate::slt, e, zero), negRes, r);
+}
+
+/// Integer floor division / remainder with NumPy semantics (floor rounding,
+/// remainder has the sign of the divisor). Division by zero gives 0 (NumPy
+/// warns and returns 0); b == -1 is special-cased so INT_MIN // -1 wraps
+/// instead of trapping.
+Value intDivMod(OpBuilder& b, Location loc, Value x, Value y, bool wantMod) {
+    Value zero = constLike(b, loc, x, 0.0);
+    Value one = constLike(b, loc, x, 1.0);
+    Value minusOne = constLike(b, loc, x, -1.0);
+    Value yZero = icmp(b, loc, arith::CmpIPredicate::eq, y, zero);
+    Value yNegOne = icmp(b, loc, arith::CmpIPredicate::eq, y, minusOne);
+    Value bad = arith::OrIOp::create(b, loc, yZero, yNegOne).getResult();
+    Value ySafe = sel(b, loc, bad, one, y);
+    Value q = arith::DivSIOp::create(b, loc, x, ySafe).getResult();
+    Value r = arith::RemSIOp::create(b, loc, x, ySafe).getResult();
+    Value rNonzero = icmp(b, loc, arith::CmpIPredicate::ne, r, zero);
+    Value signDiffers =
+        arith::XOrIOp::create(b, loc, icmp(b, loc, arith::CmpIPredicate::slt, r, zero),
+                              icmp(b, loc, arith::CmpIPredicate::slt, y, zero))
+            .getResult();
+    Value fix = arith::AndIOp::create(b, loc, rNonzero, signDiffers).getResult();
+    if (wantMod) {
+        Value rFixed = sel(b, loc, fix, arith::AddIOp::create(b, loc, r, y).getResult(), r);
+        return sel(b, loc, bad, zero, rFixed);
+    }
+    Value qFixed = sel(b, loc, fix, arith::SubIOp::create(b, loc, q, one).getResult(), q);
+    Value negX = arith::SubIOp::create(b, loc, zero, x).getResult();
+    return sel(b, loc, yZero, zero, sel(b, loc, yNegOne, negX, qFixed));
+}
+
+/// C fmod(x, y), exact. arith.remf cannot be used: the NVVM pipeline lowers
+/// arith to LLVM before convert-gpu-to-nvvm, and llvm.frem is illegal there.
+/// So call libm's fmod on the host and libdevice's __nv_fmod on NVIDIA GPUs.
+/// (The callee is declared afterwards by declareExternalCallees: the body is
+/// built before the linalg.generic is attached to the module.)
+Value fmodCall(OpBuilder& b, Location loc, Value x, Value y) {
+    mlir::Type t = x.getType();
+    bool isF32 = t.isF32();
+#ifdef USE_NVIDIA
+    llvm::StringRef name = isF32 ? "__nv_fmodf" : "__nv_fmod";
+#else
+    llvm::StringRef name = isF32 ? "fmodf" : "fmod";
+#endif
+    return mlir::func::CallOp::create(b, loc, name, mlir::TypeRange{t}, mlir::ValueRange{x, y})
+        .getResult(0);
+}
+
+/// Add private declarations for callees (e.g. fmod) that are called but not defined.
+void declareExternalCallees(mlir::ModuleOp module) {
+    OpBuilder b(module.getContext());
+    b.setInsertionPointToStart(module.getBody());
+    module.walk([&](mlir::func::CallOp call) {
+        if (module.lookupSymbol(call.getCalleeAttr()))
+            return;
+        auto fn = mlir::func::FuncOp::create(b, call.getLoc(), call.getCallee(),
+                                             call.getCalleeType());
+        fn.setPrivate();
+    });
+}
+
+/// Float remainder with NumPy semantics (npy_remainder): fmod, then shift
+/// into the divisor's sign; a zero result takes the divisor's sign.
+Value floatMod(OpBuilder& b, Location loc, Value x, Value y) {
+    Value zero = constLike(b, loc, x, 0.0);
+    Value m = fmodCall(b, loc, x, y);
+    Value mNonzero = fcmp(b, loc, arith::CmpFPredicate::UNE, m, zero);
+    Value signDiffers =
+        arith::XOrIOp::create(b, loc, fcmp(b, loc, arith::CmpFPredicate::OLT, y, zero),
+                              fcmp(b, loc, arith::CmpFPredicate::OLT, m, zero))
+            .getResult();
+    Value fix = arith::AndIOp::create(b, loc, mNonzero, signDiffers).getResult();
+    Value mFixed = sel(b, loc, fix, arith::AddFOp::create(b, loc, m, y).getResult(), m);
+    Value signedZero = math::CopySignOp::create(b, loc, zero, y).getResult();
+    return sel(b, loc, mNonzero, mFixed, signedZero);
+}
+
+/// Float floor division with NumPy semantics (npy_floor_divide / npy_divmod).
+Value floatFloorDiv(OpBuilder& b, Location loc, Value x, Value y) {
+    Value zero = constLike(b, loc, x, 0.0);
+    Value one = constLike(b, loc, x, 1.0);
+    Value half = constLike(b, loc, x, 0.5);
+    Value quot = arith::DivFOp::create(b, loc, x, y).getResult();
+    Value m = fmodCall(b, loc, x, y);
+    Value div = arith::DivFOp::create(b, loc, arith::SubFOp::create(b, loc, x, m), y).getResult();
+    Value mNonzero = fcmp(b, loc, arith::CmpFPredicate::UNE, m, zero);
+    Value signDiffers =
+        arith::XOrIOp::create(b, loc, fcmp(b, loc, arith::CmpFPredicate::OLT, y, zero),
+                              fcmp(b, loc, arith::CmpFPredicate::OLT, m, zero))
+            .getResult();
+    Value fix = arith::AndIOp::create(b, loc, mNonzero, signDiffers).getResult();
+    div = sel(b, loc, fix, arith::SubFOp::create(b, loc, div, one).getResult(), div);
+    Value fl = math::FloorOp::create(b, loc, div).getResult();
+    Value roundUp =
+        fcmp(b, loc, arith::CmpFPredicate::OGT, arith::SubFOp::create(b, loc, div, fl), half);
+    fl = sel(b, loc, roundUp, arith::AddFOp::create(b, loc, fl, one).getResult(), fl);
+    Value signedZero = math::CopySignOp::create(b, loc, zero, quot).getResult();
+    Value res = sel(b, loc, fcmp(b, loc, arith::CmpFPredicate::UNE, div, zero), fl, signedZero);
+    return sel(b, loc, fcmp(b, loc, arith::CmpFPredicate::OEQ, y, zero), quot, res);
+}
+
+/// log1p(x) = log(u) * x / (u - 1) with u = 1 + x (Goldberg); exact for tiny x.
+/// The CPU math-to-llvm lowering of math.log1p is the naive log(1 + x).
+Value log1pAccurate(OpBuilder& b, Location loc, Value x) {
+    Value one = constLike(b, loc, x, 1.0);
+    Value inf = constLike(b, loc, x, std::numeric_limits<double>::infinity());
+    Value u = arith::AddFOp::create(b, loc, one, x).getResult();
+    Value logU = math::LogOp::create(b, loc, u).getResult();
+    Value ratio =
+        arith::DivFOp::create(b, loc, x, arith::SubFOp::create(b, loc, u, one)).getResult();
+    Value general = arith::MulFOp::create(b, loc, logU, ratio).getResult();
+    Value r = sel(b, loc, fcmp(b, loc, arith::CmpFPredicate::OEQ, u, inf), u, general);
+    return sel(b, loc, fcmp(b, loc, arith::CmpFPredicate::OEQ, u, one), x, r);
+}
+
+/// expm1(x) = (u - 1) * x / log(u) with u = exp(x) (Kahan); exact for tiny x.
+/// The CPU math-to-llvm lowering of math.expm1 is the naive exp(x) - 1.
+Value expm1Accurate(OpBuilder& b, Location loc, Value x) {
+    Value one = constLike(b, loc, x, 1.0);
+    Value minusOne = constLike(b, loc, x, -1.0);
+    Value inf = constLike(b, loc, x, std::numeric_limits<double>::infinity());
+    Value u = math::ExpOp::create(b, loc, x).getResult();
+    Value um1 = arith::SubFOp::create(b, loc, u, one).getResult();
+    Value ratio =
+        arith::DivFOp::create(b, loc, x, math::LogOp::create(b, loc, u)).getResult();
+    Value r = arith::MulFOp::create(b, loc, um1, ratio).getResult();
+    r = sel(b, loc, fcmp(b, loc, arith::CmpFPredicate::OEQ, u, inf), u, r);
+    r = sel(b, loc, fcmp(b, loc, arith::CmpFPredicate::OEQ, um1, minusOne), minusOne, r);
+    return sel(b, loc, fcmp(b, loc, arith::CmpFPredicate::OEQ, u, one), x, r);
+}
+
+/// Wraps a math dialect unary op as a registry body.
+template <typename OpT>
+UnaryOpEntry::Fn mathUnary() {
+    return [](OpBuilder& b, Location loc, Value v) { return OpT::create(b, loc, v).getResult(); };
+}
+
+/// Wraps an arith binary op as a registry body.
+template <typename OpT>
+BinaryOpEntry::Fn arithBinary() {
+    return [](OpBuilder& b, Location loc, Value x, Value y) {
+        return OpT::create(b, loc, x, y).getResult();
+    };
+}
+
+Value identityUnary(OpBuilder&, Location, Value v) { return v; }
+} // namespace
 
 const std::unordered_map<int, BinaryOpEntry>& MLIRJitCompiler::binaryOpRegistry() {
     static const std::unordered_map<int, BinaryOpEntry> registry = {
@@ -438,6 +876,30 @@ const std::unordered_map<int, BinaryOpEntry>& MLIRJitCompiler::binaryOpRegistry(
           [](mlir::OpBuilder& b, mlir::Location loc, mlir::Value lhs, mlir::Value rhs) {
               return mlir::arith::DivSIOp::create(b, loc, lhs, rhs).getResult();
           }}},
+        {(int)Opcode::POW,
+         {arithBinary<math::PowFOp>(), [](OpBuilder& b, Location loc, Value x, Value e) {
+              return intPow(b, loc, x, e);
+          }}},
+        {(int)Opcode::MAXIMUM, {arithBinary<arith::MaximumFOp>(), arithBinary<arith::MaxSIOp>()}},
+        {(int)Opcode::MINIMUM, {arithBinary<arith::MinimumFOp>(), arithBinary<arith::MinSIOp>()}},
+        {(int)Opcode::FMAX, {arithBinary<arith::MaxNumFOp>(), arithBinary<arith::MaxSIOp>()}},
+        {(int)Opcode::FMIN, {arithBinary<arith::MinNumFOp>(), arithBinary<arith::MinSIOp>()}},
+        {(int)Opcode::MOD,
+         {floatMod,
+          [](OpBuilder& b, Location loc, Value x, Value y) { return intDivMod(b, loc, x, y, true); }}},
+        {(int)Opcode::FLOOR_DIV,
+         {floatFloorDiv, [](OpBuilder& b, Location loc, Value x, Value y) {
+              return intDivMod(b, loc, x, y, false);
+          }}},
+        // Comparisons: ordered for <, <=, == (NaN -> 0), unordered for != (NaN -> 1)
+        {(int)Opcode::LESS,
+         {fcmpMask(arith::CmpFPredicate::OLT), icmpMask(arith::CmpIPredicate::slt)}},
+        {(int)Opcode::LESS_EQUAL,
+         {fcmpMask(arith::CmpFPredicate::OLE), icmpMask(arith::CmpIPredicate::sle)}},
+        {(int)Opcode::EQUAL,
+         {fcmpMask(arith::CmpFPredicate::OEQ), icmpMask(arith::CmpIPredicate::eq)}},
+        {(int)Opcode::NOT_EQUAL,
+         {fcmpMask(arith::CmpFPredicate::UNE), icmpMask(arith::CmpIPredicate::ne)}},
     };
     return registry;
 }
@@ -454,6 +916,82 @@ const std::unordered_map<int, UnaryOpEntry>& MLIRJitCompiler::unaryOpRegistry() 
               return mlir::math::ExpOp::create(b, loc, v).getResult();
           },
           nullptr}},
+        // Float-only math (the frontend rejects integer inputs: NumPy would
+        // return float64, and there is no in-kernel dtype conversion).
+        {(int)Opcode::SQRT, {mathUnary<math::SqrtOp>(), nullptr}},
+        {(int)Opcode::LOG, {mathUnary<math::LogOp>(), nullptr}},
+        {(int)Opcode::LOG2, {mathUnary<math::Log2Op>(), nullptr}},
+        {(int)Opcode::LOG10, {mathUnary<math::Log10Op>(), nullptr}},
+        {(int)Opcode::LOG1P, {log1pAccurate, nullptr}},
+        {(int)Opcode::EXP2, {mathUnary<math::Exp2Op>(), nullptr}},
+        {(int)Opcode::EXPM1, {expm1Accurate, nullptr}},
+        {(int)Opcode::SIN, {mathUnary<math::SinOp>(), nullptr}},
+        {(int)Opcode::COS, {mathUnary<math::CosOp>(), nullptr}},
+        // Integer inputs keep their dtype (rounding is the identity on ints)
+        {(int)Opcode::ABS, {mathUnary<math::AbsFOp>(), mathUnary<math::AbsIOp>()}},
+        {(int)Opcode::FLOOR, {mathUnary<math::FloorOp>(), identityUnary}},
+        {(int)Opcode::CEIL, {mathUnary<math::CeilOp>(), identityUnary}},
+        {(int)Opcode::RINT, {mathUnary<math::RoundEvenOp>(), identityUnary}},
+        {(int)Opcode::SIGN,
+         {[](OpBuilder& b, Location loc, Value v) {
+              // sign(+-0) = +-0 and sign(NaN) = NaN, as in NumPy
+              Value zero = constLike(b, loc, v, 0.0);
+              Value pos = fcmp(b, loc, arith::CmpFPredicate::OGT, v, zero);
+              Value neg = fcmp(b, loc, arith::CmpFPredicate::OLT, v, zero);
+              return sel(b, loc, pos, constLike(b, loc, v, 1.0),
+                         sel(b, loc, neg, constLike(b, loc, v, -1.0), v));
+          },
+          [](OpBuilder& b, Location loc, Value v) {
+              Value zero = constLike(b, loc, v, 0.0);
+              Value pos = icmp(b, loc, arith::CmpIPredicate::sgt, v, zero);
+              Value neg = icmp(b, loc, arith::CmpIPredicate::slt, v, zero);
+              return sel(b, loc, pos, constLike(b, loc, v, 1.0),
+                         sel(b, loc, neg, constLike(b, loc, v, -1.0), zero));
+          }}},
+        // Predicates: 0/1 masks in the input type
+        {(int)Opcode::ISNAN,
+         {[](OpBuilder& b, Location loc, Value v) {
+              return toMask(b, loc, fcmp(b, loc, arith::CmpFPredicate::UNO, v, v), v.getType());
+          },
+          [](OpBuilder& b, Location loc, Value v) { return constLike(b, loc, v, 0.0); }}},
+        {(int)Opcode::ISINF,
+         {[](OpBuilder& b, Location loc, Value v) {
+              Value a = math::AbsFOp::create(b, loc, v).getResult();
+              Value inf = constLike(b, loc, v, std::numeric_limits<double>::infinity());
+              return toMask(b, loc, fcmp(b, loc, arith::CmpFPredicate::OEQ, a, inf), v.getType());
+          },
+          [](OpBuilder& b, Location loc, Value v) { return constLike(b, loc, v, 0.0); }}},
+        {(int)Opcode::ISFINITE,
+         {[](OpBuilder& b, Location loc, Value v) {
+              Value a = math::AbsFOp::create(b, loc, v).getResult();
+              Value inf = constLike(b, loc, v, std::numeric_limits<double>::infinity());
+              return toMask(b, loc, fcmp(b, loc, arith::CmpFPredicate::OLT, a, inf), v.getType());
+          },
+          [](OpBuilder& b, Location loc, Value v) { return constLike(b, loc, v, 1.0); }}},
+    };
+    return registry;
+}
+
+const std::unordered_map<int, TernaryOpEntry>& MLIRJitCompiler::ternaryOpRegistry() {
+    static const std::unordered_map<int, TernaryOpEntry> registry = {
+        // where(cond, x, y): any nonzero cond (including NaN) selects x
+        {(int)Opcode::WHERE,
+         {[](OpBuilder& b, Location loc, Value c, Value x, Value y) {
+              return sel(b, loc, isNonzero(b, loc, c), x, y);
+          },
+          [](OpBuilder& b, Location loc, Value c, Value x, Value y) {
+              return sel(b, loc, isNonzero(b, loc, c), x, y);
+          }}},
+        // clip(x, lo, hi) = minimum(maximum(x, lo), hi), NaN-propagating like NumPy
+        {(int)Opcode::CLIP,
+         {[](OpBuilder& b, Location loc, Value x, Value lo, Value hi) {
+              Value m = arith::MaximumFOp::create(b, loc, x, lo).getResult();
+              return arith::MinimumFOp::create(b, loc, m, hi).getResult();
+          },
+          [](OpBuilder& b, Location loc, Value x, Value lo, Value hi) {
+              Value m = arith::MaxSIOp::create(b, loc, x, lo).getResult();
+              return arith::MinSIOp::create(b, loc, m, hi).getResult();
+          }}},
     };
     return registry;
 }
@@ -643,33 +1181,33 @@ std::string MLIRJitCompiler::translateToTarget(llvm::StringRef triple, llvm::Str
     if (!llvmModule)
         return "";
 
-    llvmModule->setTargetTriple(triple);
+    llvm::Triple targetTriple(triple);
+    llvmModule->setTargetTriple(targetTriple);
 
     // 2. Look up the LLVM target
     std::string error;
-    const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, error);
+    const llvm::Target* target = llvm::TargetRegistry::lookupTarget(targetTriple, error);
     if (!target)
         return "";
 
     // 3. Create a TargetMachine
     llvm::TargetOptions opts;
     std::unique_ptr<llvm::TargetMachine> tm(
-        target->createTargetMachine(triple, cpu, features, opts, llvm::Reloc::Model::PIC_));
+        target->createTargetMachine(targetTriple, cpu, features, opts, llvm::Reloc::Model::PIC_));
     if (!tm)
         return "";
 
     llvmModule->setDataLayout(tm->createDataLayout());
 
     // 4. Emit to a string (assembly or object depending on fileType)
-    std::string outStr;
-    llvm::raw_string_ostream os(outStr);
+    llvm::SmallString<0> outBuf;
+    llvm::raw_svector_ostream os(outBuf);
     llvm::legacy::PassManager pass;
     if (tm->addPassesToEmitFile(pass, os, nullptr, fileType))
         return "";
 
     pass.run(*llvmModule);
-    os.flush();
-    return outStr;
+    return std::string(outBuf.str());
 }
 
 std::string MLIRJitCompiler::serializeToPTX() {
@@ -714,3 +1252,44 @@ std::string MLIRJitCompiler::serializeToSPIRV() {
 }
 
 #endif // JIT_ENABLE_GPU_BACKEND
+
+MLIRJitCompiler* jit_create() { return new MLIRJitCompiler(); }
+
+void jit_destroy(MLIRJitCompiler* jit) { delete jit; }
+
+void* jit_compile_ast(void* ast, void** moduleHandleOut) {
+    MLIRJitCompiler node_jit;
+    node_jit.buildFromAST(ast);
+    node_jit.optimizeAndFuse();
+    void* moduleHandle = nullptr;
+    void* funcPtr = nullptr;
+
+#if defined(USE_NVIDIA)
+    auto engine = node_jit.generateNVIDIAHost();
+    if (!engine)
+        return nullptr;
+    if (!node_jit.loadCPU(engine, "fused_kernel", &moduleHandle, &funcPtr))
+        return nullptr;
+#elif defined(USE_AMD)
+    std::string gcn = node_jit.generateAMD();
+    if (gcn.empty())
+        return nullptr;
+    if (!node_jit.loadAMD(gcn, "fused_kernel", &moduleHandle, &funcPtr))
+        return nullptr;
+#elif defined(USE_INTEL)
+    std::string spirv = node_jit.generateIntel();
+    if (spirv.empty())
+        return nullptr;
+    if (!node_jit.loadIntel(spirv, "fused_kernel", &moduleHandle, &funcPtr))
+        return nullptr;
+#else
+    auto engine = node_jit.generateCPU();
+    if (!engine)
+        return nullptr;
+    if (!node_jit.loadCPU(engine, "fused_kernel", &moduleHandle, &funcPtr))
+        return nullptr;
+#endif
+
+    *moduleHandleOut = moduleHandle;
+    return funcPtr;
+}
