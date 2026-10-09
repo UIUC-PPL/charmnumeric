@@ -191,6 +191,59 @@ void ArrayDAGExecutorND<N>::delete_array(int name) {
     dag_group->live_array_meta.erase(name);
 }
 
+/// True if chare idx of the NT-D partition owns part of root's output.
+template <int NT>
+static bool chare_owns_root_result(ArrayDAGGroup* group, ASTNode* root,
+                                   const std::array<int, NT>& idx) {
+    if (root == nullptr || root->ndims != NT)
+        return false;
+
+    int output_name = root->result_name;
+    if (static_cast<Opcode>(root->opcode) == Opcode::SET_REGION && !root->operands.empty() &&
+        root->operands[0] != nullptr)
+        output_name = root->operands[0]->result_name;
+    auto meta_it = group->array_meta.find(output_name);
+    if (meta_it == group->array_meta.end())
+        return false;
+
+    auto decomp = meta_it->second.template decomp<NT>();
+    auto chare_region = decomp.chare_region_global(idx);
+    if (chare_region.size() <= 0)
+        return false;
+
+    if (static_cast<Opcode>(root->opcode) == Opcode::SET_REGION && root->region != nullptr &&
+        !root->region->is_global) {
+        auto* out_region = static_cast<ArrayRegion<NT>*>(root->region);
+        auto out_region_global = decomp.to_global(*out_region);
+        auto [overlap, has_overlap] = intersect(out_region_global, chare_region);
+        return has_overlap && overlap.size() > 0;
+    }
+
+    return true;
+}
+
+/// True if chare idx of the nd-D partition owns part of any output of node.
+static bool chare_owns_node_result(ArrayDAGGroup* group, DAGNode* node, int nd,
+                                   const std::array<int, 3>& idx) {
+    for (ASTNode* root : node->ast->roots) {
+        switch (nd) {
+        case 1:
+            if (chare_owns_root_result<1>(group, root, {idx[0]}))
+                return true;
+            break;
+        case 2:
+            if (chare_owns_root_result<2>(group, root, {idx[0], idx[1]}))
+                return true;
+            break;
+        case 3:
+            if (chare_owns_root_result<3>(group, root, {idx[0], idx[1], idx[2]}))
+                return true;
+            break;
+        }
+    }
+    return false;
+}
+
 template <int N>
 void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
     // Check if this node is relevant to our partition dimensionality
@@ -203,6 +256,9 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
     bool is_tile_node = false;
     bool is_reduction_node = false;
     bool is_creation_node = false;
+    bool is_transpose_node = false;
+    bool is_castscansort_node = false;
+    bool is_linalg_node = false;
     // Broadcast operands: size-1 arrays from another partition used as scalars
     struct BroadcastInfo {
         int source_name;
@@ -213,39 +269,16 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
     auto* dag_group_meta = static_cast<ArrayDAGGroup*>(group);
     auto nd_idx = partition->nd_index();
 
-    auto root_output_name = [](ASTNode* root) {
-        if (root == nullptr)
-            return -1;
-        if (static_cast<Opcode>(root->opcode) == Opcode::SET_REGION &&
-            !root->operands.empty() && root->operands[0] != nullptr)
-            return root->operands[0]->result_name;
-        return root->result_name;
-    };
-
     auto chare_owns_result = [&](ASTNode* root) -> bool {
-        if (root == nullptr || root->ndims != N)
-            return false;
-
-        int output_name = root_output_name(root);
-        auto meta_it = dag_group_meta->array_meta.find(output_name);
-        if (meta_it == dag_group_meta->array_meta.end())
-            return false;
-
-        auto decomp = meta_it->second.template decomp<N>();
-        auto chare_region = decomp.chare_region_global(nd_idx);
-        if (chare_region.size() <= 0)
-            return false;
-
-        if (static_cast<Opcode>(root->opcode) == Opcode::SET_REGION && root->region != nullptr &&
-            !root->region->is_global) {
-            auto* out_region = static_cast<ArrayRegion<N>*>(root->region);
-            auto out_region_global = decomp.to_global(*out_region);
-            auto [overlap, has_overlap] = intersect(out_region_global, chare_region);
-            return has_overlap && overlap.size() > 0;
-        }
-
-        return true;
+        return chare_owns_root_result<N>(dag_group_meta, root, nd_idx);
     };
+    std::array<int, 3> nd_idx3 = {};
+    for (int d = 0; d < N; ++d)
+        nd_idx3[d] = nd_idx[d];
+
+    std::unordered_set<int> internal_results;
+    for (ASTNode* root : node->ast->roots)
+        internal_results.insert(root->result_name);
 
     for (ASTNode* root : node->ast->roots) {
         auto opc = static_cast<Opcode>(root->opcode);
@@ -261,6 +294,16 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
             int input_ndims = root->operands[0]->ndims;
             if (N == input_ndims || N == root->ndims)
                 relevant = true;
+            continue;
+        }
+        if (opc == Opcode::LINALG) {
+            // Operand chares send their blocks to the root; result chares wait.
+            is_linalg_node = true;
+            if (N == root->ndims)
+                relevant = true;
+            for (ASTNode* operand : root->operands)
+                if (!operand->is_scalar && operand->ndims == N)
+                    relevant = true;
             continue;
         }
         if (is_fill_creation(opc)) {
@@ -326,6 +369,19 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
                 relevant = true;
             continue;
         }
+        if (opc == Opcode::TRANSPOSE) {
+            is_transpose_node = true;
+            if (N == root->ndims)
+                relevant = true;
+            continue;
+        }
+        if (is_castscansort(opc)) {
+            // All chares of the partition take part; empty ones finish.
+            is_castscansort_node = true;
+            if (N == root->ndims)
+                relevant = true;
+            continue;
+        }
         if (opc == Opcode::SET_REGION && root->operands.size() >= 2 &&
             !root->operands[1]->is_scalar && !root->operands[1]->is_broadcast) {
             int source_ndims = root->operands[1]->ndims;
@@ -338,17 +394,28 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
                 continue;
             }
         }
-        // Detect broadcast operands (cross-partition or same-partition)
-        for (ASTNode* operand : root->operands) {
-            if (operand->is_broadcast) {
+        // Detect broadcast operands (cross-partition or same-partition); results of
+        // this node's own roots and SET_REGION targets are not inputs.
+        for (int op_idx = 0; op_idx < (int)root->operands.size(); ++op_idx) {
+            ASTNode* operand = root->operands[op_idx];
+            bool is_input = (operand->opcode == static_cast<int>(Opcode::NOOP) ||
+                             operand->opcode == static_cast<int>(Opcode::CREATE)) &&
+                            !internal_results.count(operand->result_name) &&
+                            !(opc == Opcode::SET_REGION && op_idx == 0);
+            if (operand->is_broadcast && is_input) {
                 auto* dag_group = static_cast<ArrayDAGGroup*>(group);
                 auto meta_it = dag_group->array_meta.find(operand->result_name);
                 if (meta_it != dag_group->array_meta.end()) {
                     int src_nd = meta_it->second.ndims;
                     int tgt_nd = root->ndims;
                     broadcast_ops.push_back({operand->result_name, src_nd, tgt_nd});
-                    // Relevant for source and target partitions
-                    if (N == src_nd || N == tgt_nd)
+                    // Relevant for the chare holding the source and for chares owning a result
+                    if (N == src_nd) {
+                        auto src_it = partition->arrays.find(operand->result_name);
+                        if (src_it != partition->arrays.end() && src_it->second->local_size() > 0)
+                            relevant = true;
+                    }
+                    if (N == tgt_nd && chare_owns_node_result(dag_group, node, N, nd_idx3))
                         relevant = true;
                 }
             }
@@ -373,6 +440,11 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
     // Check for REDUCTION/BINCOUNT nodes — partials sent to the output chares
     if (is_reduction_node) {
         execute_reduction_node(node);
+        return;
+    }
+
+    if (is_linalg_node) {
+        execute_linalg_node(node);
         return;
     }
 
@@ -417,11 +489,22 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
         return;
     }
 
+    // Check for TRANSPOSE nodes — point-to-point tile permutation
+    if (is_transpose_node) {
+        execute_transpose_node(node);
+        return;
+    }
+
+    // Check for CAST/SCAN/SORT/ARGSORT nodes (executor_castscansort.cpp)
+    if (is_castscansort_node) {
+        execute_castscansort_node(node);
+        return;
+    }
+
     // Handle cross-partition broadcast: send scalar values from source to target
     if (!broadcast_ops.empty()) {
         auto* dag_group = static_cast<ArrayDAGGroup*>(group);
         bool is_source_only = true;  // true if this partition only sends, doesn't compute
-        bool has_local_broadcast = false; // true if broadcast source is on this partition+chare
 
         // Compute broadcast input index for each broadcast op (shared logic).
         // Must match the receiver convention: n_memref_leaves + bcast_index.
@@ -581,8 +664,7 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
 #endif
 
                     if (bcast.source_ndims == bcast.target_ndims) {
-                        // Same-partition broadcast: send to all OTHER chares
-                        has_local_broadcast = true;
+                        // Same-partition broadcast: send to all other chares owning a result
                         auto pg_it = dag_group->partition_grid.find(N);
                         if (pg_it != dag_group->partition_grid.end()) {
                             int total_chares = 1;
@@ -600,14 +682,14 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
                                 for (int d = 0; d < N; ++d)
                                     if (tgt_idx[d] != nd_idx[d])
                                         is_self = false;
-                                if (is_self)
+                                if (is_self || !chare_owns_node_result(dag_group, node, N, tgt_idx))
                                     continue;
                                 send_broadcast(N, tgt_idx, bcast_input_idx, bcast.source_name,
                                                val_ptr, elem_sz);
                             }
                         }
                     } else {
-                        // Cross-partition broadcast: send to all chares on target partition
+                        // Cross-partition broadcast: send to all target chares owning a result
                         int tgt_nd = bcast.target_ndims;
                         auto pg_it = dag_group->partition_grid.find(tgt_nd);
                         if (pg_it != dag_group->partition_grid.end()) {
@@ -621,6 +703,8 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
                                     tgt_idx[d] = rem % pg_it->second.grid[d];
                                     rem /= pg_it->second.grid[d];
                                 }
+                                if (!chare_owns_node_result(dag_group, node, tgt_nd, tgt_idx))
+                                    continue;
                                 send_broadcast(tgt_nd, tgt_idx, bcast_input_idx,
                                                bcast.source_name, val_ptr, elem_sz);
                             }
@@ -629,7 +713,7 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
                 }
             }
 
-            if (N == bcast.target_ndims)
+            if (N == bcast.target_ndims && chare_owns_node_result(dag_group, node, N, nd_idx3))
                 is_source_only = false;
         }
 
@@ -648,11 +732,9 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
                 continue;
             if (bcast.source_ndims == bcast.target_ndims) {
                 // Same-partition: only expect a message if we DON'T have the array locally
-                bool have_it = partition->arrays.count(bcast.source_name) > 0;
-                DBG_PRINT("[Chare %d]   bcast count: name=%d src_nd=%d tgt_nd=%d has_local_broadcast=%d have_it=%d\n",
-                          partition->index[0], bcast.source_name, bcast.source_ndims, bcast.target_ndims,
-                          (int)has_local_broadcast, (int)have_it);
-                if (!has_local_broadcast)
+                auto src_it = partition->arrays.find(bcast.source_name);
+                bool have_it = src_it != partition->arrays.end() && src_it->second->local_size() > 0;
+                if (!have_it)
                     n_expected_broadcasts++;
             } else {
                 // Cross-partition: we always expect a message
@@ -831,8 +913,15 @@ void ArrayDAGExecutorND<N>::on_comm_done(int node_id) {
 
     PendingComm<N>& comm = it->second;
     DAGNode* node = comm.node;
-    DType dt = determine_dtype<N>(node, partition->arrays);
-    dispatch_execute<N>(dt, static_cast<ArrayDAGGroup*>(group), node, partition, &comm);
+    bool castscansort = false;
+    for (ASTNode* root : node->ast->roots)
+        castscansort |= is_castscansort(static_cast<Opcode>(root->opcode));
+    if (castscansort) {
+        finish_castscansort_node(comm);
+    } else {
+        DType dt = determine_dtype<N>(node, partition->arrays);
+        dispatch_execute<N>(dt, static_cast<ArrayDAGGroup*>(group), node, partition, &comm);
+    }
 
 #ifdef USE_NVIDIA
     // Defer cleanup + node_finished until GPU work completes on compute_stream

@@ -171,20 +171,29 @@ CPU build at +p1 and +p2). Notes on what was built:
 Q7, the frontend-only API gaps:
 
 - **`hstack`/`vstack`/`concatenate`**: `create_array` plus slice `set_region`
-  per piece. Native today. Needed by linreg and logreg.
-- **`out=`**: `out[...] = result`. Needed by gemm, einsum and scan.
-- **`eye`**: build it as `diag(ones(n))`. Today it issues N scalar ops
-  (`charmnumeric.py:1048`).
+  per piece. Needed by linreg and logreg. **DONE** (`operations.py`
+  `concatenate/hstack/vstack/stack`, results up to 3-D; linreg/logreg use it).
+- **`out=`**: `out[...] = result`. Needed by gemm, einsum and scan. **DONE**
+  for add/subtract/multiply/divide/tanh/exp/matmul/dot/`Array.dot`
+  (`charmnumeric.py` `_write_out`); gemm and einsum (2-D) use it. The
+  native scans take `out=` too (scan.py uses `cumsum(A, out=B, axis=ax)`).
+- **`eye`**: build it as `diag(ones(n))`. **DONE** (one DIAG op; non-square
+  via a block copy).
 - **Name limit**: raise `max_name` (`charmtyles/core.py:9`). Nothing in the
-  backend depends on 2^16.
+  backend depends on 2^16. **DONE**: int32 limit. Names are not recycled: the
+  backend fills `array_meta`/`live_array_meta` by name when a DAG arrives,
+  before older epochs that may still use a dead name finish, so reuse could
+  clobber in-flight metadata. Note `array_meta` entries are never erased
+  (about 80 B per name per PE).
 - **Views passed to REDUCE/TILE/DIAG**: auto-materialize them, because those
-  executors ignore view regions (README issue 5).
+  executors ignore view regions (README issue 5). **DONE.**
 - **`sum()` of 1-D/2-D arrays**: use REDUCE or matvec with `ones`, as
-  `_cnum_util.vsum/msum` do today.
+  `_cnum_util.vsum/msum` do today. **DONE**: native `cnp.sum` (REDUCTION opcode 60).
 - **Uniform-count `repeat`**: strided slices.
 - **`take` with host-known indices**: lower to column-slice copies, 496 for
   take_pairs' N=32. Cheaper and exact compared with the 0/1 selection-matrix
-  SUMMA.
+  SUMMA. **DONE** (`operations.py` `take`, also `Array.take`): contiguous or
+  constant-stride index runs become one slice copy; take_pairs uses it.
 - **General broadcasting**: until it exists natively, materialize it with
   `tile`.
 
@@ -199,7 +208,7 @@ These unlock several rows of the main table at once.
 | P1 | **Per-operand dtypes in fused kernels** (bool, astype fusion, int/float promotion) | L | WIRE: add the operand dtype to `FRONTEND_OBJECT`/`BROADCAST_OBJECT` (`ast.py:94-104`, `dag.hpp:137-141`) and include it in the node identifier (compile-cache key). JIT: per-leaf memref element types (`jit.cpp:96-104`), plus explicit `arith` casts where operand and result types differ. EXEC: `dispatch_kernel` must pack heterogeneous `MemRef<N,T>` descriptors (same layout, so pack them type-erased) and allocate outputs of a different `T` than the inputs (`execute_node.cpp:~1300-1330`). |
 | P1b | **New DTypes** (bool/uint8, uint32, uint64, f16, c64/c128) | M-L each, after P1 | `DType` enum and `dtype_size` (`include/charmtyles/core/ast.hpp:8-29`); the frontend `DType` maps (`charmnumeric.py:34-75`, `interface.py:7-8`); about 22 `switch (dt)` sites in `E/src/*.cpp`; 12 more `execute_node_nd` instantiations per dtype (`execute_node.cpp:1588-1599`); the JIT `elemType` switch; reducer cases. Unsigned types also need signedness-aware registry bodies (`DivUI`, `CmpI ult`, `UIToFP`). Complex needs the MLIR `complex` dialect. f16 needs `Kokkos::Experimental::half_t` GEMM and f32-extended math on CPU. |
 | P2 | **Generic full-array reduction** (any N, op kind ∈ {sum, prod, max, min, argmax, argmin, count_nonzero, any, all}) | M | Generalize REDUCE: relax N==1 (`executor_reduce.cpp:9-12`, `executor_core.cpp:255-259`; all chares must stay relevant); add `op_kind` and an `int64 index` to `ReduceContrib`; one reducer per kind (`executor_reducer.cpp`); local partials via `Kokkos::parallel_reduce` with `Sum/Max/Min/MaxLoc/MinLoc` (CPU: loops or Eigen). The callback still targets 1-D chare 0 (`executor_reduce.cpp:108-110`). |
-| P3 | **"Local op" framework**: run a dense kernel on one chare, with gather→compute→scatter when the operand spans more than one tile | L (framework), then S-M per kernel | Comm: all-to-one gather and one-to-all scatter of tiles (like the `get` path: `partition_get.cpp:4-66`, `dag_group_runtime.cpp:55-116`). On GPU builds the minimum tiles are 1024² for 2-D, 1M for 1-D and 128³ for 3-D (`backend.hpp:10-17`). So most default example sizes already sit on one chare, and the gather is a no-op. Exceptions: take_pairs 10000×32; on CPU builds also qr 1000² and sort 1e6. It is not scalable, but it turns every remaining HOST-FALLBACK into a device-resident op with no host round trip. |
+| P3 | **DONE for dense linear algebra (LINALG, opcode 100; one chare, not scalable)** — **"Local op" framework**: run a dense kernel on one chare, with gather→compute→scatter when the operand spans more than one tile | L (framework), then S-M per kernel | Comm: all-to-one gather and one-to-all scatter of tiles (like the `get` path: `partition_get.cpp:4-66`, `dag_group_runtime.cpp:55-116`). On GPU builds the minimum tiles are 1024² for 2-D, 1M for 1-D and 128³ for 3-D (`backend.hpp:10-17`). So most default example sizes already sit on one chare, and the gather is a no-op. Exceptions: take_pairs 10000×32; on CPU builds also qr 1000² and sort 1e6. It is not scalable, but it turns every remaining HOST-FALLBACK into a device-resident op with no host round trip. |
 | P4 | **Bulk host→device upload** — **DONE (P4a)** | M | Implemented as an INLINE_DATA operand (type 4, `[nbytes:i64][bytes]`, `charmtyles/ast.py` `InlineData`, `include/charmtyles/core/dag.hpp`) on an UPLOAD node (opcode 50). `ArrayDAGGroup::stage_uploads` (`E/src/executor_creation.cpp`) cuts the payload into the tiles of the PE's own chares (home PE) right after the decomposition pass and frees the full payload; each chare moves its tile into the new array (`copyToDevice` on GPU builds). Ordering is the DAG's (the upload is an ordinary node writing a fresh array). Cost: P× replication of the DAG message; the size field is int32 (< 2 GiB). The frontend drops the payload after the flush. `_assign_host_data`'s per-element loop is gone. |
 
 Library note for P3 and the factorization rows: the installed KokkosKernels
@@ -228,38 +237,38 @@ distributed version.
 |---|---|---|---|---|---|---|
 | unary math: sqrt, log, abs, floor, ceil, round, … | **DONE** (Q1) | OPC, JIT, FE | none | float-only math rejects int input until astype (P1) | black_scholes, black_scholes_greeks, logreg, tssvd, quantiles (methods), solve check | native |
 | power / square | **DONE** (Q2) | OPC, JIT, FE | none | int `**` by square-and-multiply | cfd, linreg, lstm_backward, kmeans | native |
-| maximum / minimum | **DONE** (Q3) | OPC, JIT, FE | none | none | kmeans, kmeans_slow; exact sort/quantiles network | native |
+| maximum / minimum | **DONE** (Q3) | OPC, JIT, FE | none | none | kmeans, kmeans_slow | native |
 | mod, floor_divide | **DONE** (Q4) | OPC, JIT, FE | none | NumPy sign semantics | black_scholes_greeks, indexing_routines | native |
 | comparisons, isnan, isinf | **DONE** as numeric masks (Q5) → **L** (true bool, P1+P1b) | OPC, JIT, FE (+WIRE, EXEC, all DType switches for bool) | none | Bool result is impossible today: single `elemType`, no bool DType | black_scholes(+greeks), kmeans(+slow), sort, quantiles, scan nan*, indexing_routines, jacobi/logreg diagnostics | 0/1 mask in the input dtype (native) |
 | where / select / choose / mask-assign | **DONE** (Q6, ternary JIT op) | OPC, JIT (`TernaryOpEntry`), FE | none (halo for shifted views, as for any elementwise op) | cond must have the dtype of x/y until P1 | black_scholes(+greeks), kmeans_slow, scan nan*, indexing_routines (choose) | native; ai* scatters still need gather/scatter |
-| astype | **M** (non-fused CAST executor) → **L** (fused, via P1) | OPC, FE, RECV (result meta = input meta), EXEC (local only), KK convert kernel | none: output decomposition = input decomposition | needs a 4×4 (later more) dtype dispatch; outputs allocated with a different T | quantiles (int), svd (int), scan (int), black_scholes_greeks (int→float), kmeans (labels/counts), indexing_routines (bool) | none native; host round trip today |
+| astype | **DONE** (non-fused CAST executor, opcode 80, `E/src/executor_castscansort.cpp`) → **L** (fused, via P1) | OPC, FE, RECV (result meta pinned to input meta), EXEC (local only), KK convert kernel | none: output decomposition = input decomposition | 4×4 dtype dispatch; views are materialized first; float→int truncates (NaN/inf/out-of-range unspecified) | quantiles (int), svd (int), black_scholes_greeks (int→float), kmeans (counts), indexing_routines (choose on int C1); bool still missing (P1b) | — |
 | native RNG: rand, random, randn, uniform, normal, randint, seed, default_rng; arange/linspace/indices/meshgrid/eye — **DONE** | M | OPC (51 RANDOM, 52 IOTA), FE (`random.py`, `charmnumeric.py`), RECV/SOLV (treated like CREATE: `is_creation()`), EXEC (`executor_creation.cpp`, kernels in `creation_kernels.hpp`) | none | randint takes exact int64 bounds (parameters travel as hi/lo 32-bit scalar pairs) | cholesky, qr, solve, svd, tssvd, take_pairs, jacobi, gemm, black_scholes, scan switched; the rest still use `_cnum_util` generators | Philox4x32-10 keyed by (seed, stream) on the global element index: independent of decomposition/PEs; CPU and GPU builds bit-identical (no FMA, software log/cos). Streams differ from NumPy's. |
-| bulk host→device upload — **DONE (P4a)** | M | WIRE, OPC, EXEC, FE | none | none | cholesky, qr, solve, svd, take_pairs (host factors / selection matrices); removes the 65k-element cap | see P4 |
+| bulk host→device upload — **DONE (P4a)** | M | WIRE, OPC, EXEC, FE | none | none | cholesky, qr, solve, svd (host factors); removes the 65k-element cap | see P4 |
 | full reductions: sum, prod, max, min, argmax/argmin (flat), count_nonzero, any/all, norm(inf/2) | **DONE** (REDUCTION opcode 60, `E/src/executor_reduction.cpp`, `E/charmnumeric/reductions.py`; also mean/var/std, views, 1-3-D, all dtypes). Was: **M** (P2) | OPC, FE, RECV, EXEC (`executor_reduce` generalized), reducer | reduction tree (Charm++ `contribute`) | argmax returns int64; result is a (1,) array on 1-D chare 0 | cfd, jacobi, linreg, logreg, kmeans (distance sum, `sum(changes)`), tssvd, take_pairs, indexing_routines warmup, qr check (`max`), solve check (`norm(·,inf)`) | dot/matvec with `ones` (sum only) |
 | axis reductions: sum, mean, amin, amax, argmin, argmax, norm along one axis | **DONE** (REDUCTION opcode 60 with an axis mask: any axis or axis tuple of 1-3-D operands, keepdims; partials go point-to-point to the owning output chares). Was: **M** → **L** | OPC, FE, RECV, SOLV (pin), EXEC, KK | partial vectors reduced along one tile-grid dimension to the owning 1-D chares (exactly matvec's `cross_matmul_send_result_2d_to_1d`, `backend_internal.hpp:261`) | arg* output is int64, so the output dtype differs from the input; (value, index) pairs on the wire | kmeans, kmeans_slow (norm axis=1, argmin, amin, sum axis=0), lstm_backward (sum axis 0), tssvd (row sums), solve (pivot argmax), quantiles(axis) | sum = `A @ ones` (exact); argmin/amin need the Q3/Q5 one-hot trick |
-| bincount (weights, minlength) | **DONE** (BINCOUNT opcode 61; length = minlength or max(x)+1 via `interface=`). Was: **M** after P2 | OPC, FE, EXEC, reducer (vector-valued) | local histogram, then an all-reduce of a length-C vector (reduction tree) | int labels with float weights: mixed dtype inside one op (fine in an executor) | kmeans, kmeans_slow | one-hot M with `ones @ M`, `dataT @ M` |
-| transpose (2-D, materialized) | **M** (about 3 days) | OPC, FE (`.T`, `transpose()`, `swapaxes`), RECV (shape + expansion of the N×M grid), SOLV (pin zero offset), EXEC, KK local transpose | **point-to-point permutation**: square tiles of the same size for every dim (`array_region.hpp` `ArrayDecomp::tile`), so tile (i,j) goes to chare (j,i); diagonal tiles stay local | none | kmeans, kmeans_slow, linreg, logreg, lstm_backward, einsum, cholesky, qr, svd, tssvd | generate transposed inputs; symmetry tricks |
-| vecmat (1-D @ 2-D) and transposed-operand matmul (`A.T @ B`, `A @ B.T`) | **M** (vecmat as a mirror of matvec) → **L** (SUMMA variants without materializing) | FE (`_array_matmul`, `charmnumeric.py:522`), EXEC (`executor_matmul.cpp` / `executor_matmatmul.cpp` flag) | vecmat: vector slices multicast along grid rows, partials reduced along grid columns. SUMMA-T: panel broadcast along the other grid axis. | none | linreg, logreg (`err.dot(X)`), lstm_backward, qr/svd (`A^T A`, `Q^T Q`) | materialized transpose + existing SUMMA |
-| 3-D axis permutation (transpose for N=3) | **L** | as for 2-D, rank 3 | point-to-point (tile-index permutation); the 3-D grid may need expansion | none | einsum (general), lstm (if not reduced to 2-D) | per-slice 2-D transposes |
-| dense factorizations: potrf, getrf+getrs, geqrf, syevd, gesvd, tssvd | **L** (P3 + Eigen/cuSOLVER, S-M per routine) → **XL** (distributed blocked: ScaLAPACK-style panels, pivot search across chares, TSQR trees, two-stage eigensolvers) | OPC, FE (`linalg` module), EXEC (P3), KK or cuSOLVER link, CMake | P3: gather/scatter. Distributed: panel broadcasts plus column-max reductions (getrf) and binary reduction trees (TSQR for tssvd). | s/d only (z with P1b) | cholesky, qr, solve, svd, tssvd | the ports' blocked algorithms with host-side bs×bs kernels |
-| trsm / trtri | **S-M** on P3 (diagonal block) → **L** (distributed wavefront) | OPC, FE, EXEC | wavefront along the tile diagonal | none | cholesky, solve, qr | invert the small diagonal block (host) + SUMMA |
+| bincount (weights, minlength) | **DONE** (BINCOUNT opcode 61; length = minlength or max(x)+1 via `interface=`). Was: **M** after P2 | OPC, FE, EXEC, reducer (vector-valued) | local histogram, then an all-reduce of a length-C vector (reduction tree) | int labels with float weights: mixed dtype inside one op (fine in an executor) | kmeans, kmeans_slow | one-hot M with `ones @ M`, `M.T @ data` |
+| transpose (2-D, materialized) | **DONE** (opcode TRANSPOSE=70) | FE (`.T`, `transpose()`, `swapaxes`), RECV (shape + grid expansion incl. offset), SOLV (result takes the source tile and the permuted source offset+view start, fixed-offset source), EXEC `executor_transpose.cpp` (Kokkos pack/place on GPU, memcpy loops on CPU) | **point-to-point**: each source chare packs its part of the (possibly strided/offset) view in result order, once per overlapping result chare; with the solver alignment that is one message per tile | none | kmeans, kmeans_slow, linreg, logreg, lstm_backward, einsum, cholesky, qr, svd, tssvd (all switched) | — |
+| vecmat (1-D @ 2-D) and transposed-operand matmul (`A.T @ B`, `A @ B.T`) | **DONE** as materialized transpose + matvec/SUMMA (vecmat caches A.T until A is written) → **L** (SUMMA variants without materializing) | FE (`_array_matmul`), later EXEC (`executor_matmul.cpp` / `executor_matmatmul.cpp` flag) | vecmat: transpose + matvec today. Fused: vector slices multicast along grid rows, partials reduced along grid columns; SUMMA-T: panel broadcast along the other grid axis. | none | linreg, logreg (`err.dot(X)`), lstm_backward, qr/svd (`A^T A`, `Q^T Q`) | — |
+| 3-D axis permutation (transpose for N=3) | **DONE** (same executor, any axes permutation) | as for 2-D, rank 3 | point-to-point | none | einsum (batched forms use `transpose(x, (0, 2, 1))`) | — |
+| dense factorizations: potrf, getrf+getrs, geqrf, syevd, gesvd, tssvd | **DONE (P3 interim; factors on one chare, not scalable)**: `cnp.linalg.cholesky/qr/solve/inv/det/slogdet/eigh/eigvalsh/svd/svdvals/lstsq/solve_triangular/tssvd` (`E/charmnumeric/linalg.py`, `E/src/executor_linalg.cpp`; Eigen on CPU, cuSOLVER/cuBLAS on NVIDIA). Next: **XL** (distributed blocked: ScaLAPACK-style panels, pivot search across chares, TSQR trees, two-stage eigensolvers) | OPC, FE, EXEC, cuSOLVER link, CMake | gather of the operand blocks to chare 0 of the result partition, factor there, scatter the result tiles (point-to-point, host-staged). **Limits:** the whole problem must fit in one chare's (PE's / GPU's) memory, the factorization runs serially on that one PE/GPU while the others wait, and all operand/result data crosses the network to/from that chare once. Distributed: panel broadcasts plus column-max reductions (getrf) and binary reduction trees (TSQR for tssvd). | s/d (int inputs factored in float64) | cholesky, qr, solve, svd, tssvd (all direct now) | — |
+| trsm / trtri | **DONE on P3 (one chare, not scalable)**: `cnp.linalg.solve_triangular` (scipy/cuPyNumeric signature), `inv` → **L** (distributed wavefront) | OPC, FE, EXEC | wavefront along the tile diagonal | none | cholesky, solve, qr | — |
 | gather / take / fancy indexing / row permutation from a **device** index array | **XL** | OPC, FE (`_parse_key` accepts only int/slice, `charmnumeric.py:308-343`), WIRE, EXEC | **data-dependent all-to-all** (request/reply). Communication can't be planned from regions at DAG-build time. | int64 index arrays | indexing_routines (ai1/ai2/ai3), take_pairs, solve (device pivots) | **host-known indices → M**: indices as SCALAR operands give a static plan like slicing. take_pairs: S via column-slice copies (Q7) |
 | boolean-mask **read** `A[mask]` (compaction), variable-count `repeat`, `nonzero` | **L-XL** | as above + a scan (prefix count) + a host sync for the result shape | prefix scan of counts along the tile order + redistribution | bool (P1b) | indexing_routines (zipped `A2[b, b]`, `A3[idx, :, idx]`), `repeat(A2, R, axis=1)` with an array R | mask *assignment* is S via where (Q6) |
 | reshape / flatten / ravel (1-3 D) | **M-L** | OPC, FE, RECV, EXEC | static redistribution: each source tile's contiguous row-major runs go to the 1-2 target tiles that own those linear ranges (all-to-all-ish). The linearization is the same as the `get` path (`partition_get.cpp:23-66`). | none | black_scholes_greeks, take_pairs, scan (axis=None), sort/quantiles/svd input reshapes | adding/removing singleton dims via cross-dim set_region (after Q8): **S** |
 | more than 3 dims | **L-XL** | `PartitionTraits<4>`/`Partition4D` (`backend.hpp:22-43`, `backend.ci`), all `if constexpr (N==…)` and `switch(nd)` sites (`dag_group_receive.cpp` aborts on nd>3), solver, instantiations ×dtypes | same as now | none | black_scholes_greeks (4-D CALL/PUT), scan/sort/quantiles with ≥4-D `--shape`, einsum (≥4 modes) | FE folding of contiguous leading dims into dim 0 (what the greeks port does): S-M |
-| sort / argsort | **M** (local op: `Kokkos::sort` / `sort_by_key`, `std::stable_sort`; arrays that fit one tile, plus segmented sort along an axis that lies inside a tile) → **L-XL** (distributed sample sort) | OPC, FE, EXEC, KK | sample sort: gather samples, broadcast splitters, **data-dependent all-to-all**, local merge, then rebalance to block tiling (a second all-to-all) | argsort returns int64; uint32 is the default dtype (P1b) | sort, quantiles | O(n²) odd-even network (exact once Q3 exists) |
-| scan: cumsum, cumprod (nan* variants) | **S-M** (local op, `Kokkos::parallel_scan` / `std::inclusive_scan`) → **M-L** (distributed 1-D, 3 phases) → **L** (axis scans in 2-D/3-D) | OPC, FE, EXEC, KK | local scan, then an exclusive scan of per-tile totals along one grid dim (a chain or tree of scalars), then an elementwise add of the offset | nan* variants = `where(isnan(x), id, x)` first (Q5/Q6) | scan | Hillis-Steele with shifted slices (O(n log n) work) |
+| sort / argsort | **DONE (not scalable)**: SORT/ARGSORT executors (opcodes 82/83) gather the whole array on the chare holding element 0, sort every line along any axis there (`std::sort` with a NaN-last, index-tie-broken comparator on CPU; `Kokkos::sort` with the same comparator, i.e. thrust, on GPU), and scatter the tiles back. Stable (= `kind='stable'`). → **L-XL** (distributed sample sort) | OPC, FE, EXEC, KK | today: all-to-one + one-to-all. Sample sort: gather samples, broadcast splitters, **data-dependent all-to-all**, local merge, then rebalance to block tiling (a second all-to-all) | argsort returns int64; uint32 is the default dtype (P1b) | sort, quantiles | — |
+| scan: cumsum, cumprod, nancumsum, nancumprod | **DONE** (distributed, any axis of 1-D/2-D/3-D): SCAN executor (opcode 81) | OPC, FE, EXEC, KK | per-tile scan along the axis (GPU: one thread per line, or a `Kokkos::parallel_scan` per line when lines are few and long), each tile sends its per-line totals to every later tile of its grid line (P(P-1)/2 cross-section messages per line, one round), receivers fold them into a carry and add it | nan* treat NaN as the identity inside the executor (no isnan/where needed); int32 accumulates in int64 as in NumPy (implicit astype first) | scan | — |
 | convolve, N-D, mode="same", direct | **M-L** | OPC, FE, EXEC, KK | **halo exchange** of width f//2 per side, the same pattern as the fragment path for shifted views; then a local direct convolution | none | richardson_lucy | f³ shifted-view MACs (works today; about 64 views per call) |
 | convolve via FFT (`--conv-method fft`, possibly also chosen by `auto`) | **M** (single-tile cuFFT/FFTW) → **XL** (distributed FFT with transposes) | EXEC, cuFFT link | all-to-all transposes | complex intermediates (P1b) | richardson_lucy (non-default) | direct convolution |
 | flip / negative-step slicing | **M-L** | FE (`_parse_key` rejects step<0, `charmnumeric.py:321-322`), JIT (negative memref strides), EXEC (mirrored source tile: point-to-point, split across ≤2 tiles when misaligned) | point-to-point mirror | none | richardson_lucy (`np.flip(psf)`) | reversed-index generation (the port's approach) |
 | general broadcasting, newaxis | **L** (S-M for the JIT part) | FE (`_expand_key` raises on `None`, `charmnumeric.py:292`), JIT (projected indexing maps in `emitGenericArrayOp`), SOLV (do not union lower-rank leaves with the output), EXEC | **multicast** of the lower-rank operand slice to every chare along the broadcast dim (like matvec's vector send, `executor_matmul.cpp:6-60`) | none | kmeans, kmeans_slow (`[:, newaxis]`), svd/tssvd check (`u * s`); also fixes README issue 4 (silent wrong results) | `tile()` to materialize (S, memory cost); SUMMA with ones |
-| einsum | **L** after transpose + reshape + batched matmul; **XL** for arbitrary expressions | FE lowering (modes → permute/reshape/matmul/axis-sum) | inherits from the lowered ops | none | einsum | the 4 hand-lowered expressions |
+| einsum | **L** after reshape + batched matmul; **XL** for arbitrary expressions | FE lowering (modes → permute/reshape/matmul/axis-sum) | inherits from the lowered ops | none | einsum | the port lowers every single-contraction 2-D / batched 3-D matrix product via native transposes |
 | batched matmul (3-D) | **M-L** | EXEC (`executor_matmatmul.cpp` already has a 3-D dim-dropped path) | local `KokkosBatched` gemm when the contracted dims fit in a tile; otherwise per-batch SUMMA | none | einsum (`kac,kbc->kab`), lstm | loop of 2-D SUMMA calls (the port does this) |
 | complex dtypes | **L** (after P1) | P1b + `complex` dialect + KK `Kokkos::complex` gemm + reducers | none | everything | scan, sort, svd, einsum (c64/c128) | none |
 | float16 | **M-L** | P1b | none | f16 math must be extended to f32 on CPU | gemm, black_scholes, linreg, logreg, kmeans, einsum (`--precision 16`) | none |
 | unsigned ints (uint32, uint64) | **M-L** | P1b + unsigned registry bodies | none | signedness in Cmp/Div/convert | sort and quantiles (**uint32 is the default dtype**), kmeans (uint64 counts) | int64 stand-in |
 | exact int64 scalars | **S-M** | WIRE: a new `SCALAR_I64` operand (today every scalar is a double: `ast.py:105-107`, `dag.hpp:162-163`, `ast.hpp:38`) + JIT constant path (`jit.cpp:128`) | none | values above 2^53 are rounded today | sort/quantiles with `iinfo(int64)` bounds; randint | keep |values| < 2^53 |
-| mixed-dtype elementwise promotion | **S** (FE: promote scalars, insert explicit astype) after astype; **L** natively (P1) | FE (`_operand_dtype` ignores scalars, `charmnumeric.py:361-366`) | none | **Likely silent bug today**: array-array int+float is fused with one `elemType`, so the int buffer is reinterpreted as float (`jit.cpp:65-104`, `dispatch.hpp:141`). Not verified at runtime. | black_scholes_greeks (`(temp_arr % n) * money_step` stays int64 instead of becoming float64), kmeans (counts / centroids) | keep everything in one dtype (the ports do) |
+| mixed-dtype elementwise promotion | **DONE** (FE implicit astype) → **L** natively (P1) | FE (`_promote_operands` in `charmnumeric.py`): binary ops, matmul/dot and `__setitem__` cast array operands to the NumPy result dtype; a Python float promotes an int array to float64 (NEP 50) | none | **Verified bug before the fix** (CPU backend): `int64 + float64` returned `0 + b` and `int32 * float32` returned denormals/NaN, because the int buffer was read as float. Int/int true division still truncates (ports rely on it). | black_scholes_greeks, kmeans | — |
 
 ---
 
@@ -276,12 +285,11 @@ with the lhs element type (`jit.cpp:338-352`). Every new elementwise op fuses
 with its neighbours automatically. Fusion is split only on output dtype
 change (`charmtyles/ast.py:731`).
 
-**astype (interim).** A non-fused CAST node has no communication. Copy the
-input's decomposition into the result's `array_meta` in the receive shape
-pass, and pin both in the solver. Then each chare runs
-`partition->allocate_or_reuse(region, gs, name, dt_out, decomp)` plus a
-`parallel_for` conversion. That is a 16-case (src, dst) dispatch. Making it
-fusible needs P1.
+**astype (done).** A non-fused CAST node with no communication: the receive
+pass copies the input's metadata to the result, and after the solver pins
+the result's decomposition to the input's final (live) decomposition. Each
+chare then allocates its tile with the target dtype and runs a 16-case
+(src, dst) conversion (`parallel_for` on GPU). Making it fusible needs P1.
 
 **RNG.** Use a counter-based generator, such as Philox or splitmix64 hashed
 on `(seed, global linear index)`. Results are then independent of the
@@ -306,18 +314,24 @@ the matvec executor gives `sum/max/min(axis=1)` at about M. `argmin/argmax`
 need (value, int64 index) pairs and an int64 output array. axis=0 is
 vecmat-shaped.
 
-**Transpose.** All dims of an array share one tile size, and the
-`Partition2D` grid is shared by every 2-D array. A transposed array therefore
-lives on the mirrored chares. The executor packs its tile, sends it to
-`(j,i)` with `receive_data`, and the receiver writes the transposed block.
-Use `Kokkos::parallel_for` with a 2-D MDRange on GPU; Eigen's `.transpose()`
-works on CPU. When the array's decomposition offset is nonzero, the
-permutation is no longer tile-aligned, so pin to zero offset
-(`decomposition_solver.hpp:590-595`). Transposed-operand SUMMA (`A^T B`)
-avoids the copy and is the better long-term target. It is also what
-`tssvd`/`svd`/`qr` Gram products need.
+**Transpose (done).** `src/executor_transpose.cpp`. Result axis k reads
+source axis perm[k]. Every chare of the partition runs the node: a source
+chare computes, per axis, the view-index range its tile holds (strided views
+included), maps it to result coordinates, and sends one block per overlapping
+result chare, packed in result row-major order (Kokkos `parallel_for` on the
+comm stream + `device_pack_send` on GPU, strided memcpy loops on CPU). A
+result chare counts the expected blocks with the same per-axis rule and
+copies them in (`transpose_place`, from the `execute_node_nd` interpreter).
+Source and result may have different tiles and offsets. The solver gives the
+result the source's tile and offset = (source offset + view start) permuted,
+mod tile, and treats it as a fixed-offset source, so a full or step-1 view
+transpose is a pure tile permutation (tile (i,j) -> (j,i) for zero offsets);
+matmul operands keep the zero-offset pin. Transposed-operand SUMMA (`A^T B`)
+would avoid the copy; it is still the better long-term target for the
+`tssvd`/`svd`/`qr` Gram products.
 
-**Factorizations.** The 5 HOST-FALLBACK examples already do the bulk work
+**Factorizations.** (Status 2026-10-09: done as single-chare LINALG ops, see the main
+table; the text below is the original analysis.) The 5 HOST-FALLBACK examples already do the bulk work
 natively (SUMMA). Only the bs×bs or n×n kernels go to the host. P3 removes
 the host round trips without any distributed linear algebra. A truly
 distributed potrf/getrf/geqrf/syevd is a ScaLAPACK or SLATE-sized effort on
@@ -337,16 +351,12 @@ case. When indices are known on the host, which covers every use in the
 ports' defaults, a static plan is possible. Send them as SCALAR operands, or
 as an INLINE_DATA payload after P4.
 
-**Sort.** On GPU builds the 1-D minimum tile is 1,048,576 elements, so sort's
-default of 1e6 and quantiles' default of 1000 both fit in one tile. A
-single-tile `Kokkos::sort` / `Kokkos::Experimental::sort_by_key` op (M)
-therefore makes both examples native at default sizes. Distributed sample
-sort is needed only for scaling.
+**Sort (done, not scalable).** On GPU builds the 1-D minimum tile is
+1,048,576 elements, so sort's default of 1e6 and quantiles' default of 1000
+both fit in one tile anyway; the gather/scatter is then a no-op. Distributed
+sample sort is needed only for scaling.
 
-**Scan.** The single-tile version is S-M and covers scan's default (n=10).
-The distributed 1-D version adds a small chain or tree over tile totals,
-which is cheap. Most of the work is the 3-phase executor and nodes for the
-axis variants.
+**Scan (done).** Distributed along any axis; see the main table.
 
 **Convolve.** The existing fragment path already brings remote halos in for
 shifted views. A CONVOLVE op can reuse that region machinery for the input:
@@ -425,11 +435,12 @@ README list misses or under-reports:
 3. **P2 full reductions, then 2-D axis reductions via the matvec path**
    (about 1 week). Covers cfd, jacobi, linreg, logreg, kmeans and
    lstm_backward without dot-with-ones tricks; adds argmin/argmax.
-4. **2-D transpose + vecmat** (about 1 week). Unblocks 10 examples' natural
-   code.
-5. **CAST executor (astype)**, then **P3 local-op framework** with
-   Eigen/cuSOLVER factorizations, sort and scan (about 2-3 weeks). Every
-   HOST-FALLBACK becomes device-resident at default sizes.
+4. ~~**2-D transpose + vecmat**~~ Done (plus 3-D permutations); the 10
+   examples use their natural code.
+5. ~~**CAST executor (astype)**, then **P3 local-op framework** with
+   Eigen/cuSOLVER factorizations, sort and scan~~ Done: CAST/SCAN/SORT
+   (opcodes 80-83) and LINALG (opcode 100). Factorizations and sort run on
+   one chare (not scalable); the factorization HOST-FALLBACKs are gone.
 6. Then the L/XL items, as research needs dictate: P1 typed kernels with
    bool/uint/complex/f16, general broadcasting, reshape, distributed
    sort/scan/gather, and distributed factorizations.

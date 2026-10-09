@@ -6,12 +6,13 @@ Verdict: port with workarounds (fully native). Changes:
     stops at 3-D, so the greek axis is folded into the first axis
     (N_GREEKS*t, vol, money), and CALL[g] becomes the 3-D view
     CALL[g*t:(g+1)*t].
-  * arange(...).reshape(...) is the native row-major linear index
-    U.linear_index(steps); the % is native. K and T are kept in the working
-    dtype D. NumPy would promote them to float64.
+  * arange(..., dtype=int).reshape(...) is the native row-major linear index
+    U.linear_index(steps), int64 as in the original; the % is native. As in
+    the original, int * float promotes natively to float64, and K, T are then
+    converted to the working dtype D with a native astype.
   * sqrt, log, absolute and where(d > 0) are native; d > 0 is a 0/1 mask in
     the working dtype. np.sqrt(T) is computed once per call and reused.
-Backend ops that would make it direct: 4-D arrays (or reshape), arange.
+Backend ops that would make it direct: 4-D arrays (or reshape).
 """
 
 import argparse
@@ -63,12 +64,13 @@ def initialize(n_vol_steps, n_t_steps, n_money_steps, D):
     CALL = cnp.zeros((N_GREEKS * n_t_steps, n_vol_steps, n_money_steps), dtype=D)
     PUT = cnp.zeros((N_GREEKS * n_t_steps, n_vol_steps, n_money_steps), dtype=D)
     S = cnp.full(steps, S0, dtype=D)
-    # temp_arr = arange(nv*nt*nm).reshape(steps): the row-major linear index
-    temp_arr = U.linear_index(steps, dtype=D)
+    # temp_arr = arange(nv*nt*nm, dtype=int).reshape(steps): the row-major
+    # linear index (int64). int * float promotes natively to float64, then astype(D).
+    temp_arr = U.linear_index(steps, dtype=cnp.int64)
     k_temp = (temp_arr % n_money_steps) * money_step
-    K = (k_temp + (1 + money_start)) * S0
+    K = ((k_temp + (1 + money_start)) * S0).astype(D)
     t_temp = (temp_arr % (n_vol_steps * n_money_steps)) * vol_step
-    T = t_temp + t_start
+    T = (t_temp + t_start).astype(D)
     R = 0.02
     V = cnp.full(steps, vol_start, dtype=D)
     for i in range(n_vol_steps):

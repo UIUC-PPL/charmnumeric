@@ -518,9 +518,12 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
         std::unordered_set<int> source_arrays;
 
         detail::for_each_node_topo(dag, [&](DAGNode* dag_node) {
-            for (ASTNode* ast_node : dag_node->ast->roots)
-                if (is_creation(static_cast<Opcode>(ast_node->opcode)))
+            for (ASTNode* ast_node : dag_node->ast->roots) {
+                Opcode op = static_cast<Opcode>(ast_node->opcode);
+                // TRANSPOSE results get a fixed offset (align_transpose_results)
+                if (is_creation(op) || op == Opcode::TRANSPOSE)
                     source_arrays.insert(ast_node->result_name);
+            }
         });
 
         auto collect_unionable_nonfixed_leaves = [&](auto&& self, ASTNode* node, int out_name,
@@ -605,9 +608,9 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                     matmul_arrays.insert(ast_node->result_name);
                 }
 
-                // Reduction results are routed by a zero-offset decomposition.
+                // Reduction and linalg results are routed by a zero-offset decomposition.
                 // BINCOUNT also needs x and weights laid out identically.
-                if (is_reduction_op(op)) {
+                if (is_reduction_op(op) || op == Opcode::LINALG) {
                     matmul_arrays.insert(ast_node->result_name);
                     if (op == Opcode::BINCOUNT)
                         for (ASTNode* operand : ast_node->operands)
@@ -616,6 +619,41 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                 }
             }
         });
+
+        // TRANSPOSE result: source tile, permuted (source offset + view start),
+        // so source tiles map 1:1 onto result tiles. Matmul operands stay at 0.
+        auto align_transpose_results = [&]() {
+            detail::for_each_node_topo(dag, [&](DAGNode* dag_node) {
+                for (ASTNode* ast_node : dag_node->ast->roots) {
+                    if (static_cast<Opcode>(ast_node->opcode) != Opcode::TRANSPOSE ||
+                        ast_node->operands.empty())
+                        continue;
+                    auto in_it = array_meta.find(ast_node->operands[0]->result_name);
+                    auto out_it = array_meta.find(ast_node->result_name);
+                    if (in_it == array_meta.end() || out_it == array_meta.end() ||
+                        out_it->second.decomp_final)
+                        continue;
+                    auto& in = in_it->second;
+                    auto& out = out_it->second;
+                    int nd = out.ndims;
+                    if (in.ndims != nd || (int)ast_node->operands.size() < nd + 1)
+                        continue;
+                    Region* view = ast_node->get_operand_region(0);
+                    auto vstart = extract_region_start(view, nd);
+                    auto vstep = extract_region_step(view, nd);
+                    out.tile = in.tile;
+                    out.offset = zero_offset;
+                    if (!matmul_arrays.count(ast_node->result_name)) {
+                        for (int k = 0; k < nd; ++k) {
+                            int d = (int)ast_node->operands[k + 1]->scalar;
+                            if (vstep[d] == 1)
+                                out.offset[k] = positive_mod(in.offset[d] + vstart[d], in.tile);
+                        }
+                    }
+                }
+            });
+        };
+        align_transpose_results();
 
         struct ClassInfo {
             int tile = 0;
@@ -1722,6 +1760,9 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                 meta_it->second.offset = best_offset;
             }
         }
+
+        // sources' offsets may have moved since
+        align_transpose_results();
 
         for (int name : matmul_arrays) {
             auto meta_it = array_meta.find(name);

@@ -8,7 +8,7 @@ Distributed N-dimensional array DSL built on charmtyles. Supports up to 3D array
 | Symbol | Line | Description |
 |--------|------|-------------|
 | `DType` | 34 | Type encoding — FLOAT32=0, FLOAT64=1, INT32=2, INT64=3; `from_numpy()`, `to_numpy()`, `promote()` |
-| `ArrayOperation` | 139 | Opcodes: add=0, sub=1, mul=2, div=3, matmul=4, tanh=5, exp=6, tile=7, reduce=8, matmatmul=9, diag=10; elementwise math/comparisons/where/clip 20-49 |
+| `ArrayOperation` | 139 | Opcodes: add=0, sub=1, mul=2, div=3, matmul=4, tanh=5, exp=6, tile=7, reduce=8, matmatmul=9, diag=10; elementwise math/comparisons/where/clip 20-49; creation upload=50, random=51, iota=52; reduction=60, bincount=61; transpose=70; astype (CAST)=80, scan=81, sort=82, argsort=83; linalg=100 |
 | `ArrayRegion` | 153 | N-D region with start/stop/step per dim — `serialize()`:194, `shape()`:209, `compose()`:212, `overlaps()`:232, `covers()`:239, `intersect()`:246 |
 | `Array(FrontendObject)` | 618 | Main array class — `wire_dtype()`:639, `get()`:683, `get_region()`/`__getitem__()`:690/697, `__setitem__()`:708, `dot()`:724, `matvec()`:727, `copy()`:730, `fill()`:735, `astype()`:738; operators: +,-,*,/,@ at 713-722 |
 | `ArrayView(FrontendObjectView)` | 747 | View with same ops as Array — `get()`:796, `__getitem__()`:801, `__setitem__()`:812, `dot()`:828 |
@@ -51,6 +51,14 @@ Distributed N-dimensional array DSL built on charmtyles. Supports up to 3D array
 | `sum/prod/mean/var/std/amax/amin/argmax/argmin/count_nonzero/all/any` | NumPy-style API (`axis`, `keepdims`, `dtype`, `out`); also installed as `Array`/`ArrayView` methods |
 | `bincount()` | BINCOUNT (opcode 61) node; needs `minlength` or `interface=` |
 | `norm()` | `cnp.linalg.norm` subset (vector 2/1/inf/-inf/0, matrix fro/inf/-inf/1/-1, axis) |
+
+### `charmnumeric/linalg.py` — Dense linear algebra (`cnp.linalg`)
+| Symbol | Description |
+|--------|-------------|
+| `_la()` | Builds a LINALG (opcode 100) node: operands `arrays..., kind, out_nd, out0, out1, p0, p1, p2` |
+| `cholesky/qr/solve/inv/det/slogdet/eigh/eigvalsh/svd/svdvals/lstsq/solve_triangular/tssvd` | NumPy (and cuPyNumeric) API; multi-factor results are one packed 2-D node, sliced natively (`_block`, `_vec`) |
+| `norm` | Re-exported from `reductions.py` |
+| `_reference()` | NumPy model of a LINALG node (used by the CNUM_SIM simulator) |
 
 ### `charmnumeric/interface.py` — Cluster management (130 lines)
 | Symbol | Line | Description |
@@ -165,11 +173,14 @@ Bit-exact NumPy mirror of `src/creation_kernels.hpp` (Philox4x32-10, software lo
 | `executor_reduction.cpp` | REDUCTION/BINCOUNT: per-chare partials (Kokkos on GPU) sent point-to-point to the output chares (`receive_reduce_partial`) |
 | `executor_reducer.cpp` | Custom reduction operations |
 | `executor_transfer.cpp` | Cross-partition data transfer |
+| `executor_transpose.cpp` | TRANSPOSE (2-D/3-D axis permutation of an array or view): point-to-point pack/send, `transpose_place` receive side |
+| `executor_castscansort.cpp` | CAST (astype), SCAN (cumsum/cumprod/nan*), SORT/ARGSORT executors (opcodes 80-83) |
 | `executor_incremental.cpp` | Incremental computation |
 | `executor_ast_visitor.cpp` | AST visitor for elementwise node execution |
 | `partition_lifecycle.cpp` | `init()`, `create()`, `run()`, destructor |
 | `partition_comm.cpp` | `receive_data()` inter-chare communication |
 | `partition_get.cpp` | `process_get()` — gather results to PE 0 |
+| `executor_linalg.cpp` | LINALG: operand blocks gathered to chare 0 of the result partition (`receive_linalg`), factored there (Eigen on CPU, cuSOLVER/cuBLAS on NVIDIA), result tiles scattered back |
 | `executor_creation.cpp` | UPLOAD/RANDOM/IOTA: `stage_uploads()` (cut payload into this PE's chare tiles), `execute_creation_node()` (create + fill locally) |
 | `creation_kernels.hpp` | Host/device element functions: Philox RNG, Box-Muller with software log/cos, arange/linspace/indices/eye |
 | `jit.cpp` | MLIRJitCompiler implementation — buildFromAST, emitOp |
@@ -187,4 +198,4 @@ Bit-exact NumPy mirror of `src/creation_kernels.hpp` (Philox4x32-10, software lo
 | `test_strided_copy_reduces_tile_and_sets_offset()` | 374 | Stride-2 access regression: tile reduction and absolute offset lifting |
 
 ### `backend.ci` — Charm++ interface (86 lines)
-Module `charmnumeric` (depends on `charmtyles`). Mainchare `Main`. Group `ArrayDAGGroup : DAGGroup` with entries: `set_proxies()`, `proxies_ready()` [reduction], `receive_dag()`, `receive_get_request()`, `gather()`. Arrays `Partition1D/2D/3D` with entries: `run()`, `receive_data()` [nocopy/nocopydevice], `send_complete()`, `comm_done()`, `reduce_result()`.
+Module `charmnumeric` (depends on `charmtyles`). Mainchare `Main`. Group `ArrayDAGGroup : DAGGroup` with entries: `set_proxies()`, `proxies_ready()` [reduction], `receive_dag()`, `receive_get_request()`, `gather()`. Arrays `Partition1D/2D/3D` with entries: `run()`, `receive_data()` [nocopy/nocopydevice], `send_complete()`, `comm_done()`, `reduce_result()`, `receive_reduce_partial()`, `receive_linalg()`.

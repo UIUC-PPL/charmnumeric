@@ -8,14 +8,16 @@
 #endif
 
 /// Collect memrefLeaves, broadcastLeaves, and outputRoots from a DAG node's AST.
+/// scalarLeaves (optional) gets the distinct scalar operands, in the JIT's argument order.
 static void collect_leaves_and_outputs(DAGNode* node, std::vector<ASTNode*>& memrefLeaves,
                                        std::vector<ASTNode*>& outputRoots,
-                                       std::vector<ASTNode*>& broadcastLeaves) {
+                                       std::vector<ASTNode*>& broadcastLeaves,
+                                       std::vector<ASTNode*>* scalarLeaves = nullptr) {
     std::unordered_set<int> internalResults;
     for (ASTNode* root : node->ast->roots)
         internalResults.insert(root->result_name);
 
-    std::unordered_set<int> seenBroadcasts;
+    std::unordered_set<int> seenBroadcasts, seenScalars;
 
     for (ASTNode* root : node->ast->roots) {
         auto root_opc = static_cast<Opcode>(root->opcode);
@@ -29,7 +31,10 @@ static void collect_leaves_and_outputs(DAGNode* node, std::vector<ASTNode*>& mem
             if (root_opc == Opcode::SET_REGION && op_idx == 0)
                 continue;
             auto opc = static_cast<Opcode>(operand->opcode);
-            if ((opc == Opcode::NOOP || opc == Opcode::CREATE) && !operand->is_scalar) {
+            if ((opc == Opcode::NOOP || opc == Opcode::CREATE) && operand->is_scalar) {
+                if (scalarLeaves && seenScalars.insert(operand->result_name).second)
+                    scalarLeaves->push_back(operand);
+            } else if ((opc == Opcode::NOOP || opc == Opcode::CREATE) && !operand->is_scalar) {
                 if (operand->is_broadcast) {
                     if (seenBroadcasts.insert(operand->result_name).second)
                         broadcastLeaves.push_back(operand);
@@ -95,10 +100,6 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
     auto& ameta = this->array_meta;
 
 
-    // DBG_PRINT("[Chare %d] execute_node_nd<%d>: node_id=%d identifier=%lld fusible=%d comm=%s\n",
-    //           chare_idx, N, node->id, (long long)node->identifier, (int)node->fusible,
-    //           comm ? "yes" : "no");
-
     auto it = compile_cache.find(node->identifier);
 
     std::vector<ASTNode*> memrefLeaves_check;
@@ -109,7 +110,6 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
 
     if (force_interpreter || it == compile_cache.end() || !it->second) {
         // Interpreter fallback
-        // DBG_PRINT("[Chare %d]   -> interpreter fallback\n", chare_idx);
         bool handled = false;
         if (comm) {
             for (auto ast_node : node->ast->roots) {
@@ -117,7 +117,6 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                     if constexpr (N == 2) {
                         // --- 2D MATMUL interpreter with communication data ---
                         int mat_name = ast_node->operands[0]->result_name;
-                        int vec_name = ast_node->operands[1]->result_name;
                         int result_name = ast_node->result_name;
 
                         // Get local matrix
@@ -127,7 +126,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                             continue;
                         }
                         Array<N, T>* mat = static_cast<Array<N, T>*>(mat_it->second);
-                        int local_rows = mat->region.size(0);
+                        [[maybe_unused]] int local_rows = mat->region.size(0);
                         int local_cols = mat->region.size(1);
 
                         // Extract slice regions if present
@@ -275,7 +274,6 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                     } else if constexpr (N == 3) {
                         // --- 3D MATMUL interpreter: dimension-dropped matvec ---
                         int mat_name = ast_node->operands[0]->result_name;
-                        int vec_name = ast_node->operands[1]->result_name;
                         int result_name = ast_node->result_name;
 
                         auto mat_it = partition->arrays.find(mat_name);
@@ -309,13 +307,10 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                         rd_s += mat_decomp.offset[rd]; rd_e += mat_decomp.offset[rd];
                         cd_s += mat_decomp.offset[cd]; cd_e += mat_decomp.offset[cd];
 
-                        // Local tile sizes for each dim
-                        int local_dims[3] = {local_d0, local_d1, local_d2};
 
                         // Compute overlap in each dim using decomp
                         auto mat_chare = mat_decomp.chare_region_global(nd_idx);
                         int dd_lo = std::max(mat_chare.start[dd], dd_s);
-                        int dd_hi = std::min(mat_chare.stop[dd], dd_e);
                         int row_lo = std::max(mat_chare.start[rd], rd_s);
                         int row_hi = std::min(mat_chare.stop[rd], rd_e);
                         int col_lo = std::max(mat_chare.start[cd], cd_s);
@@ -518,7 +513,6 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                                 slice_rows = meta_it->second.global_shape[0];
                         }
 
-                        int tile_1d = array_tile(ameta, result_name, 1);
 
                         int k = partition->nd_index()[0];
                         // Decomp-aware result chare start (in result-local space)
@@ -598,11 +592,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                     }
                 }
                 if (static_cast<Opcode>(ast_node->opcode) == Opcode::DIAG) {
-                    int input_name = ast_node->operands[0]->result_name;
                     int result_name = ast_node->result_name;
-                    int k_offset = 0;
-                    if (ast_node->operands.size() >= 2 && ast_node->operands[1]->is_scalar)
-                        k_offset = (int)ast_node->operands[1]->scalar;
 
                     auto* dag_group = static_cast<ArrayDAGGroup*>(
                         partition->dag_proxy.ckLocalBranch());
@@ -944,6 +934,13 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                         continue;
                     }
                 }
+                if (static_cast<Opcode>(ast_node->opcode) == Opcode::TRANSPOSE) {
+                    // Place the permuted blocks received in execute_transpose_node
+                    if constexpr (N >= 2)
+                        transpose_place<N, T>(this, partition, ast_node, comm);
+                    handled = true;
+                    continue;
+                }
                 if (static_cast<Opcode>(ast_node->opcode) == Opcode::SET_REGION) {
                     int target_name = ast_node->operands[0]->result_name;
                     int source_name = ast_node->operands[1]->result_name;
@@ -1199,7 +1196,8 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
     std::vector<ASTNode*> memrefLeaves;
     std::vector<ASTNode*> outputRoots;
     std::vector<ASTNode*> broadcastLeaves;
-    collect_leaves_and_outputs(node, memrefLeaves, outputRoots, broadcastLeaves);
+    std::vector<ASTNode*> scalarLeaves;
+    collect_leaves_and_outputs(node, memrefLeaves, outputRoots, broadcastLeaves, &scalarLeaves);
 
     int n_inputs = (int)memrefLeaves.size();
     int n_outputs = (int)outputRoots.size();
@@ -1245,6 +1243,12 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
         broadcast_ptrs[i] = &broadcast_values[i];
         DBG_PRINT("[Chare %d]   broadcast[%d] name=%d value=%f\n",
                   chare_idx, i, bname, (double)broadcast_values[i]);
+    }
+    // Scalar leaves follow the broadcast arguments.
+    std::vector<T> scalar_values(scalarLeaves.size());
+    for (size_t i = 0; i < scalarLeaves.size(); ++i) {
+        scalar_values[i] = static_cast<T>(scalarLeaves[i]->scalar);
+        broadcast_ptrs.push_back(&scalar_values[i]);
     }
 
     // For the fragment path, we need the AST regions. extract_regions_nd
@@ -1529,50 +1533,6 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                             partition->compute_stream_raw
 #endif
             );
-
-            // Debug: verify input and output data for this fragment
-            DBG_PRINT("[Chare %d]   fragment %d/%d: n_inputs=%d n_outputs=%d\n",
-                      chare_idx, m, M, n_inputs, n_outputs);
-            for (int i = 0; i < n_inputs; ++i) {
-                T first_val = T(0);
-                if (descs[i].sizes[0] > 0 && (N < 2 || descs[i].sizes[1] > 0))
-                    first_val = descs[i].aligned[0];
-                DBG_PRINT("[Chare %d]     input[%d]: ptr=%p sizes=[%lld",
-                          chare_idx, i, (void*)descs[i].aligned, (long long)descs[i].sizes[0]);
-                for (int d = 1; d < N; ++d)
-                    DBG_PRINT(",%lld", (long long)descs[i].sizes[d]);
-                DBG_PRINT("] strides=[%lld", (long long)descs[i].strides[0]);
-                for (int d = 1; d < N; ++d)
-                    DBG_PRINT(",%lld", (long long)descs[i].strides[d]);
-                DBG_PRINT("] first_val=%f\n", (double)first_val);
-            }
-            for (int i = 0; i < n_outputs; ++i) {
-                int j = n_inputs + i;
-                T first_val = T(0);
-                if (descs[j].sizes[0] > 0 && (N < 2 || descs[j].sizes[1] > 0))
-                    first_val = descs[j].aligned[0];
-                T sum = T(0);
-                int64_t total = 1;
-                for (int d = 0; d < N; ++d)
-                    total *= descs[j].sizes[d];
-                int check_count = std::min((int64_t)16, total);
-                for (int c = 0; c < check_count; ++c) {
-                    int64_t flat = 0, rem = c;
-                    for (int d = N - 1; d >= 0; --d) {
-                        flat += (rem % descs[j].sizes[d]) * descs[j].strides[d];
-                        rem /= descs[j].sizes[d];
-                    }
-                    sum += descs[j].aligned[flat];
-                }
-                DBG_PRINT("[Chare %d]     output[%d]: ptr=%p sizes=[%lld",
-                          chare_idx, i, (void*)descs[j].aligned, (long long)descs[j].sizes[0]);
-                for (int d = 1; d < N; ++d)
-                    DBG_PRINT(",%lld", (long long)descs[j].sizes[d]);
-                DBG_PRINT("] strides=[%lld", (long long)descs[j].strides[0]);
-                for (int d = 1; d < N; ++d)
-                    DBG_PRINT(",%lld", (long long)descs[j].strides[d]);
-                DBG_PRINT("] first_val=%f sum_first16=%f\n", (double)first_val, (double)sum);
-            }
         }
     }
 

@@ -113,8 +113,10 @@ with np.errstate(all="ignore"):
     m1 = ints((40,), -1, -1, dtype=np.int64)
     C.check("x // -1", big // m1, bigh // -1, dtype=np.int64)
 
-    # mixed array dtypes are rejected (single element type per kernel)
-    C.raises("float64 % float32 rejected", TypeError, lambda: a32 % cnp.zeros((600, 7)))
+    # mixed array dtypes promote like NumPy
+    z64 = cnp.full((600, 7), 3.0)
+    C.check("float32 % float64 promotes", a32 % z64,
+            np.remainder(C.fetch(a32), np.full((600, 7), 3.0)), rtol=1e-12, dtype=np.float64)
 
     # old-backend (fix-temporaries) method API
     a = floats((37, 41), -3.0, 3.0, seed=9)

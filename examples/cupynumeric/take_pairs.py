@@ -1,19 +1,17 @@
 #!/usr/bin/env python
 """charmnumeric port of cupynumeric/examples/take_pairs.py.
 
-Verdict: needs a backend feature (take/gather). Workaround:
+Verdict: port with workarounds (fully native). Changes:
   * data_array = arange(M*N).reshape(M, N) is built natively, without
     reshape, as i*N + j from cnp.meshgrid(cnp.arange(N), cnp.arange(M)).
   * indices = itertools.combinations(range(N), 2) is a host-side list in the
-    original too. take(indices, axis=1) is expressed as two matmuls with 0/1
-    selection matrices: R_c = data @ S_c, with S_c[j, p] = 1 iff
-    indices[p, c] == j. S_c is built on the host from the index list and uploaded in bulk
-    (cnp.array): HOST-FALLBACK (no native gather/scatter from an index array).
-  * result[:, :, c] = R_c (2-D into a 3-D view, offset only in the
-    singleton dim). result.sum() is the native full reduction (int32 input,
-    int64 result as in NumPy).
-Backend ops that would make it direct: take/gather along an axis and reshape
-(arange is native now).
+    original too, so data_array.take(indices, axis=1) is native: cnp.take
+    lowers host indices to column-slice copies (contiguous index runs become
+    one slice copy each) and writes the (M, P) result for each index column
+    into the 3-D result.
+  * result.sum() is the native full reduction (int32 input, int64 result as
+    in NumPy).
+Backend ops that would make it direct: reshape (arange is native now).
 """
 
 import argparse
@@ -38,19 +36,10 @@ def take_pairs(M, N):
     jj, ii = cnp.meshgrid(cnp.arange(N, dtype=I32), cnp.arange(M, dtype=I32))
     data_array = ii * N + jj
     indices = numpy.array(list(a for a in itertools.combinations(range(N), 2)))
-    P = indices.shape[0]
 
-    # HOST-FALLBACK: gather lowered to selection matmuls; S_c built from the host index list
-    S = []
-    for c in range(2):
-        S_c = numpy.zeros((N, P), dtype=numpy.int32)
-        S_c[indices[:, c], numpy.arange(P)] = 1
-        S.append(cnp.array(S_c))
-
-    result = cnp.zeros((M, P, 2), dtype=I32)  # data_array.take(indices, axis=1)
-    for c in range(2):
-        result[:, :, c] = data_array @ S[c]
-    value = result.sum()
+    # native take with host indices: lowered to column-slice copies
+    result = data_array.take(indices, axis=1)  # (M, P, 2)
+    value = result.sum()  # native full reduction
     return data_array, indices, result, value
 
 

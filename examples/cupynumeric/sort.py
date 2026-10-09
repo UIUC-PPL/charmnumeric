@@ -1,21 +1,16 @@
 #!/usr/bin/env python
 """charmnumeric port of cupynumeric/examples/sort.py (sort / argsort along an axis).
 
-Verdict: port with workarounds (fully native). There is no sort op, so
-the port uses a native odd-even transposition sorting network
-(U.oddeven_sort). It has n phases of compare-exchange over strided views:
-h = x > y (a native 0/1 mask), then where(h, y, x) / where(h, x, y), which
-is exact for float and integer keys (equal keys are never swapped).
-argsort carries an index array through the same network.
-O(n^2) work instead of O(n log n). Defaults are sized for that (n=256).
+Verdict: direct. cnp.sort / cnp.argsort are native (SORT/ARGSORT executor).
+The backend gathers the array on one chare, sorts every line along the axis
+(std::sort on CPU, Kokkos::sort on GPU) and scatters the result back:
+correct for any axis of 1-D..3-D arrays, but not scalable (no distributed
+sample sort yet). NaNs sort last and ties keep their order (NumPy's
+kind='stable'), so argsort is compared exactly with numpy.argsort(kind='stable').
 Other changes:
   * uint32 (the original default) is not a charmnumeric dtype. The default
     here is float64. Use -d int64/int32 for integer keys (generated
     natively in [lower, upper)). complex is unsupported.
-  * argsort is checked by applying it to the input: the result must be
-    sorted and a permutation. Ties may legitimately order differently from
-    numpy.
-Backend ops that would make it direct: sort/argsort.
 """
 
 import argparse
@@ -47,15 +42,10 @@ def make_input(shape, datatype, lower, upper):
     raise NotImplementedError("UNKNOWN/unsupported type " + str(dt))
 
 
-def index_along(shape, axis, dtype):
-    return U.index_grid(shape, axis, dtype=dtype)
-
-
 def run_sort(shape, axis, argsort, datatype, lower, upper):
     a = make_input(shape, datatype, lower, upper)
-    idx = index_along(shape, axis % len(shape), a.dtype) if argsort else None
-    a_sorted, perm = U.oddeven_sort(a, axis=axis, index=idx)
-    return a, (perm if argsort else a_sorted)
+    out = cnp.argsort(a, axis=axis) if argsort else cnp.sort(a, axis=axis)
+    return a, out
 
 
 def main(chk):
@@ -86,11 +76,11 @@ def main(chk):
     if not args.argsort:
         chk.close("sorted", out_h, numpy.sort(a_h, args.axis), rtol=0, atol=0)
     else:
-        perm = numpy.rint(out_h).astype(numpy.int64)
-        chk.true("argsort indices are integral", bool(numpy.all(perm == out_h)))
+        perm = numpy.asarray(out_h)
+        chk.true("argsort dtype is int64", perm.dtype == numpy.int64, str(perm.dtype))
         chk.true(
-            "argsort is a permutation",
-            bool(numpy.all(numpy.sort(perm, axis=args.axis) == numpy.sort(numpy.argsort(a_h, args.axis), axis=args.axis))),
+            "argsort == numpy.argsort(kind='stable')",
+            bool(numpy.array_equal(perm, numpy.argsort(a_h, args.axis, kind="stable"))),
         )
         gathered = numpy.take_along_axis(a_h, perm, axis=args.axis)
         chk.close("a[argsort(a)] == sort(a)", gathered, numpy.sort(a_h, args.axis), rtol=0, atol=0)

@@ -76,7 +76,8 @@ with np.errstate(all="ignore"):
         C.check(f"clip {n}", cnp.clip(a, -5, 5), np.clip(ah, -5, 5), dtype=dt)
         C.check(f"clip arrays {n}", cnp.clip(a, b, b + 4), np.clip(ah, bh, bh + 4), dtype=dt)
         C.raises(f"where({n}, 0.5) rejected", TypeError, lambda: cnp.where(a > 0, a, 0.5))
-    C.raises("cond dtype mismatch rejected", TypeError, lambda: cnp.where(cnp.zeros((600, 7)), a32, a32))
+    C.check("where with float64 cond", cnp.where(cnp.zeros((600, 7)), a32, a32 + 1),
+            C.fetch(a32) + 1, rtol=1e-6, dtype=np.float32)
 
     # old-backend (fix-temporaries) API: cond.where(x, y)
     a = floats((37, 41), -3.0, 3.0, seed=6)

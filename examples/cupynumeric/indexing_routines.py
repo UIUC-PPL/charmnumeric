@@ -179,7 +179,7 @@ def reference(np, routine, steps, N, warmup):
 
 def run_indexing_routines(interface, N, steps, warmup, routine):
     # simple operation to warm up the library
-    warm = U.vsum(cnp.zeros((N, N)).dot(cnp.zeros((N,))))
+    warm = cnp.sum(cnp.zeros((N, N)).dot(cnp.zeros((N,))))
     assert not math.isnan(U.to_float(warm, interface))
     results = {}
     if routine in ("diagonal", "all"):

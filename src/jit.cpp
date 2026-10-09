@@ -1,6 +1,8 @@
 #include "jit.hpp"
 #include "jit_api.hpp"
 
+#include "mlir/IR/Verifier.h"
+
 #include <limits>
 
 #ifdef JIT_ENABLE_GPU_BACKEND
@@ -18,36 +20,37 @@ namespace {
 void declareExternalCallees(mlir::ModuleOp module);
 }
 
-MLIRJitCompiler::MLIRJitCompiler() {
-    // 1. Load required dialects
-    context.getOrLoadDialect<mlir::linalg::LinalgDialect>();
-    context.getOrLoadDialect<mlir::affine::AffineDialect>();
-    context.getOrLoadDialect<mlir::gpu::GPUDialect>();
-    context.getOrLoadDialect<mlir::arith::ArithDialect>();
-    context.getOrLoadDialect<mlir::memref::MemRefDialect>();
-    context.getOrLoadDialect<mlir::func::FuncDialect>();
-    context.getOrLoadDialect<mlir::scf::SCFDialect>();
-    context.getOrLoadDialect<mlir::LLVM::LLVMDialect>();
-    context.getOrLoadDialect<mlir::NVVM::NVVMDialect>();
-    context.getOrLoadDialect<mlir::ROCDL::ROCDLDialect>();
-    context.getOrLoadDialect<mlir::spirv::SPIRVDialect>();
-    context.getOrLoadDialect<mlir::math::MathDialect>();
-
-    // 2. Register LLVM IR translation interfaces (needed by ExecutionEngine)
-    mlir::DialectRegistry registry;
-    mlir::registerAllToLLVMIRTranslations(registry);
+namespace {
+// One context per process: creating one (dialect loading, thread pool) per kernel dominated compile time.
+mlir::MLIRContext& sharedContext() {
+    static mlir::MLIRContext* ctx = [] {
+        mlir::DialectRegistry registry;
+        mlir::registerAllToLLVMIRTranslations(registry);
 #ifdef USE_NVIDIA
-    // #nvvm.target serialization (gpu-module-to-binary) and gpu.binary/launch_func
-    // translation for the host-launcher path.
-    mlir::NVVM::registerNVVMTargetInterfaceExternalModels(registry);
-    // ConvertToLLVM interfaces: convert-gpu-to-nvvm lowers cf/arith/math/memref
-    // inside kernels through these.
-    mlir::registerAllExtensions(registry);
-    mlir::gpu::registerOffloadingLLVMTranslationInterfaceExternalModels(registry);
+        mlir::NVVM::registerNVVMTargetInterfaceExternalModels(registry);
+        mlir::registerAllExtensions(registry);
+        mlir::gpu::registerOffloadingLLVMTranslationInterfaceExternalModels(registry);
 #endif
-    context.appendDialectRegistry(registry);
+        auto* c = new mlir::MLIRContext(registry, mlir::MLIRContext::Threading::DISABLED);
+        c->getOrLoadDialect<mlir::linalg::LinalgDialect>();
+        c->getOrLoadDialect<mlir::affine::AffineDialect>();
+        c->getOrLoadDialect<mlir::gpu::GPUDialect>();
+        c->getOrLoadDialect<mlir::arith::ArithDialect>();
+        c->getOrLoadDialect<mlir::memref::MemRefDialect>();
+        c->getOrLoadDialect<mlir::func::FuncDialect>();
+        c->getOrLoadDialect<mlir::scf::SCFDialect>();
+        c->getOrLoadDialect<mlir::LLVM::LLVMDialect>();
+        c->getOrLoadDialect<mlir::NVVM::NVVMDialect>();
+        c->getOrLoadDialect<mlir::ROCDL::ROCDLDialect>();
+        c->getOrLoadDialect<mlir::spirv::SPIRVDialect>();
+        c->getOrLoadDialect<mlir::math::MathDialect>();
+        return c;
+    }();
+    return *ctx;
+}
+} // namespace
 
-    // 3. Initialize Module
+MLIRJitCompiler::MLIRJitCompiler() : context(sharedContext()) {
     module = mlir::ModuleOp::create(mlir::UnknownLoc::get(&context));
     builder = std::make_unique<mlir::OpBuilder>(&context);
 }
@@ -59,9 +62,19 @@ void MLIRJitCompiler::buildFromAST(void* astPtr) {
 
     // --- 1. Collect leaf nodes ---
     std::vector<LeafUse> memrefLeaves;     // non-scalar leaves → memref func args
-    std::vector<ASTNode*> scalarLeaves;    // scalar leaves → constants
+    std::vector<ASTNode*> scalarLeaves;    // scalar leaves → scalar func args
     std::vector<ASTNode*> broadcastLeaves; // size-1 arrays → scalar func args
     collectLeaves(ast, memrefLeaves, scalarLeaves, broadcastLeaves);
+
+    // Scalar values are runtime arguments, so kernels differing only in constants are shared.
+    {
+        std::unordered_set<int> seen;
+        std::vector<ASTNode*> unique;
+        for (ASTNode* sn : scalarLeaves)
+            if (seen.insert(sn->result_name).second)
+                unique.push_back(sn);
+        scalarLeaves.swap(unique);
+    }
 
     // Collect non-temp root operations as output slots.
     // Each gets a caller-provided output memref appended after the input args.
@@ -109,6 +122,8 @@ void MLIRJitCompiler::buildFromAST(void* astPtr) {
     // Broadcast leaves are scalar function arguments (runtime values, not constants)
     for (size_t i = 0; i < broadcastLeaves.size(); ++i)
         argTypes.push_back(elemType);
+    for (size_t i = 0; i < scalarLeaves.size(); ++i)
+        argTypes.push_back(elemType);
     for (ASTNode* root : outputRoots)
         argTypes.push_back(dynamicStridedMemRefType(root->ndims));
     auto funcType = FunctionType::get(&context, argTypes, /*results=*/{});
@@ -131,16 +146,10 @@ void MLIRJitCompiler::buildFromAST(void* astPtr) {
         nodeValues[broadcastLeaves[i]->result_name] =
             entry->getArgument(memrefLeaves.size() + i);
 
-    // Seed scalar leaves as arith.constant values
-    for (ASTNode* sn : scalarLeaves) {
-        mlir::TypedAttr attr;
-        if (mlir::isa<IntegerType>(elemType))
-            attr = builder->getIntegerAttr(elemType, static_cast<int64_t>(sn->scalar));
-        else
-            attr = builder->getFloatAttr(elemType, static_cast<double>(sn->scalar));
-        auto val = arith::ConstantOp::create(*builder, loc, attr);
-        nodeValues[sn->result_name] = val.getResult();
-    }
+    // Seed scalar leaves with their scalar block arguments
+    for (size_t i = 0; i < scalarLeaves.size(); ++i)
+        nodeValues[scalarLeaves[i]->result_name] =
+            entry->getArgument(memrefLeaves.size() + broadcastLeaves.size() + i);
 
     // --- 3. Process each operation sequentially (flat list) ---
     for (ASTNode* op : ast->roots)
@@ -155,7 +164,7 @@ void MLIRJitCompiler::buildFromAST(void* astPtr) {
     // array with stride [16,1]).  A linalg.generic copy lowers to affine
     // loops that respect each operand's stride descriptor and participates
     // in affine loop fusion, eliminating the intermediate allocation.
-    size_t outArgIdx = memrefLeaves.size() + broadcastLeaves.size();
+    size_t outArgIdx = memrefLeaves.size() + broadcastLeaves.size() + scalarLeaves.size();
     for (ASTNode* root : outputRoots) {
         Value result = nodeValues[root->result_name];
         Value outArg = entry->getArgument(outArgIdx++);
@@ -189,6 +198,7 @@ void MLIRJitCompiler::buildFromAST(void* astPtr) {
 
 bool MLIRJitCompiler::optimizeAndFuse() {
     mlir::PassManager pm(&context);
+    pm.enableVerifier(false); // the module is verified once, after building
     auto& funcPM = pm.nest<mlir::func::FuncOp>();
 
 #if defined(USE_NVIDIA) || defined(USE_AMD) || defined(USE_INTEL)
@@ -246,7 +256,11 @@ bool MLIRJitCompiler::loadCPU(std::unique_ptr<mlir::ExecutionEngine>& engine,
     return true;
 }
 
+bool MLIRJitCompiler::verify() { return mlir::succeeded(mlir::verify(*module)); }
+
 void MLIRJitCompiler::dumpMLIR() { module->dump(); }
+
+void MLIRJitCompiler::printModule(llvm::raw_ostream& os) { module->print(os); }
 
 // ---- Private helpers ----
 
@@ -471,6 +485,7 @@ void MLIRJitCompiler::emitOp(ASTNode* node, mlir::Location loc) {
 
 bool MLIRJitCompiler::lowerToCPU() {
     mlir::PassManager pm(&context);
+    pm.enableVerifier(false); // the module is verified once, after building
     // Lower any remaining Linalg ops to Affine loops (no-op if optimizeAndFuse() ran first)
     pm.addPass(mlir::createConvertLinalgToAffineLoopsPass());
     // Lower Affine to SCF (structured control flow)
@@ -998,26 +1013,6 @@ const std::unordered_map<int, TernaryOpEntry>& MLIRJitCompiler::ternaryOpRegistr
 
 #ifdef JIT_ENABLE_GPU_BACKEND
 
-std::string MLIRJitCompiler::generateNVIDIA() {
-    if (!lowerToGPU())
-        return "";
-
-    // Lower ops inside gpu.module to LLVM + NVVM dialects
-    mlir::PassManager pm(&context);
-    auto& gpuPM = pm.nest<mlir::gpu::GPUModuleOp>();
-    gpuPM.addPass(mlir::createConvertMathToLLVMPass());
-    gpuPM.addPass(mlir::createArithToLLVMConversionPass());
-    gpuPM.addPass(mlir::createConvertIndexToLLVMPass());
-    gpuPM.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
-    gpuPM.addPass(mlir::createConvertFuncToLLVMPass());
-    gpuPM.addPass(mlir::createConvertGpuOpsToNVVMOps());
-    gpuPM.addPass(mlir::createReconcileUnrealizedCastsPass());
-    if (mlir::failed(pm.run(*module)))
-        return "";
-
-    return serializeToPTX();
-}
-
 std::string MLIRJitCompiler::generateAMD() {
     if (!lowerToGPU())
         return "";
@@ -1052,29 +1047,6 @@ std::string MLIRJitCompiler::generateIntel() {
         return "";
 
     return serializeToSPIRV();
-}
-
-bool MLIRJitCompiler::loadNVIDIA(const std::string& ptx, const char* kernelName, void** moduleOut,
-                                 void** functionOut) {
-#if defined(USE_NVIDIA)
-    CUmodule cuModule;
-    CUfunction cuFunction;
-    CUresult res;
-
-    res = cuModuleLoadDataEx(&cuModule, ptx.c_str(), 0, 0, 0);
-    if (res != CUDA_SUCCESS)
-        return false;
-
-    res = cuModuleGetFunction(&cuFunction, cuModule, kernelName);
-    if (res != CUDA_SUCCESS)
-        return false;
-
-    *moduleOut = (void*)cuModule;
-    *functionOut = (void*)cuFunction;
-    return true;
-#else
-    return false;
-#endif
 }
 
 bool MLIRJitCompiler::loadAMD(const std::string& gcn, const char* kernelName, void** moduleOut,
@@ -1210,18 +1182,6 @@ std::string MLIRJitCompiler::translateToTarget(llvm::StringRef triple, llvm::Str
     return std::string(outBuf.str());
 }
 
-std::string MLIRJitCompiler::serializeToPTX() {
-    llvm::InitializeAllTargets();
-    llvm::InitializeAllTargetMCs();
-    llvm::InitializeAllAsmPrinters();
-    mlir::registerNVVMDialectTranslation(context);
-
-    return translateToTarget(
-        /*triple=*/"nvptx64-nvidia-cuda",
-        /*cpu=*/"sm_70",
-        /*features=*/"+ptx60", llvm::CodeGenFileType::AssemblyFile);
-}
-
 std::string MLIRJitCompiler::serializeToGCN() {
     llvm::InitializeAllTargets();
     llvm::InitializeAllTargetMCs();
@@ -1253,13 +1213,30 @@ std::string MLIRJitCompiler::serializeToSPIRV() {
 
 #endif // JIT_ENABLE_GPU_BACKEND
 
-MLIRJitCompiler* jit_create() { return new MLIRJitCompiler(); }
 
-void jit_destroy(MLIRJitCompiler* jit) { delete jit; }
+namespace {
+std::unordered_map<std::string, std::pair<void*, void*>>& kernelCache() {
+    static std::unordered_map<std::string, std::pair<void*, void*>> cache;
+    return cache;
+}
+} // namespace
 
 void* jit_compile_ast(void* ast, void** moduleHandleOut) {
     MLIRJitCompiler node_jit;
     node_jit.buildFromAST(ast);
+    // Kernels take every array as a dynamic memref, so equal IR means an equal kernel.
+    std::string key;
+    {
+        llvm::raw_string_ostream os(key);
+        node_jit.printModule(os);
+    }
+    auto hit = kernelCache().find(key);
+    if (hit != kernelCache().end()) {
+        *moduleHandleOut = hit->second.first;
+        return hit->second.second;
+    }
+    if (!node_jit.verify())
+        return nullptr;
     node_jit.optimizeAndFuse();
     void* moduleHandle = nullptr;
     void* funcPtr = nullptr;
@@ -1290,6 +1267,21 @@ void* jit_compile_ast(void* ast, void** moduleHandleOut) {
         return nullptr;
 #endif
 
+    kernelCache().emplace(std::move(key), std::make_pair(moduleHandle, funcPtr));
     *moduleHandleOut = moduleHandle;
     return funcPtr;
+}
+
+void jit_free_module(void* moduleHandle) {
+#if !defined(USE_NVIDIA) && !defined(USE_AMD) && !defined(USE_INTEL)
+    if (!moduleHandle)
+        return;
+    for (auto it = kernelCache().begin(); it != kernelCache().end();) {
+        if (it->second.first == moduleHandle)
+            it = kernelCache().erase(it);
+        else
+            ++it;
+    }
+    delete static_cast<mlir::ExecutionEngine*>(moduleHandle);
+#endif
 }

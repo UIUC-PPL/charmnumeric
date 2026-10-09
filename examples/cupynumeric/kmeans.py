@@ -9,22 +9,23 @@ broadcasting and centroids.T. The port maps each one to native ops:
     in for astype) as an (N, 1) column. It is expanded to a one-hot matrix
     M (N, C) with M[:, c] = (labels == c), a native comparison (0/1 mask).
   * bincount(labels) = sum(M, axis=0) (native axis reduction).
-    bincount(labels, weights=data[:, d]) for all d at once = dataT @ M,
-    giving the (D, C) centroid sums (one SUMMA instead of D bincounts whose
-    1-D results would need 1-D -> 2-D row placement).
+    bincount(labels, weights=data[:, d]) for all d at once = M.T @ data,
+    giving the (C, D) centroid sums (native transpose + one SUMMA instead of
+    D bincounts whose 1-D results would need 1-D -> 2-D row placement).
   * sum(amin(pairwise, axis=1)) is native (cnp.amin + cnp.sum).
   * data_dots[:, newaxis] + centroid_dots[newaxis, :] is built with two
-    SUMMAs against ones: (data*data) @ ones(D, C) + ones(N, D) @ (cT*cT).
-  * centroids.T: the port keeps centroids in transposed form cT (D, C)
-    throughout. dataT is generated natively from the same closed form as
-    data (checked against data.T).
-  * maximum(counts, 1) is native. counts[:, newaxis] is
-    tile(counts_row, (D, 1)).
+    SUMMAs against ones: (data*data) @ ones(D, C) + ones(N, D) @ (c*c).T.
+  * centroids.T is the native transpose.
+  * counts are int64 as in the original (native sum of the one-hot columns +
+    native astype). maximum(counts, 1) is native. counts[:, newaxis] is
+    tile(counts.T, (1, D)); dividing the float centroid sums by it promotes
+    natively as in NumPy, and astype(T, copy=False) keeps the in-place
+    `centroids /= ...` dtype.
   * np.not_equal(labels, new_labels).sum() = count_nonzero(labels - new_labels)
     (native).
 Defaults to float64. With float32, a near-tie can make argmin differ from
-the NumPy reference. Backend ops that would make it direct: astype,
-transpose, general broadcasting.
+the NumPy reference. Backend ops that would make it direct:
+general broadcasting.
 """
 
 import argparse
@@ -43,17 +44,15 @@ from _cnum_connect import get_interface  # noqa: E402
 
 def initialize(N, D, C, T):
     data = U.uniform((N, D), seed=1, dtype=T)
-    dataT = U.uniform((N, D), seed=1, dtype=T, perm=(1, 0))  # == data.T
-    # random centers, held transposed: centroidsT == centroids.T
-    centroidsT = U.uniform((C, D), seed=2, dtype=T, perm=(1, 0))
-    return data, dataT, centroidsT
+    centroids = U.uniform((C, D), seed=2, dtype=T)  # random centers
+    return data, centroids
 
 
-def calculate_distances(data, centroidsT, DD, ones_ND):
-    # centroid_dots[newaxis, :] broadcast to (N, C): ones(N, D) @ (cT * cT)
-    CD = ones_ND @ (centroidsT * centroidsT)
+def calculate_distances(data, centroids, DD, ones_ND):
+    # centroid_dots[newaxis, :] broadcast to (N, C): ones(N, D) @ (c * c).T
+    CD = ones_ND @ (centroids * centroids).T
     # ||x-y||^2 = ||x||^2 + ||y||^2 - 2 x . y
-    return DD + CD - 2.0 * (data @ centroidsT)
+    return DD + CD - 2.0 * (data @ centroids.T)
 
 
 def relabel(pairwise, N, C, T):
@@ -65,15 +64,16 @@ def relabel(pairwise, N, C, T):
     return labels, M
 
 
-def find_centroids(dataT, M, pairwise, N, D, C, T):
+def find_centroids(data, M, pairwise, N, D, C, T):
     # Get the number of points associated with each centroid: bincount(labels)
-    counts = cnp.sum(M, axis=0, keepdims=True)  # (1, C)
-    # weighted bincounts for every dimension at once: (D, N) @ (N, C)
-    centroidsT = dataT @ M
+    counts = cnp.sum(M, axis=0, keepdims=True).astype(numpy.int64)  # (1, C), int64 like bincount
+    # weighted bincounts for every dimension at once: (C, N) @ (N, D)
+    centroids = M.T @ data
     distance_sum = cnp.sum(cnp.amin(pairwise, axis=1))
-    counts = cnp.maximum(counts, 1.0)
-    centroidsT = centroidsT / cnp.tile(U.materialize(counts), (D, 1))
-    return centroidsT, distance_sum
+    counts = cnp.maximum(counts, 1)
+    # centroids /= counts[:, newaxis]  (float / int64 promotes natively)
+    centroids = (centroids / cnp.tile(counts.T, (1, D))).astype(T, copy=False)
+    return centroids, distance_sum
 
 
 def run_kmeans(interface, C, D, T, I, N, S, benchmarking=False):  # noqa: E741
@@ -82,8 +82,8 @@ def run_kmeans(interface, C, D, T, I, N, S, benchmarking=False):  # noqa: E741
     print("Number of dimensions: " + str(D))
     print("Number of centroids: " + str(C))
     print("Max iterations: " + str(I))
-    data, dataT, centroidsT = initialize(N, D, C, T)
-    init = (data, dataT, centroidsT)
+    data, centroids = initialize(N, D, C, T)
+    init = (data, centroids)
     init_host = [x.get(interface) for x in init]
 
     # data_dots[:, newaxis] broadcast to (N, C): (data*data) @ ones(D, C)
@@ -94,9 +94,9 @@ def run_kmeans(interface, C, D, T, I, N, S, benchmarking=False):  # noqa: E741
     iteration = 0
     prior_distance_sum = None
     while iteration < I:
-        pairwise = calculate_distances(data, centroidsT, DD, ones_ND)
+        pairwise = calculate_distances(data, centroids, DD, ones_ND)
         new_labels, M = relabel(pairwise, N, C, T)
-        centroidsT, distance_sum = find_centroids(dataT, M, pairwise, N, D, C, T)
+        centroids, distance_sum = find_centroids(data, M, pairwise, N, D, C, T)
 
         if iteration > 0 and iteration % S == 0:
             # np.sum(np.not_equal(labels, new_labels))
@@ -113,7 +113,7 @@ def run_kmeans(interface, C, D, T, I, N, S, benchmarking=False):  # noqa: E741
         iteration += 1
     prior_distance_sum = U.to_float(prior_distance_sum, interface)
     print(f"Final distance sum at iteration {iteration}: {prior_distance_sum}")
-    return centroidsT, iteration, prior_distance_sum, init_host
+    return centroids, iteration, prior_distance_sum, init_host
 
 
 # ---- original NumPy algorithm (reference) -------------------------------------
@@ -155,13 +155,12 @@ def parse(argv=None):
     return parser.parse_args(argv)
 
 
-def check(chk, centroidsT, iters, dist, init_host, args, T, interface):
-    data_h, dataT_h, cT_h = init_host
-    chk.close("generated dataT == data.T", dataT_h, data_h.T, rtol=0, atol=0)
-    c_ref, it_ref, d_ref = reference(numpy, data_h.copy(), cT_h.T.copy(), args.C, args.I, args.S)
+def check(chk, centroids, iters, dist, init_host, args, T, interface):
+    data_h, c_h = init_host
+    c_ref, it_ref, d_ref = reference(numpy, data_h.copy(), c_h.copy(), args.C, args.I, args.S)
     rtol = 1e-4 if T == numpy.float32 else 1e-9
     chk.true("iteration count", iters == it_ref, f"(port {iters}, numpy {it_ref})")
-    chk.close("centroids", centroidsT.get(interface).T, c_ref, rtol=rtol, atol=rtol)
+    chk.close("centroids", centroids.get(interface), c_ref, rtol=rtol, atol=rtol)
     chk.close("final distance sum", dist, d_ref, rtol=rtol, atol=0)
 
 
@@ -172,9 +171,9 @@ def main(chk):
         raise TypeError("Precision must be one of 32 or 64")
     interface = get_interface()
     t0 = time.perf_counter()
-    centroidsT, iters, dist, init_host = run_kmeans(interface, args.C, args.D, T, args.I, args.N * 1000, args.S)
+    centroids, iters, dist, init_host = run_kmeans(interface, args.C, args.D, T, args.I, args.N * 1000, args.S)
     print(f"Elapsed Time: {(time.perf_counter() - t0) * 1e3:.3f} ms (incl. sync)")
-    check(chk, centroidsT, iters, dist, init_host, args, T, interface)
+    check(chk, centroids, iters, dist, init_host, args, T, interface)
 
 
 if __name__ == "__main__":

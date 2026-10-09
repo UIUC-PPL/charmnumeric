@@ -3,14 +3,14 @@
 #include "jit_api.hpp"
 
 #include <cstring>
+#include <unordered_set>
 
-ArrayDAGGroup::ArrayDAGGroup() : num_compile(0) {
+ArrayDAGGroup::ArrayDAGGroup() {
 #ifdef USE_KOKKOS
     if (!Kokkos::is_initialized())
         Kokkos::initialize();
 #endif
     register_reduce_dot_sum();
-    jit = jit_create();
     if (CkMyPe() == 0) {
         partition_proxy_1 = CProxy_Partition1D::ckNew();
         partition_proxy_2 = CProxy_Partition2D::ckNew();
@@ -32,7 +32,10 @@ void ArrayDAGGroup::proxies_ready() {
 }
 
 ArrayDAGGroup::~ArrayDAGGroup() {
-    jit_destroy(jit);
+    std::unordered_set<void*> freed;
+    for (auto& [id, handle] : module_cache)
+        if (handle && freed.insert(handle).second)
+            jit_free_module(handle);
 #ifdef USE_KOKKOS
     if (Kokkos::is_initialized())
         Kokkos::finalize();

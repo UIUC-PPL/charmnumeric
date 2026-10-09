@@ -28,7 +28,7 @@ Support files:
 | file | purpose |
 |---|---|
 | `_cnum_connect.py` | `get_interface()`. Connects with `cnp.CharmNumericInterface().connect(CNUM_HOST, CNUM_PORT, CNUM_ODF)`. With `CNUM_SIM=1` it returns the simulator instead. |
-| `_cnum_util.py` | Native input generators, thin wrappers over the native elementwise ops (kept for compatibility), the sort network, reductions built from dots, the `upload` host-upload helper (bulk `cnp.array` into a block of a target), and the Checker/`run` PASS/FAIL harness. |
+| `_cnum_util.py` | Native input generators, thin wrappers over the native elementwise ops (kept for compatibility), reductions built from dots, the `upload` host-upload helper (bulk `cnp.array` into a block of a target), and the Checker/`run` PASS/FAIL harness. |
 | `_cnum_sim.py` | Simulator. Hooks the charmtyles `ExecutionState` to evaluate every recorded op eagerly with NumPy. Ops are still fused and serialized normally. It also flags patterns that the frontend accepts but the backend mishandles. |
 | `_static_check.py` | Runs every port and variant under the simulator and prints a table. |
 
@@ -57,11 +57,11 @@ cond ~2e3 to 4e3 for 128x128, no lag or cross-seed correlation). Each port then
 fetches the generated inputs with `.get()` and computes the NumPy reference from
 exactly those values.
 
-When an algorithm needs `X.T` of an *input* X, the port generates the transpose
-natively from the same draw with permuted indices (`cnp.random.transposed(X)`
-for `cnp.random` inputs, `perm=` for the `_cnum_util` generators). It also
-checks that the result equals `X.T` exactly. This is how the missing transpose
-is worked around.
+Transposes (`X.T`, `transpose`, `swapaxes`) and vecmat (`x @ A`) are native
+(TRANSPOSE executor, `src/executor_transpose.cpp`). Earlier versions of the
+ports generated `X.T` of an input from the same draw with permuted indices
+(`cnp.random.transposed(X)`, `perm=` for the `_cnum_util` generators) or used
+symmetry tricks; they now use `.T` as the originals do.
 
 ## Feasibility table
 
@@ -75,47 +75,48 @@ Verdict meanings:
 | example | NumPy ops needed | missing in charmnumeric | verdict | port status |
 |---|---|---|---|---|
 | black_scholes | random, sqrt, log, exp, abs, where(d>0) | none (random) | direct | native: cnp.sqrt/log/absolute/where, `d > 0` is a 0/1 mask |
-| black_scholes_greeks | 4-D arrays, arange/%/reshape, sqrt, log, exp, abs, where | >3-D, reshape | workarounds | native. The greek axis is folded into dim 0; `arange(..).reshape` is the native linear index, `%` is native. |
+| black_scholes_greeks | 4-D arrays, arange/%/reshape, sqrt, log, exp, abs, where | >3-D, reshape | workarounds | native. The greek axis is folded into dim 0; `arange(..).reshape` is the native int64 linear index, `%` is native, int * float promotes natively and K/T are converted with native `astype`. |
 | cfd | slicing stencils, `**2`, `sum` | none | direct | native (`x**2`, native `cnp.sum`) |
 | cg | diag(v,k), eye, matvec, dot, sqrt(scalar) | none (random) | direct | native. Convergence test is a host scalar. |
-| cholesky | linalg.cholesky (input eye) | potrf, trsm, transpose | needs backend | blocked right-looking. Native SUMMA updates. HOST-FALLBACK: bs x bs potrf+trtri. |
-| einsum | einsum (batched contraction), ones | einsum, transpose | needs backend | 4 expressions lowered to (batched) matmul. Others raise NotImplementedError. |
-| gemm | dot(out=) | `out=` | direct | native (`C[...] = A @ B`) |
+| cholesky | linalg.cholesky (input eye) | none | direct | native `cnp.linalg.cholesky` (LINALG executor). `--input spd` for a non-trivial input. |
+| einsum | einsum (batched contraction), ones | einsum | needs backend | every single-contraction matrix product (2-D, or 3-D with a leading batch mode, any mode order) lowered to native transposes + (batched) matmul; 2-D ones with an untransposed output use `cnp.matmul(..., out=C)`. Others raise NotImplementedError. |
+| gemm | dot(out=) | none | direct | native (`cnp.dot(A, B, out=C)`) |
 | indexing_routines | diag, choose, repeat, fancy/bool-mask indexing, `%`, arange | choose, repeat, gather/scatter, mask indexing | needs backend | diag native. choose = native `%` + chain of native where (int64, exact). Uniform repeat via strided slices. ai1/2/3 index patterns lowered to slices (HOST-FALLBACK). |
 | jacobi | rand, eye, diag, dot, sum (NaN assertion) | none (random) | direct | native (NaN assertion via native `cnp.sum`) |
-| kmeans | norm(axis=1), newaxis broadcast, `.T`, argmin, bincount, amin, maximum, not_equal | broadcasting, transpose, astype | workarounds | native. Native argmin(axis=1) (as float labels), one-hot via native `==`, native amin+sum, maximum and count_nonzero; centroid sums = dataT @ M |
-| kmeans_slow | same, plus `labels == idx`, where, sum(axis=0) | as above | workarounds | native (native argmin/sum/count_nonzero/`==`; mask = M@e_idx, where(m,x,0) = m*x) |
-| linreg | randn, hstack, matvec, vecmat (`err.dot(X)`), power, sum | vecmat/transpose, hstack | workarounds | native (featuresT generated, `featuresT @ err`, native power and `cnp.sum`) |
-| logreg | as linreg + exp, log, floor | as linreg | workarounds | native (native log, floor and `cnp.sum`) |
-| lstm_backward | 3-D slicing, `**2`, `.transpose()`, sum(axis 0), dot | transpose | workarounds | native (WT generated, native `**2`, native batch `cnp.sum(axis=1)`) |
+| kmeans | norm(axis=1), newaxis broadcast, `.T`, argmin, bincount, amin, maximum, not_equal | broadcasting | workarounds | native. Native argmin(axis=1) (as float labels), one-hot via native `==`, native amin+sum, maximum and count_nonzero; counts int64 via native `astype`; centroid sums = native `M.T @ data`; native `.T` |
+| kmeans_slow | same, plus `labels == idx`, where, sum(axis=0) | as above | workarounds | native (native argmin/sum/count_nonzero/`==`; mask = M@e_idx, where(m,x,0) = m*x, row sums = native vecmat `mask @ data`) |
+| linreg | randn, hstack, matvec, vecmat (`err.dot(X)`), power, sum | none | workarounds | native (native vecmat `error.dot(features)`, `cnp.hstack` for the intercept, native power and `cnp.sum`) |
+| logreg | as linreg + exp, log, floor | none | workarounds | native (native vecmat, `cnp.hstack`, log, floor and `cnp.sum`) |
+| lstm_backward | 3-D slicing, `**2`, `.transpose()`, sum(axis 0), dot | none | workarounds | native (native `WLSTM.transpose()`, native `**2`, native batch `cnp.sum(axis=1)`) |
 | lstm_forward | 3-D slicing, tile, exp, tanh, dot | none | direct | native (h0 tiled to 3-D (1,b,d)) |
-| qr | linalg.qr | geqrf (or potrf+trsm), transpose | needs backend | CholeskyQR2. Native SUMMA. HOST-FALLBACK: n x n chol+inv of the Gram matrix. |
-| quantiles | quantile (sort + interpolation), astype | sort, astype, reshape | workarounds | native O(n^2) odd-even sort network (native comparisons + where) + native interpolation (float only) |
+| qr | linalg.qr | none | direct | native `cnp.linalg.qr` (Householder on one chare); allclose(a, q @ r) and Q^T Q (native `q.T @ q`) checked natively. |
+| quantiles | quantile (sort + interpolation), astype | reshape | direct | native `cnp.sort` + native interpolation; int inputs via native `astype(float64)` |
 | richardson_lucy | 3-D convolve(mode=same), flip, `/`, `*` | convolve, flip / negative strides | workarounds | native direct convolution (f^3 broadcast-scalar MACs); psf_mirror from the reversed index |
-| scan | cumsum/cumprod/nancumsum/nancumprod, axis=None flatten | scan, reshape | workarounds | native Hillis-Steele scan; nan* variants use native where(isnan(A), identity, A). |
-| solve | linalg.solve | getrf/getrs, argmax, row gather/permute | needs backend | blocked LU with partial pivoting. Native row swaps + SUMMA. HOST-FALLBACK: panel getrf, bs x bs inverses. |
-| sort | sort/argsort (uint32 default) | sort/argsort, uint32 | workarounds | native O(n^2) odd-even transposition network built from native comparisons + where (exact for float and int keys). |
+| scan | cumsum/cumprod/nancumsum/nancumprod, axis=None flatten | reshape | direct | native `cnp.cumsum/cumprod/nancumsum/nancumprod` (with `out=`). axis=None on 2-D composed from native axis scans (no reshape). |
+| solve | linalg.solve | none | direct | native `cnp.linalg.solve` (partial-pivoted LU on one chare); residual norm native. |
+| sort | sort/argsort (uint32 default) | uint32 | direct | native `cnp.sort/argsort` (gather-to-one-chare executor, stable). |
 | stencil | slicing views, in-place view assignment | none | direct | native |
-| svd | linalg.svd | gesvd/syevd, transpose | needs backend | Gram SVD. Native A^T A and A V S^-1. HOST-FALLBACK: k x k eigh. |
-| take_pairs | arange.reshape, take(axis=1), sum | take/gather, reshape | needs backend | data grid native (meshgrid of aranges). take = matmul with 0/1 selection matrices (HOST-FALLBACK: built on the host, bulk upload). Native 3-D `result.sum()`. |
-| tssvd | rand, abs, sum, linalg.tssvd | syevd/tssvd, transpose | needs backend | native make_random_matrix (row sums of abs = native `linalg.norm(ord=1, axis=1)`) + Gram SVD (HOST-FALLBACK eigh) |
+| svd | linalg.svd | general broadcasting (`u * s`), complex | direct | native `cnp.linalg.svd` (full_matrices; int inputs factored in float64, int/float promotion native in the check); `u * s` written `u @ diag(s)`. |
+| take_pairs | arange.reshape, take(axis=1), sum | reshape | workarounds | data grid native (meshgrid of aranges). `data.take(indices, axis=1)` is native (host indices lowered to column-slice copies). Native 3-D `result.sum()`. |
+| tssvd | rand, abs, sum, linalg.tssvd | general broadcasting (`u * s`) | direct | original make_random_matrix loop + native `cnp.linalg.tssvd` (eigh of A^T A on one chare, U = A V S^-1 by SUMMA). |
 
 ### Summary
 
-- **Direct, fully native, no emulation (7):** stencil, jacobi, gemm, cg, cfd,
-  lstm_forward, black_scholes.
-- **Fully native with workarounds or emulation, no host step in the algorithm
-  (11):** black_scholes_greeks, lstm_backward, linreg, logreg, kmeans,
-  kmeans_slow, sort, quantiles, richardson_lucy, einsum (subset), scan.
-- **Native bulk work with marked HOST-FALLBACKs (7):** cholesky, qr, solve,
-  svd, tssvd (small factorizations); indexing_routines (advanced-indexing
-  patterns); take_pairs (selection-matrix fill).
+- **Direct, fully native, no emulation (15):** stencil, jacobi, gemm, cg, cfd,
+  lstm_forward, black_scholes, scan, sort, quantiles, cholesky, qr, solve,
+  svd, tssvd.
+- **Fully native with workarounds, no host step in the algorithm (9):**
+  black_scholes_greeks, lstm_backward, linreg, logreg, kmeans, kmeans_slow,
+  richardson_lucy, einsum (subset), take_pairs (native take with host
+  indices).
+- **Native bulk work with marked HOST-FALLBACKs (1):** indexing_routines
+  (advanced-indexing patterns).
 - **Partially blocked:**
-  - einsum: any expression other than the 4 lowered ones.
-  - quantiles: integer dtypes, axis=None on N-D.
+  - einsum: anything but a single-contraction matrix product (2-D, or 3-D
+    with a leading batch mode).
+  - quantiles: axis=None on N-D.
   - sort/quantiles: uint32.
-  - scan/sort/svd: complex dtypes.
-  - svd: integer dtypes; full_matrices with m != n.
+  - scan/sort/svd/tssvd/cholesky/qr/solve: complex dtypes.
   - --precision 16 everywhere.
 
 ## Per-example notes
@@ -137,61 +138,54 @@ Verdict meanings:
   already keeps the dim.
 - **cg.** The convergence test fetches `rsnew` only at check points. Verifies
   A (exact), `A.dot(x) ~ b`, and `x ~ linalg.solve`.
-- **cholesky.** Default input is the SPD matrix from cg.py's `generate_random`;
-  `--input eye` gives the original identity input. `L21.T` comes from the upper
-  block A12 (symmetry), because there is no transpose. Use a block size that
-  divides n. Otherwise the frontend's `(K,1)` matmul special case kicks in;
-  see the bugs list.
+- **cholesky / qr / solve / svd / tssvd.** Same calls as the originals
+  (`cnp.linalg.*`, see `examples/ops/test_linalg.py`), default sizes as in the
+  originals, `nargs="+"` size lists. The verification always runs, natively
+  where possible (`U.allclose`), plus a NumPy reference on the fetched inputs,
+  with dtype-aware tolerances (`U.tolerances`; solve's fixed 1e-4 residual
+  limit becomes n eps ||a|| ||x|| for float32). cholesky keeps the original
+  identity input by default (`--input spd` for a random SPD matrix).
 - **einsum.** Inputs are pseudo-random/N instead of ones so that the check is
-  meaningful (`--ones` gives the original). B never changes under the A<->C
-  swap, so B.T is generated once.
+  meaningful (`--ones` gives the original). A transposed operand is
+  recomputed only when it changes; B never changes under the A<->C swap, so
+  B.T is transposed once.
 - **indexing_routines.** The ai2 and ai3 final states are fully overwritten
   (all-true masks), as in the original.
 - **kmeans / kmeans_slow.** Default precision is 64. A float32 near-tie could
-  make argmin differ from the NumPy reference, although the emulation itself
-  is exact. About 400 frontend names per iteration, so roughly 150 iterations
-  fit in the 65536-name budget.
-- **kmeans relabel.** The pairwise "column a beats column b" mask is written
-  `(P[:, b] - P[:, a]) > 0` rather than `P[:, b] > P[:, a]`: a fused kernel
-  holding only one binary op on two column views of the same array hangs the
-  backend inside kmeans_slow (also with a plain `-`), see the comment in
-  `kmeans.py`.
+  make the native argmin differ from the NumPy reference. The frontend name
+  limit is now the int32 limit, so the iteration count is not name-bound.
 - **linreg / logreg.** `--num` is in thousands, default 1 (1000 points).
 - **lstm_forward.** Tiling h0 to 3-D avoids a 2-D->3-D set_region at a nonzero
   column offset. See the suspected backend issue below. The existing
   `examples/lstm_forward.py` does exactly that pattern.
-- **qr.** Default is 128x32 (the original is 1000x1000 square). Square inputs
-  work too (`-m 48 -n 48` is in the static check). `Q@R ~ A` and `Q^T Q ~ I`
-  are checked natively.
-- **quantiles / sort.** n phases of compare-exchange gives O(n^2) work. Each
-  phase writes a fresh buffer, so no op reads and writes the same array. The
-  compare-exchange is exact for float and integer keys (no NaN keys).
-  argsort is verified by `a[perm] == sort(a)` plus permutation check, since
-  ties may order differently from numpy.
+- **quantiles / sort.** `cnp.sort`/`cnp.argsort` gather the array on one
+  chare, sort each line along the axis there (NaNs last, stable) and scatter
+  it back: exact, O(n log n), but not scalable (no distributed sample sort).
+  argsort is compared exactly with `numpy.argsort(kind="stable")`. The old
+  O(n^2) odd-even network was removed from `_cnum_util.py`.
 - **richardson_lucy.** Assumes cuPyNumeric's N-D `convolve(mode="same")`
   follows the scipy.signal.convolve centering (start index (f-1)//2).
-- **scan.** For `axis=None` on 2-D, the port computes the flattened-order scan
-  but keeps the 2-D shape, since there is no reshape.
-- **solve.** With nrhs == 1, b is kept 1-D so that every product is a matvec.
-  This avoids the frontend's `(K,1)` special case.
-- **svd / tssvd.** The Gram approach squares the condition number. That is
-  fine for these inputs, and the reconstruction check holds regardless.
-- **take_pairs.** int32 SUMMA with 0/1 selection matrices (one bulk upload
-  each). The result sum is checked exactly.
-- **HOST-FALLBACK factors** (cholesky, qr, solve, svd): the small host
-  factors are bulk uploads (`U.upload`), no longer one scalar set per nonzero,
-  so larger `-n`/block sizes no longer hit the 65536-name budget.
+- **scan.** Native SCAN executor. For `axis=None` on 2-D, the port computes
+  the flattened-order scan from native axis scans but keeps the 2-D shape,
+  since there is no reshape.
+- **take_pairs.** `cnp.take` with the host index list (N=16, P=120 pairs):
+  index column 1 is 15 contiguous runs (15 slice copies), index column 0
+  repeats indices (120 single-column copies, which fuse); each (M, P) column
+  result then goes into the 3-D result with one 2-D -> 3-D copy. The result
+  sum is checked exactly.
 
 ## Missing backend/frontend ops, ranked by examples they would unblock or simplify
 
-1. **Transpose (`.T`/`transpose`) or vecmat (1-D @ 2-D).** 10 examples:
-   kmeans, kmeans_slow, linreg, logreg, lstm_backward, einsum, cholesky, qr,
-   svd, tssvd. All currently rely on generated transposed inputs or symmetry
-   tricks.
+1. ~~**Transpose (`.T`/`transpose`) or vecmat (1-D @ 2-D).**~~ Done: native
+   2-D/3-D transpose and vecmat (opcode 70, `src/executor_transpose.cpp`).
+   The 10 examples that needed it (kmeans, kmeans_slow, linreg, logreg,
+   lstm_backward, einsum, cholesky, qr, svd, tssvd) now use `.T` / `x @ A`
+   directly instead of generated transposed inputs or symmetry tricks. A
+   fused transposed-operand SUMMA (no materialized copy) is still open.
 2. ~~**Comparisons + `where`/select, `minimum`/`maximum`.**~~ Native since
    2026-10-08 (0/1 masks in the operand dtype). Ports switched: black_scholes,
    black_scholes_greeks, kmeans, kmeans_slow, logreg, sort, quantiles, scan,
-   indexing_routines. solve's pivot search still needs argmax.
+   indexing_routines.
 3. ~~**Bulk host->device upload and a native RNG**~~ Done: `cnp.array`
    uploads in bulk and `cnp.random` generates on the backend (opcodes 50-52,
    `src/executor_creation.cpp`). cholesky, qr, solve, svd, tssvd, take_pairs,
@@ -203,22 +197,26 @@ Verdict meanings:
    (check), qr (check) use them. Was: 8 examples: cfd, kmeans, kmeans_slow, linreg, logreg,
    lstm_backward, tssvd, indexing_routines. sum is emulable with dot-with-ones;
    argmin/amin are not cheaply emulable.
-5. **Dense factorization kernels (potrf, getrf with pivoting, geqrf, syevd/gesvd)
-   and trsm.** 5 examples: cholesky, solve, qr, svd, tssvd. These remove every
-   HOST-FALLBACK there.
+5. ~~**Dense factorization kernels (potrf, getrf with pivoting, geqrf, syevd/gesvd)
+   and trsm.**~~ Native (`cnp.linalg`, LINALG opcode 100, single-chare
+   gather-factor-scatter): cholesky, solve, qr, svd, tssvd are direct ports.
+   Limit: the operands are gathered and factored on one chare, so this is
+   not scalable (distributed blocked factorizations are still open).
 6. ~~**Elementwise math: sqrt, log, abs, pow (`__pow__`), floor.**~~ Native
    since 2026-10-08; black_scholes, black_scholes_greeks, logreg, tssvd, cfd,
    lstm_backward and linreg use them.
-7. **Gather/scatter: take, fancy and boolean-mask indexing, bincount, row
-   permutation.** 4 examples: indexing_routines, take_pairs, kmeans, solve.
+7. **Gather/scatter: fancy and boolean-mask indexing, row permutation, take
+   with device indices.** 1 example: indexing_routines (bincount is native;
+   kmeans uses the one-hot form; solve's pivoting is inside `cnp.linalg.solve`). `take` with host indices is native
+   now; take_pairs uses it.
 8. **reshape/flatten, more than 3 dims, arange on device** (`%` is native).
    4 examples:
    black_scholes_greeks, scan (axis=None), quantiles, take_pairs.
-9. **sort/argsort.** 2 examples: sort, quantiles. The O(n^2) network is only
-   viable for n up to about 1e3.
-10. **astype (dtype conversion).** 3 examples: quantiles (int), svd (int),
-    scan.
-11. **One example each:** scan (cumsum/cumprod), convolve (richardson_lucy),
+9. ~~sort/argsort~~ (native since the castscansort ops; a distributed sample
+   sort is still missing for scaling).
+10. ~~astype (dtype conversion)~~ (native CAST executor; mixed int/float
+    operands are cast implicitly).
+11. **One example each:** ~~scan (cumsum/cumprod)~~ (native), convolve (richardson_lucy),
     einsum, flip/negative-step slicing (richardson_lucy), general broadcasting
     / newaxis (kmeans), complex dtypes (scan/sort/svd), float16 (gemm,
     black_scholes, linreg, logreg, kmeans).
@@ -228,12 +226,14 @@ Verdict meanings:
 1. `example/charmnumeric/charmnumeric/charmnumeric.py:291-292`:
    `np.newaxis`/`None` in an index raises NotImplementedError, although
    `__init__.py:37` exports `newaxis = None`.
+   **Fixed:** `x[:, newaxis]` returns a *copy* with the size-1 dims inserted
+   (a view cannot change ndims); newaxis in a setitem key is dropped.
 2. (fixed) `random.randn` used to return a zero-filled array; `cnp.random` is
    now a native generator.
-3. `charmtyles/core.py:9,23-28`: names are never recycled and capped at
-   `max_name = 1<<16`. Long iterative programs hit "Too many objects were
-   created". (Host data no longer costs one name per element: uploads, arange
-   and eye are single nodes now.)
+3. `charmtyles/core.py:9,23-28`: names are never recycled. **Fixed:**
+   `max_name` is now the int32 limit (names are int32 on the wire and in
+   every backend map), and host data no longer costs one name per element
+   (uploads, arange and eye are single nodes).
 4. `charmnumeric.py:346-358`: `_broadcast_shape` accepts full NumPy
    broadcasting, e.g. (4,8)+(8,). The backend only broadcasts size-1 operands
    (`BROADCAST_OBJECT` in `charmtyles/ast.py:95,101`). Such expressions are
@@ -243,21 +243,38 @@ Verdict meanings:
    operands by array name and ignore the view region
    (`src/executor_reduce.cpp:32-42`, `src/execute_node.cpp:601,756`). So
    `x[0:4] @ x[4:8]` or `tile(A[0:2], ...)` silently use the whole array. The
-   frontend should materialise views first.
-6. `charmnumeric.py:521-522`: 1-D @ 2-D (vecmat, e.g. `error.dot(features)`)
-   raises "matmul requires a 2D matrix, got 1D".
+   frontend should materialise views first. **Fixed:** partial views are copied
+   first.
+6. Fixed: 1-D @ 2-D (vecmat, e.g. `error.dot(features)`) used to raise
+   "matmul requires a 2D matrix, got 1D". It is now `A.T @ x` with a native
+   transpose of A that is cached until A is written.
 7. `charmnumeric.py:526-530` (and 542-545): `A @ B` with B of shape (K,1)
    becomes a matvec. The result has shape (M,) instead of NumPy's (M,1), and
    the rewrite goes through a cross-ndim copy from a view (see the next item).
+   **Fixed:** the result is (M, 1).
 8. `charmnumeric.py:851-860`: `create_array` accepts more than 3 dims (e.g.
    `zeros((2,2,2,2))`), but the backend only has `Partition1D/2D/3D`.
+   **Fixed:** every Array with 0 or more than 3 dims raises NotImplementedError.
 9. `charmtyles/interface.py:88`: `CCSInterface.connect` has no timeout. With no
    backend listening, a port hangs instead of failing.
 10. `charmtyles/ast.py:494`: `_ancestor_bits` uses `1 << node_id` with global,
     never-reset node ids. The ints grow without bound over a long program.
     This is performance, not correctness.
 
-Suspected backend issue, not verified at runtime:
+Backend/serialization bugs found while testing the frontend ops. All of
+them are fixed by the merged backend bug-fix patches (`wt-bugs/bugfixes.diff`,
+`bugfixes-charmtyles-core.diff`), which the `frontend` worktree is based on:
+size-1 views sent as broadcasts (`r[2:3] + 0` returned `r[0]`), reads after
+an in-place set_region inside one fused kernel, the 1-D -> N-D rank promotion
+in `dag.hpp` (cross-ndim set_region did nothing), cross-ndim set_region with
+views / offsets / offset decompositions, `get()` of offset-decomposed arrays,
+and partitions first used by a MATMUL/MATMATMUL result never starting (hang
+in einsum's batched path). `examples/ops/test_frontend.py` covers each.
+
+Known remaining backend limit: unary math on an all-broadcast (size-1) kernel
+crashes the JIT (`tanh(ones((1,)))`), see MISSING_OPS Recipe A.
+
+Suspected backend issue (fixed by the bug-fix patches; kept for reference):
 `src/backend_internal.hpp:345-351` (`cross_set_region_send`) maps source-local
 coordinates directly to target coordinates. It ignores the target region's start
 in non-singleton dims, and it sends the whole source array rather than a view's
@@ -278,10 +295,13 @@ new ops; `examples/ops/test_creation.py` avoids them):
 ## Static check results
 
 `python _static_check.py` runs 46 cases (all 25 ports plus variants) with
-`CNUM_SIM=1`. Result (2026-10-08, after the switch to native elementwise
-ops): **46/46 PASS, 0 simulator errors, 0 warnings.** Each run uses 75 to
-6.4k frontend names. The simulator knows the elementwise opcodes 20-49
-(math, comparisons as 0/1 masks, where, clip). This checks:
+`CNUM_SIM=1`. Result (2026-10-09, after merging native transpose/vecmat,
+the frontend ops (hstack/vstack, take, `out=`), astype/scan/sort and
+`cnp.linalg` into the native elementwise/creation/reduction tree): **46/46
+PASS, 0 simulator errors, 0 warnings.** The simulator knows the elementwise
+opcodes 20-49 (math, comparisons as 0/1 masks, where, clip), creation 50-52,
+reductions 60-61, transpose 70, CAST/SCAN/SORT/ARGSORT 80-83 and LINALG 100.
+This checks:
 
 - frontend graph construction, shapes and dtypes,
 - fusion and DAG serialization (every DAG is serialized and handed to

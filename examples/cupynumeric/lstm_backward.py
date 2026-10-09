@@ -2,11 +2,7 @@
 """charmnumeric port of cupynumeric/examples/lstm_backward.py.
 
 Verdict: port with workarounds (fully native). Changes:
-  * WLSTM.transpose(): charmnumeric has no transpose. WLSTM is input data,
-    so its transpose WT is generated natively from the same closed form with
-    permuted indices (U.randn(..., perm=(1, 0))). The port checks that the
-    fetched WT equals WLSTM.T exactly. A native transpose op would remove
-    this workaround.
+  * WLSTM.transpose() is the native transpose, as in the original.
   * np.sum(dHin[t, :, word_size:], 0) is the native axis reduction
     cnp.sum(..., axis=1): in charmnumeric the integer index keeps its dim, so
     the view is (1, b, d) and the batch axis is axis 1; the result is the
@@ -30,7 +26,7 @@ import _cnum_util as U  # noqa: E402
 from _cnum_connect import get_interface  # noqa: E402
 
 
-def lstm_backward(np, WLSTM, WT, dHout, IFOGf, C, Ct, Hin, n, b, d, word_size, batch_sum):
+def lstm_backward(np, WLSTM, dHout, IFOGf, C, Ct, Hin, n, b, d, word_size, batch_sum):
     dIFOG = np.zeros((n, b, d * 4))
     dIFOGf = np.zeros(IFOGf.shape)
     dHin = np.zeros(Hin.shape)
@@ -55,8 +51,8 @@ def lstm_backward(np, WLSTM, WT, dHout, IFOGf, C, Ct, Hin, n, b, d, word_size, b
         y = IFOGf[t, :, : 3 * d]
         dIFOG[t, :, : 3 * d] = (y * (1.0 - y)) * dIFOGf[t, :, : 3 * d]
 
-        # backprop matrix multiply (WT == WLSTM.transpose())
-        dHin[t] = dIFOG[t].dot(WT)
+        # backprop matrix multiply
+        dHin[t] = dIFOG[t].dot(WLSTM.transpose())
 
         # backprop the identity transforms into Hin
         if t > 0:
@@ -80,27 +76,25 @@ def main(chk):
     t0 = time.perf_counter()
     scale = 1.0 / numpy.sqrt(word_size + d)
     WLSTM = U.randn((word_size + d, 4 * d), seed=1) * scale
-    WT = U.randn((word_size + d, 4 * d), seed=1, perm=(1, 0)) * scale  # == WLSTM.T
     xphpb = WLSTM.shape[0]
     dHout = U.randn((n, b, d), seed=2)
     IFOGf = U.randn((n, b, d * 4), seed=3)
     C = U.randn((n, b, d), seed=4)
     Ct = U.randn((n, b, d), seed=5)
     Hin = U.randn((n, b, xphpb), seed=6)
-    host_in = [x.get(interface) for x in (WLSTM, WT, dHout, IFOGf, C, Ct, Hin)]
+    host_in = [x.get(interface) for x in (WLSTM, dHout, IFOGf, C, Ct, Hin)]
 
     outs = lstm_backward(
-        cnp, WLSTM, WT, dHout, IFOGf, C, Ct, Hin, n, b, d, word_size,
+        cnp, WLSTM, dHout, IFOGf, C, Ct, Hin, n, b, d, word_size,
         batch_sum=lambda x: cnp.sum(x, axis=1),
     )
     got = [o.get(interface) for o in outs]
     if args.timing:
         print(f"Elapsed Time: {(time.perf_counter() - t0) * 1e3:.3f} ms (incl. sync)")
 
-    Wh, WTh, dHouth, IFOGfh, Ch, Cth, Hinh = host_in
-    chk.close("generated WT == WLSTM.T", WTh, Wh.T, rtol=0, atol=0)
+    Wh, dHouth, IFOGfh, Ch, Cth, Hinh = host_in
     ref = lstm_backward(
-        numpy, Wh, Wh.T, dHouth.copy(), IFOGfh, Ch, Cth, Hinh, n, b, d, word_size,
+        numpy, Wh, dHouth.copy(), IFOGfh, Ch, Cth, Hinh, n, b, d, word_size,
         batch_sum=lambda x: numpy.sum(x, 0),
     )
     for name, g, r in zip(("dIFOG", "dIFOGf", "dHin", "dC", "dh0", "dHout"), got, ref):

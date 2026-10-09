@@ -3,13 +3,13 @@
 
 Verdict: port with workarounds (fully native). Changes:
   * sigmoid is 1/(1+exp(-x)) (native exp), as in the original.
-  * np.dot(error, features) is a vecmat. It is computed as
-    featuresT @ error, where featuresT is generated natively from the same
-    closed form as features (see linreg.py).
+  * np.dot(error, features) is the native vecmat (cached native transpose
+    of features + matvec).
   * np.log and np.floor are native. np.sum is the native full reduction
     (cnp.sum).
-  * np.hstack becomes slice assignment. --precision 16 is not supported.
-Backend ops that would make this a direct port: a vecmat/transpose, sum.
+  * np.hstack is native (cnp.hstack). --precision 16 is not supported.
+No backend ops are missing for this port (vecmat/transpose, hstack, log,
+floor and sum are all native); only float16 remains unsupported.
 """
 
 import argparse
@@ -29,10 +29,9 @@ from _cnum_connect import get_interface  # noqa: E402
 
 def initialize(N, F, T):
     x = U.randn((N, F), seed=1, dtype=T)
-    xT = U.randn((N, F), seed=1, dtype=T, perm=(1, 0))  # == x.T
     # Give the results either a 0 or 1 value
     y = cnp.floor(2.0 * U.uniform((N,), seed=2, dtype=T))
-    return x, xT, y
+    return x, y
 
 
 def sigmoid(x):
@@ -52,15 +51,9 @@ def run_logistic_regression(interface, N, F, T, I, warmup, S, B):  # noqa: E741
     print("Number of iterations: " + str(I))
 
     learning_rate = 1e-5
-    features, featuresT, target = initialize(N, F, T)
+    features, target = initialize(N, F, T)
     if B:
-        f2 = cnp.zeros((N, F + 1), dtype=T)
-        f2[:, 0:1] = 1.0
-        f2[:, 1:] = features
-        f2T = cnp.zeros((F + 1, N), dtype=T)
-        f2T[0:1, :] = 1.0
-        f2T[1:, :] = featuresT
-        features, featuresT = f2, f2T
+        features = cnp.hstack((cnp.ones((N, 1), dtype=T), features))
     weights = cnp.zeros((features.shape[1],), dtype=T)
 
     lls = []
@@ -68,13 +61,13 @@ def run_logistic_regression(interface, N, F, T, I, warmup, S, B):  # noqa: E741
         scores = cnp.dot(features, weights)
         predictions = sigmoid(scores)
         error = target - predictions
-        gradient = featuresT.dot(error)  # == np.dot(error, features)
+        gradient = cnp.dot(error, features)  # native vecmat
         weights += learning_rate * gradient
         if step >= 0 and step % S == 0:
             ll = U.to_float(log_likelihood(features, target, weights), interface)
             lls.append(ll)
             print("Log Likelihood of step " + str(step) + ": " + str(ll))
-    return features, featuresT, target, weights, lls
+    return features, target, weights, lls
 
 
 def reference(features, target, T, I, warmup, S):  # noqa: E741
@@ -111,7 +104,7 @@ def main(chk):
 
     interface = get_interface()
     t0 = time.perf_counter()
-    features, featuresT, target, weights, lls = run_logistic_regression(
+    features, target, weights, lls = run_logistic_regression(
         interface, args.N * 1000, args.F, T, args.I, args.warmup, args.S, args.B
     )
     w = weights.get(interface)
@@ -120,8 +113,8 @@ def main(chk):
     # the original's assertion, with the native sum
     chk.true("no NaN in weights (native sum)",
              not math.isnan(U.to_float(cnp.sum(weights), interface)))
-    Fh, FTh, yh = features.get(interface), featuresT.get(interface), target.get(interface)
-    chk.close("generated featuresT == features.T", FTh, Fh.T, rtol=0, atol=0)
+    Fh, yh = features.get(interface), target.get(interface)
+    chk.close("native features.T", features.T.get(interface), Fh.T, rtol=0, atol=0)
     chk.true("target is exactly 0/1", bool(numpy.all((yh == 0) | (yh == 1))))
     w_ref, ll_ref = reference(Fh, yh, T, args.I, args.warmup, args.S)
     rtol = 1e-4 if T == numpy.float32 else 1e-10

@@ -147,9 +147,12 @@ set(BACKEND_EXECUTOR_SOURCES
     executor_matmul.cpp
     executor_matmatmul.cpp
     executor_transfer.cpp
+    executor_transpose.cpp
     executor_incremental.cpp
     executor_ast_visitor.cpp
     executor_creation.cpp
+    executor_castscansort.cpp
+    executor_linalg.cpp
 )
 
 set(BACKEND_PARTITION_SOURCES
@@ -202,6 +205,18 @@ if(DEFINED GPU_BACKEND)
         find_package(CUDAToolkit REQUIRED)
         target_link_libraries(jit_obj     PRIVATE CUDA::cuda_driver)
         target_link_libraries(backend_obj PRIVATE CUDA::cuda_driver)
+        # cuSOLVER/cuBLAS for the LINALG executor (CUDA toolkit or the HPC SDK math_libs)
+        set(CT_MATH_LIBS_DIR "/opt/nvidia/hpc_sdk/Linux_x86_64/26.5/math_libs/12.9"
+            CACHE PATH "Directory with include/ and lib64/ of cuSOLVER and cuBLAS")
+        find_path(CUSOLVER_INCLUDE_DIR cusolverDn.h
+            HINTS ${CUDAToolkit_INCLUDE_DIRS} ${CT_MATH_LIBS_DIR}/include REQUIRED)
+        find_library(CUSOLVER_LIB cusolver
+            HINTS ${CUDAToolkit_LIBRARY_DIR} ${CT_MATH_LIBS_DIR}/lib64 REQUIRED)
+        find_library(CUBLAS_LIB cublas
+            HINTS ${CUDAToolkit_LIBRARY_DIR} ${CT_MATH_LIBS_DIR}/lib64 REQUIRED)
+        get_filename_component(CUSOLVER_LIB_DIR ${CUSOLVER_LIB} DIRECTORY)
+        get_filename_component(CUBLAS_LIB_DIR ${CUBLAS_LIB} DIRECTORY)
+        target_include_directories(backend_obj PRIVATE ${CUSOLVER_INCLUDE_DIR})
     elseif(GPU_BACKEND_UPPER STREQUAL "AMD")
         target_compile_definitions(jit_obj     PRIVATE USE_AMD JIT_ENABLE_GPU_BACKEND)
         target_compile_definitions(backend_obj PRIVATE USE_AMD JIT_ENABLE_GPU_BACKEND)
@@ -243,7 +258,9 @@ if(DEFINED GPU_BACKEND)
     if(GPU_BACKEND_UPPER STREQUAL "NVIDIA")
         list(APPEND GPU_LINK_ARGS
             "-L${CUDAToolkit_LIBRARY_DIR}" "-L${CUDAToolkit_LIBRARY_DIR}/stubs"
-            "-Wl,-rpath,${CUDAToolkit_LIBRARY_DIR}" -lcudart -lcuda)
+            "-Wl,-rpath,${CUDAToolkit_LIBRARY_DIR}" -lcudart -lcuda
+            "-L${CUSOLVER_LIB_DIR}" "-Wl,-rpath,${CUSOLVER_LIB_DIR}"
+            "-L${CUBLAS_LIB_DIR}" "-Wl,-rpath,${CUBLAS_LIB_DIR}" -lcusolver -lcublas)
     endif()
 endif()
 

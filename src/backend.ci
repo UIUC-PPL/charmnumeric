@@ -34,6 +34,7 @@ mainmodule charmnumeric
         entry void comm_done(int node_id);
         entry void reduce_result(CkReductionMsg* msg);
         entry void receive_reduce_partial(int node_id, int64_t size, char data[size]);
+        entry void receive_linalg(int node_id, int64_t size, char data[size]);
     };
 
     array [2D] Partition2D
@@ -53,6 +54,7 @@ mainmodule charmnumeric
         entry void comm_done(int node_id);
         entry void reduce_result(CkReductionMsg* msg);
         entry void receive_reduce_partial(int node_id, int64_t size, char data[size]);
+        entry void receive_linalg(int node_id, int64_t size, char data[size]);
     };
 
     array [3D] Partition3D
@@ -72,5 +74,6 @@ mainmodule charmnumeric
         entry void comm_done(int node_id);
         entry void reduce_result(CkReductionMsg* msg);
         entry void receive_reduce_partial(int node_id, int64_t size, char data[size]);
+        entry void receive_linalg(int node_id, int64_t size, char data[size]);
     };
 }

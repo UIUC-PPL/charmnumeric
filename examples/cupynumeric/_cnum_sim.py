@@ -320,11 +320,52 @@ def _eval(obj):
         _store_result(obj, _fit(np.bincount(xv[keep], weights=wv, minlength=length), obj))
         return
 
+    if op == AO.linalg:
+        from charmnumeric import linalg as LA
+
+        arrays = [x for x in ops if isinstance(x, (FrontendObject, FrontendObjectView))]
+        kind, _nd, _s0, _s1, p0, p1, p2 = ops[len(arrays):]
+        values = [_value(x) for x in arrays]
+        res = LA._reference(int(kind), values, tuple(obj.shape), (p0, p1, p2))
+        _store_result(obj, _fit(np.asarray(res).reshape(obj.shape), obj))
+        return
+
     if op in (AO.upload, AO.random, AO.iota):
         # creation nodes: [region, (hi, lo) scalar word pairs..., InlineData?]
         scalars = [x for x in ops if isinstance(x, (int, float))]
         payload = next((x.data for x in ops if isinstance(x, InlineData)), None)
         _store_result(obj, creation_values(op, scalars, payload, tuple(obj.shape), obj.dtype))
+        return
+
+    if op == AO.transpose:
+        x = ops[0]
+        perm = tuple(int(p) for p in ops[1:])
+        _store_result(obj, _fit(np.transpose(_value(x), perm), obj))
+        return
+
+    if op == AO.astype:
+        (x,) = ops
+        if _is_view(x):
+            _error(f"astype of a view {_desc(x)}: backend reads the whole array")
+        with np.errstate(all="ignore"):
+            _store_result(obj, _fit(_value(x).astype(obj.dtype), obj))
+        return
+
+    if op == AO.scan:
+        x, axis, kind = ops
+        if _is_view(x):
+            _error(f"scan of a view {_desc(x)}: backend reads the whole array")
+        fn = (np.cumsum, np.cumprod, np.nancumsum, np.nancumprod)[int(kind)]
+        with np.errstate(all="ignore"):
+            _store_result(obj, _fit(fn(_value(x), axis=int(axis)), obj))
+        return
+
+    if op in (AO.sort, AO.argsort):
+        x, axis = ops
+        if _is_view(x):
+            _error(f"sort of a view {_desc(x)}: backend reads the whole array")
+        fn = np.sort if op == AO.sort else np.argsort
+        _store_result(obj, _fit(fn(_value(x), axis=int(axis), kind="stable"), obj))
         return
 
     _error(f"unknown opcode {op}")

@@ -256,7 +256,6 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
         }
 
         int M = a_re - a_rs;        // result rows
-        int K = a_ce - a_cs;        // shared dimension
         int N_cols = b_ce - b_cs;   // result cols
 
         // C result range in global coords
@@ -269,14 +268,10 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
         // Chare ranges for A, B, and C
         a_tile = array_tile(dag_group->array_meta, a_name, a_meta_it->second.ndims);
         b_tile = array_tile(dag_group->array_meta, b_name, b_meta_it->second.ndims);
-        int first_a_row_chare = a_rs / a_tile;
-        int last_a_row_chare = (a_re > 0) ? (a_re - 1) / a_tile : 0;
         int first_a_col_chare = a_cs / a_tile;
         int last_a_col_chare = (a_ce > 0) ? (a_ce - 1) / a_tile : 0;
         int first_b_row_chare = b_rs / b_tile;
         int last_b_row_chare = (b_re > 0) ? (b_re - 1) / b_tile : 0;
-        int first_b_col_chare = b_cs / b_tile;
-        int last_b_col_chare = (b_ce > 0) ? (b_ce - 1) / b_tile : 0;
         int first_c_row_chare = c_rs / c_tile;
         int last_c_row_chare = (c_re > 0) ? (c_re - 1) / c_tile : 0;
         int first_c_col_chare = c_cs / c_tile;
@@ -296,7 +291,6 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
             int a_col_hi = std::min(a_chare.stop[1], a_ce);
 
             if (a_row_lo < a_row_hi && a_col_lo < a_col_hi) {
-                int sub_rows = a_row_hi - a_row_lo;
                 int sub_cols = a_col_hi - a_col_lo;
                 int row_offset = a_row_lo - a_chare.start[0];
                 int col_offset = a_col_lo - a_chare.start[1];
@@ -350,7 +344,6 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
 
             if (b_row_lo < b_row_hi && b_col_lo < b_col_hi) {
                 int sub_rows = b_row_hi - b_row_lo;
-                int sub_cols = b_col_hi - b_col_lo;
                 int row_offset = b_row_lo - b_chare.start[0];
                 int col_offset = b_col_lo - b_chare.start[1];
 

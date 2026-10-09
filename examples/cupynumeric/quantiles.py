@@ -1,21 +1,19 @@
 #!/usr/bin/env python
 """charmnumeric port of cupynumeric/examples/quantiles.py.
 
-Verdict: port with workarounds (native sort network built from native
-comparisons and where). np.quantile is a sort followed by interpolation at
-order-statistic positions. The positions depend only on n and q, not on
-the data, so they are computed on the host as plain Python scalars. The
-data path is native:
-    s = oddeven_sort(a, axis)                 (see sort.py / _cnum_util.py)
+Verdict: direct data path (native sort + native interpolation).
+np.quantile is a sort followed by interpolation at order-statistic positions.
+The positions depend only on n and q, not on the data, so they are computed
+on the host as plain Python scalars. The data path is native:
+    s = cnp.sort(a, axis)                     (SORT executor)
     out[k] = s[lo] + t * (s[hi] - s[lo])      (size-1 views, native)
+Integer inputs are sorted as integers and converted with a native astype to
+float64 before the interpolation, as NumPy does.
 Supported methods: linear (default), lower, higher, nearest, midpoint.
 Supported layouts: 1-D (axis None/0) and 2-D with axis 0 or 1. axis=None on
-N-D needs reshape (missing). For axis=1 the result is produced as
-(rows, nq). NumPy gives (nq, rows), and with no transpose op the check
-compares against the transpose.
-Integer inputs are not supported: the interpolated output must be float and
-charmnumeric has no astype. The default dtype is float64 (the original
-default uint32 is not a charmnumeric dtype).
+N-D needs reshape (missing). For axis=1 the interpolation fills a
+(rows, nq) array, and the native transpose returns NumPy's (nq, rows). The original default dtype uint32 is not a
+charmnumeric dtype; the default here is float64 (-d int32/int64 also work).
 """
 
 import argparse
@@ -61,12 +59,20 @@ def positions(n, q, method):
     return out
 
 
+def _sorted_float(a, axis):
+    """Native sort along axis; integer data is converted to float64 afterwards."""
+    s = cnp.sort(a, axis=axis)
+    if numpy.issubdtype(numpy.dtype(s.dtype), numpy.integer):
+        s = s.astype(numpy.float64)
+    return s
+
+
 def quantile_native(a, q, axis, method):
     if a.ndim == 1 or axis is None:
         if a.ndim != 1:
             raise NotImplementedError("axis=None on N-D input needs reshape (not in charmnumeric)")
-        s, _ = U.oddeven_sort(a, axis=0)
-        out = cnp.zeros((len(q),), dtype=a.dtype)
+        s = _sorted_float(a, 0)
+        out = cnp.zeros((len(q),), dtype=s.dtype)
         for k, (lo, hi, t) in enumerate(positions(a.shape[0], q, method)):
             slo, shi = s[lo : lo + 1], s[hi : hi + 1]
             out[k : k + 1] = slo + t * (shi - slo) if t else slo
@@ -74,20 +80,21 @@ def quantile_native(a, q, axis, method):
     if a.ndim != 2:
         raise NotImplementedError("only 1-D and 2-D inputs are ported")
     axis = axis % 2
-    s, _ = U.oddeven_sort(a, axis=axis)
+    s = _sorted_float(a, axis)
     n = a.shape[axis]
     other = a.shape[1 - axis]
     pos = positions(n, q, method)
     if axis == 0:
-        out = cnp.zeros((len(q), other), dtype=a.dtype)
+        out = cnp.zeros((len(q), other), dtype=s.dtype)
         for k, (lo, hi, t) in enumerate(pos):
             slo, shi = s[lo : lo + 1, :], s[hi : hi + 1, :]
             out[k : k + 1, :] = slo + t * (shi - slo) if t else slo
     else:
-        out = cnp.zeros((other, len(q)), dtype=a.dtype)  # transposed w.r.t. numpy
+        outT = cnp.zeros((other, len(q)), dtype=s.dtype)
         for k, (lo, hi, t) in enumerate(pos):
             slo, shi = s[:, lo : lo + 1], s[:, hi : hi + 1]
-            out[:, k : k + 1] = slo + t * (shi - slo) if t else slo
+            outT[:, k : k + 1] = slo + t * (shi - slo) if t else slo
+        out = outT.T  # native transpose: NumPy's (nq, rows)
     return out
 
 
@@ -107,12 +114,17 @@ def main(chk):
     args = parser.parse_args()
     shape = tuple(args.shape)
     dt = numpy.dtype(args.datatype)
-    if dt not in (numpy.dtype(numpy.float32), numpy.dtype(numpy.float64)):
-        raise NotImplementedError(f"{dt}: only float32/float64 are ported (no astype for int->float)")
+    if dt not in (numpy.dtype(t) for t in (numpy.float32, numpy.float64, numpy.int32, numpy.int64)):
+        raise NotImplementedError(f"{dt} is not a charmnumeric dtype")
 
     q = numpy.array([0.0, 0.37, 0.42, 0.5, 0.67, 0.83, 0.99, 1.0])
     interface = get_interface()
-    a = U.uniform(shape, seed=1729, dtype=dt)
+    if numpy.issubdtype(dt, numpy.integer):
+        lower = 0 if args.lower is None else args.lower
+        upper = 1000 if args.upper is None else args.upper
+        a = U.rand_int(shape, lower, upper, seed=1729, dtype=dt)
+    else:
+        a = U.uniform(shape, seed=1729, dtype=dt)
     t0 = time.perf_counter()
     q_out = quantile_native(a, q, args.axis, args.method)
     got = q_out.get(interface)
@@ -121,10 +133,8 @@ def main(chk):
 
     arr = a.get(interface)
     np_q_out = numpy.quantile(arr, q, axis=args.axis, method=args.method)
-    if args.axis is not None and len(shape) == 2 and args.axis % 2 == 1:
-        np_q_out = np_q_out.T
     print("Checking result...")
-    eps = 1.0e-8 if dt == numpy.float64 else 1e-6
+    eps = 1e-6 if dt == numpy.float32 else 1.0e-8
     chk.close("quantiles", got, np_q_out, rtol=0, atol=eps)
 
 

@@ -395,6 +395,57 @@ void test_strided_copy_reduces_tile_and_sets_offset() {
     delete dag;
 }
 
+ASTNode* make_transpose(int result_name, ASTNode* src, Region* src_region,
+                        std::vector<int> perm) {
+    int nd = (int)perm.size();
+    auto* node = new ASTNode(result_name, static_cast<int>(Opcode::TRANSPOSE),
+                             /*is_temp=*/false, /*is_scalar=*/false, /*scalar=*/0.0, nd);
+    node->add_operand(src);
+    node->operand_regions.push_back(src_region);
+    static int scalar_id = -1000;
+    for (int p : perm) {
+        node->add_operand(new ASTNode(scalar_id--, static_cast<int>(Opcode::NOOP),
+                                      false, /*is_scalar=*/true, (double)p));
+        node->operand_regions.push_back(nullptr);
+    }
+    return node;
+}
+
+void test_transpose_result_aligned_to_source_tiles() {
+    std::cout << "=== test_transpose_result_aligned_to_source_tiles ===" << std::endl;
+
+    constexpr int A = 1;
+    constexpr int T = 2;
+    constexpr int V = 3;
+    constexpr int C = 4;
+
+    // A: (1100, 700), live with offset (3, 5); T = A.T; V = A[100:1050, 30:690].T;
+    // C = V + 1 (elementwise consumer of a transpose result).
+    MetaMap meta;
+    meta[A] = make_meta(2, {1100, 700, 0}, {3, 5, 0}, 512, /*final=*/true);
+    meta[T] = make_meta(2, {700, 1100, 0}, {0, 0, 0}, 0, false);
+    meta[V] = make_meta(2, {660, 950, 0}, {0, 0, 0}, 0, false);
+    meta[C] = make_meta(2, {660, 950, 0}, {0, 0, 0}, 0, false);
+
+    ASTNode* t = make_transpose(T, make_leaf(A, 2), nullptr, {1, 0});
+    ASTNode* v = make_transpose(V, make_leaf(A, 2),
+                                make_region<2>({100, 30}, {1050, 690}, {1, 1}), {1, 0});
+    ASTNode* c = make_add(C, make_leaf(V, 2), nullptr, make_leaf(V, 2), nullptr,
+                          /*is_temp=*/false, /*ndims=*/2);
+    DAG* dag = make_single_node_dag({t, v, c});
+
+    decomposition_solver::compute_decompositions(meta, dag, /*odf=*/4, /*num_pes=*/2);
+
+    expect_eq("T.tile", meta.at(T).tile, 512);
+    expect_offset("T.offset", meta.at(T).offset, {5, 3, 0});
+    expect_eq("V.tile", meta.at(V).tile, 512);
+    // view start (100, 30) + A offset (3, 5) -> source global (103, 35), permuted
+    expect_offset("V.offset", meta.at(V).offset, {35, 103, 0});
+    expect_offset("C.offset follows V", meta.at(C).offset, {35, 103, 0});
+
+    delete dag;
+}
+
 } // namespace
 
 int main() {
@@ -406,6 +457,7 @@ int main() {
         test_jacobi2d_temp_offset();
         test_jacobi3d_temp_offset();
         test_strided_copy_reduces_tile_and_sets_offset();
+        test_transpose_result_aligned_to_source_tiles();
     } catch (const std::exception& ex) {
         std::cerr << "test_compute_decompositions failed: " << ex.what() << std::endl;
         return 1;

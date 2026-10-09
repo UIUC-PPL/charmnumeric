@@ -1,17 +1,18 @@
 #!/usr/bin/env python
-"""charmnumeric port of cupynumeric/examples/scan.py (cumsum/cumprod/nan* variants).
+"""charmnumeric port of cupynumeric/examples/scan.py (cumsum/cumprod/nancumsum/nancumprod).
 
-Verdict: port with workarounds. cumsum/cumprod are native: a Hillis-Steele
-scan of ceil(log2 n) shifted-slice steps along the axis,
-    B_new[k:] = B[k:] (+|*) B[:-k],
-double-buffered so no step reads and writes the same array. Gaps:
-  * nancumsum/nancumprod first replace NaNs with the identity natively:
-    where(isnan(A), 0 or 1, A).
+Verdict: direct for axis scans. cnp.cumsum/cumprod/nancumsum/nancumprod are
+native (SCAN executor: per-tile scan along the axis, exclusive combination of
+the per-tile line totals along the chare grid, offset add). Gaps:
   * axis=None on an N-D array needs flatten/reshape (missing). The port
-    computes the row-major (flattened-order) scan in place and keeps the
-    N-D shape. The check compares against numpy's 1-D result reshaped.
+    computes the row-major (flattened-order) scan from native scans and keeps
+    the N-D shape: scan the last axis, scan the row totals, and combine the
+    previous rows' carry into each row. The check compares against numpy's
+    1-D result reshaped. Only 1-D/2-D for axis=None.
   * complex dtype is unsupported (no complex in charmnumeric).
   * Inputs come from the native cnp.random.randint / cnp.random.random.
+    As in NumPy, int32 inputs accumulate in int64; B (the original's out=
+    array) keeps the input dtype, and assigning into it casts natively.
 """
 
 import argparse
@@ -44,38 +45,26 @@ def initialize(shape, dt, axis):
     return A, B, nan_pos
 
 
-def _sl(nd, axis, s):
-    key = [slice(None)] * nd
-    key[axis] = s
-    return tuple(key)
+_SCANS = {
+    "cumsum": cnp.cumsum,
+    "cumprod": cnp.cumprod,
+    "nancumsum": cnp.nancumsum,
+    "nancumprod": cnp.nancumprod,
+}
 
 
-def scan_axis(A, axis, mul):
-    """Inclusive scan along `axis` (Hillis-Steele, log2(n) native steps)."""
-    nd = A.ndim
-    n = A.shape[axis]
-    B = A.copy()
-    k = 1
-    while k < n:
-        Bn = B.copy()
-        hi, lo = B[_sl(nd, axis, slice(k, n))], B[_sl(nd, axis, slice(0, n - k))]
-        Bn[_sl(nd, axis, slice(k, n))] = (hi * lo) if mul else (hi + lo)
-        B = Bn
-        k *= 2
-    return B
-
-
-def scan_flat(A, mul):
+def scan_flat(A, OP):
     """Row-major (flattened) scan of an N-D array, kept in N-D shape."""
+    scan = _SCANS[OP]
     if A.ndim == 1:
-        return scan_axis(A, 0, mul)
-    # scan the last axis, then carry the running total of the previous rows
-    rows = scan_axis(A, A.ndim - 1, mul)
+        return scan(A, axis=0)
     if A.ndim != 2:
         raise NotImplementedError("axis=None scan implemented for 1-D/2-D only (needs reshape)")
+    mul = OP in ("cumprod", "nancumprod")
+    rows = scan(A, axis=1)  # native scan of each row
     n0, n1 = A.shape
-    last = rows[:, n1 - 1 : n1]  # (n0, 1) row totals
-    carry = scan_axis(U.materialize(last), 0, mul)  # inclusive scan of row totals
+    # inclusive scan of the row totals (already NaN-free for the nan* variants)
+    carry = (cnp.cumprod if mul else cnp.cumsum)(rows[:, n1 - 1 : n1], axis=0)
     out = rows.copy()
     # row i gets combined with carry[i-1]
     tiled = cnp.tile(U.materialize(carry[0 : n0 - 1, :]), (1, n1))  # (n0-1, n1)
@@ -91,16 +80,11 @@ def run_scan(OP, shape, dt, ax):
     print(f"Problem Type:    OP={OP}")
     print(f"Axis:            axis={ax}")
     print(f"Data type:       dtype={dt}32")
-    A, B, nan_pos = initialize(shape, dt, ax)
-    src = A
-    if OP.startswith("nan"):
-        # nancumsum/nancumprod: NaNs count as the identity
-        src = cnp.where(cnp.isnan(A), 1 if OP == "nancumprod" else 0, A)
-    mul = OP in ("cumprod", "nancumprod")
+    A, B, _ = initialize(shape, dt, ax)
     if ax is None:
-        B[...] = scan_flat(src, mul)
+        B[...] = scan_flat(A, OP)
     else:
-        B[...] = scan_axis(src, ax % len(shape), mul)
+        _SCANS[OP](A, out=B, axis=ax)  # native scan, cast into B like numpy's out=
     return A, B
 
 

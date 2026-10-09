@@ -164,7 +164,6 @@ void ArrayDAGExecutorND<N>::execute_matmul_node(DAGNode* node) {
 
     if constexpr (N == 1) {
         // --- 1D partition role in cross-partition matmul ---
-        int tile_1d = array_tile(dag_group->array_meta, vec_name, 1);
 
         auto nd_idx = partition->nd_index();
         int k = nd_idx[0];
@@ -426,14 +425,12 @@ void ArrayDAGExecutorND<N>::execute_matmul_node(DAGNode* node) {
 
         auto nd_idx = partition->nd_index();
 
-        DType dt = determine_dtype<N>(node, partition->arrays);
 
         auto mat_it = partition->arrays.find(mat_name);
         if (mat_it == partition->arrays.end()) {
             node_finished(node->id);
             return;
         }
-        int tile_2d = mat_it->second->decomp.tile;
         int mat_global_rows = mat_it->second->global_shape[0];
         int mat_global_cols = mat_it->second->global_shape[1];
 
@@ -503,14 +500,12 @@ void ArrayDAGExecutorND<N>::execute_matmul_node(DAGNode* node) {
 
         auto nd_idx = partition->nd_index();
 
-        DType dt = determine_dtype<N>(node, partition->arrays);
 
         auto mat_it = partition->arrays.find(mat_name);
         if (mat_it == partition->arrays.end()) {
             node_finished(node->id);
             return;
         }
-        int tile_3d = mat_it->second->decomp.tile;
 
         // operand_regions[0] is a 3D region
         auto* mat_region_3d = static_cast<ArrayRegion<3>*>(matmul_root->operand_regions[0]);

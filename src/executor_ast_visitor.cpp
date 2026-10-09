@@ -349,14 +349,11 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
             // Create result array if needed
             if (partition->arrays.find(result_name) == partition->arrays.end()) {
                 std::array<int, N> out_start = {}, out_stop, out_step, out_gs;
+                out_stop.fill(1);
+                out_step.fill(1);
+                out_gs.fill(1);
                 out_stop[0] = local_rows;
-                out_step[0] = 1;
                 out_gs[0] = mat_base->global_shape[0];
-                if (N > 1) {
-                    out_stop[1] = 1;
-                    out_step[1] = 1;
-                    out_gs[1] = 1;
-                }
                 ArrayRegion<N> out_region(out_start, out_stop, out_step);
                 ArrayDecomp<N> out_decomp =
                     static_cast<ArrayDAGGroup*>(group)->array_meta[result_name].template decomp<N>();
@@ -607,7 +604,11 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
         return node->result_name;
     case Opcode::REDUCTION:
     case Opcode::BINCOUNT:
-        // Always handled by execute_reduction_node.
+    case Opcode::TRANSPOSE:
+        // Handled by their own executors.
+        return node->result_name;
+    case Opcode::LINALG:
+        // Always handled by execute_linalg_node.
         return node->result_name;
     default:
         CkAbort("Unknown opcode in interpreter: %d", node->opcode);

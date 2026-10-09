@@ -190,6 +190,13 @@ class ArrayOperation(Operation):
     iota = 52    # arange / linspace / indices / eye
     reduction = 60
     bincount = 61
+    transpose = 70
+    # 80-89: non-fused cast / scan / sort executors (src/executor_castscansort.cpp)
+    astype = 80
+    scan = 81
+    sort = 82
+    argsort = 83
+    linalg = 100  # factorizations and solves (charmnumeric/linalg.py)
 
 
 class ArrayRegion(Region):
@@ -311,7 +318,12 @@ def _full_region(shape):
     return region
 
 
-def _expand_key(key, ndims):
+def _expand_key(key, ndims, keep_newaxis=False):
+    """Expand ellipsis and pad with full slices to ``ndims`` entries.
+
+    ``None`` (np.newaxis) entries are dropped unless ``keep_newaxis`` is set,
+    in which case they stay in place and do not count towards ``ndims``.
+    """
     if key is Ellipsis:
         key = (Ellipsis,)
     elif not isinstance(key, tuple):
@@ -331,20 +343,37 @@ def _expand_key(key, ndims):
                 raise IndexError("too many indices for array")
             normalized.extend(slice(None) for _ in range(fill))
         elif item is None:
-            raise NotImplementedError("np.newaxis is not supported yet")
+            if keep_newaxis:
+                normalized.append(None)
         else:
             normalized.append(item)
 
-    if len(normalized) > ndims:
+    indexed = sum(1 for item in normalized if item is not None)
+    if indexed > ndims:
         raise IndexError(
             f"too many indices for array: array is {ndims}-dimensional, "
-            f"but {len(normalized)} were indexed"
+            f"but {indexed} were indexed"
         )
 
-    if len(normalized) < ndims:
-        normalized.extend(slice(None) for _ in range(ndims - len(normalized)))
+    if indexed < ndims:
+        normalized.extend(slice(None) for _ in range(ndims - indexed))
 
     return tuple(normalized)
+
+
+def _has_newaxis(key):
+    if key is None:
+        return True
+    return isinstance(key, tuple) and any(item is None for item in key)
+
+
+def _newaxis_shape(key, view_shape, ndims):
+    """Shape of ``x[key]`` where ``view_shape`` is the shape without newaxes."""
+
+    dims = iter(view_shape)
+    return tuple(
+        1 if item is None else next(dims) for item in _expand_key(key, ndims, keep_newaxis=True)
+    )
 
 
 def _parse_key(key, shape, ndims):
@@ -428,24 +457,108 @@ def _operand_dtype(value):
     return None
 
 
-def _check_same_dtype(lhs_dtype, rhs_dtype, what):
-    # The backend runs each kernel in one element type and reinterprets every
-    # array operand's buffer in it; there is no dtype conversion op yet.  Mixed
-    # array dtypes therefore silently produced garbage (int32 + float64 -> the
-    # int buffer read as doubles); reject them instead.
-    if lhs_dtype is not None and rhs_dtype is not None and lhs_dtype != rhs_dtype:
-        raise TypeError(
-            f"{what} between arrays of different dtypes ({lhs_dtype} and {rhs_dtype}) "
-            "is not supported by the charmnumeric backend (no dtype conversion)"
-        )
-
-
 def _result_dtype(lhs, rhs):
     other_dtype = _operand_dtype(rhs)
     if other_dtype is None:
+        # A Python float promotes an int array to float64 (NEP 50).
+        if (
+            isinstance(rhs, float)
+            and lhs.dtype is not None
+            and np.issubdtype(lhs.dtype, np.integer)
+        ):
+            return _DEFAULT_DTYPE
         return lhs.dtype
-    _check_same_dtype(_operand_dtype(lhs), other_dtype, "an operation")
     return _normalize_dtype(np.result_type(lhs.dtype, other_dtype))
+
+
+def _astype(x, dtype):
+    """Non-fused CAST node: a new array of ``dtype`` with x's shape."""
+    dtype = _normalize_dtype(dtype)
+    x = _materialize(x)
+    if x.dtype == dtype:
+        return x
+    return nonfusible_op(x, operation=ArrayOperation.astype, shape=x.shape, dtype=dtype)
+
+
+def _cast_operand(value, dtype):
+    if isinstance(value, (Array, ArrayView)) and value.dtype != dtype:
+        return _astype(value, dtype)
+    return value
+
+
+def _promote_operands(lhs, rhs):
+    """Cast array operands to the result dtype (kernels use one element type).
+
+    Returns ``(lhs, rhs, dtype)``; ``lhs`` must be an Array or ArrayView.
+    """
+    dtype = _result_dtype(lhs, rhs)
+    return _cast_operand(lhs, dtype), _cast_operand(rhs, dtype), dtype
+
+
+def _normalize_axis(axis, ndims):
+    axis = int(axis)
+    if axis < -ndims or axis >= ndims:
+        raise ValueError(f"axis {axis} is out of bounds for array of dimension {ndims}")
+    return axis % ndims
+
+
+_SCAN_KINDS = {"cumsum": 0, "cumprod": 1, "nancumsum": 2, "nancumprod": 3}
+
+
+def _scan(name, a, axis=None, dtype=None, out=None):
+    """cumsum / cumprod / nancumsum / nancumprod along one axis (SCAN node)."""
+    a = asarray(a)
+    if axis is None:
+        if a.ndims != 1:
+            raise NotImplementedError(
+                f"{name}(axis=None) on a {a.ndims}-D array needs reshape (not supported)"
+            )
+        axis = 0
+    axis = _normalize_axis(axis, a.ndims)
+    if dtype is None:
+        # NumPy accumulates small integers in the platform integer (int64).
+        dtype = a.dtype
+        if np.issubdtype(dtype, np.integer) and dtype.itemsize < np.dtype(np.int_).itemsize:
+            dtype = np.dtype(np.int_)
+    dtype = _normalize_dtype(dtype)
+    src = _astype(a, dtype)
+    result = nonfusible_op(
+        src,
+        axis,
+        _SCAN_KINDS[name],
+        operation=ArrayOperation.scan,
+        shape=src.shape,
+        dtype=dtype,
+    )
+    if out is not None:
+        out[...] = result
+        return out
+    return result
+
+
+def _sort(a, axis=-1, kind=None, order=None, arg=False):
+    """sort / argsort along one axis (SORT / ARGSORT node).
+
+    Gathers the array on one chare (not scalable). NaNs last, always stable.
+    """
+    if order is not None:
+        raise NotImplementedError("sort(order=...) needs structured dtypes")
+    a = asarray(a)
+    if axis is None:
+        if a.ndims != 1:
+            raise NotImplementedError(
+                f"sort(axis=None) on a {a.ndims}-D array needs reshape (not supported)"
+            )
+        axis = 0
+    axis = _normalize_axis(axis, a.ndims)
+    src = _materialize(a)
+    return nonfusible_op(
+        src,
+        axis,
+        operation=ArrayOperation.argsort if arg else ArrayOperation.sort,
+        shape=src.shape,
+        dtype=np.dtype(np.int64) if arg else src.dtype,
+    )
 
 
 def _coerce_operand(value):
@@ -468,34 +581,37 @@ def _coerce_operand(value):
 
 def _array_add(self, other):
     other = _coerce_operand(other)
+    self, other, dtype = _promote_operands(self, other)
     return fusible_op(
         self,
         other,
         operation=ArrayOperation.add,
         shape=_broadcast_shape(self.shape, other),
-        dtype=_result_dtype(self, other),
+        dtype=dtype,
     )
 
 
 def _array_radd(self, other):
     other = _coerce_operand(other)
+    self, other, dtype = _promote_operands(self, other)
     return fusible_op(
         other,
         self,
         operation=ArrayOperation.add,
         shape=_broadcast_shape(self.shape, other),
-        dtype=_result_dtype(self, other),
+        dtype=dtype,
     )
 
 
 def _array_sub(self, other):
     other = _coerce_operand(other)
+    self, other, dtype = _promote_operands(self, other)
     return fusible_op(
         self,
         other,
         operation=ArrayOperation.sub,
         shape=_broadcast_shape(self.shape, other),
-        dtype=_result_dtype(self, other),
+        dtype=dtype,
     )
 
 
@@ -511,56 +627,61 @@ def _array_neg(self):
 
 def _array_rsub(self, other):
     other = _coerce_operand(other)
+    self, other, dtype = _promote_operands(self, other)
     return fusible_op(
         other,
         self,
         operation=ArrayOperation.sub,
         shape=_broadcast_shape(self.shape, other),
-        dtype=_result_dtype(self, other),
+        dtype=dtype,
     )
 
 
 def _array_mul(self, other):
     other = _coerce_operand(other)
+    self, other, dtype = _promote_operands(self, other)
     return fusible_op(
         self,
         other,
         operation=ArrayOperation.mul,
         shape=_broadcast_shape(self.shape, other),
-        dtype=_result_dtype(self, other),
+        dtype=dtype,
     )
 
 
 def _array_rmul(self, other):
     other = _coerce_operand(other)
+    self, other, dtype = _promote_operands(self, other)
     return fusible_op(
         other,
         self,
         operation=ArrayOperation.mul,
         shape=_broadcast_shape(self.shape, other),
-        dtype=_result_dtype(self, other),
+        dtype=dtype,
     )
 
 
 def _array_truediv(self, other):
     other = _coerce_operand(other)
+    self, other, dtype = _promote_operands(self, other)
     return fusible_op(
         self,
         other,
         operation=ArrayOperation.div,
         shape=_broadcast_shape(self.shape, other),
-        dtype=_result_dtype(self, other),
+        dtype=dtype,
     )
 
 
 def _array_rtruediv(self, other):
     other = _coerce_operand(other)
+    self, other, dtype = _promote_operands(self, other)
     return fusible_op(
         other,
         self,
         operation=ArrayOperation.div,
         shape=_broadcast_shape(self.shape, other),
-        dtype=_result_dtype(self, other),
+        dtype=dtype,
     )
 
 
@@ -600,13 +721,11 @@ def _ew_operands(name, *operands):
     if not arrays:
         raise TypeError(f"{name}: at least one operand must be a charmnumeric array")
 
-    dtype = arrays[0].dtype
-    for value in arrays[1:]:
-        if value.dtype != dtype:
-            raise TypeError(
-                f"{name}: operands have different dtypes ({dtype} and {value.dtype}); "
-                "fused charmnumeric kernels use a single element type"
-            )
+    # Kernels use one element type: promote array operands like NumPy.
+    dtype = np.result_type(*[value.dtype for value in arrays])
+    if any(value.dtype != dtype for value in arrays):
+        operands = tuple(_cast_operand(v, dtype) if _is_array(v) else v for v in operands)
+        arrays = [value for value in operands if _is_array(value)]
 
     full = [value for value in arrays if value.size != 1]
     shape = full[0].shape if full else arrays[0].shape
@@ -813,6 +932,14 @@ def _where(condition, x, y):
     condition = _coerce_operand(condition)
     if not _is_array(condition):
         condition = int(bool(condition))
+    else:
+        # The condition takes no part in dtype promotion (NumPy); pass it as an
+        # exact 0/1 mask in the values' dtype.
+        values = [v for v in (_coerce_operand(x), _coerce_operand(y)) if _is_array(v)]
+        if values:
+            dtype = np.result_type(*[v.dtype for v in values])
+            if condition.dtype != dtype:
+                condition = _cast_operand(_compare(condition, 0, "not_equal"), dtype)
     return _ew_ternary(condition, x, y, ArrayOperation.where, "where")
 
 
@@ -1017,6 +1144,7 @@ def _array_matmul(self, other):
     other = _coerce_operand(other)
     if not isinstance(other, (Array, ArrayView)):
         raise ValueError("matmul does not support scalar operands")
+    self, other, _ = _promote_operands(self, other)
 
     if self.ndims == 1 and other.ndims == 1:
         if self.shape[0] != other.shape[0]:
@@ -1024,8 +1152,8 @@ def _array_matmul(self, other):
                 f"Shape mismatch for dot product: ({self.shape[0]},) @ ({other.shape[0]},)"
             )
         return nonfusible_op(
-            self,
-            other,
+            _materialize(self),
+            _materialize(other),
             operation=ArrayOperation.reduce,
             shape=(1,),
             dtype=_result_dtype(self, other),
@@ -1042,6 +1170,14 @@ def _array_matmul(self, other):
             f"3D matmul requires exactly one singleton dim, got shape {self.shape}"
         )
 
+    if self.ndims == 1 and other.ndims == 2:
+        # vecmat: x @ A == A.T @ x
+        if self.shape[0] != other.shape[0]:
+            raise ValueError(
+                f"Shape mismatch for vecmat: ({self.shape[0]},) @ {other.shape}"
+            )
+        return _matvec(_cached_transpose(other), self)
+
     if self.ndims != 2:
         raise ValueError(f"matmul requires a 2D matrix, got {self.ndims}D")
 
@@ -1049,12 +1185,15 @@ def _array_matmul(self, other):
         return _matvec(self, other)
     if other.ndims >= 2:
         if other.ndims == 2 and other.shape[1] == 1:
+            # (M, K) @ (K, 1) -> (M, 1): run it as a matvec, keep the 2-D shape
             temp = create_array((other.shape[0],), dtype=other.dtype)
             temp[:] = other
-            return _matvec(self, temp)
+            return _reshape_copy(_matvec(self, temp), (self.shape[0], 1))
         return _matmatmul(self, other)
 
     raise ValueError(f"matmul requires a 2D operand, got {other.ndims}D")
+
+
 
 
 def _matvec(mat_obj, vec):
@@ -1139,6 +1278,93 @@ def _matmatmul(lhs, rhs):
     )
 
 
+def _normalize_axes(axes, ndim):
+    """Return a full axis permutation tuple for ``transpose(axes)``."""
+
+    if axes is None:
+        return tuple(range(ndim - 1, -1, -1))
+    if isinstance(axes, numbers.Integral):
+        axes = (axes,)
+    axes = tuple(int(axis) for axis in axes)
+    if len(axes) != ndim:
+        raise ValueError("axes don't match array")
+    perm = []
+    for axis in axes:
+        if axis < -ndim or axis >= ndim:
+            raise np.exceptions.AxisError(axis, ndim)
+        perm.append(axis % ndim)
+    if len(set(perm)) != ndim:
+        raise ValueError("repeated axis in transpose")
+    return tuple(perm)
+
+
+def _transpose(x, axes=None):
+    """Permute the axes of ``x``. Returns a new array, not a view (1-D or
+    identity permutations return ``x``)."""
+
+    perm = _normalize_axes(axes, x.ndims)
+    if perm == tuple(range(x.ndims)):
+        return x
+    if x.ndims > 3:
+        raise NotImplementedError(
+            f"transpose of a {x.ndims}D array is not supported (max 3 dims)"
+        )
+
+    shape = tuple(x.shape[axis] for axis in perm)
+    if _shape_size(shape) <= 1:
+        # size-1 operands are sent as broadcast scalars
+        result = empty(shape, dtype=x.dtype)
+        if _shape_size(shape) == 1:
+            result[...] = x
+        return result
+
+    return nonfusible_op(
+        x,
+        *perm,
+        operation=ArrayOperation.transpose,
+        shape=shape,
+        dtype=x.dtype,
+    )
+
+
+def _swapaxes(x, axis1, axis2):
+    ndim = x.ndims
+    for axis in (axis1, axis2):
+        if axis < -ndim or axis >= ndim:
+            raise np.exceptions.AxisError(axis, ndim)
+    perm = list(range(ndim))
+    a, b = int(axis1) % ndim, int(axis2) % ndim
+    perm[a], perm[b] = perm[b], perm[a]
+    return _transpose(x, perm)
+
+
+def _transpose_method(self, *axes):
+    if len(axes) == 0 or (len(axes) == 1 and axes[0] is None):
+        return _transpose(self)
+    if len(axes) == 1 and not isinstance(axes[0], numbers.Integral):
+        return _transpose(self, axes[0])
+    return _transpose(self, axes)
+
+
+_TRANSPOSE_CACHE_MAX = 4
+
+
+def _cached_transpose(x):
+    """Internal transpose for vecmat; cached until the root array is written."""
+
+    root = x._root_parent if isinstance(x, ArrayView) else x
+    cache = root.__dict__.setdefault("_transpose_cache", {})
+    region = x.region
+    key = (tuple(region.start), tuple(region.stop), tuple(region.step))
+    hit = cache.get(key)
+    if hit is None:
+        hit = _transpose(x)
+        if len(cache) >= _TRANSPOSE_CACHE_MAX:
+            cache.pop(next(iter(cache)))
+        cache[key] = hit
+    return hit
+
+
 class Array(FrontendObject, _ElementwiseMethods):
     __array_priority__ = 1000
     # __eq__ is elementwise; keep FrontendObject's name-based hash
@@ -1157,6 +1383,10 @@ class Array(FrontendObject, _ElementwiseMethods):
 
         self._shape = tuple(shape) if shape is not None else tuple(self.region.shape())
         self.ndims = len(self._shape)
+        if not 1 <= self.ndims <= 3:
+            raise NotImplementedError(
+                f"charmnumeric arrays must have 1 to 3 dimensions, got shape {self._shape}"
+            )
         self._size = _shape_size(self._shape)
 
         if self.region.is_global and self._shape is not None:
@@ -1221,6 +1451,10 @@ class Array(FrontendObject, _ElementwiseMethods):
         return ArrayView(self, region, **kwargs)
 
     def __getitem__(self, key):
+        if _has_newaxis(key):
+            # a view cannot change ndims: return a copy
+            view = self[_expand_key(key, self.ndims)]
+            return _reshape_copy(view, _newaxis_shape(key, view.shape, self.ndims))
         region = _parse_key(key, self._shape, self.ndims)
         region_shape = region.shape()
         return self.get_region(
@@ -1232,9 +1466,21 @@ class Array(FrontendObject, _ElementwiseMethods):
         )
 
     def __setitem__(self, key, rhs):
-        region = _parse_key(key, self._shape, self.ndims)
-        rhs = _coerce_assignment_operand(rhs, region.shape(), self.dtype)
-        self.set_region(region, rhs, shape=region.shape(), dtype=self.dtype)
+        _setitem(self, key, rhs)
+
+    def set_region(self, region, rhs, **kwargs):
+        # all writes (incl. via views) land here
+        self.__dict__.pop("_transpose_cache", None)
+        return super().set_region(region, rhs, **kwargs)
+
+    @property
+    def T(self):
+        return _transpose(self)
+
+    transpose = _transpose_method
+
+    def swapaxes(self, axis1, axis2):
+        return _swapaxes(self, axis1, axis2)
 
     __add__ = _array_add
     __radd__ = _array_radd
@@ -1268,8 +1514,13 @@ class Array(FrontendObject, _ElementwiseMethods):
     __xor__ = __rxor__ = _logical_xor
     __invert__ = _logical_not
 
-    def dot(self, other):
-        return _array_matmul(self, other)
+    def dot(self, other, out=None):
+        return _write_out(_array_matmul(self, other), out)
+
+    def take(self, indices, axis=None, out=None, mode="raise"):
+        from .operations import take
+
+        return take(self, indices, axis=axis, out=out, mode=mode)
 
     def matvec(self, vec):
         return _matvec(self, vec)
@@ -1285,10 +1536,21 @@ class Array(FrontendObject, _ElementwiseMethods):
     def astype(self, dtype, copy=True):
         dtype = _normalize_dtype(dtype)
         if dtype != self.dtype:
-            raise NotImplementedError(
-                "dtype conversion for existing charmnumeric arrays is not implemented yet"
-            )
+            return _astype(self, dtype)
         return self.copy() if copy else self
+
+    def cumsum(self, axis=None, dtype=None, out=None):
+        return _scan("cumsum", self, axis, dtype, out)
+
+    def cumprod(self, axis=None, dtype=None, out=None):
+        return _scan("cumprod", self, axis, dtype, out)
+
+    def sort(self, axis=-1, kind=None, order=None):
+        """Sort in place along ``axis`` (like ``ndarray.sort``)."""
+        self[...] = _sort(self, axis, kind, order)
+
+    def argsort(self, axis=-1, kind=None, order=None):
+        return _sort(self, axis, kind, order, arg=True)
 
 
 class ArrayView(FrontendObjectView, _ElementwiseMethods):
@@ -1348,6 +1610,9 @@ class ArrayView(FrontendObjectView, _ElementwiseMethods):
         return materialized.get(interface)
 
     def __getitem__(self, key):
+        if _has_newaxis(key):
+            view = self[_expand_key(key, self.ndims)]
+            return _reshape_copy(view, _newaxis_shape(key, view.shape, self.ndims))
         region = _parse_key(key, self.shape, self.ndims)
         region_shape = region.shape()
         return self.get_region(
@@ -1359,9 +1624,16 @@ class ArrayView(FrontendObjectView, _ElementwiseMethods):
         )
 
     def __setitem__(self, key, rhs):
-        region = _parse_key(key, self.shape, self.ndims)
-        rhs = _coerce_assignment_operand(rhs, region.shape(), self.dtype)
-        self.set_region(region, rhs, shape=region.shape(), dtype=self.dtype)
+        _setitem(self, key, rhs)
+
+    @property
+    def T(self):
+        return _transpose(self)
+
+    transpose = _transpose_method
+
+    def swapaxes(self, axis1, axis2):
+        return _swapaxes(self, axis1, axis2)
 
     __add__ = _array_add
     __radd__ = _array_radd
@@ -1395,8 +1667,13 @@ class ArrayView(FrontendObjectView, _ElementwiseMethods):
     __xor__ = __rxor__ = _logical_xor
     __invert__ = _logical_not
 
-    def dot(self, other):
-        return _array_matmul(self, other)
+    def dot(self, other, out=None):
+        return _write_out(_array_matmul(self, other), out)
+
+    def take(self, indices, axis=None, out=None, mode="raise"):
+        from .operations import take
+
+        return take(self, indices, axis=axis, out=out, mode=mode)
 
     def matvec(self, vec):
         return _matvec(self, vec)
@@ -1412,10 +1689,21 @@ class ArrayView(FrontendObjectView, _ElementwiseMethods):
     def astype(self, dtype, copy=True):
         dtype = _normalize_dtype(dtype)
         if dtype != self.dtype:
-            raise NotImplementedError(
-                "dtype conversion for existing charmnumeric arrays is not implemented yet"
-            )
+            return _astype(self, dtype)
         return self.copy() if copy else self
+
+    def cumsum(self, axis=None, dtype=None, out=None):
+        return _scan("cumsum", self, axis, dtype, out)
+
+    def cumprod(self, axis=None, dtype=None, out=None):
+        return _scan("cumprod", self, axis, dtype, out)
+
+    def sort(self, axis=-1, kind=None, order=None):
+        """Sort in place along ``axis`` (like ``ndarray.sort``)."""
+        self[...] = _sort(self, axis, kind, order)
+
+    def argsort(self, axis=-1, kind=None, order=None):
+        return _sort(self, axis, kind, order, arg=True)
 
 
 def create_array(shape, dtype=_DEFAULT_DTYPE, **kwargs):
@@ -1533,7 +1821,6 @@ def _shape_dtype_from_like(obj):
 
 def _coerce_assignment_operand(rhs, shape, dtype):
     if isinstance(rhs, (Array, ArrayView)):
-        _check_same_dtype(_normalize_dtype(dtype, allow_none=True), rhs.dtype, "assignment")
         if _shape_size(shape) > 1:
             return _scalar_view_operand(rhs)
         return rhs
@@ -1553,6 +1840,118 @@ def _coerce_assignment_operand(rhs, shape, dtype):
         ) from exc
 
     return _array_from_host_data(host, dtype=host.dtype, copy=False)
+
+
+def _squeeze_shape(shape):
+    return tuple(dim for dim in shape if dim != 1)
+
+
+def _is_whole(x):
+    """True if ``x`` is an Array, or a view covering its whole root array."""
+
+    if isinstance(x, Array):
+        return True
+    root = x._root_parent
+    region = x.region
+    return (
+        tuple(x.shape) == tuple(root.shape)
+        and all(s == 0 for s in region.start)
+        and all(st == 1 for st in region.step)
+    )
+
+
+def _materialize(x):
+    """Copy a partial view (REDUCE/TILE/DIAG ignore view regions)."""
+
+    if isinstance(x, ArrayView) and not _is_whole(x):
+        return x.copy()
+    return x
+
+
+def _expand_scalar_array(value, shape):
+    """Non-broadcast set_region source with a size-1 array's value.
+
+    Cross-rank broadcasts hang the backend, so the rank changes via a
+    one-element regular copy first.
+    """
+
+    def ones_view(arr):
+        # one-element view of a 2-element array: a regular (non-broadcast) operand
+        nd = arr.ndims
+        pair = zeros((1,) * (nd - 1) + (2,), dtype=arr.dtype) + arr
+        return pair[(slice(None),) * (nd - 1) + (slice(0, 1),)]
+
+    if value.ndims != len(shape):
+        moved = empty((1,) * len(shape), dtype=value.dtype)
+        moved.set_region(_full_region(moved.shape), ones_view(value),
+                         shape=moved.shape, dtype=value.dtype)
+        value = moved
+    if _shape_size(shape) > 1:
+        return zeros(shape, dtype=value.dtype) + value
+    return ones_view(value)
+
+
+def _setitem(self, key, rhs):
+    region = _parse_key(key, self.shape, self.ndims)
+    shape = tuple(region.shape())
+    rhs = _coerce_assignment_operand(rhs, shape, self.dtype)
+    rhs = _cast_operand(rhs, self.dtype)  # NumPy casts on assignment
+    if isinstance(rhs, (Array, ArrayView)) and _shape_size(
+        (rhs._root_parent if isinstance(rhs, ArrayView) else rhs).shape
+    ) == 1:
+        if rhs.ndims == self.ndims:
+            result = self.set_region(region, rhs, shape=shape, dtype=self.dtype)
+            prefix = get_execution_state().open_prefix
+            owner = rhs._root_parent if isinstance(rhs, ArrayView) else rhs
+            if prefix is not None and any(o is result for o in prefix.objs) and any(
+                o is owner for o in prefix.objs
+            ):
+                return  # fused with rhs's producer: the kernel has array inputs
+        # a set_region whose only input is a broadcast writes nothing
+        rhs = _expand_scalar_array(rhs, shape)
+    if isinstance(rhs, (Array, ArrayView)) and int(rhs.size) != 1 and tuple(rhs.shape) != shape:
+        # shapes differing only in size-1 dims: cross-ndim set_region
+        if _squeeze_shape(rhs.shape) != _squeeze_shape(shape):
+            raise ValueError(
+                f"could not broadcast input array from shape {tuple(rhs.shape)} "
+                f"into shape {shape}"
+            )
+    self.set_region(region, rhs, shape=shape, dtype=self.dtype)
+
+
+def _reshape_copy(x, shape):
+    """New Array of ``shape`` holding ``x`` (shapes differ only in size-1 dims)."""
+
+    result = empty(shape, dtype=x.dtype)
+    result[...] = x
+    return result
+
+
+def _write_out(result, out):
+    """NumPy ``out=``: ``out[...] = result`` (out may be a view); returns out."""
+
+    if out is None:
+        return result
+    if isinstance(out, tuple):
+        if len(out) != 1:
+            raise ValueError("out must be a single array or a 1-tuple")
+        out = out[0]
+    if not isinstance(out, (Array, ArrayView)):
+        raise TypeError("out must be a charmnumeric Array or ArrayView")
+
+    if isinstance(result, (Array, ArrayView)):
+        if int(result.size) != 1 and tuple(result.shape) != tuple(out.shape):
+            raise ValueError(
+                f"non-broadcastable output operand with shape {tuple(out.shape)} "
+                f"doesn't match the broadcast shape {tuple(result.shape)}"
+            )
+        if result.dtype != out.dtype:
+            raise TypeError(
+                f"cannot write a {result.dtype} result into a {out.dtype} out array "
+                "(dtype conversion is not implemented yet)"
+            )
+    out[...] = result
+    return out
 
 
 def empty(shape, dtype=_DEFAULT_DTYPE):
@@ -1627,9 +2026,7 @@ def asarray(a, dtype=None):
     if isinstance(a, (Array, ArrayView)):
         if requested_dtype is None or requested_dtype == a.dtype:
             return a
-        raise NotImplementedError(
-            "dtype conversion for existing charmnumeric arrays is not implemented yet"
-        )
+        return _astype(a, requested_dtype)
 
     return _array_from_host_data(a, dtype=requested_dtype, copy=False)
 
@@ -1639,12 +2036,9 @@ def array(a, dtype=None, copy=True, ndmin=0):
 
     if isinstance(a, (Array, ArrayView)):
         target_dtype = a.dtype if requested_dtype is None else requested_dtype
-        if target_dtype != a.dtype:
-            raise NotImplementedError(
-                "dtype conversion for existing charmnumeric arrays is not implemented yet"
-            )
-
         target_shape = _apply_ndmin(a.shape, ndmin)
+        if target_dtype != a.dtype and target_shape == a.shape:
+            return _astype(a, target_dtype)
         if not copy and target_shape == a.shape:
             return a
 

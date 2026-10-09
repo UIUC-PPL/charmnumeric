@@ -3,17 +3,16 @@
 
 Verdict: port with workarounds (fully native).
 Same as kmeans.py (distances, native argmin -> labels and one-hot M,
-transposed centroids), but find_centroids keeps the original per-centroid loop:
+native centroids.T), but find_centroids keeps the original per-centroid loop:
     counts = bincount(labels)      ->  sum(M, axis=0)              (native)
     centroid_mask = labels == idx  ->  mask = M @ e_idx            (1-D, native)
     np.sum(np.where(mask[..., newaxis], data, zero_point), axis=0)
-                                   ->  dataT @ mask   (no (N,1) x (N,D) broadcast;
-                                                       where(m,x,0) == m*x)
+                                   ->  mask @ data   (native vecmat; where(m,x,0) == m*x)
     distance_sum += np.sum(np.where(mask, pairwise[:, idx], 0.0))
                                    ->  sum(mask * (pairwise @ e_idx))   (native sum)
-centroidsT[:, idx:idx+1] = dataT @ mask is a 1-D -> 2-D set_region whose
-offset lies only in the singleton column dim. The backend cross-ndim path
-handles that case.
+centroids[idx:idx+1, :] = mask @ data is a 1-D -> 2-D set_region whose
+offset lies only in the singleton row dim. The backend cross-ndim path
+handles that case. The vecmat reuses one cached transpose of data.
 """
 
 import os
@@ -30,7 +29,7 @@ from _cnum_connect import get_interface  # noqa: E402
 from kmeans import calculate_distances, initialize, parse, relabel  # noqa: E402
 
 
-def find_centroids(centroidsT, dataT, M, pairwise, N, D, C, T):
+def find_centroids(centroids, data, M, pairwise, N, D, C, T):
     # Get the number of points associated with each centroid
     counts = cnp.sum(M, axis=0, keepdims=True)  # bincount(labels, minlength=C) as (1, C)
     # Build label masks for each centroid and sum across all the
@@ -39,15 +38,15 @@ def find_centroids(centroidsT, dataT, M, pairwise, N, D, C, T):
     for idx in range(C):
         e = U.unit_vector(C, idx, dtype=T)
         # Boolean mask indicating where the points are for this center
-        centroid_mask = labels == idx
-        centroidsT[:, idx : idx + 1] = dataT @ centroid_mask
+        centroid_mask = M @ e  # (N,) 0/1 mask of points labelled idx
+        centroids[idx : idx + 1, :] = centroid_mask @ data
         term = cnp.sum(centroid_mask * (pairwise @ e))
         distance_sum = term if distance_sum is None else distance_sum + term
 
     # To avoid introducing divide by zero errors
     counts = cnp.maximum(counts, 1.0)
-    centroidsT = centroidsT / cnp.tile(U.materialize(counts), (D, 1))
-    return centroidsT, distance_sum
+    centroids = centroids / cnp.tile(counts.T, (1, D))  # counts[:, newaxis]
+    return centroids, distance_sum
 
 
 def run_kmeans(interface, C, D, T, I, N, S, benchmarking=False):  # noqa: E741
@@ -56,8 +55,8 @@ def run_kmeans(interface, C, D, T, I, N, S, benchmarking=False):  # noqa: E741
     print("Number of dimensions: " + str(D))
     print("Number of centroids: " + str(C))
     print("Max iterations: " + str(I))
-    data, dataT, centroidsT = initialize(N, D, C, T)
-    init_host = [x.get(interface) for x in (data, dataT, centroidsT)]
+    data, centroids = initialize(N, D, C, T)
+    init_host = [x.get(interface) for x in (data, centroids)]
 
     DD = (data * data) @ cnp.ones((D, C), dtype=T)
     ones_ND = cnp.ones((N, D), dtype=T)
@@ -66,10 +65,10 @@ def run_kmeans(interface, C, D, T, I, N, S, benchmarking=False):  # noqa: E741
     iteration = 0
     prior_distance_sum = None
     while iteration < I:
-        pairwise = calculate_distances(data, centroidsT, DD, ones_ND)
+        pairwise = calculate_distances(data, centroids, DD, ones_ND)
         new_labels, M = relabel(pairwise, N, C, T)
-        centroidsT, distance_sum = find_centroids(
-            centroidsT, dataT, M, pairwise, N, D, C, T
+        centroids, distance_sum = find_centroids(
+            centroids, data, M, pairwise, N, D, C, T
         )
         if iteration > 0 and iteration % S == 0:
             total_changes = U.to_float(cnp.count_nonzero(labels - new_labels), interface)
@@ -84,7 +83,7 @@ def run_kmeans(interface, C, D, T, I, N, S, benchmarking=False):  # noqa: E741
         iteration += 1
     prior_distance_sum = U.to_float(prior_distance_sum, interface)
     print(f"Final distance sum at iteration {iteration}: {prior_distance_sum}")
-    return centroidsT, iteration, prior_distance_sum, init_host
+    return centroids, iteration, prior_distance_sum, init_host
 
 
 # ---- original NumPy algorithm (slow variant, reference) ----------------------
@@ -121,15 +120,14 @@ def main(chk):
         raise TypeError("Precision must be one of 32 or 64")
     interface = get_interface()
     t0 = time.perf_counter()
-    centroidsT, iters, dist, init_host = run_kmeans(interface, args.C, args.D, T, args.I, args.N * 1000, args.S)
+    centroids, iters, dist, init_host = run_kmeans(interface, args.C, args.D, T, args.I, args.N * 1000, args.S)
     print(f"Elapsed Time: {(time.perf_counter() - t0) * 1e3:.3f} ms (incl. sync)")
 
-    data_h, dataT_h, cT_h = init_host
-    chk.close("generated dataT == data.T", dataT_h, data_h.T, rtol=0, atol=0)
-    c_ref, it_ref, d_ref = reference(numpy, data_h.copy(), cT_h.T.copy(), args.C, args.D, args.I, args.S)
+    data_h, c_h = init_host
+    c_ref, it_ref, d_ref = reference(numpy, data_h.copy(), c_h.copy(), args.C, args.D, args.I, args.S)
     rtol = 1e-4 if T == numpy.float32 else 1e-9
     chk.true("iteration count", iters == it_ref, f"(port {iters}, numpy {it_ref})")
-    chk.close("centroids", centroidsT.get(interface).T, c_ref, rtol=rtol, atol=rtol)
+    chk.close("centroids", centroids.get(interface), c_ref, rtol=rtol, atol=rtol)
     chk.close("final distance sum", dist, d_ref, rtol=rtol, atol=0)
 
 

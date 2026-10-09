@@ -115,7 +115,9 @@ class MLIRJitCompiler {
     std::unique_ptr<mlir::ExecutionEngine> generateCPU();
     bool loadCPU(std::unique_ptr<mlir::ExecutionEngine>& engine, const char* kernelName,
                  void** moduleOut, void** functionOut);
+    bool verify();
     void dumpMLIR();
+    void printModule(llvm::raw_ostream& os);
 
 #ifdef USE_NVIDIA
     /// Lower the fused function to a host-side launcher (kernels embedded as PTX,
@@ -125,11 +127,8 @@ class MLIRJitCompiler {
     std::unique_ptr<mlir::ExecutionEngine> generateNVIDIAHost();
 #endif
 #ifdef JIT_ENABLE_GPU_BACKEND
-    std::string generateNVIDIA();
     std::string generateAMD();
     std::string generateIntel();
-    bool loadNVIDIA(const std::string& ptx, const char* kernelName, void** moduleOut,
-                    void** functionOut);
     bool loadAMD(const std::string& gcn, const char* kernelName, void** moduleOut,
                  void** functionOut);
     bool loadIntel(const std::string& spirv, const char* kernelName, void** moduleOut,
@@ -145,7 +144,7 @@ class MLIRJitCompiler {
 #ifdef USE_NVIDIA
     bool lowerToNVIDIAHost();
 #endif
-    mlir::MLIRContext context;
+    mlir::MLIRContext& context;
     mlir::OwningOpRef<mlir::ModuleOp> module;
     std::unique_ptr<mlir::OpBuilder> builder;
 
@@ -170,7 +169,6 @@ class MLIRJitCompiler {
     std::string
     translateToTarget(llvm::StringRef triple, llvm::StringRef cpu, llvm::StringRef features,
                       llvm::CodeGenFileType fileType = llvm::CodeGenFileType::AssemblyFile);
-    std::string serializeToPTX();
     std::string serializeToGCN();
     std::string serializeToSPIRV();
 #endif

@@ -2,7 +2,6 @@
 #include "jit_api.hpp"
 
 #include <pthread.h>
-#include <string>
 
 #if !defined(USE_NVIDIA) && !defined(USE_AMD) && !defined(USE_INTEL)
 namespace {
@@ -81,7 +80,6 @@ void ArrayDAGGroup::compile(DAG* dag) {
                 compile_cache[node->identifier] = nullptr;
                 continue;
             }
-            num_compile++;
             newly_compiled++;
             void* compiled_fn = compile_node(node);
             compile_cache[node->identifier] = compiled_fn;

@@ -129,20 +129,6 @@ inline T eigen_dot(T* a_data, T* b_data, int n) {
     return a.dot(b);
 }
 
-/// Eigen-based gemm: C += A * B (accumulate).
-/// A is (a_rows × a_cols), B is (a_cols × b_cols), C is (a_rows × b_cols).
-/// All matrices are row-major, contiguous.
-template <typename T>
-inline void eigen_gemm(T* a_data, int a_rows, int a_cols,
-                       T* b_data, int b_cols,
-                       T* c_data) {
-    using Mat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-    Eigen::Map<Mat> A(a_data, a_rows, a_cols);
-    Eigen::Map<Mat> B(b_data, a_cols, b_cols);
-    Eigen::Map<Mat> C(c_data, a_rows, b_cols);
-    C.noalias() += A * B;
-}
-
 /// Eigen-based sub-matrix gemm: C += A_sub * B_sub (accumulate).
 /// Extracts sub-blocks from row-major A and B by offset, accumulates into C.
 /// A has row stride a_full_cols, B has row stride b_full_cols.
@@ -245,6 +231,11 @@ bool extract_regions_nd(DAGNode* node, std::unordered_map<int, CTArrayBase<N>*>&
 /// Determine the DType for a DAG node from its AST or the arrays map.
 template <int N>
 DType determine_dtype(DAGNode* node, std::unordered_map<int, CTArrayBase<N>*>& arrays);
+
+/// TRANSPOSE receive side (executor_transpose.cpp, N = 2, 3).
+template <int N, typename T>
+void transpose_place(ArrayDAGGroup* dag_group, PartitionImpl<N>* partition, ASTNode* root,
+                     PendingComm<N>* comm);
 
 /// Send matmul result from a 3D partition back to a 1D partition.
 template <typename T>
@@ -403,7 +394,7 @@ struct CrossSetRegionMap {
     /// Target region (global) written from the source chare covering
     /// src_chare (global).  Returns false if that chare holds none of the view.
     bool mapped_region(const ArrayRegion<N_src>& src_chare, ArrayRegion<N_tgt>& out) const {
-        int k_lo[N_src], k_hi[N_src];
+        int k_lo[N_src] = {}, k_hi[N_src] = {};
         for (int d = 0; d < N_src; ++d) {
             if (!is_mapped_src(d)) {
                 // Fixed coordinate: this chare must own it.

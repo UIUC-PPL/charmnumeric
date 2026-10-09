@@ -523,7 +523,6 @@ void ArrayDAGExecutorND<N>::execute_diag_node(DAGNode* node) {
                 node_finished(node->id);
                 return;
             }
-            int diag_len = result_meta_it->second.global_shape[0];
             auto result_decomp = result_meta_it->second.template decomp<1>();
             auto result_chare = result_decomp.chare_region_global(nd_idx);
             int my_start_idx = result_chare.start[0];

@@ -1,6 +1,15 @@
 #include "backend_internal.hpp"
 #include "dispatch.hpp"
 
+#ifdef USE_NVIDIA
+#define CT_CUDA_CHECK(call)                                                                        \
+    do {                                                                                           \
+        cudaError_t err_ = (call);                                                                 \
+        if (err_ != cudaSuccess)                                                                   \
+            CkAbort("CUDA error '%s' at %s:%d", cudaGetErrorString(err_), __FILE__, __LINE__);     \
+    } while (0)
+#endif
+
 template <int N>
 void PartitionImpl<N>::init(typename PartitionTraits<N>::ProxyType proxy, std::array<int, N> idx,
                             CProxy_ArrayDAGGroup dag_proxy_) {
@@ -8,8 +17,8 @@ void PartitionImpl<N>::init(typename PartitionTraits<N>::ProxyType proxy, std::a
     index = idx;
     dag_proxy = dag_proxy_;
 #ifdef USE_NVIDIA
-    cudaStreamCreate(&compute_stream_raw);
-    cudaStreamCreate(&comm_stream_raw);
+    CT_CUDA_CHECK(cudaStreamCreate(&compute_stream_raw));
+    CT_CUDA_CHECK(cudaStreamCreate(&comm_stream_raw));
     compute_exec = Kokkos::Cuda(compute_stream_raw);
     comm_exec = Kokkos::Cuda(comm_stream_raw);
 #endif
@@ -34,6 +43,13 @@ PartitionImpl<N>::~PartitionImpl() {
     for (auto& [key, bucket] : free_arrays)
         for (auto* arr : bucket)
             delete arr;
+#ifdef USE_KOKKOS
+    for (auto& [id, ptr] : pending_sends)
+        Kokkos::kokkos_free<DeviceSpace>(ptr);
+    for (auto& [key, bufs] : posted_recv_bufs)
+        for (char* p : bufs)
+            Kokkos::kokkos_free<DeviceSpace>(p);
+#endif
 #ifdef USE_NVIDIA
     cudaStreamDestroy(compute_stream_raw);
     cudaStreamDestroy(comm_stream_raw);
@@ -69,6 +85,13 @@ int PartitionImpl<N>::create(ArrayRegion<N>* region, int name, DType dtype,
     }
     dag_group->live_array_meta[name] = live_meta;
 
+    // A re-created array replaces any previous buffer, even when this chare no longer owns a tile.
+    auto old_it = arrays.find(name);
+    if (old_it != arrays.end()) {
+        delete old_it->second;
+        arrays.erase(old_it);
+    }
+
     auto local_region = decomp.chare_region_local(nd_idx);
     for (int d = 0; d < N; ++d) {
         local_sizes[d] = local_region.size(d);
@@ -77,11 +100,6 @@ int PartitionImpl<N>::create(ArrayRegion<N>* region, int name, DType dtype,
     }
 
     ArrayRegion<N> chare_region(zeros, local_sizes, steps);
-    auto old_it = arrays.find(name);
-    if (old_it != arrays.end()) {
-        delete old_it->second;
-        arrays.erase(old_it);
-    }
 
     arrays[name] = allocate_or_reuse(chare_region, global_shape, name, dtype, decomp);
     return name;

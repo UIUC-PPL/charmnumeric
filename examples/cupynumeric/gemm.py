@@ -2,8 +2,8 @@
 """charmnumeric port of cupynumeric/examples/gemm.py (rotating GEMM).
 
 Verdict: direct port.
-  * np.dot(A, B, out=C) becomes C[...] = A @ B (no out= argument; SUMMA
-    result copied into C).
+  * np.dot(A, B, out=C) is native (cnp.dot with out=; the SUMMA result is
+    copied into C).
   * np.random.uniform(...).astype(ft) is cnp.random.uniform(..., dtype=ft)
     (native generator; no astype yet).
   * --precision 16 is not supported (no float16 in charmnumeric).
@@ -36,10 +36,7 @@ def total_flops(M, N, K):
 
 def gemm_loop(np, A, B, C, I, warmup):  # noqa: E741
     for idx in range(I + warmup):
-        if np is numpy:
-            np.dot(A, B, out=C)
-        else:
-            C[...] = A @ B
+        np.dot(A, B, out=C)
         # rotate the matrices (as in the original)
         A, B, C = B, C, A
     return A, B, C

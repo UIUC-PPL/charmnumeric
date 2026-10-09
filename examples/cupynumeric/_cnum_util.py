@@ -56,6 +56,19 @@ def to_float(x, interface):
     return float(np.asarray(x.get(interface)).reshape(-1)[0])
 
 
+def allclose(a, b, interface, rtol=1e-05, atol=1e-08):
+    """numpy.allclose(a, b) evaluated natively; only the verdict is fetched."""
+    ok = cnp.all(cnp.abs(a - b) <= atol + rtol * cnp.abs(b))
+    return to_float(ok, interface) != 0.0
+
+
+def tolerances(dtype):
+    """(rtol, atol) for allclose: NumPy's defaults for float64, scaled for float32."""
+    if np.dtype(dtype) == np.float32:
+        return 1e-04, 1e-05
+    return 1e-05, 1e-08
+
+
 # ---------------------------------------------------------------------------
 # native index / pseudo-random generation
 # ---------------------------------------------------------------------------
@@ -106,7 +119,7 @@ def linear_index(shape, perm=None, dtype=np.float64):
     for out_axis, src_axis in enumerate(perm):
         if shape[src_axis] == 1:
             continue
-        term = index_grid(out_shape, out_axis, dtype=dtype) * float(strides[src_axis])
+        term = index_grid(out_shape, out_axis, dtype=dtype) * strides[src_axis]  # int: keeps int dtypes
         L = term if L is None else L + term
     if L is None:
         L = cnp.zeros(out_shape, dtype=dtype)
@@ -227,52 +240,6 @@ def int_mod(x, m):
 def greater(a, b):
     """Indicator (a > b) as a 0/1 mask (native comparison, exact)."""
     return a > b
-
-
-# ---------------------------------------------------------------------------
-# sorting network (odd-even transposition sort), built from slices + select
-# ---------------------------------------------------------------------------
-def _axis_slice(nd, axis, s):
-    key = [slice(None)] * nd
-    key[axis] = s
-    return tuple(key)
-
-
-def oddeven_sort(a, axis=-1, index=None):
-    """Sort `a` along `axis` with an odd-even transposition network.
-
-    n phases. Each phase compare-exchanges the pairs (2i, 2i+1) or
-    (2i+1, 2i+2) through strided views, using the native comparison
-    x > y (a 0/1 mask) and where(). Each phase writes into a fresh buffer
-    (double buffering), so the backend never has to resolve aliasing
-    between reads and writes of the same array. If `index` (same shape and
-    dtype) is given, it is permuted alongside, which gives argsort. Exact
-    for any keys without NaN; equal keys are never swapped.
-    Returns (sorted, index_or_None).
-    """
-    nd = a.ndim
-    axis = axis % nd
-    n = a.shape[axis]
-    for phase in range(n):
-        start = phase % 2
-        m = (n - start) // 2
-        if m == 0:
-            continue
-        lo = _axis_slice(nd, axis, slice(start, start + 2 * m, 2))
-        hi = _axis_slice(nd, axis, slice(start + 1, start + 2 * m, 2))
-        x, y = a[lo], a[hi]
-        h = x > y  # 1 -> swap
-        a_new = a.copy()
-        a_new[lo] = cnp.where(h, y, x)
-        a_new[hi] = cnp.where(h, x, y)
-        if index is not None:
-            ix, iy = index[lo], index[hi]
-            i_new = index.copy()
-            i_new[lo] = cnp.where(h, iy, ix)
-            i_new[hi] = cnp.where(h, ix, iy)
-            index = i_new
-        a = a_new
-    return a, index
 
 
 # ---------------------------------------------------------------------------

@@ -8,6 +8,7 @@ from .charmnumeric import (
     Array,
     ArrayOperation,
     ArrayView,
+    _astype,
     _clip,
     _coerce_scalar,
     _compare,
@@ -19,11 +20,19 @@ from .charmnumeric import (
     _logical_not,
     _logical_or,
     _logical_xor,
+    _materialize,
+    _normalize_dtype,
     _power,
     _reciprocal,
+    _reshape_copy,
     _round,
+    _scan,
+    _sort,
+    _swapaxes,
+    _transpose,
     _trunc,
     _where,
+    _write_out,
     arange,
     array,
     asarray,
@@ -51,25 +60,29 @@ def _coerce_binary_operand(value):
     return asarray(value)
 
 
-def tanh(x):
+def tanh(x, out=None):
     if _is_scalar_like(x):
-        return np.tanh(_coerce_scalar(x))
+        return _write_out(np.tanh(_coerce_scalar(x)), out)
     x = asarray(x)
-    return fusible_op(x, operation=ArrayOperation.tanh, shape=x.shape, dtype=x.dtype)
+    return _write_out(
+        fusible_op(x, operation=ArrayOperation.tanh, shape=x.shape, dtype=x.dtype), out
+    )
 
 
-def exp(x):
+def exp(x, out=None):
     if _is_scalar_like(x):
-        return np.exp(_coerce_scalar(x))
+        return _write_out(np.exp(_coerce_scalar(x)), out)
     x = asarray(x)
-    return fusible_op(x, operation=ArrayOperation.exp, shape=x.shape, dtype=x.dtype)
+    return _write_out(
+        fusible_op(x, operation=ArrayOperation.exp, shape=x.shape, dtype=x.dtype), out
+    )
 
 
 def tile(x, reps):
     if _is_scalar_like(x):
         return array(np.tile(_coerce_scalar(x), reps))
 
-    x = asarray(x)
+    x = _materialize(asarray(x))
     if isinstance(reps, int):
         reps = (reps,)
     reps = tuple(int(rep) for rep in reps)
@@ -88,45 +101,45 @@ def tile(x, reps):
     )
 
 
-def add(x1, x2):
+def add(x1, x2, out=None):
     if _is_scalar_like(x1) and _is_scalar_like(x2):
-        return _coerce_scalar(x1) + _coerce_scalar(x2)
-    return _coerce_binary_operand(x1) + _coerce_binary_operand(x2)
+        return _write_out(_coerce_scalar(x1) + _coerce_scalar(x2), out)
+    return _write_out(_coerce_binary_operand(x1) + _coerce_binary_operand(x2), out)
 
 
-def subtract(x1, x2):
+def subtract(x1, x2, out=None):
     if _is_scalar_like(x1) and _is_scalar_like(x2):
-        return _coerce_scalar(x1) - _coerce_scalar(x2)
-    return _coerce_binary_operand(x1) - _coerce_binary_operand(x2)
+        return _write_out(_coerce_scalar(x1) - _coerce_scalar(x2), out)
+    return _write_out(_coerce_binary_operand(x1) - _coerce_binary_operand(x2), out)
 
 
-def multiply(x1, x2):
+def multiply(x1, x2, out=None):
     if _is_scalar_like(x1) and _is_scalar_like(x2):
-        return _coerce_scalar(x1) * _coerce_scalar(x2)
-    return _coerce_binary_operand(x1) * _coerce_binary_operand(x2)
+        return _write_out(_coerce_scalar(x1) * _coerce_scalar(x2), out)
+    return _write_out(_coerce_binary_operand(x1) * _coerce_binary_operand(x2), out)
 
 
-def divide(x1, x2):
+def divide(x1, x2, out=None):
     if _is_scalar_like(x1) and _is_scalar_like(x2):
-        return _coerce_scalar(x1) / _coerce_scalar(x2)
-    return _coerce_binary_operand(x1) / _coerce_binary_operand(x2)
+        return _write_out(_coerce_scalar(x1) / _coerce_scalar(x2), out)
+    return _write_out(_coerce_binary_operand(x1) / _coerce_binary_operand(x2), out)
 
 
-def matmul(x1, x2):
+def matmul(x1, x2, out=None):
     if _is_scalar_like(x1) or _is_scalar_like(x2):
         raise ValueError("matmul does not support scalar operands")
-    return asarray(x1) @ asarray(x2)
+    return _write_out(asarray(x1) @ asarray(x2), out)
 
 
-def dot(x1, x2):
+def dot(x1, x2, out=None):
     if _is_scalar_like(x1) and _is_scalar_like(x2):
-        return _coerce_scalar(x1) * _coerce_scalar(x2)
+        return _write_out(_coerce_scalar(x1) * _coerce_scalar(x2), out)
 
     lhs = _coerce_binary_operand(x1)
     rhs = _coerce_binary_operand(x2)
     if _is_scalar_like(lhs) or _is_scalar_like(rhs):
-        return lhs * rhs
-    return lhs.dot(rhs)
+        return _write_out(lhs * rhs, out)
+    return lhs.dot(rhs, out=out)
 
 
 def norm2(x):
@@ -141,7 +154,7 @@ def norm2(x):
 def diag(v, k=0):
     """Construct a diagonal matrix or extract a diagonal."""
 
-    v = asarray(v)
+    v = _materialize(asarray(v))
 
     if v.ndims == 1:
         n = v.shape[0] + builtins.abs(k)
@@ -374,20 +387,326 @@ def clip(a, a_min=None, a_max=None, out=None, *, min=None, max=None):
     return _with_out(_clip(a, a_min, a_max), out)
 
 
+def transpose(a, axes=None):
+    """``numpy.transpose`` for 1-3D arrays; returns a new array, not a view."""
+
+    return _transpose(asarray(a), axes)
+
+
+def swapaxes(a, axis1, axis2):
+    """Interchange two axes of an array (``numpy.swapaxes``)."""
+
+    return _swapaxes(asarray(a), axis1, axis2)
+
+
+def _normalize_axis(axis, ndim):
+    axis = int(axis)
+    if not -ndim <= axis < ndim:
+        raise np.exceptions.AxisError(axis, ndim)
+    return axis % ndim
+
+
+def _axis_key(ndim, axis, item):
+    key = [slice(None)] * ndim
+    key[axis] = item
+    return tuple(key)
+
+
+def _join_inputs(arrays, dtype):
+    """Inputs as device arrays / host arrays of one dtype (device dtype wins)."""
+
+    if isinstance(arrays, (Array, ArrayView)):
+        raise TypeError("expected a sequence of arrays, not a single charmnumeric array")
+    pieces = [
+        a if isinstance(a, (Array, ArrayView)) else np.asarray(a) for a in arrays
+    ]
+    if not pieces:
+        raise ValueError("need at least one array to concatenate")
+
+    if dtype is None:
+        device = [a.dtype for a in pieces if isinstance(a, (Array, ArrayView))]
+        dtype = np.result_type(*(device or [a.dtype for a in pieces]))
+    dtype = _normalize_dtype(dtype)
+
+    result = []
+    for a in pieces:
+        if isinstance(a, (Array, ArrayView)):
+            if a.dtype != dtype:
+                raise TypeError(
+                    f"cannot join a {a.dtype} array into a {dtype} result "
+                    "(dtype conversion is not implemented yet)"
+                )
+            result.append(a)
+        else:
+            result.append(a.astype(dtype, copy=False))
+    return result, dtype
+
+
+def _join(pieces, shapes, axis, dtype, out):
+    """One slice assignment per piece; ``shapes`` may add size-1 dims (vstack, stack)."""
+
+    ndim = len(shapes[0])
+    if any(len(shape) != ndim for shape in shapes):
+        raise ValueError(
+            "all the input arrays must have same number of dimensions, but got "
+            + ", ".join(str(len(shape)) for shape in shapes)
+        )
+    axis = _normalize_axis(axis, ndim)
+    for shape in shapes[1:]:
+        for d in range(ndim):
+            if d != axis and shape[d] != shapes[0][d]:
+                raise ValueError(
+                    "all the input array dimensions except for the concatenation axis "
+                    f"must match exactly, but along dimension {d} the arrays have sizes "
+                    f"{shapes[0][d]} and {shape[d]}"
+                )
+
+    total = sum(shape[axis] for shape in shapes)
+    result_shape = shapes[0][:axis] + (total,) + shapes[0][axis + 1:]
+    if len(result_shape) > 3:
+        raise NotImplementedError(
+            f"charmnumeric arrays must have 1 to 3 dimensions, got shape {result_shape}"
+        )
+
+    # Write straight into out when no input aliases it.
+    direct = (
+        out is not None
+        and isinstance(out, (Array, ArrayView))
+        and tuple(out.shape) == result_shape
+        and out.dtype == dtype
+        and not any(
+            isinstance(p, (Array, ArrayView)) and p.name == out.name for p in pieces
+        )
+    )
+    result = out if direct else empty(result_shape, dtype=dtype)
+
+    offset = 0
+    for piece, shape in zip(pieces, shapes):
+        n = shape[axis]
+        if n == 0:
+            continue
+        result[_axis_key(ndim, axis, slice(offset, offset + n))] = piece
+        offset += n
+    if direct:
+        return out
+    return _write_out(result, out)
+
+
+def _atleast_shape(a, ndmin):
+    shape = tuple(a.shape)
+    if len(shape) >= ndmin:
+        return shape
+    if ndmin == 2 and len(shape) == 1:
+        return (1,) + shape
+    return (1,) * (ndmin - len(shape)) + shape
+
+
+def concatenate(arrays, axis=0, out=None, *, dtype=None, casting="same_kind"):
+    """Join arrays along an existing axis (slice assignment into a new array)."""
+
+    if out is not None and dtype is not None:
+        raise TypeError("concatenate() only takes `out` or `dtype` as an argument, but both were provided.")
+    if dtype is None and isinstance(out, (Array, ArrayView)):
+        dtype = out.dtype
+    pieces, dtype = _join_inputs(arrays, dtype)
+    if axis is None:
+        if any(np.ndim(p) != 1 for p in pieces):
+            raise NotImplementedError("concatenate(axis=None) of N-D arrays needs reshape (flatten)")
+        axis = 0
+    if any(np.ndim(p) == 0 for p in pieces):
+        raise ValueError("zero-dimensional arrays cannot be concatenated")
+    return _join(pieces, [tuple(p.shape) for p in pieces], axis, dtype, out)
+
+
+def hstack(tup, *, dtype=None, casting="same_kind"):
+    """Stack arrays column-wise (axis 0 for 1-D inputs, axis 1 otherwise)."""
+
+    pieces, dtype = _join_inputs(tup, dtype)
+    shapes = [_atleast_shape(p, 1) for p in pieces]
+    axis = 0 if all(len(shape) == 1 for shape in shapes) else 1
+    return _join(pieces, shapes, axis, dtype, None)
+
+
+def vstack(tup, *, dtype=None, casting="same_kind"):
+    """Stack arrays row-wise; 1-D inputs of length N become (1, N) rows."""
+
+    pieces, dtype = _join_inputs(tup, dtype)
+    shapes = [_atleast_shape(p, 2) for p in pieces]
+    return _join(pieces, shapes, 0, dtype, None)
+
+
+def stack(arrays, axis=0, out=None, *, dtype=None, casting="same_kind"):
+    """Join same-shape arrays along a new axis (result must be at most 3-D)."""
+
+    if dtype is None and isinstance(out, (Array, ArrayView)):
+        dtype = out.dtype
+    pieces, dtype = _join_inputs(arrays, dtype)
+    shape = tuple(pieces[0].shape)
+    if any(tuple(p.shape) != shape for p in pieces):
+        raise ValueError("all input arrays must have the same shape")
+    axis = _normalize_axis(axis, len(shape) + 1)
+    logical = shape[:axis] + (1,) + shape[axis:]
+    return _join(pieces, [logical] * len(pieces), axis, dtype, out)
+
+
+def _index_runs(flat):
+    """(dst, src, length, step) slice copies: step-1 runs, or constant-step runs of >= 3."""
+
+    runs = []
+    count = len(flat)
+    j = 0
+    while j < count:
+        if j + 1 < count:
+            step = int(flat[j + 1] - flat[j])
+            if step >= 1:
+                k = j + 1
+                while k + 1 < count and int(flat[k + 1] - flat[k]) == step:
+                    k += 1
+                length = k - j + 1
+                if step == 1 or length >= 3:
+                    runs.append((j, int(flat[j]), length, step))
+                    j = k + 1
+                    continue
+        runs.append((j, int(flat[j]), 1, 1))
+        j += 1
+    return runs
+
+
+def _take_1d(a, flat, axis):
+    """a.take(flat, axis) for 1-D host indices: one slice copy per index run."""
+
+    ndim = a.ndim
+    result = empty(a.shape[:axis] + (len(flat),) + a.shape[axis + 1:], dtype=a.dtype)
+    for dst, src, length, step in _index_runs(flat):
+        stop = src + (length - 1) * step + 1
+        result[_axis_key(ndim, axis, slice(dst, dst + length))] = a[
+            _axis_key(ndim, axis, slice(src, stop, step))
+        ]
+    return result
+
+
+def take(a, indices, axis=None, out=None, mode="raise"):
+    """take() with host indices, lowered to slice copies (one per index run).
+
+    A scalar index on a 1-D array gives a (1,) array (no 0-D arrays).
+    """
+
+    if isinstance(indices, (Array, ArrayView)):
+        raise NotImplementedError(
+            "take with a device index array needs a native gather op; "
+            "fetch the indices with .get() first"
+        )
+    if not isinstance(a, (Array, ArrayView)):
+        a = asarray(a)
+
+    idx = np.asarray(indices)
+    if idx.size == 0:
+        raise NotImplementedError("take with an empty index list (empty result) is not supported")
+    if idx.dtype.kind not in "iu":
+        raise IndexError("arrays used as indices must be of integer type")
+    idx = idx.astype(np.int64)
+
+    if axis is None:
+        if a.ndim != 1:
+            raise NotImplementedError("take with axis=None on an N-D array needs reshape (flatten)")
+        axis = 0
+    axis = _normalize_axis(axis, a.ndim)
+    n = a.shape[axis]
+    if mode == "raise":
+        bad = idx[(idx < -n) | (idx >= n)]
+        if bad.size:
+            raise IndexError(f"index {int(bad[0])} is out of bounds for axis {axis} with size {n}")
+        idx = np.where(idx < 0, idx + n, idx)
+    elif mode == "wrap":
+        idx = np.mod(idx, n)
+    elif mode == "clip":
+        idx = np.clip(idx, 0, n - 1)
+    else:
+        raise ValueError(f"clipmode must be one of 'clip', 'raise', or 'wrap' (got {mode!r})")
+
+    out_shape = a.shape[:axis] + idx.shape + a.shape[axis + 1:]
+    if len(out_shape) > 3:
+        raise NotImplementedError(
+            f"take result would have shape {out_shape}; charmnumeric supports at most 3 dims"
+        )
+
+    if idx.ndim <= 1:
+        result = _take_1d(a, idx.reshape(-1), axis)
+        if idx.ndim == 0 and len(out_shape) > 0:
+            # drop the size-1 axis left by the scalar index
+            result = _reshape_copy(result, out_shape)
+        return _write_out(result, out)
+
+    # multi-dim indices: one 1-D take per line along the longest index dim
+    free = int(np.argmax(idx.shape))
+    result = empty(out_shape, dtype=a.dtype)
+    lead_shape = tuple(1 if d == free else idx.shape[d] for d in range(idx.ndim))
+    for lead in np.ndindex(*lead_shape):
+        sel = list(lead)
+        sel[free] = slice(None)
+        part = _take_1d(a, idx[tuple(sel)], axis)
+        key = [slice(None)] * len(out_shape)
+        for d in range(idx.ndim):
+            if d != free:
+                key[axis + d] = slice(lead[d], lead[d] + 1)
+        result[tuple(key)] = part
+    return _write_out(result, out)
+
+
+def astype(x, dtype, /, *, copy=True):
+    """Copy of ``x`` converted to ``dtype``; float -> int truncates."""
+    return asarray(x).astype(dtype, copy=copy)
+
+
+def cumsum(a, axis=None, dtype=None, out=None):
+    """Inclusive sum along ``axis``. axis=None only for 1-D input (no reshape)."""
+    return _scan("cumsum", a, axis, dtype, out)
+
+
+def cumprod(a, axis=None, dtype=None, out=None):
+    """Inclusive product along ``axis``. axis=None only for 1-D input."""
+    return _scan("cumprod", a, axis, dtype, out)
+
+
+def nancumsum(a, axis=None, dtype=None, out=None):
+    """cumsum treating NaNs as zero."""
+    return _scan("nancumsum", a, axis, dtype, out)
+
+
+def nancumprod(a, axis=None, dtype=None, out=None):
+    """cumprod treating NaNs as one."""
+    return _scan("nancumprod", a, axis, dtype, out)
+
+
+def sort(a, axis=-1, kind=None, order=None):
+    """Sorted copy along ``axis`` (NaNs last, stable; gathers to one chare)."""
+    return _sort(a, axis, kind, order)
+
+
+def argsort(a, axis=-1, kind=None, order=None):
+    """int64 indices that sort ``a`` along ``axis`` (stable, NaNs last)."""
+    return _sort(a, axis, kind, order, arg=True)
+
+
 __all__ = [
     "abs",
     "absolute",
     "add",
     "arange",
+    "argsort",
     "around",
     "array",
     "asarray",
+    "astype",
     "ceil",
     "clip",
+    "concatenate",
     "copy",
     "copyto",
     "cos",
     "create_array",
+    "cumprod",
+    "cumsum",
     "diag",
     "divide",
     "divmod",
@@ -409,6 +728,7 @@ __all__ = [
     "full_like",
     "greater",
     "greater_equal",
+    "hstack",
     "identity",
     "isfinite",
     "isinf",
@@ -428,6 +748,8 @@ __all__ = [
     "minimum",
     "mod",
     "multiply",
+    "nancumprod",
+    "nancumsum",
     "negative",
     "norm2",
     "not_equal",
@@ -442,12 +764,18 @@ __all__ = [
     "round",
     "sign",
     "sin",
+    "sort",
     "sqrt",
     "square",
+    "stack",
     "subtract",
+    "swapaxes",
+    "take",
     "tanh",
     "tile",
+    "transpose",
     "trunc",
+    "vstack",
     "where",
     "zeros",
     "zeros_like",

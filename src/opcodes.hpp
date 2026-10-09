@@ -57,7 +57,16 @@ enum class Opcode {
     IOTA = 52,   // arange / linspace / indices / eye
     // Reductions (executor_reduction.cpp). Opcode range 60-69.
     REDUCTION = 60, // full or axis reduction of one operand (sum, max, argmin, ...)
-    BINCOUNT = 61   // histogram of a non-negative int vector (optionally weighted)
+    BINCOUNT = 61,  // histogram of a non-negative int vector (optionally weighted)
+    // Transpose (70): materialized axis permutation (executor_transpose.cpp).
+    TRANSPOSE = 70,
+    // 80-89: executor_castscansort.cpp
+    CAST = 80,    // astype: operands (x); result dtype is the node dtype
+    SCAN = 81,    // operands (x, axis, kind); kind: 0 cumsum, 1 cumprod, 2 nancumsum, 3 nancumprod
+    SORT = 82,    // operands (x, axis); sorted copy along axis (NaNs last)
+    ARGSORT = 83, // operands (x, axis); stable int64 indices along axis
+    // Dense linear algebra (100-119, executor_linalg.cpp).
+    LINALG = 100 // factorization/solve on one chare; kind is a scalar operand
 };
 
 /// Returns true for ops handled by execute_reduction_node.
@@ -133,6 +142,19 @@ inline bool is_ternary_elementwise(Opcode op) {
     switch (op) {
     case Opcode::WHERE:
     case Opcode::CLIP:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/// Returns true for the cast/scan/sort ops (result shaped/decomposed like the input).
+inline bool is_castscansort(Opcode op) {
+    switch (op) {
+    case Opcode::CAST:
+    case Opcode::SCAN:
+    case Opcode::SORT:
+    case Opcode::ARGSORT:
         return true;
     default:
         return false;

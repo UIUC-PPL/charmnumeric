@@ -69,8 +69,6 @@ using HostSpace = Kokkos::HostSpace;
 #endif
 #endif
 
-class MLIRJitCompiler; // forward declaration — full definition only needed in backend.cpp
-
 /// Map C++ type to DType enum at compile time.
 template <typename T>
 constexpr DType dtype_of();
@@ -251,12 +249,26 @@ struct ReductionState {
     int64_t expected = 0;   // mine.size() * reduced extent
 };
 
+/// State of a LINALG node on one chare of the result's partition
+/// (executor_linalg.cpp). Messages that arrive early wait in `stash`.
+template <int N>
+struct LinalgState {
+    DAGNode* node = nullptr;
+    bool started = false;
+    bool owner = false;
+    bool root = false;     // chare 0: gathers the operands and factors them
+    bool computed = false;
+    std::vector<std::vector<char>> stash;
+    std::vector<std::vector<char>> inputs; // gathered operand blocks (root)
+    ArrayRegion<N> mine;
+    int64_t in_covered = 0, in_expected = 0;
+    int64_t out_covered = 0, out_expected = 0;
+};
+
 // ---- ArrayDAGGroup ----
 
 class ArrayDAGGroup : public CBase_ArrayDAGGroup {
   public:
-    int num_compile;
-
     // Per-ndims partition state: current chare grid and proxy.
     struct PartitionGrid {
         int grid[3] = {0, 0, 0};
@@ -314,8 +326,6 @@ class ArrayDAGGroup : public CBase_ArrayDAGGroup {
     std::map<std::array<int, 4>, UploadTile> upload_tiles;
     void stage_uploads(DAG* dag);
 
-    MLIRJitCompiler* jit;
-
     ArrayDAGGroup();
     ArrayDAGGroup(CkMigrateMessage* m) {}
     ~ArrayDAGGroup();
@@ -349,6 +359,11 @@ int reduction_result_meta(ASTNode* root,
                           const std::unordered_map<int, ArrayDAGGroup::ArrayMetadata>& meta,
                           std::array<int, 3>& shape_out);
 
+/// Result ndims and shape of a LINALG root (executor_linalg.cpp).
+int linalg_result_meta(ASTNode* root,
+                       const std::unordered_map<int, ArrayDAGGroup::ArrayMetadata>& meta,
+                       std::array<int, 3>& shape_out);
+
 // ---- Unified Executor (templated on N only) ----
 
 template <int N>
@@ -359,6 +374,7 @@ class ArrayDAGExecutorND : public DAGExecutor {
   public:
     std::unordered_map<int, PendingComm<N>> pending;
     std::unordered_map<int, ReductionState<N>> red_state;
+    std::unordered_map<int, LinalgState<N>> la_state;
 
     ArrayDAGExecutorND(ArrayDAGGroup* group_, PartitionImpl<N>* partition_)
         : DAGExecutor(group_, N), partition(partition_) {}
@@ -374,7 +390,12 @@ class ArrayDAGExecutorND : public DAGExecutor {
     void execute_tile_node(DAGNode* node);
     void execute_reduction_node(DAGNode* node);
     void on_reduce_partial(int node_id, char* data, int64_t size);
+    void execute_linalg_node(DAGNode* node);
+    void on_linalg_msg(int node_id, char* data, int64_t size);
     void execute_creation_node(DAGNode* node);
+    void execute_transpose_node(DAGNode* node);
+    void execute_castscansort_node(DAGNode* node);
+    void finish_castscansort_node(PendingComm<N>& comm);
     void on_comm_done(int node_id);
     void on_matmatmul_receive(int node_id, int input_index);
     void on_matmul_partial(int node_id, RemoteBuffer<N>& partial_buf);
@@ -619,6 +640,7 @@ class PartitionImpl {
     void comm_done(int node_id);
     void reduce_result(CkReductionMsg* msg);
     void receive_reduce_partial(int node_id, int64_t size, char* data);
+    void receive_linalg(int node_id, int64_t size, char* data);
     void process_get(int epoch);
 };
 
@@ -657,6 +679,9 @@ class Partition1D : public CBase_Partition1D {
     void receive_reduce_partial(int node_id, int64_t size, char* data) {
         impl.receive_reduce_partial(node_id, size, data);
     }
+    void receive_linalg(int node_id, int64_t size, char* data) {
+        impl.receive_linalg(node_id, size, data);
+    }
 };
 
 class Partition2D : public CBase_Partition2D {
@@ -692,6 +717,9 @@ class Partition2D : public CBase_Partition2D {
     void receive_reduce_partial(int node_id, int64_t size, char* data) {
         impl.receive_reduce_partial(node_id, size, data);
     }
+    void receive_linalg(int node_id, int64_t size, char* data) {
+        impl.receive_linalg(node_id, size, data);
+    }
 };
 
 class Partition3D : public CBase_Partition3D {
@@ -726,5 +754,8 @@ class Partition3D : public CBase_Partition3D {
     void reduce_result(CkReductionMsg* msg) { impl.reduce_result(msg); }
     void receive_reduce_partial(int node_id, int64_t size, char* data) {
         impl.receive_reduce_partial(node_id, size, data);
+    }
+    void receive_linalg(int node_id, int64_t size, char* data) {
+        impl.receive_linalg(node_id, size, data);
     }
 };
