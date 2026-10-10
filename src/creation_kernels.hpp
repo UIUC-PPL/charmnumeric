@@ -1,16 +1,15 @@
 #pragma once
 
-// Per-element value functions for the array-creation ops (RANDOM, IOTA).
-// They are plain host/device functions so the CPU loops and the Kokkos
-// kernels share one implementation. Floating-point work goes through the
-// ct_* helpers, which use the CUDA _rn intrinsics on the device: they are
-// never contracted into FMAs, so CPU and GPU builds produce identical values.
-// charmnumeric/_rng_reference.py mirrors this file operation for operation.
+// Per-element value functions for array-creation ops (RANDOM, IOTA), shared by
+// CPU loops and Kokkos kernels. The d* / f* helpers use _rn intrinsics on device
+// so no FMA contraction occurs. charmnumeric/_rng_reference.py mirrors this file.
 
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
+
+#include "dtypes.hpp"
 
 #ifdef USE_KOKKOS
 #include <Kokkos_Core.hpp>
@@ -231,7 +230,7 @@ CT_HD T random_value(const RandomParams& p, uint64_t g) {
         uint64_t range = p.b - p.a;
         uint64_t w = word_a(x);
         if (range == 0) // the full 2^64 range: every word is a valid draw
-            return (T)(int64_t)(w + low);
+            return cn_cast<T>((int64_t)(w + low));
         uint64_t thresh = (0 - range) % range;
         uint64_t hi = mulhi64(w, range);
         uint64_t lo = w * range;
@@ -244,7 +243,7 @@ CT_HD T random_value(const RandomParams& p, uint64_t g) {
             lo = w * range;
             ++draw;
         }
-        return (T)(int64_t)(hi + low);
+        return cn_cast<T>((int64_t)(hi + low));
     }
     if constexpr (std::is_floating_point_v<T>) {
         if (p.kind == RANDOM_U01) {
@@ -283,14 +282,13 @@ struct IotaParams {
     uint64_t v3; // LINSPACE: delta = stop - start
 };
 
-/// Value bits of type T from a 64-bit parameter word (double bits for floats,
-/// int64 for ints).
+/// Value of type T from a 64-bit parameter word (double bits or int64).
 template <typename T>
 CT_HD T param_value(uint64_t bits) {
-    if constexpr (std::is_floating_point_v<T>)
-        return (T)bits_to_double(bits);
+    if constexpr (cn_is_real_float_v<T> || cn_is_complex_v<T>)
+        return cn_cast<T>(bits_to_double(bits));
     else
-        return (T)(int64_t)bits;
+        return cn_cast<T>((int64_t)bits);
 }
 
 template <typename C>
@@ -354,22 +352,25 @@ CT_HD T iota_value(const IotaParams& p, const int64_t* idx) {
             return fadd(v0, fmul((float)i, fadd(v1, -v0)));
         } else if constexpr (std::is_same_v<T, double>) {
             return dadd(v0, dmul((double)i, dsub(v1, v0)));
+        } else if constexpr (cn_is_half_v<T> || cn_is_complex_v<T>) {
+            double d0 = bits_to_double(p.v0), d1 = bits_to_double(p.v1);
+            return cn_cast<T>(dadd(d0, dmul((double)i, dsub(d1, d0))));
         } else {
-            uint64_t delta = (uint64_t)(int64_t)v1 - (uint64_t)(int64_t)v0;
-            return (T)(int64_t)((uint64_t)(int64_t)v0 + (uint64_t)i * delta);
+            uint64_t delta = (uint64_t)p.v1 - (uint64_t)p.v0;
+            return cn_cast<T>((int64_t)((uint64_t)p.v0 + (uint64_t)i * delta));
         }
     }
     case IOTA_LINSPACE: {
         int64_t i = idx[p.axis];
         double y = (p.flags & 4) ? linspace_value<float>(p, i) : linspace_value<double>(p, i);
-        if constexpr (std::is_floating_point_v<T>)
-            return (T)y;
+        if constexpr (cn_is_real_float_v<T> || cn_is_complex_v<T>)
+            return cn_cast<T>(y);
         else
-            return (T)floor(y);
+            return cn_cast<T>(floor(y));
     }
     case IOTA_INDICES:
         // numpy.indices: out[k, i0, i1, ...] = i_k
-        return (T)idx[1 + idx[0]];
+        return cn_cast<T>(idx[1 + idx[0]]);
     case IOTA_EYE:
         return (idx[1] - idx[0] == (int64_t)p.v0) ? T(1) : T(0);
     default:

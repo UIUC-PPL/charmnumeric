@@ -1,7 +1,6 @@
-"""Comparisons and predicates vs NumPy. Results are 0/1 masks in the
-operands' dtype (no bool dtype): less, less_equal, greater, greater_equal,
-equal, not_equal (and < <= > >= == !=), isnan, isinf, isfinite,
-logical_and/or/xor/not (and & | ^ ~)."""
+"""Comparisons and predicates vs NumPy (bool results): less, less_equal,
+greater, greater_equal, equal, not_equal (and < <= > >= == !=), isnan, isinf,
+isfinite, logical_and/or/xor/not (and & | ^ ~)."""
 
 import numpy as np
 
@@ -12,8 +11,9 @@ iface = connect()
 C = Checker("test_compare", iface)
 
 
-def m(x, dt):
-    return np.asarray(x).astype(dt)
+def m(x, dt=None):
+    """NumPy's bool result (dt is ignored)."""
+    return np.asarray(x).astype(bool)
 
 
 CMP = [
@@ -32,7 +32,7 @@ with np.errstate(all="ignore"):
         ah, bh = C.fetch(a), C.fetch(b)
         s = f" {shape}"
         for name, f, nf, op in CMP:
-            C.check(name + s, f(a, b), m(nf(ah, bh), ah.dtype), dtype=ah.dtype)
+            C.check(name + s, f(a, b), m(nf(ah, bh), ah.dtype), dtype=bool)
             C.check(f"op {name}" + s, op(a, b), m(nf(ah, bh), ah.dtype))
             C.check(f"{name}(a, 0.5)" + s, f(a, 0.5), m(nf(ah, 0.5), ah.dtype))
             C.check(f"{name}(0.5, a)" + s, f(0.5, a), m(nf(0.5, ah), ah.dtype))
@@ -72,7 +72,7 @@ with np.errstate(all="ignore"):
     # float32
     a32 = halves((600, 7), dtype=np.float32)
     a32h = C.fetch(a32)
-    C.check("less f32 (0.1 rounds to f32)", a32 < 0.1, m(a32h < np.float32(0.1), np.float32), dtype=np.float32)
+    C.check("less f32 (0.1 rounds to f32)", a32 < 0.1, m(a32h < np.float32(0.1), np.float32), dtype=bool)
     C.check("isfinite f32", cnp.isfinite(a32 / 0.0), m(np.isfinite(a32h / np.float32(0.0)), np.float32))
 
     # integers: exact; float scalars are compared exactly (not truncated)
@@ -82,14 +82,14 @@ with np.errstate(all="ignore"):
         ah, bh = C.fetch(a), C.fetch(b)
         n = np.dtype(dt).name
         for name, f, nf, op in CMP:
-            C.check(f"{name} {n}", f(a, b), m(nf(ah, bh), dt), dtype=dt)
+            C.check(f"{name} {n}", f(a, b), m(nf(ah, bh), dt), dtype=bool)
             for sc in (2, 2.5, -2.5, 3.0, 1e30, -1e30, np.inf, np.nan):
-                C.check(f"{name}(a, {sc}) {n}", f(a, sc), m(nf(ah, sc), dt), dtype=dt)
-                C.check(f"{name}({sc}, a) {n}", f(sc, a), m(nf(sc, ah), dt), dtype=dt)
-        C.check(f"isnan {n}", cnp.isnan(a), np.zeros(ah.shape, dt), dtype=dt)
-        C.check(f"isinf {n}", cnp.isinf(a), np.zeros(ah.shape, dt), dtype=dt)
-        C.check(f"isfinite {n}", cnp.isfinite(a), np.ones(ah.shape, dt), dtype=dt)
-        C.check(f"logical_xor {n}", cnp.logical_xor(a, b), m(np.logical_xor(ah, bh), dt), dtype=dt)
+                C.check(f"{name}(a, {sc}) {n}", f(a, sc), m(nf(ah, sc), dt), dtype=bool)
+                C.check(f"{name}({sc}, a) {n}", f(sc, a), m(nf(sc, ah), dt), dtype=bool)
+        C.check(f"isnan {n}", cnp.isnan(a), np.zeros(ah.shape, bool), dtype=bool)
+        C.check(f"isinf {n}", cnp.isinf(a), np.zeros(ah.shape, bool), dtype=bool)
+        C.check(f"isfinite {n}", cnp.isfinite(a), np.ones(ah.shape, bool), dtype=bool)
+        C.check(f"logical_xor {n}", cnp.logical_xor(a, b), m(np.logical_xor(ah, bh), dt), dtype=bool)
 
     # old-backend (fix-temporaries) method API
     a = floats((37, 41), -3.0, 3.0, seed=5)
@@ -97,7 +97,7 @@ with np.errstate(all="ignore"):
     ah, bh = C.fetch(a), C.fetch(b)
     C.check("a.greater_than(b)", a.greater_than(b), m(ah > bh, ah.dtype))
     C.check("a.less_than(b)", a.less_than(b), m(ah < bh, ah.dtype))
-    C.check("a.equal(a)", a.equal(a), np.ones(ah.shape))
+    C.check("a.equal(a)", a.equal(a), np.ones(ah.shape, bool))
     C.check("a.equal(b, epsilon=0.5)", a.equal(b, epsilon=0.5), m(np.abs(ah - bh) <= 0.5, ah.dtype))
 
 C.finish()

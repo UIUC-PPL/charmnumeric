@@ -49,8 +49,7 @@ with np.errstate(all="ignore"):
     C.check("clip nan", cnp.clip(x, -1.0, 1.0), np.clip(xh, -1.0, 1.0))
     C.check("where(isnan, 0, x)", cnp.where(cnp.isnan(x), 0.0, x), np.where(np.isnan(xh), 0.0, xh))
 
-    # size-1 (broadcast) operands, with the ndim of the other operands: a 1-D
-    # (1,) array broadcast into a 2-D kernel hangs the backend (also b + x).
+    # A 1-D (1,) operand broadcast into a 2-D kernel hangs the backend, so use (1, 1).
     lo = cnp.full((1, 1), -0.25)
     hi = cnp.full((1, 1), 0.75)
     C.fetch(lo)
@@ -75,7 +74,8 @@ with np.errstate(all="ignore"):
         C.check(f"where(b, a, 7) {n}", cnp.where(b, a, 7), np.where(bh, ah, 7), dtype=dt)
         C.check(f"clip {n}", cnp.clip(a, -5, 5), np.clip(ah, -5, 5), dtype=dt)
         C.check(f"clip arrays {n}", cnp.clip(a, b, b + 4), np.clip(ah, bh, bh + 4), dtype=dt)
-        C.raises(f"where({n}, 0.5) rejected", TypeError, lambda: cnp.where(a > 0, a, 0.5))
+        C.check(f"where({n}, 0.5) promotes", cnp.where(a > 0, a, 0.5), np.where(ah > 0, ah, 0.5),
+                dtype=np.float64)
     C.check("where with float64 cond", cnp.where(cnp.zeros((600, 7)), a32, a32 + 1),
             C.fetch(a32) + 1, rtol=1e-6, dtype=np.float32)
 

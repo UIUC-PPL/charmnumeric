@@ -99,28 +99,10 @@ void ArrayDAGExecutorND<N>::on_matmatmul_receive(int node_id, int input_index) {
         }
     };
 
-    switch (dt) {
-    case DType::FLOAT32: {
-        float* d = nullptr;
+    cn_dispatch_blas(dt, [&](auto tag) {
+        decltype(tag)* d = nullptr;
         compute_pair(d);
-        break;
-    }
-    case DType::FLOAT64: {
-        double* d = nullptr;
-        compute_pair(d);
-        break;
-    }
-    case DType::INT32: {
-        int32_t* d = nullptr;
-        compute_pair(d);
-        break;
-    }
-    case DType::INT64: {
-        int64_t* d = nullptr;
-        compute_pair(d);
-        break;
-    }
-    }
+    });
 }
 
 template <int N>

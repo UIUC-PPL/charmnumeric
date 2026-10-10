@@ -1,90 +1,172 @@
 #!/usr/bin/env python
-"""charmnumeric port of cupynumeric/examples/sort.py (sort / argsort along an axis).
 
-Verdict: direct. cnp.sort / cnp.argsort are native (SORT/ARGSORT executor).
-The backend gathers the array on one chare, sorts every line along the axis
-(std::sort on CPU, Kokkos::sort on GPU) and scatters the result back:
-correct for any axis of 1-D..3-D arrays, but not scalable (no distributed
-sample sort yet). NaNs sort last and ties keep their order (NumPy's
-kind='stable'), so argsort is compared exactly with numpy.argsort(kind='stable').
-Other changes:
-  * uint32 (the original default) is not a charmnumeric dtype. The default
-    here is float64. Use -d int64/int32 for integer keys (generated
-    natively in [lower, upper)). complex is unsupported.
-"""
+# Copyright 2024 NVIDIA Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 
 import argparse
-import os
-import sys
-import time
 
 import numpy
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-import charmnumeric as cnp  # noqa: E402
-import _cnum_util as U  # noqa: E402
-from _cnum_connect import get_interface  # noqa: E402
+# charmnumeric port: _benchmark is the local shim (_benchmark.py). It connects,
+# runs with np = charmnumeric and checks the result against NumPy.
+from _benchmark import benchmark_info, get_numpy, parse_with_harness
 
 
-def make_input(shape, datatype, lower, upper):
-    dt = numpy.dtype(datatype)
-    if numpy.issubdtype(dt, numpy.integer):
-        if dt not in (numpy.dtype(numpy.int32), numpy.dtype(numpy.int64)):
-            raise NotImplementedError(f"{dt} is not a charmnumeric dtype (int32/int64 only)")
-        lower = 0 if lower is None else int(lower)
-        upper = 1000003 if upper is None else int(upper)
-        return U.rand_int(shape, lower, upper, seed=5, dtype=dt)
-    if numpy.issubdtype(dt, numpy.floating):
-        if dt not in (numpy.dtype(numpy.float32), numpy.dtype(numpy.float64)):
-            raise NotImplementedError(f"{dt} is not a charmnumeric dtype")
-        return U.uniform(shape, seed=5, dtype=dt)
-    raise NotImplementedError("UNKNOWN/unsupported type " + str(dt))
+def check_sorted(np, a, a_sorted, axis=-1):
+    a_numpy = get_numpy(a)
+    a_numpy_sorted = numpy.sort(a_numpy, axis)
+    print("Checking result...")
+    if np.allclose(a_numpy_sorted, a_sorted):
+        print("PASS!")
+    else:
+        print("FAIL!")
+        print("NUMPY    : " + str(a_numpy_sorted))
+        print(np.__name__ + ": " + str(a_sorted))
+        assert False
 
 
-def run_sort(shape, axis, argsort, datatype, lower, upper):
-    a = make_input(shape, datatype, lower, upper)
-    out = cnp.argsort(a, axis=axis) if argsort else cnp.sort(a, axis=axis)
-    return a, out
+@benchmark_info(name="Sort")
+def run_sort(
+    np,
+    shape,
+    axis,
+    argsort,
+    datatype,
+    lower,
+    upper,
+    *,
+    timer,
+    perform_check=False,
+    print_timing=False,
+):
+    np.random.seed(42)
+    newtype = numpy.dtype(datatype).type
+
+    N = 1
+    for e in shape:
+        N *= e
+    shape = tuple(shape)
+    if numpy.issubdtype(newtype, numpy.integer):
+        if lower is None:
+            lower = np.iinfo(newtype).min
+        if upper is None:
+            upper = np.iinfo(newtype).max
+        a = np.random.randint(low=lower, high=upper, size=N).astype(newtype)
+        a = a.reshape(shape)
+    elif numpy.issubdtype(newtype, numpy.floating):
+        a = np.random.random(shape).astype(newtype)
+    elif numpy.issubdtype(newtype, numpy.complexfloating):
+        a = np.array(
+            np.random.random(shape) + np.random.random(shape) * 1j
+        ).astype(newtype)
+    else:
+        print("UNKNOWN type " + str(newtype))
+        assert False
+
+    timer.start()
+    if argsort:
+        a_sorted = np.argsort(a, axis)
+    else:
+        a_sorted = np.sort(a, axis)
+    total = timer.stop()
+
+    if perform_check and not argsort:
+        check_sorted(a, a_sorted, axis)
+    else:
+        # do we need to synchronize?
+        assert True
+    if print_timing:
+        print("Elapsed Time: " + str(total) + " ms")
+    return total
 
 
-def main(chk):
+if __name__ == "__main__":
+
     def tuple_of_ints(arg):
         return tuple(map(int, arg.strip("()").split(",")))
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--check", dest="check", action="store_true")
-    parser.add_argument("-t", "--time", dest="timing", action="store_true")
-    parser.add_argument("-s", "--shape", type=tuple_of_ints, default=(256,), dest="shape")
-    parser.add_argument("-d", "--datatype", type=str, default="float64", dest="datatype")
-    parser.add_argument("-l", "--lower", type=int, default=None, dest="lower")
-    parser.add_argument("-u", "--upper", type=int, default=None, dest="upper")
-    parser.add_argument("-a", "--axis", type=int, default=-1, dest="axis")
-    parser.add_argument("--argsort", dest="argsort", action="store_true")
-    args = parser.parse_args()
-    shape = tuple(args.shape)
+    parser.add_argument(
+        "--check",
+        dest="check",
+        action="store_true",
+        help="check the result of the solve",
+    )
+    parser.add_argument(
+        "-t",
+        "--time",
+        dest="timing",
+        action="store_true",
+        help="perform timing",
+    )
+    parser.add_argument(
+        "-s",
+        "--shape",
+        type=tuple_of_ints,
+        nargs="+",
+        default=[(1000000,)],
+        dest="shape",
+        help="array reshape tuple (default '(1000000,)')",
+    )
+    parser.add_argument(
+        "-d",
+        "--datatype",
+        type=str,
+        default="uint32",
+        dest="datatype",
+        help="data type (default np.uint32)",
+    )
+    parser.add_argument(
+        "-l",
+        "--lower",
+        type=int,
+        default=None,
+        dest="lower",
+        help="lower bound for integer based arrays (inclusive)",
+    )
+    parser.add_argument(
+        "-u",
+        "--upper",
+        type=int,
+        default=None,
+        dest="upper",
+        help="upper bound for integer based arrays (exclusive)",
+    )
+    parser.add_argument(
+        "-a",
+        "--axis",
+        type=int,
+        default=-1,
+        dest="axis",
+        help="sort axis (default -1)",
+    )
+    parser.add_argument(
+        "-g", "--arg", dest="argsort", action="store_true", help="use argsort"
+    )
 
-    interface = get_interface()
-    t0 = time.perf_counter()
-    a, out = run_sort(shape, args.axis, args.argsort, args.datatype, args.lower, args.upper)
-    out_h = out.get(interface)
-    if args.timing:
-        print(f"Elapsed Time: {(time.perf_counter() - t0) * 1e3:.3f} ms (incl. sync)")
+    args, harness = parse_with_harness(parser)
 
-    a_h = a.get(interface)
-    print("Checking result...")
-    if not args.argsort:
-        chk.close("sorted", out_h, numpy.sort(a_h, args.axis), rtol=0, atol=0)
-    else:
-        perm = numpy.asarray(out_h)
-        chk.true("argsort dtype is int64", perm.dtype == numpy.int64, str(perm.dtype))
-        chk.true(
-            "argsort == numpy.argsort(kind='stable')",
-            bool(numpy.array_equal(perm, numpy.argsort(a_h, args.axis, kind="stable"))),
-        )
-        gathered = numpy.take_along_axis(a_h, perm, axis=args.axis)
-        chk.close("a[argsort(a)] == sort(a)", gathered, numpy.sort(a_h, args.axis), rtol=0, atol=0)
-
-
-if __name__ == "__main__":
-    U.run("sort", main)
+    harness.run_timed(
+        run_sort,
+        harness.np,
+        args.shape,
+        args.axis,
+        args.argsort,
+        args.datatype,
+        args.lower,
+        args.upper,
+        timer=harness.timer,
+        perform_check=args.check,
+        print_timing=args.timing,
+    )

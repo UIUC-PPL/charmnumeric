@@ -4,7 +4,8 @@ template <int N>
 bool extract_regions_nd(DAGNode* node, std::unordered_map<int, CTArrayBase<N>*>& arrays,
                         ArrayRegion<N>& r_out, std::vector<ArrayRegion<N>>& input_regions,
                         std::vector<int>& input_source_names,
-                        std::array<int, N>& global_shape_out) {
+                        std::array<int, N>& global_shape_out,
+                        const std::unordered_map<int, ArrayDAGGroup::ArrayMetadata>* meta) {
     bool has_regions = false;
     bool has_output = false;
     std::array<int, N> global_shape = {};
@@ -35,6 +36,13 @@ bool extract_regions_nd(DAGNode* node, std::unordered_map<int, CTArrayBase<N>*>&
             if (global_shape[0] != 0)
                 break;
         }
+    }
+    if (global_shape[0] == 0 && meta != nullptr) {
+        // a chare that only owns part of the output (e.g. past an offset tile edge)
+        auto it = meta->find(fused_output_decomp_name(node));
+        if (it != meta->end() && it->second.ndims == N)
+            for (int d = 0; d < N; ++d)
+                global_shape[d] = it->second.global_shape[d];
     }
     if (global_shape[0] == 0) {
         int best_gs = 0;
@@ -133,10 +141,13 @@ bool extract_regions_nd(DAGNode* node, std::unordered_map<int, CTArrayBase<N>*>&
 
 template bool extract_regions_nd<1>(DAGNode*, std::unordered_map<int, CTArrayBase<1>*>&,
                                     ArrayRegion<1>&, std::vector<ArrayRegion<1>>&,
-                                    std::vector<int>&, std::array<int, 1>&);
+                                    std::vector<int>&, std::array<int, 1>&,
+                                    const std::unordered_map<int, ArrayDAGGroup::ArrayMetadata>*);
 template bool extract_regions_nd<2>(DAGNode*, std::unordered_map<int, CTArrayBase<2>*>&,
                                     ArrayRegion<2>&, std::vector<ArrayRegion<2>>&,
-                                    std::vector<int>&, std::array<int, 2>&);
+                                    std::vector<int>&, std::array<int, 2>&,
+                                    const std::unordered_map<int, ArrayDAGGroup::ArrayMetadata>*);
 template bool extract_regions_nd<3>(DAGNode*, std::unordered_map<int, CTArrayBase<3>*>&,
                                     ArrayRegion<3>&, std::vector<ArrayRegion<3>>&,
-                                    std::vector<int>&, std::array<int, 3>&);
+                                    std::vector<int>&, std::array<int, 3>&,
+                                    const std::unordered_map<int, ArrayDAGGroup::ArrayMetadata>*);

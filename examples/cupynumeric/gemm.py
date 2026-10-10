@@ -1,32 +1,36 @@
 #!/usr/bin/env python
-"""charmnumeric port of cupynumeric/examples/gemm.py (rotating GEMM).
 
-Verdict: direct port.
-  * np.dot(A, B, out=C) is native (cnp.dot with out=; the SUMMA result is
-    copied into C).
-  * np.random.uniform(...).astype(ft) is cnp.random.uniform(..., dtype=ft)
-    (native generator; no astype yet).
-  * --precision 16 is not supported (no float16 in charmnumeric).
-"""
+# Copyright 2024 NVIDIA Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 
 import argparse
-import os
-import sys
-import time
 
-import numpy
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-import charmnumeric as cnp  # noqa: E402
-import _cnum_util as U  # noqa: E402
-from _cnum_connect import get_interface  # noqa: E402
+# charmnumeric port: _benchmark is the local shim (_benchmark.py). It connects,
+# runs with np = charmnumeric and checks the result against NumPy.
+from _benchmark import (
+    benchmark_info,
+    format_dtype,
+    parse_with_harness,
+    get_benchmark_info,
+)
 
 
-def initialize(M, N, K, ft):
-    A = cnp.random.uniform(size=(N, N), dtype=ft)
-    B = cnp.random.uniform(size=(N, N), dtype=ft)
-    C = cnp.zeros((N, N), dtype=ft)
+def initialize(np, M, N, K, ft):
+    A = np.random.uniform(size=(N, N)).astype(ft)
+    B = np.random.uniform(size=(N, N)).astype(ft)
+    C = np.zeros((N, N), dtype=ft)
     return A, B, C
 
 
@@ -34,48 +38,100 @@ def total_flops(M, N, K):
     return M * N * (2 * K - 1)
 
 
-def gemm_loop(np, A, B, C, I, warmup):  # noqa: E741
+def total_space(np, M, N, K, ft):
+    return (M * N + M * K + K * N) * np.dtype(ft).itemsize
+
+
+@benchmark_info(formats={"ft": format_dtype})
+def run_gemm(np, N, I, warmup, ft, *, timer):  # noqa: E741
+    print("Problem Size:     M=" + str(N) + " N=" + str(N) + " K=" + str(N))
+    print("Total Iterations: " + str(I))
+    flops = total_flops(N, N, N)
+    print("Total Flops:      " + str(flops / 1e9) + " GFLOPS/iter")
+    space = total_space(np, N, N, N, ft)
+    print("Total Size:       " + str(space / 1e6) + " MB")
+    A, B, C = initialize(np, N, N, N, ft)
+
+    timer.start()
+    # Run for as many iterations as was requested
     for idx in range(I + warmup):
+        if idx == warmup:
+            timer.start()
         np.dot(A, B, out=C)
-        # rotate the matrices (as in the original)
+        # We need to rotate the matrices to keep Legate honest
+        # about moving data so it can't just duplicate A and B
+        # on the first iteration and reuse them, this means
+        # that A, B, C all need to be square
         A, B, C = B, C, A
-    return A, B, C
+    total = timer.stop()
 
-
-def main(chk):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-i", "--iter", type=int, default=4, dest="I")
-    parser.add_argument("-w", "--warmup", type=int, default=1, dest="warmup")
-    parser.add_argument("-n", "--num", type=int, default=128, dest="N")
-    parser.add_argument("--precision", type=int, default=32, dest="P")
-    args = parser.parse_args()
-
-    if args.P == 32:
-        ft = numpy.float32
-    elif args.P == 64:
-        ft = numpy.float64
-    else:
-        raise TypeError("Precision must be one of 32 or 64 (no float16 in charmnumeric)")
-    N = args.N
-    print(f"Problem Size:     M={N} N={N} K={N}")
-    print(f"Total Iterations: {args.I}")
-    print(f"Total Flops:      {total_flops(N, N, N) / 1e9} GFLOPS/iter")
-
-    interface = get_interface()
-    A, B, C = initialize(N, N, N, ft)
-    A_h, B_h, C_h = A.get(interface), B.get(interface), C.get(interface)
-
-    t0 = time.perf_counter()
-    A, B, C = gemm_loop(cnp, A, B, C, args.I, args.warmup)
-    out = [A.get(interface), B.get(interface), C.get(interface)]
-    total = (time.perf_counter() - t0) * 1e3
-    print(f"Elapsed Time:     {total:.3f} ms (incl. sync)")
-
-    ref = gemm_loop(numpy, A_h.copy(), B_h.copy(), C_h.copy(), args.I, args.warmup)
-    rtol = 1e-4 if ft == numpy.float32 else 1e-10
-    for name, got, exp in zip("ABC", out, ref):
-        chk.close(f"rotated {name}", got, exp, rtol=rtol, atol=0.0)
+    print("Elapsed Time:     " + str(total) + " ms")
+    average = total / I
+    print("Average GEMM:     " + str(average) + " ms")
+    print("FLOPS/s:          " + str(flops / (average * 1e6)) + " GFLOPS/s")
+    return total
 
 
 if __name__ == "__main__":
-    U.run("gemm", main)
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-i",
+        "--iter",
+        type=int,
+        default=100,
+        dest="I",
+        help="number of iterations to run",
+    )
+    parser.add_argument(
+        "-w",
+        "--warmup",
+        type=int,
+        default=5,
+        dest="warmup",
+        help="warm-up iterations",
+    )
+    parser.add_argument(
+        "-n",
+        "--num",
+        type=int,
+        nargs="+",
+        default=[100],
+        dest="N",
+        help="number of elements in one dimension",
+    )
+    parser.add_argument(
+        "--precision",
+        type=int,
+        default=32,
+        dest="P",
+        help="number of bits of precision to use for the gemm computation "
+        "(16,32,64)",
+    )
+
+    args, harness = parse_with_harness(parser)
+    np = harness.np
+
+    name = None
+    dtype = None
+    if args.P == 16:
+        name = "HGEMM"
+        dtype = np.float16
+    elif args.P == 32:
+        name = "SGEMM"
+        dtype = np.float32
+    elif args.P == 64:
+        name = "DGEMM"
+        dtype = np.float64
+    else:
+        raise TypeError("Precision must be one of 16, 32, or 64")
+    info = get_benchmark_info(run_gemm).replace(name=name)
+    harness.run_timed_with_info(
+        info,
+        run_gemm,
+        np,
+        args.N,
+        args.I,
+        args.warmup,
+        dtype,
+        timer=harness.timer,
+    )

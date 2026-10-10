@@ -1,29 +1,18 @@
-"""Host-side reference simulator for charmnumeric programs (static check aid).
+"""Host-side NumPy simulator for charmnumeric programs (static check aid).
 
-Importing this module installs hooks on charmtyles' ExecutionState so that
-every frontend op is also evaluated eagerly with NumPy as it is recorded.
-The ops are still recorded, fused and serialized normally, and the
-serialized DAGs are handed to SimInterface.run_async, which discards them.
-SimInterface.get() returns the simulated values, so a port runs end to end
-(including its PASS/FAIL verification) without a backend.
+Ops are evaluated eagerly as they are recorded; SimInterface.get() returns the
+simulated values, so a port runs end to end without a backend. Checks the
+Python side only.
 
-This checks the Python side: graph construction, shapes, fusion, and
-serialization. It also checks that the algorithm is correct under the
-intended charmnumeric semantics. It does NOT check the C++ backend.
-
-It also flags patterns that the frontend accepts but the backend (as of
-reading src/) does not support or handles differently:
-  ERROR  general (non size-1) broadcasting in elementwise ops
-  ERROR  REDUCE / TILE / DIAG applied to a view: the backend reads the whole
-         array by name
+Flags patterns the frontend accepts but the backend (as of reading src/) does
+not support:
+  ERROR  general broadcasting reaching an elementwise kernel
+  ERROR  REDUCE / TILE / DIAG / scan / sort on a view (backend reads the whole array)
   ERROR  set_region shape mismatch
-  WARN   cross-ndim set_region whose source is a view, or whose target has
-         a nonzero offset in a non-singleton dim: cross_set_region_send in
-         backend_internal.hpp maps source-local coords to the target without
-         the target offset
+  WARN   cross-ndim set_region from a view, or into a nonzero offset in a
+         non-singleton dim (cross_set_region_send ignores the target offset)
   WARN   set_region between arrays of different dtype
-With CNUM_SIM_STRICT=1 (the default), ERRORs raise SimError at the
-offending op.
+CNUM_SIM_STRICT=1 (default) raises SimError at the first ERROR.
 """
 
 import atexit
@@ -112,8 +101,8 @@ def _int_power(a, b):
 
 
 def _mask(fn):
-    """Comparisons/predicates: 0/1 masks (cast to the result dtype by _fit)."""
-    return lambda *args: fn(*args).astype(np.int8)
+    """Wrap a comparison or predicate so it returns bool arrays."""
+    return lambda *args: np.asarray(fn(*args), dtype=bool)
 
 
 _BINARY = {
@@ -132,6 +121,11 @@ _BINARY = {
     AO.less_equal: _mask(np.less_equal),
     AO.equal: _mask(np.equal),
     AO.not_equal: _mask(np.not_equal),
+    AO.bitwise_and: np.bitwise_and,
+    AO.bitwise_or: np.bitwise_or,
+    AO.bitwise_xor: np.bitwise_xor,
+    AO.left_shift: np.left_shift,
+    AO.right_shift: np.right_shift,
 }
 _UNARY = {
     AO.tanh: np.tanh,
@@ -153,7 +147,25 @@ _UNARY = {
     AO.isnan: _mask(np.isnan),
     AO.isinf: _mask(np.isinf),
     AO.isfinite: _mask(np.isfinite),
+    AO.convert: lambda x: x,
+    AO.real: np.real,
+    AO.imag: np.imag,
+    AO.conj: np.conjugate,
+    AO.invert: np.invert,
 }
+# Compute dtype per emitOp in src/jit.cpp.
+_COMPARISON_OPS = (AO.less, AO.less_equal, AO.equal, AO.not_equal)
+_OPERAND_TYPED = (AO.isnan, AO.isinf, AO.isfinite, AO.abs, AO.real, AO.imag, AO.convert)
+
+
+def _compute_dtype(op, ops, vals, result_dtype):
+    arrays = [np.asarray(v).dtype for x, v in zip(ops, vals)
+              if isinstance(x, (FrontendObject, FrontendObjectView))]
+    if op in _COMPARISON_OPS:
+        return np.result_type(*arrays) if arrays else np.dtype(np.float64)
+    if op in _OPERAND_TYPED:
+        return arrays[0] if arrays else np.dtype(np.float64)
+    return np.dtype(result_dtype)
 _TERNARY = {
     AO.where: lambda c, x, y: np.where(np.asarray(c) != 0, x, y),
     AO.clip: lambda x, lo, hi: np.minimum(np.maximum(x, lo), hi),
@@ -172,7 +184,7 @@ def _squeeze_mat(v, what):
 
 
 def _fit(result, obj):
-    shape = tuple(obj.shape)
+    shape = tuple(obj.shape) or (1,)  # 0-d arrays are stored as (1,)
     result = np.asarray(result)
     if result.shape != shape:
         if result.size == 1:
@@ -194,7 +206,7 @@ def _eval(obj):
     if op == Operation.noop:
         return
     if op == Operation.create:
-        _store_result(obj, np.zeros(tuple(obj.shape), dtype=obj.dtype))
+        _store_result(obj, np.zeros(tuple(obj.shape) or (1,), dtype=obj.dtype))
         return
     if op == Operation.set_region:
         target, region, rhs = ops
@@ -245,23 +257,24 @@ def _eval(obj):
                 f"elementwise {_NAMES[op]} with non-trivial broadcasting "
                 f"{' vs '.join(_desc(x) for x in ops)} (backend only broadcasts size-1 operands)"
             )
-        # one element type per kernel: operands are read in the result dtype
-        if np.issubdtype(obj.dtype, np.integer):
-            vals = [np.asarray(v).astype(obj.dtype) for v in vals]
-        if op == AO.div and np.issubdtype(obj.dtype, np.integer):
-            res = np.trunc(np.divide(*vals))
-        elif op == AO.power and np.issubdtype(obj.dtype, np.integer):
-            res = _int_power(*vals)
-        else:
-            with np.errstate(all="ignore"):
+        # operands are converted to the op's compute dtype in-kernel
+        cdt = _compute_dtype(op, ops, vals, obj.dtype)
+        with np.errstate(all="ignore"):
+            vals = [np.asarray(v).astype(cdt) if i or op != AO.where else np.asarray(v)
+                    for i, v in enumerate(vals)]
+            if op == AO.power and np.issubdtype(cdt, np.integer):
+                res = _int_power(*vals)
+            else:
                 res = (_BINARY.get(op) or _TERNARY.get(op))(*vals)
         _store_result(obj, _fit(res, obj))
         return
 
     if op in _UNARY:
         (a,) = ops
+        v = _operand(a)
+        cdt = _compute_dtype(op, ops, [v], obj.dtype)
         with np.errstate(all="ignore"):
-            res = _UNARY[op](_operand(a))
+            res = _UNARY[op](np.asarray(v).astype(cdt))
         _store_result(obj, _fit(res, obj))
         return
 
@@ -337,18 +350,26 @@ def _eval(obj):
         _store_result(obj, creation_values(op, scalars, payload, tuple(obj.shape), obj.dtype))
         return
 
+    if op in (AO.convolve, AO.flip):
+        from charmnumeric import signal as SIG
+
+        arrays = [x for x in ops if isinstance(x, (FrontendObject, FrontendObjectView))]
+        scalars = ops[len(arrays):]
+        res = SIG.reference(op, [_value(x) for x in arrays], scalars, tuple(obj.shape))
+        _store_result(obj, _fit(np.asarray(res), obj))
+        return
+
+    if op in (AO.reshape, AO.broadcast):
+        x = ops[0]
+        shape = tuple(int(n) for n in ops[1:])
+        fn = np.reshape if op == AO.reshape else np.broadcast_to
+        _store_result(obj, _fit(np.array(fn(_value(x), shape)), obj))
+        return
+
     if op == AO.transpose:
         x = ops[0]
         perm = tuple(int(p) for p in ops[1:])
         _store_result(obj, _fit(np.transpose(_value(x), perm), obj))
-        return
-
-    if op == AO.astype:
-        (x,) = ops
-        if _is_view(x):
-            _error(f"astype of a view {_desc(x)}: backend reads the whole array")
-        with np.errstate(all="ignore"):
-            _store_result(obj, _fit(_value(x).astype(obj.dtype), obj))
         return
 
     if op == AO.scan:
@@ -368,11 +389,48 @@ def _eval(obj):
         _store_result(obj, _fit(fn(_value(x), axis=int(axis), kind="stable"), obj))
         return
 
+    if op in (AO.gather, AO.scatter):
+        root, L = ops[0], ops[1]
+        p = 3 if op == AO.scatter else 2
+        npre, npost, nde = (int(v) for v in ops[p:p + 3])
+        E = tuple(int(v) for v in ops[p + 3:p + 3 + nde])
+        offs = _index_offsets(np.asarray(_value(L)).astype(np.int64), E, npre, npost,
+                              [int(v) for v in ops[p + 3 + nde:]])
+        tgt = _store[root.name]
+        if offs.size and (offs.min() < 0 or offs.max() >= tgt.size):
+            _error(f"index offsets out of bounds for array of size {tgt.size}")
+            return
+        if op == AO.gather:
+            _store_result(obj, _fit(tgt.reshape(-1)[offs], obj))
+        else:
+            v = ops[2]
+            vals = _value(v) if isinstance(v, (FrontendObject, FrontendObjectView)) else v
+            tgt.flat[offs.reshape(-1)] = np.broadcast_to(np.asarray(vals), E).reshape(-1)
+        return
+
+    if op == AO.expand:
+        x, mode, _total = ops
+        xv = np.asarray(_value(x)).reshape(-1)
+        counts = (xv != 0).astype(np.int64) if int(mode) == 0 else np.maximum(xv.astype(np.int64), 0)
+        _store_result(obj, _fit(np.repeat(np.arange(xv.size), counts), obj))
+        return
+
     _error(f"unknown opcode {op}")
 
 
+def _index_offsets(Lv, E, npre, npost, strides):
+    """Flat source/target offset of every element of a GATHER/SCATTER iteration space."""
+    nb = Lv.ndim
+    e = np.indices(E, dtype=np.int64)
+    offs = Lv[tuple(e[npre:npre + nb])]
+    slice_dims = list(range(npre)) + list(range(npre + nb, npre + nb + npost))
+    for k, d in enumerate(slice_dims):
+        offs = offs + e[d] * strides[k]
+    return offs
+
+
 def _reduction(kind, xv, axes, keepdims, ddof):
-    """NumPy model of the REDUCTION executor (kinds from charmnumeric.reductions)."""
+    """NumPy model of the REDUCTION executor."""
     from charmnumeric import reductions as R
 
     kw = dict(axis=axes, keepdims=keepdims)
@@ -443,7 +501,7 @@ if not getattr(ct_ast.ExecutionState, "_cnum_sim_hooked", False):
 
 
 class SimInterface(CharmNumericInterface):
-    """Drop-in for CharmNumericInterface that never talks to a backend."""
+    """CharmNumericInterface stand-in that never talks to a backend."""
 
     def __init__(self, *args, **kwargs):
         super().__init__()
@@ -462,6 +520,8 @@ class SimInterface(CharmNumericInterface):
 
     def get(self, ndims, name, size, dtype=None):
         _stats["gets"] += 1
+        if name == -1:  # synchronize() barrier
+            return np.empty(0, dtype=dtype)
         arr = _store[name]
         if arr.size != size:
             _error(f"get size mismatch for name {name}: {arr.size} != {size}")

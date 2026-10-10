@@ -94,56 +94,24 @@ static void dispatch_cross_matmul_send_vector_slice_3d(
     DType dt, PartitionImpl<1>* partition, DAGNode* node, int vec_name,
     const ChareIndex<3>& target_ci, int local_offset, int send_len, int col_start, int col_end,
     CProxy_Partition3D& proxy_3d) {
-    switch (dt) {
-    case DType::FLOAT32:
-        cross_matmul_send_vector_slice_1d_to_3d<float>(partition, node, vec_name, target_ci,
+    cn_dispatch_blas(dt, [&](auto tag) {
+        using T = decltype(tag);
+        cross_matmul_send_vector_slice_1d_to_3d<T>(partition, node, vec_name, target_ci,
                                                         local_offset, send_len, col_start, col_end,
                                                         proxy_3d);
-        break;
-    case DType::FLOAT64:
-        cross_matmul_send_vector_slice_1d_to_3d<double>(partition, node, vec_name, target_ci,
-                                                         local_offset, send_len, col_start,
-                                                         col_end, proxy_3d);
-        break;
-    case DType::INT32:
-        cross_matmul_send_vector_slice_1d_to_3d<int32_t>(partition, node, vec_name, target_ci,
-                                                          local_offset, send_len, col_start,
-                                                          col_end, proxy_3d);
-        break;
-    case DType::INT64:
-        cross_matmul_send_vector_slice_1d_to_3d<int64_t>(partition, node, vec_name, target_ci,
-                                                          local_offset, send_len, col_start,
-                                                          col_end, proxy_3d);
-        break;
-    }
+    });
 }
 
 static void dispatch_cross_matmul_send_vector_slice(
     DType dt, PartitionImpl<1>* partition, DAGNode* node, int vec_name,
     const ChareIndex<2>& target_ci, int local_offset, int send_len, int col_start, int col_end,
     CProxy_Partition2D& proxy_2d) {
-    switch (dt) {
-    case DType::FLOAT32:
-        cross_matmul_send_vector_slice_1d_to_2d<float>(partition, node, vec_name, target_ci,
+    cn_dispatch_blas(dt, [&](auto tag) {
+        using T = decltype(tag);
+        cross_matmul_send_vector_slice_1d_to_2d<T>(partition, node, vec_name, target_ci,
                                                         local_offset, send_len, col_start, col_end,
                                                         proxy_2d);
-        break;
-    case DType::FLOAT64:
-        cross_matmul_send_vector_slice_1d_to_2d<double>(partition, node, vec_name, target_ci,
-                                                         local_offset, send_len, col_start,
-                                                         col_end, proxy_2d);
-        break;
-    case DType::INT32:
-        cross_matmul_send_vector_slice_1d_to_2d<int32_t>(partition, node, vec_name, target_ci,
-                                                          local_offset, send_len, col_start,
-                                                          col_end, proxy_2d);
-        break;
-    case DType::INT64:
-        cross_matmul_send_vector_slice_1d_to_2d<int64_t>(partition, node, vec_name, target_ci,
-                                                          local_offset, send_len, col_start,
-                                                          col_end, proxy_2d);
-        break;
-    }
+    });
 }
 
 template <int N>

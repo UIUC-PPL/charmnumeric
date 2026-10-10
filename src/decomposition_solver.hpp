@@ -248,11 +248,8 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
             return try_assign_tile(array_name, candidate_tile);
         };
 
-        // visited_temps: temps already expanded during this top-level walk.
-        // Fused chains reuse temps (e.g. Newton steps x' = f(x, x)), so
-        // re-expanding a temp per use is exponential in the chain length; one
-        // expansion yields the same proposals (operand regions come from the
-        // temp's own definition, not from the path that reached it).
+        // Each temp is expanded once per walk: fused chains reuse temps, and
+        // re-expanding per use is exponential in chain length.
         auto collect_tile_candidates =
             [&](auto&& self, int array_name, int ndims, ASTNode* node, Region* carried_region,
                 const std::unordered_map<int, ASTNode*>& temp_defs,
@@ -608,9 +605,10 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                     matmul_arrays.insert(ast_node->result_name);
                 }
 
-                // Reduction and linalg results are routed by a zero-offset decomposition.
-                // BINCOUNT also needs x and weights laid out identically.
-                if (is_reduction_op(op) || op == Opcode::LINALG) {
+                // These results are routed by a zero-offset decomposition; BINCOUNT
+                // also needs x and weights laid out identically.
+                if (is_reduction_op(op) || op == Opcode::LINALG || is_shape_op(op) ||
+                    is_signal_op(op) || op == Opcode::GATHER || op == Opcode::EXPAND) {
                     matmul_arrays.insert(ast_node->result_name);
                     if (op == Opcode::BINCOUNT)
                         for (ASTNode* operand : ast_node->operands)
@@ -1769,6 +1767,58 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
             if (meta_it != array_meta.end() && !meta_it->second.decomp_final)
                 meta_it->second.offset = zero_offset;
         }
+
+        // The executor allocates a fused kernel's other kept results at the
+        // shifted set_region shape, so place them to match.
+        detail::for_each_node_topo(dag, [&](DAGNode* dag_node) {
+            for (ASTNode* root : dag_node->ast->roots) {
+                if (static_cast<Opcode>(root->opcode) != Opcode::SET_REGION ||
+                    root->operands.empty() || root->region == nullptr || root->region->is_global)
+                    continue;
+                auto target_it = array_meta.find(root->operands[0]->result_name);
+                if (target_it == array_meta.end())
+                    continue;
+                const auto& target = target_it->second;
+                int nd = target.ndims;
+                auto start = extract_region_start(root->region, nd);
+                auto step = extract_region_step(root->region, nd);
+                auto stop = extract_region_stop(root->region, nd, target.global_shape);
+                bool shifted = false, unit = true;
+                for (int d = 0; d < nd; ++d) {
+                    shifted |= start[d] != 0;
+                    unit &= step[d] == 1;
+                }
+                if (!shifted || !unit)
+                    continue;
+                for (ASTNode* other : dag_node->ast->roots) {
+                    if (other == root || other->is_temp ||
+                        static_cast<Opcode>(other->opcode) == Opcode::SET_REGION)
+                        continue;
+                    auto it = array_meta.find(other->result_name);
+                    if (it == array_meta.end() || it->second.decomp_final ||
+                        it->second.ndims != nd)
+                        continue;
+                    bool same_shape = true;
+                    for (int d = 0; d < nd; ++d)
+                        same_shape &= it->second.global_shape[d] == stop[d] - start[d];
+                    if (!same_shape)
+                        continue;
+                    for (int d = 0; d < nd; ++d)
+                        it->second.offset[d] = target.offset[d] + start[d];
+                    it->second.tile = target.tile;
+                }
+            }
+        });
+    }
+
+    // Chare indices are global / tile, so a negative offset (from a view that
+    // starts left of its anchor) moves to the same tile phase in [0, tile).
+    for (auto& [name, meta] : array_meta) {
+        if (meta.decomp_final || meta.tile <= 0)
+            continue;
+        for (int d = 0; d < meta.ndims; ++d)
+            if (meta.offset[d] < 0)
+                meta.offset[d] = ((meta.offset[d] % meta.tile) + meta.tile) % meta.tile;
     }
 
     for (auto& [name, meta] : array_meta)

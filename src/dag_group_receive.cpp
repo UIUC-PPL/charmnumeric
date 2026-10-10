@@ -5,7 +5,6 @@
 #include <cstring>
 #include <cstdlib>
 #include <set>
-#include <unordered_set>
 
 namespace {
 
@@ -219,11 +218,18 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
                         active_ndims.insert(operand->ndims);
                 active_ndims.insert(ast_node->ndims);
             }
+            if (is_shape_op(static_cast<Opcode>(ast_node->opcode))) {
+                active_ndims.insert(ast_node->operands[0]->ndims);
+                active_ndims.insert(ast_node->ndims);
+            }
             if (is_reduction_op(static_cast<Opcode>(ast_node->opcode))) {
                 // The operand may be a size-1 broadcast view; both sides still run.
                 active_ndims.insert(ast_node->operands[0]->ndims);
                 active_ndims.insert(ast_node->ndims);
             }
+            if (is_index_op(static_cast<Opcode>(ast_node->opcode)))
+                for (int nd : index_op_ndims(ast_node))
+                    active_ndims.insert(nd);
             if (static_cast<Opcode>(ast_node->opcode) == Opcode::TILE) {
                 int input_nd = ast_node->operands[0]->ndims;
                 int result_nd = ast_node->ndims;
@@ -274,6 +280,17 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
                 std::array<int, 3> out_shape;
                 int out_nd = linalg_result_meta(ast_node, array_meta, out_shape);
                 array_meta[ast_node->result_name] = {out_nd, out_shape, {}, 0};
+            } else if (is_index_op(op)) {
+                std::array<int, 3> out_shape;
+                int out_nd = index_result_meta(ast_node, array_meta, out_shape);
+                if (out_nd > 0)
+                    array_meta[ast_node->result_name] = {out_nd, out_shape, {}, 0};
+            } else if (is_shape_op(op)) {
+                // operands: x, result shape...
+                std::array<int, 3> out_shape = {0, 0, 0};
+                for (int k = 0; k < ast_node->ndims; ++k)
+                    out_shape[k] = (int)ast_node->operands[k + 1]->scalar;
+                array_meta[ast_node->result_name] = {ast_node->ndims, out_shape, {}, 0};
             } else if (op == Opcode::MATMUL) {
                 int mat_op_name = ast_node->operands[0]->result_name;
                 auto mat_it = array_meta.find(mat_op_name);
@@ -406,6 +423,19 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
                 for (int k = 0; k < nd && k + 1 < (int)ast_node->operands.size(); ++k)
                     out_shape[k] = in_shape[(int)ast_node->operands[k + 1]->scalar];
                 array_meta[ast_node->result_name] = {nd, out_shape, {}, 0};
+            } else if (is_signal_op(op)) {
+                // CONVOLVE: shape operands (after the shifts); FLIP: the view's shape
+                int nd = ast_node->ndims;
+                std::array<int, 3> shape = {0, 0, 0};
+                if (op == Opcode::CONVOLVE) {
+                    for (int d = 0; d < nd; ++d)
+                        shape[d] = (int)ast_node->operands[3 + nd + d]->scalar;
+                } else if (!region_to_shape(ast_node->get_operand_region(0), nd, shape)) {
+                    auto input_it = array_meta.find(ast_node->operands[0]->result_name);
+                    if (input_it != array_meta.end())
+                        shape = input_it->second.global_shape;
+                }
+                array_meta[ast_node->result_name] = {nd, shape, {}, 0};
             } else if (is_castscansort(op)) {
                 // Same shape as the input (pinned again after the solver).
                 auto input_it = array_meta.find(ast_node->operands[0]->result_name);
@@ -454,8 +484,7 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
         meta_it->second.offset = live_meta.offset;
     }
 
-    // CAST/SCAN/SORT/ARGSORT results take the input's final decomposition
-    // (topological order, so chains propagate).
+    // SCAN/SORT/ARGSORT take the input's final decomposition (topo order, chains propagate).
     dag_group_for_each_node_topo(dag, [&](DAGNode* dag_node) {
         for (ASTNode* ast_node : dag_node->ast->roots) {
             if (!is_castscansort(static_cast<Opcode>(ast_node->opcode)))
@@ -502,9 +531,8 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
                     int tile_1d = res_it->second.tile;
                     std::array<int, 1> s = {0}, e = {mat_rows}, st = {1};
                     ArrayRegion<1> result_region(s, e, st);
-                    // The result may be the first 1-D array: new chares must
-                    // start at this epoch (set before inserting, since a local
-                    // insert constructs the chare immediately).
+                    // New chares must start at this epoch; set it before inserting,
+                    // since a local insert constructs the chare immediately.
                     if (partition_grid[1].start_epoch < 0)
                         partition_grid[1].start_epoch = epoch;
                     expand_partition_nd<1>(thisProxy, partition_proxy_1, partition_grid[1].grid,
@@ -518,9 +546,7 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
                     int tile_2d = res_it->second.tile;
                     std::array<int, 2> s = {0, 0}, e = {M, N_cols}, st = {1, 1};
                     ArrayRegion<2> result_region(s, e, st);
-                    // The result may be the first 2-D array (e.g. A3d[k] @
-                    // B3d[k]); without a start epoch the new chares start at
-                    // -1, never run this DAG, and the result never appears.
+                    // Without a start epoch, new chares start at -1 and never run this DAG.
                     if (partition_grid[2].start_epoch < 0)
                         partition_grid[2].start_epoch = epoch;
                     expand_partition_nd<2>(thisProxy, partition_proxy_2, partition_grid[2].grid,
@@ -549,7 +575,9 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
                                                &result_region, tile);
                     }
                 }
-            } else if (op == Opcode::TILE || is_reduction_op(op) || op == Opcode::LINALG) {
+            } else if (op == Opcode::TILE || is_reduction_op(op) || op == Opcode::LINALG ||
+                       is_shape_op(op) || is_signal_op(op) || op == Opcode::GATHER ||
+                       op == Opcode::EXPAND) {
                 auto res_it = array_meta.find(ast_node->result_name);
                 if (res_it != array_meta.end()) {
                     int res_nd = res_it->second.ndims;
@@ -610,7 +638,10 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
                 if (res_it != array_meta.end() && res_it->second.global_shape[0] > 0) {
                     int nd = res_it->second.ndims;
                     int tile = res_it->second.tile;
-                    auto& sh = res_it->second.global_shape;
+                    // a nonzero decomposition offset shifts the tiles: cover [0, offset + shape)
+                    std::array<int, 3> sh = res_it->second.global_shape;
+                    for (int d = 0; d < nd; ++d)
+                        sh[d] += res_it->second.offset[d];
                     if (partition_grid[nd].start_epoch < 0)
                         partition_grid[nd].start_epoch = epoch;
                     switch (nd) {
@@ -643,8 +674,7 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
     DBG_PRINT("[PE %d] receive_dag epoch=%d: partition expansion pass complete\n", CkMyPe(),
               epoch);
 
-    // Cut UPLOAD payloads into the tiles of this PE's chares, now that the
-    // decompositions and the chare grids are final.
+    // Cut UPLOAD payloads into tiles once decompositions and chare grids are final.
     stage_uploads(dag);
 
     compile(dag);

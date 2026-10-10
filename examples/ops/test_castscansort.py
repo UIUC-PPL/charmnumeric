@@ -1,24 +1,9 @@
 #!/usr/bin/env python
-"""Tests for astype (CAST), mixed-dtype promotion, scans (SCAN) and sorts (SORT/ARGSORT).
+"""Tests for astype, mixed-dtype promotion, scans (cumsum family) and sorts/argsort.
 
-  astype     all 12 conversions between float32/float64/int32/int64, on 1-D/2-D/3-D
-             arrays, views, size-1 arrays; float->int truncates toward zero.
-  promotion  int array (+|-|*|/) float array, int array * Python float, mixed-dtype
-             matmul and assignment insert implicit casts (they used to read int
-             buffers as float inside fused kernels).
-  scans      cumsum/cumprod/nancumsum/nancumprod along every axis of 1-D/2-D/3-D
-             arrays, int32 -> int64 accumulation, dtype=, out=, views, NaNs.
-  sorts      sort/argsort along every axis, ties (argsort must equal NumPy's
-             kind='stable' exactly), NaNs (sorted last), views, in-place a.sort().
-
-Inputs are generated natively (no per-element upload). On the CPU build the
-minimum tiles are 262144 (1-D), 512 (2-D) and 64 (3-D), so the "big" shapes
-span several chares (with CNUM_ODF=4, also at +p1). Views of a larger array
-make inputs whose decomposition has a nonzero offset.
-
-Environment: CNUM_HOST, CNUM_PORT, CNUM_ODF (default 4). Run with e.g.
+Inputs are generated natively. The big shapes span several chares.
+Env: CNUM_HOST, CNUM_PORT, CNUM_ODF (default 4). Run as e.g.
     harness/run_one.sh server.out 2 35001 examples/ops/test_castscansort.py
-Prints PASS test_castscansort / FAIL test_castscansort: ... (exit status 0 / 1).
 """
 
 import os
@@ -152,7 +137,7 @@ def main(chk):
         check("matvec f64 @ i64", M @ v, Mh @ vh, rtol=1e-12, atol=1e-9)
         check("matmatmul i64 @ f64", Mi @ M, Mih @ Mh, rtol=1e-12, atol=1e-9)
         w = real_data((n,), 34)
-        check("dot i64 . f64", v @ w, np.array([vh @ w.get(iface)]), rtol=1e-12)
+        check("dot i64 . f64", v @ w, np.asarray(vh @ w.get(iface)), rtol=1e-12)
         T = cnp.zeros((n, n), dtype=np.float32)
         T[...] = Mi
         check("setitem i64 -> f32 array", T, Mih.astype(np.float32))
@@ -221,11 +206,7 @@ def main(chk):
         bigh = big.get(iface)
         check("cumsum offset view big[100003:650004]", cnp.cumsum(big[100003:650004]),
               np.cumsum(bigh[100003:650004]), rtol=1e-9, atol=1e-9)
-        try:
-            cnp.cumsum(I)
-            chk.true("cumsum(axis=None) on 2-D raises", False)
-        except NotImplementedError:
-            chk.true("cumsum(axis=None) on 2-D raises", True)
+        check("cumsum(axis=None) on 2-D", cnp.cumsum(I), np.cumsum(Ih))
 
     # ------------------------------------------------------------------ sorts
     if "sort" in only:
@@ -285,8 +266,7 @@ def main(chk):
               np.argsort(Qh, kind="stable") + 0.5)
 
     # ------------------------------------------------------- size-1 arrays
-    # Scalar fills, run last: size-1 elementwise results on multi-chare
-    # partitions are wrong in the backend today (independent of these ops).
+    # Run last: size-1 results on multi-chare partitions are wrong in the backend.
     x1 = cnp.full((1,), -34.75)
     i1 = cnp.full((1,), -648, dtype=np.int64)
     x1h, i1h = np.array([-34.75]), np.array([-648])

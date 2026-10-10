@@ -1,20 +1,16 @@
 """NumPy reference for charmnumeric's counter-based generators.
 
-This mirrors ``src/creation_kernels.hpp`` operation for operation, so it
-produces bit-identical values. It is used by the host simulator
-(``examples/cupynumeric/_cnum_sim.py``) and by the tests to check backend
-results exactly.
+Mirrors ``src/creation_kernels.hpp`` operation for operation, so results are
+bit-identical. Used by the host simulator (``examples/cupynumeric/_cnum_sim.py``)
+and by the tests.
 
-Generator: Philox4x32-10 (Salmon et al., SC'11). For element ``g`` (its global
-row-major linear index, or the permuted index for ``random.transposed``) of
-the ``stream``-th draw after ``seed(seed)``, the counter is
-``(g_lo, g_hi, stream, attempt)`` and the key is ``(seed_lo, seed_hi)``.
-Every element is a pure function of (seed, stream, g), so the values do not
-depend on the decomposition, the over-decomposition factor or the PE count.
-The streams differ from NumPy's MT19937.
+Generator: Philox4x32-10 (Salmon et al., SC'11). Element ``g`` (global row-major
+index, or the permuted index for ``random.transposed``) of the ``stream``-th draw
+after ``seed`` uses counter ``(g_lo, g_hi, stream, attempt)`` and key
+``(seed_lo, seed_hi)``. The streams differ from NumPy's MT19937.
 
-Floating point follows a fixed sequence of IEEE operations (no FMA), with
-software ``log`` and ``cos(2*pi*u)``, so CPU and GPU builds agree bitwise.
+Floating point follows a fixed sequence of IEEE operations (no FMA), with software
+``log`` and ``cos(2*pi*u)``, so CPU and GPU builds agree bitwise.
 """
 
 import numpy as np

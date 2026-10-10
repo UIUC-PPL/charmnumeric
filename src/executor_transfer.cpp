@@ -46,6 +46,7 @@ static void dispatch_cross_send(DType dt, PartitionImpl<N>* partition, DAGNode* 
                                 int target_name, ASTNode* sr_root, ArrayDAGGroup* dag_group) {
     int target_ndims = sr_root->ndims;
 
+    // Compute dimension mapping from source metadata
     auto src_it = partition->arrays.find(source_name);
     if (src_it == partition->arrays.end() || src_it->second->local_size() == 0)
         return;
@@ -139,8 +140,7 @@ void ArrayDAGExecutorND<N>::execute_cross_set_region_node(DAGNode* node) {
         auto r_chare_global = tgt_decomp.chare_region_global(nd_idx);
         auto* tgt_region = static_cast<ArrayRegion<N>*>(sr_root->region);
 
-        // Preserve the target lattice for stepped target slices.  The wire
-        // region is array-local; chare regions are decomp-global.
+        // Wire region is array-local; chare regions are decomp-global.
         auto [my_input, has_overlap] =
             intersect(tgt_decomp.to_global(*tgt_region), r_chare_global);
         if (!has_overlap) {
@@ -157,8 +157,7 @@ void ArrayDAGExecutorND<N>::execute_cross_set_region_node(DAGNode* node) {
         }
         int src_ndims = meta_it->second.ndims;
 
-        // Count exactly the source chares whose share of the source view maps
-        // onto this chare, using the same lattice map as the sender.
+        // Must use the same lattice map as the sender.
         ArrayDAGGroup::ArrayMetadata tgt_meta{};
         tgt_meta.ndims = N;
         for (int d = 0; d < N; ++d) {
@@ -386,20 +385,10 @@ template <int N_src>
 static void dispatch_diag_send(DType dt, PartitionImpl<N_src>* partition, DAGNode* node,
                                int source_name, int result_name, int k_offset,
                                ArrayDAGGroup* dag_group) {
-    switch (dt) {
-    case DType::FLOAT32:
-        diag_send<N_src, float>(partition, node, source_name, result_name, k_offset, dag_group);
-        break;
-    case DType::FLOAT64:
-        diag_send<N_src, double>(partition, node, source_name, result_name, k_offset, dag_group);
-        break;
-    case DType::INT32:
-        diag_send<N_src, int32_t>(partition, node, source_name, result_name, k_offset, dag_group);
-        break;
-    case DType::INT64:
-        diag_send<N_src, int64_t>(partition, node, source_name, result_name, k_offset, dag_group);
-        break;
-    }
+    cn_dispatch(dt, [&](auto tag) {
+        using T = decltype(tag);
+        diag_send<N_src, T>(partition, node, source_name, result_name, k_offset, dag_group);
+    });
 }
 
 template <int N>
@@ -721,24 +710,11 @@ static void dispatch_tile_send(DType dt, PartitionImpl<N_src>* partition, DAGNod
                                std::array<int, 3> const& reps,
                                std::array<int, 3> const& input_shape, int out_ndims,
                                ArrayDAGGroup* dag_group) {
-    switch (dt) {
-    case DType::FLOAT32:
-        tile_send<N_src, N_tgt, float>(partition, node, source_name, result_name, reps,
+    cn_dispatch(dt, [&](auto tag) {
+        using T = decltype(tag);
+        tile_send<N_src, N_tgt, T>(partition, node, source_name, result_name, reps,
                                        input_shape, out_ndims, dag_group);
-        break;
-    case DType::FLOAT64:
-        tile_send<N_src, N_tgt, double>(partition, node, source_name, result_name, reps,
-                                        input_shape, out_ndims, dag_group);
-        break;
-    case DType::INT32:
-        tile_send<N_src, N_tgt, int32_t>(partition, node, source_name, result_name, reps,
-                                         input_shape, out_ndims, dag_group);
-        break;
-    case DType::INT64:
-        tile_send<N_src, N_tgt, int64_t>(partition, node, source_name, result_name, reps,
-                                         input_shape, out_ndims, dag_group);
-        break;
-    }
+    });
 }
 
 template <int N>

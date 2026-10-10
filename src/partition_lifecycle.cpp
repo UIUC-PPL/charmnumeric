@@ -85,7 +85,7 @@ int PartitionImpl<N>::create(ArrayRegion<N>* region, int name, DType dtype,
     }
     dag_group->live_array_meta[name] = live_meta;
 
-    // A re-created array replaces any previous buffer, even when this chare no longer owns a tile.
+    // Re-create replaces any old buffer, even if this chare no longer owns a tile.
     auto old_it = arrays.find(name);
     if (old_it != arrays.end()) {
         delete old_it->second;

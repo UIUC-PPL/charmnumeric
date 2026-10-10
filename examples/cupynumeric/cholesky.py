@@ -1,79 +1,102 @@
-#!/usr/bin/env python
-"""charmnumeric port of cupynumeric/examples/cholesky.py.
-
-Verdict: direct. Same input (np.eye(n)) and the same call,
-cnp.linalg.cholesky(input), which is native (LINALG executor: gathered to one
-chare and factored there). The check compares with numpy.linalg.cholesky, as
-the original does, and always runs. --input spd factors a non-trivial SPD
-matrix instead (0.5*(R + R.T) + n*I, with the native transpose R.T).
-Complex dtypes are not supported.
-"""
+# Copyright 2024 NVIDIA Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 
 import argparse
-import os
-import sys
-import time
-
 import numpy
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# charmnumeric port: _benchmark is the local shim (_benchmark.py). It connects,
+# runs with np = charmnumeric and checks the result against NumPy.
+from _benchmark import (
+    benchmark_info,
+    get_numpy,
+    format_dtype,
+    parse_with_harness,
+)
 
-import charmnumeric as cnp  # noqa: E402
-import _cnum_util as U  # noqa: E402
-from _cnum_connect import get_interface  # noqa: E402
-from charmtyles.core import sync  # noqa: E402
 
-
-def check_equal_numpy(chk, interface, input, output, dtype):
+def check_equal_numpy(np, input, output):
     print("Checking result...")
-    out2 = numpy.linalg.cholesky(input.get(interface))
-    rtol, atol = U.tolerances(dtype)
-    chk.close(f"cholesky n={input.shape[0]} {dtype} vs numpy", output.get(interface), out2,
-              rtol=rtol, atol=atol * max(1.0, float(numpy.abs(out2).max())))
+    out2 = numpy.linalg.cholesky(get_numpy(np, input))
+    if numpy.allclose(output, out2):
+        print("PASS!")
+    else:
+        print("FAIL!")
+        print("numpy     : " + str(out2))
+        print(f"{np.__name__} : " + str(output))
+        assert False
 
 
-def make_input(n, dtype, kind):
-    if kind == "eye":
-        return cnp.eye(n, dtype=dtype)
-    R = cnp.random.rand(n, n, dtype=dtype)
-    return 0.5 * (R + R.T) + float(n) * cnp.eye(n, dtype=dtype)
+@benchmark_info(name="Cholesky", formats={"dtype": format_dtype})
+def cholesky(np, n, dtype, *, timer, perform_check=False, print_timing=False):
+    input = np.eye(n, dtype=dtype)
 
+    timer.start()
+    out1 = np.linalg.cholesky(input)
+    total = timer.stop()
 
-def cholesky(chk, interface, n, dtype, kind, print_timing=False):
-    input = make_input(n, dtype, kind)
-    sync(interface)
-
-    t0 = time.perf_counter()
-    out1 = cnp.linalg.cholesky(input)
-    sync(interface)
-    total = (time.perf_counter() - t0) * 1e3
-
-    check_equal_numpy(chk, interface, input, out1, dtype)
+    if perform_check:
+        check_equal_numpy(np, input, out1)
 
     if print_timing:
         print(f"Elapsed Time: {total} ms")
         flops = (n**3) / 3 + 2 * n / 3
         print(f"{flops / total / 1000000} GOP/s")
+
     return total
 
 
-def main(chk):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-t", "--time", dest="timing", action="store_true", help="perform timing")
-    parser.add_argument("-n", "--num", type=int, nargs="+", default=[10], dest="n",
-                        help="number of rows/cols in the matrix")
-    parser.add_argument("-d", "--dtype", default="float64", choices=["float32", "float64"],
-                        dest="dtype", help="data type")
-    parser.add_argument("--input", default="eye", choices=["eye", "spd"], dest="input",
-                        help="eye (as the original) or a random SPD matrix")
-    parser.add_argument("--check", dest="check", action="store_true",
-                        help="compare result to numpy (always done)")
-    args = parser.parse_args()
-
-    interface = get_interface()
-    for n in args.n:
-        cholesky(chk, interface, n, numpy.dtype(args.dtype), args.input, args.timing)
-
-
 if __name__ == "__main__":
-    U.run("cholesky", main)
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-t",
+        "--time",
+        dest="timing",
+        action="store_true",
+        help="perform timing",
+    )
+    parser.add_argument(
+        "-n",
+        "--num",
+        type=int,
+        nargs="+",
+        default=[10],
+        dest="n",
+        help="number of rows/cols in the matrix",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        default="float64",
+        choices=["float32", "float64", "complex64", "complex128"],
+        dest="dtype",
+        help="data type",
+    )
+    parser.add_argument(
+        "--check",
+        dest="check",
+        action="store_true",
+        help="compare result to numpy",
+    )
+    args, harness = parse_with_harness(parser)
+
+    harness.run_timed(
+        cholesky,
+        harness.np,
+        args.n,
+        args.dtype,
+        timer=harness.timer,
+        perform_check=args.check,
+        print_timing=args.timing,
+    )

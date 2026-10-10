@@ -1,19 +1,9 @@
 #!/usr/bin/env python
 """Tests for native transpose (TRANSPOSE executor) and transposed-operand matmul.
 
-Covers a.T / cnp.transpose / a.transpose() / cnp.swapaxes on 2-D and 3-D
-arrays, square / non-square / non-tile-aligned shapes, offset and strided
-views, chains (A.T.T, (A.T @ B).T), elementwise consumers of transposes,
-vecmat (x @ A) and A.T @ B, A @ B.T, A.T @ x, all checked against NumPy.
-
-Inputs are generated natively (no per-element upload): linear-index grids,
-whose values are all distinct, so any misplaced element is detected exactly.
-
-Environment: CNUM_HOST, CNUM_PORT, CNUM_ODF (default 4). Run with e.g.
+Inputs are linear-index grids with distinct values, so misplaced elements are caught exactly.
+Env: CNUM_HOST, CNUM_PORT, CNUM_ODF. Run as e.g.
     harness/run_one.sh server.out 2 34001 examples/ops/test_transpose.py
-Prints PASS test_transpose / FAIL test_transpose: ... (exit status 0 / 1).
-On the CPU build the minimum 2-D tile is 512 and 3-D tile 64, so the larger
-shapes here span several chares (more with +p2 and odf > 1).
 """
 
 import os
@@ -35,7 +25,6 @@ def lin(shape, dtype=np.float64, scale=1.0, shift=0.0):
         L = L * scale + shift
     if np.dtype(dtype) == np.float64:
         return L
-    # other dtypes: build directly from integer index grids
     shape = tuple(shape)
     out = cnp.zeros(shape, dtype=dtype)
     stride = 1
@@ -113,8 +102,7 @@ def main(chk):
         ]
         for key, label in views:
             eq(f"{label} A[...].T", A[key].T, Ah[key].T)
-        # (1, n) / (n, 1) arrays (U.linear_index mis-builds singleton-dim grids,
-        # so copy them out of A)
+        # U.linear_index mis-builds singleton-dim grids, so copy these out of A.
         eq("(1,700) array .T", A[5:6, :].copy().T, Ah[5:6, :].T)
         eq("(1100,1) array .T", A[:, 3:4].copy().T, Ah[:, 3:4].T)
         V = A[100:1050, 30:690]
@@ -140,11 +128,14 @@ def main(chk):
         E = lin((300, 200))
         Eh = host_lin((300, 200))
         ET = E.T
-        E[0:1, 0:1] = -1.0  # writes to E must not reach the materialized ET
+        E[0:1, 0:1] = -1.0  # ET is a view: it follows writes to E
         Eh2 = Eh.copy()
         Eh2[0, 0] = -1.0
-        eq("transpose is materialized (unaffected by later write)", ET, Eh.T)
+        eq("transpose follows later write", ET, Eh2.T)
         eq("transpose after write", E.T, Eh2.T)
+        ET[1:2, 0:1] = -2.0  # and writes to ET reach E
+        Eh2[0, 1] = -2.0
+        eq("write through transpose", E, Eh2)
 
         # 1-D and identity permutations return the array itself (NumPy view semantics)
         v = U.iota(10)
@@ -164,7 +155,6 @@ def main(chk):
         eq("A @ B.T", N_.T @ M, Nh.T @ Mh, rtol=rtol)
         eq("A @ B.T (rhs)", M @ P.T, Mh @ Ph.T, rtol=rtol)
         eq("(A.T @ B).T", (M.T @ N_).T, (Mh.T @ Nh).T, rtol=rtol)
-        # operands that get different tile sizes at small +p/odf
         M2 = U.uniform((640, 520), seed=6)
         N2 = U.uniform((640, 300), seed=7)
         M2h, N2h = M2.get(iface), N2.get(iface)

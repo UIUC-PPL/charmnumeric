@@ -142,43 +142,24 @@ static void send_remote_input(PartitionImpl<N>* partition, DAGNode* node, const 
 #endif
 }
 
+/// Sends an input array's elements in that array's own dtype (kernels may mix dtypes).
 template <int N>
-static void dispatch_send(DType dt, PartitionImpl<N>* partition, DAGNode* node,
-                          const RemoteSend<N>& send, int inp_name,
-                          const std::array<int, N>& nd_idx) {
-    switch (dt) {
-    case DType::FLOAT32:
-        send_remote_input<N, float>(partition, node, send, inp_name, nd_idx);
-        break;
-    case DType::FLOAT64:
-        send_remote_input<N, double>(partition, node, send, inp_name, nd_idx);
-        break;
-    case DType::INT32:
-        send_remote_input<N, int32_t>(partition, node, send, inp_name, nd_idx);
-        break;
-    case DType::INT64:
-        send_remote_input<N, int64_t>(partition, node, send, inp_name, nd_idx);
-        break;
-    }
+static void dispatch_send(PartitionImpl<N>* partition, DAGNode* node, const RemoteSend<N>& send,
+                          int inp_name, const std::array<int, N>& nd_idx) {
+    auto arr_it = partition->arrays.find(inp_name);
+    if (arr_it == partition->arrays.end())
+        return;
+    cn_dispatch(arr_it->second->dtype, [&](auto tag) {
+        send_remote_input<N, decltype(tag)>(partition, node, send, inp_name, nd_idx);
+    });
 }
 
 template <int N>
 static void dispatch_execute(DType dt, ArrayDAGGroup* group, DAGNode* node,
                              PartitionImpl<N>* partition, PendingComm<N>* comm) {
-    switch (dt) {
-    case DType::FLOAT32:
-        group->execute_node_nd<N, float>(node, partition, comm);
-        break;
-    case DType::FLOAT64:
-        group->execute_node_nd<N, double>(node, partition, comm);
-        break;
-    case DType::INT32:
-        group->execute_node_nd<N, int32_t>(node, partition, comm);
-        break;
-    case DType::INT64:
-        group->execute_node_nd<N, int64_t>(node, partition, comm);
-        break;
-    }
+    cn_dispatch(dt, [&](auto tag) {
+        group->execute_node_nd<N, decltype(tag)>(node, partition, comm);
+    });
 }
 
 template <int N>
@@ -189,6 +170,20 @@ void ArrayDAGExecutorND<N>::delete_array(int name) {
               CkMyPe(), N, epoch, name, had_live_meta);
     partition->retire_array(name);
     dag_group->live_array_meta.erase(name);
+}
+
+/// True if chare idx of the NT-D partition owns part of array `name` in its
+/// decomposition. Only owners compute, send broadcasts and answer gets.
+template <int NT>
+static bool chare_owns_array(ArrayDAGGroup* group, int name, const std::array<int, NT>& idx) {
+    auto meta_it = group->array_meta.find(name);
+    if (meta_it == group->array_meta.end() || meta_it->second.ndims != NT)
+        return false;
+    auto chare_region = meta_it->second.template decomp<NT>().chare_region_global(idx);
+    for (int d = 0; d < NT; ++d)
+        if (chare_region.size(d) <= 0)
+            return false;
+    return true;
 }
 
 /// True if chare idx of the NT-D partition owns part of root's output.
@@ -202,17 +197,13 @@ static bool chare_owns_root_result(ArrayDAGGroup* group, ASTNode* root,
     if (static_cast<Opcode>(root->opcode) == Opcode::SET_REGION && !root->operands.empty() &&
         root->operands[0] != nullptr)
         output_name = root->operands[0]->result_name;
-    auto meta_it = group->array_meta.find(output_name);
-    if (meta_it == group->array_meta.end())
-        return false;
-
-    auto decomp = meta_it->second.template decomp<NT>();
-    auto chare_region = decomp.chare_region_global(idx);
-    if (chare_region.size() <= 0)
+    if (!chare_owns_array<NT>(group, output_name, idx))
         return false;
 
     if (static_cast<Opcode>(root->opcode) == Opcode::SET_REGION && root->region != nullptr &&
         !root->region->is_global) {
+        auto decomp = group->array_meta.find(output_name)->second.template decomp<NT>();
+        auto chare_region = decomp.chare_region_global(idx);
         auto* out_region = static_cast<ArrayRegion<NT>*>(root->region);
         auto out_region_global = decomp.to_global(*out_region);
         auto [overlap, has_overlap] = intersect(out_region_global, chare_region);
@@ -259,6 +250,9 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
     bool is_transpose_node = false;
     bool is_castscansort_node = false;
     bool is_linalg_node = false;
+    bool is_signal_node = false;
+    bool is_index_node = false;
+    bool is_shape_node = false;
     // Broadcast operands: size-1 arrays from another partition used as scalars
     struct BroadcastInfo {
         int source_name;
@@ -266,6 +260,8 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
         int target_ndims;
     };
     std::vector<BroadcastInfo> broadcast_ops;
+    int n_expected_broadcasts = 0; // broadcast values this chare receives
+    bool sender_only = false;      // owns no output: only sends its input fragments
     auto* dag_group_meta = static_cast<ArrayDAGGroup*>(group);
     auto nd_idx = partition->nd_index();
 
@@ -288,11 +284,17 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
             continue;
         }
         if (is_reduction_op(opc)) {
-            // Every chare of the input and output partitions runs the node:
-            // input chares send partials, output chares wait for them.
+            // Input chares send partials; output chares wait for them.
             is_reduction_node = true;
             int input_ndims = root->operands[0]->ndims;
             if (N == input_ndims || N == root->ndims)
+                relevant = true;
+            continue;
+        }
+        if (is_shape_op(opc)) {
+            // Source chares send, result chares receive.
+            is_shape_node = true;
+            if (N == root->operands[0]->ndims || N == root->ndims)
                 relevant = true;
             continue;
         }
@@ -306,9 +308,16 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
                     relevant = true;
             continue;
         }
+        if (is_index_op(opc)) {
+            // All chares of these partitions run the node (they may get messages).
+            is_index_node = true;
+            for (int nd : index_op_ndims(root))
+                if (nd == N)
+                    relevant = true;
+            continue;
+        }
         if (is_fill_creation(opc)) {
-            // UPLOAD / RANDOM / IOTA: every chare of the result's partition
-            // creates its tile and fills it locally.
+            // UPLOAD / RANDOM / IOTA: each chare fills its own tile.
             is_creation_node = true;
             if (root->ndims == N)
                 relevant = true;
@@ -375,6 +384,12 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
                 relevant = true;
             continue;
         }
+        if (is_signal_op(opc)) {
+            is_signal_node = true;
+            if (N == root->ndims)
+                relevant = true;
+            continue;
+        }
         if (is_castscansort(opc)) {
             // All chares of the partition take part; empty ones finish.
             is_castscansort_node = true;
@@ -410,11 +425,8 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
                     int tgt_nd = root->ndims;
                     broadcast_ops.push_back({operand->result_name, src_nd, tgt_nd});
                     // Relevant for the chare holding the source and for chares owning a result
-                    if (N == src_nd) {
-                        auto src_it = partition->arrays.find(operand->result_name);
-                        if (src_it != partition->arrays.end() && src_it->second->local_size() > 0)
-                            relevant = true;
-                    }
+                    if (N == src_nd && chare_owns_array<N>(dag_group, operand->result_name, nd_idx))
+                        relevant = true;
                     if (N == tgt_nd && chare_owns_node_result(dag_group, node, N, nd_idx3))
                         relevant = true;
                 }
@@ -437,7 +449,6 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
         return;
     }
 
-    // Check for REDUCTION/BINCOUNT nodes — partials sent to the output chares
     if (is_reduction_node) {
         execute_reduction_node(node);
         return;
@@ -448,8 +459,18 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
         return;
     }
 
+    if (is_shape_node) {
+        execute_shape_node(node);
+        return;
+    }
+
     if (is_creation_node) {
         execute_creation_node(node);
+        return;
+    }
+
+    if (is_index_node) {
+        execute_index_node(node);
         return;
     }
 
@@ -495,7 +516,12 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
         return;
     }
 
-    // Check for CAST/SCAN/SORT/ARGSORT nodes (executor_castscansort.cpp)
+    if (is_signal_node) {
+        execute_signal_node(node);
+        return;
+    }
+
+    // Check for SCAN/SORT/ARGSORT nodes (executor_castscansort.cpp)
     if (is_castscansort_node) {
         execute_castscansort_node(node);
         return;
@@ -566,8 +592,7 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
             partition->comm_bytes_sent += elem_sz;
 #endif
 #ifdef USE_KOKKOS
-            // receive_data takes a nocopydevice buffer: stage the scalar on the device and
-            // send it asynchronously; send_complete frees the buffer.
+            // receive_data takes a nocopydevice buffer; send_complete frees it.
             auto send_device = [&](auto& proxy, const auto& ci, auto nt) {
                 constexpr int NT = decltype(nt)::value;
                 char* dbuf = static_cast<char*>(Kokkos::kokkos_malloc<DeviceSpace>(elem_sz));
@@ -642,16 +667,18 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
             int bcast_input_idx = compute_bcast_input_idx(bcast.source_name);
 
             if (N == bcast.source_ndims) {
-                // We are on the source partition — send if we have the array
+                // We are on the source partition — send if we own the array
                 auto arr_it = partition->arrays.find(bcast.source_name);
                 DBG_PRINT("[Chare %d]   bcast send check: name=%d found=%d local_size=%d\n",
                           partition->index[0], bcast.source_name,
                           (int)(arr_it != partition->arrays.end()),
                           (arr_it != partition->arrays.end()) ? arr_it->second->local_size() : -1);
-                if (arr_it != partition->arrays.end() && arr_it->second->local_size() > 0) {
+                if (chare_owns_array<N>(dag_group, bcast.source_name, nd_idx) &&
+                    arr_it != partition->arrays.end() &&
+                    arr_it->second->local_size() > 0) {
                     int elem_sz = arr_it->second->elem_size();
 #ifdef USE_KOKKOS
-                    char host_scalar[8];
+                    char host_scalar[16];
                     Kokkos::deep_copy(
                         Kokkos::View<char*, HostSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>(
                             host_scalar, elem_sz),
@@ -664,7 +691,6 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
 #endif
 
                     if (bcast.source_ndims == bcast.target_ndims) {
-                        // Same-partition broadcast: send to all other chares owning a result
                         auto pg_it = dag_group->partition_grid.find(N);
                         if (pg_it != dag_group->partition_grid.end()) {
                             int total_chares = 1;
@@ -689,7 +715,6 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
                             }
                         }
                     } else {
-                        // Cross-partition broadcast: send to all target chares owning a result
                         int tgt_nd = bcast.target_ndims;
                         auto pg_it = dag_group->partition_grid.find(tgt_nd);
                         if (pg_it != dag_group->partition_grid.end()) {
@@ -717,24 +742,29 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
                 is_source_only = false;
         }
 
-        // If this partition is only the broadcast source (cross-partition), we're done
         if (is_source_only) {
-            node_finished(node->id);
-            return;
+            // No owned output: only sends broadcasts and, on the result partition, inputs.
+            bool holds_input = false;
+            for (ASTNode* root : node->ast->roots)
+                for (ASTNode* operand : root->operands)
+                    if (root->ndims == N && !operand->is_scalar && !operand->is_broadcast &&
+                        partition->arrays.count(operand->result_name))
+                        holds_input = true;
+            if (!holds_input) {
+                node_finished(node->id);
+                return;
+            }
+            sender_only = true;
         }
 
         // Count expected broadcast messages for this chare
-        // For same-partition: chares that DON'T have the source array expect 1 message per broadcast
+        // For same-partition: every chare but the source's owner expects 1 message per broadcast
         // For cross-partition: all target chares expect 1 message per broadcast
-        int n_expected_broadcasts = 0;
         for (auto& bcast : broadcast_ops) {
-            if (N != bcast.target_ndims)
+            if (N != bcast.target_ndims || sender_only)
                 continue;
             if (bcast.source_ndims == bcast.target_ndims) {
-                // Same-partition: only expect a message if we DON'T have the array locally
-                auto src_it = partition->arrays.find(bcast.source_name);
-                bool have_it = src_it != partition->arrays.end() && src_it->second->local_size() > 0;
-                if (!have_it)
+                if (!chare_owns_array<N>(dag_group, bcast.source_name, nd_idx))
                     n_expected_broadcasts++;
             } else {
                 // Cross-partition: we always expect a message
@@ -743,30 +773,30 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
         }
         DBG_PRINT("[Chare %d]   n_expected_broadcasts=%d is_source_only=%d\n",
                   partition->index[0], n_expected_broadcasts, (int)is_source_only);
-
-        if (n_expected_broadcasts > 0) {
-            auto pre_it = pending.find(node->id);
-            int pre_arrived = 0;
-            std::unordered_map<int, std::vector<RemoteBuffer<N>>> pre_buffers;
-            if (pre_it != pending.end()) {
-                pre_arrived = -(pre_it->second.expected_msgs);
-                pre_buffers = std::move(pre_it->second.remote_buffers);
-            }
-
-            int remaining = n_expected_broadcasts - pre_arrived;
-            pending[node->id] = {node, remaining, {}, std::move(pre_buffers)};
-
-            if (remaining <= 0) {
-                on_comm_done(node->id);
-            } else {
-                DBG_PRINT("[Chare %d]   -> waiting for %d broadcast values\n",
-                          partition->index[0], remaining);
-            }
-            return;
-        }
-        // If no messages expected (source chare in same-partition broadcast),
-        // fall through to normal execution — broadcast value is already local.
+        // Broadcast values arrive as extra messages of the regular path below.
     }
+
+    // Wait for `expected` messages (remote fragments and broadcast values); some
+    // may have arrived already (negative count in `pending`).
+    auto wait_for_msgs = [&](int expected, std::vector<ArrayRegion<N>> my_inputs) {
+        auto pre_it = pending.find(node->id);
+        int pre_arrived = 0;
+        std::unordered_map<int, std::vector<RemoteBuffer<N>>> pre_buffers;
+        if (pre_it != pending.end()) {
+            pre_arrived = -(pre_it->second.expected_msgs);
+            pre_buffers = std::move(pre_it->second.remote_buffers);
+        }
+
+        int remaining = expected - pre_arrived;
+        pending[node->id] = {node, remaining, std::move(my_inputs), std::move(pre_buffers)};
+
+        if (remaining <= 0) {
+            on_comm_done(node->id);
+        } else {
+            DBG_PRINT("[Chare %d]   -> waiting for %d remote messages\n", partition->index[0],
+                      remaining);
+        }
+    };
 
     ArrayRegion<N> r_out;
     std::vector<ArrayRegion<N>> input_regions;
@@ -776,8 +806,16 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
     DType dt = determine_dtype<N>(node, partition->arrays);
 
     if (!extract_regions_nd<N>(node, partition->arrays, r_out, input_regions, input_source_names,
-                               global_shape) ||
+                               global_shape, &dag_group_meta->array_meta) ||
         input_regions.empty()) {
+        if (sender_only) {
+            node_finished(node->id);
+            return;
+        }
+        if (n_expected_broadcasts > 0) {
+            wait_for_msgs(n_expected_broadcasts, {});
+            return;
+        }
         dispatch_execute<N>(dt, static_cast<ArrayDAGGroup*>(group), node, partition, nullptr);
 #ifdef USE_NVIDIA
         {
@@ -810,10 +848,8 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
         }
     }
 
-    // Output decomp: the array r_out refers to (see fused_output_decomp_name):
-    // the last SET_REGION target, else the first non-temp root output (fused
-    // ASTs often keep temporary internal roots ahead of the real result, and
-    // those temps can legitimately have a different decomposition offset).
+    // Decomp of the array r_out refers to (see fused_output_decomp_name). Fused
+    // ASTs can keep temp roots ahead of the real result, with other offsets.
     ArrayDecomp<N> output_decomp;
     {
         int result_name = fused_output_decomp_name(node);
@@ -844,14 +880,18 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
                                        input_decomps);
     for (auto& send : sends) {
         int inp_name = input_source_names[send.input_index];
-        dispatch_send<N>(dt, partition, node, send, inp_name, nd_idx);
+        dispatch_send<N>(partition, node, send, inp_name, nd_idx);
+    }
+    if (sender_only) {
+        node_finished(node->id);
+        return;
     }
 
     // Determine expected messages
     auto li = local_inputs<N>(r_out_global, input_regions_global, nd_idx, output_decomp,
                               input_decomps);
 
-    if (li.expected_msgs == 0) {
+    if (li.expected_msgs + n_expected_broadcasts == 0) {
         if (li.my_inputs.empty()) {
             auto [r_myout, has_out] = intersect(r_out_global, r_chare_out);
             if (has_out && r_myout.size() > 0) {
@@ -885,23 +925,7 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
 #endif
         }
     } else {
-        auto pre_it = pending.find(node->id);
-        int pre_arrived = 0;
-        std::unordered_map<int, std::vector<RemoteBuffer<N>>> pre_buffers;
-        if (pre_it != pending.end()) {
-            pre_arrived = -(pre_it->second.expected_msgs);
-            pre_buffers = std::move(pre_it->second.remote_buffers);
-        }
-
-        int remaining = li.expected_msgs - pre_arrived;
-        pending[node->id] = {node, remaining, std::move(li.my_inputs), std::move(pre_buffers)};
-
-        if (remaining <= 0) {
-            on_comm_done(node->id);
-        } else {
-            DBG_PRINT("[Chare %d]   -> waiting for %d remote messages\n", partition->index[0],
-                      remaining);
-        }
+        wait_for_msgs(li.expected_msgs + n_expected_broadcasts, std::move(li.my_inputs));
     }
 }
 
@@ -913,11 +937,15 @@ void ArrayDAGExecutorND<N>::on_comm_done(int node_id) {
 
     PendingComm<N>& comm = it->second;
     DAGNode* node = comm.node;
-    bool castscansort = false;
-    for (ASTNode* root : node->ast->roots)
+    bool castscansort = false, signal = false;
+    for (ASTNode* root : node->ast->roots) {
         castscansort |= is_castscansort(static_cast<Opcode>(root->opcode));
+        signal |= is_signal_op(static_cast<Opcode>(root->opcode));
+    }
     if (castscansort) {
         finish_castscansort_node(comm);
+    } else if (signal) {
+        finish_signal_node(comm);
     } else {
         DType dt = determine_dtype<N>(node, partition->arrays);
         dispatch_execute<N>(dt, static_cast<ArrayDAGGroup*>(group), node, partition, &comm);

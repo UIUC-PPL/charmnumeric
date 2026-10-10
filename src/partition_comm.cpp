@@ -17,9 +17,8 @@ template <int N>
 void PartitionImpl<N>::receive_data(int& node_id, int& input_index, int& name, int& ndims,
                                     int*& region_data, int64_t& size, char*& data,
                                     CkDeviceBufferPost* devicePost) {
-    // Post entry method: allocate device buffer for incoming GPU data. Charm++
-    // invokes the regular entry with a null data pointer once the transfer is
-    // done, so remember the buffer under the message's identity.
+    // Post entry method: allocate device buffer for incoming GPU data
+    // receive_data later gets a null data pointer, so the buffer is keyed by message identity.
     data = static_cast<char*>(Kokkos::kokkos_malloc<DeviceSpace>(size));
     posted_recv_bufs[recv_key(node_id, input_index, name, ndims, region_data)].push_back(data);
 }
@@ -40,7 +39,7 @@ void PartitionImpl<N>::receive_data(int node_id, int input_index, int name, int 
     PendingComm<N>& comm = executor->pending[node_id];
 
 #ifdef USE_KOKKOS
-    // The payload landed in the device buffer allocated by the post entry above.
+    // Payload is already in the buffer from the post entry.
     char* buf = data;
     if (buf == nullptr) {
         auto key = recv_key(node_id, input_index, name, ndims, region_data);
@@ -89,48 +88,9 @@ void PartitionImpl<N>::comm_done(int node_id) {
 }
 
 template <int N>
-void PartitionImpl<N>::reduce_result(CkReductionMsg* msg) {
-    if constexpr (N == 1) {
-        // Extract metadata and summed value from the custom reducer's output
-        ReduceContrib result;
-        memcpy(&result, msg->getData(), sizeof(ReduceContrib));
-        int node_id = result.node_id;
-        int result_name = result.result_name;
-        DType dt = static_cast<DType>(result.dtype_int);
-
-        // Create the scalar result array (size 1) on chare 0
-        if (arrays.find(result_name) == arrays.end()) {
-            auto* dag_group = static_cast<ArrayDAGGroup*>(dag_proxy.ckLocalBranch());
-            ArrayDecomp<1> out_decomp = dag_group->array_meta[result_name].decomp<1>();
-            std::array<int, 1> out_start = {0};
-            std::array<int, 1> out_stop = {1};
-            std::array<int, 1> out_step = {1};
-            std::array<int, 1> out_gs = {1};
-            ArrayRegion<1> out_region(out_start, out_stop, out_step);
-            arrays[result_name] =
-                allocate_or_reuse(out_region, out_gs, result_name, dt, out_decomp);
-        }
-
-        // Store the reduced value
-        int elem_size = dtype_size(dt);
-#ifdef USE_KOKKOS
-        Kokkos::deep_copy(
-            Kokkos::View<char*, DeviceSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>(
-                static_cast<char*>(arrays[result_name]->device_data_ptr()), elem_size),
-            Kokkos::View<char*, HostSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>(
-                result.value, elem_size));
-#else
-        memcpy(arrays[result_name]->data_ptr(), result.value, elem_size);
-#endif
-
-        DBG_PRINT("[1D Chare %d] reduce_result: node=%d result_name=%d stored\n",
-                  index[0], node_id, result_name);
-
-        delete msg;
-        executor->node_finished(node_id);
-    } else {
-        delete msg;
-    }
+void PartitionImpl<N>::reduce_result(int node_id, int64_t size, char* data) {
+    if constexpr (N == 1)
+        executor->on_dot_partial(node_id, data, size);
 }
 
 #ifdef USE_KOKKOS
@@ -154,6 +114,6 @@ template void PartitionImpl<1>::comm_done(int);
 template void PartitionImpl<2>::comm_done(int);
 template void PartitionImpl<3>::comm_done(int);
 
-template void PartitionImpl<1>::reduce_result(CkReductionMsg*);
-template void PartitionImpl<2>::reduce_result(CkReductionMsg*);
-template void PartitionImpl<3>::reduce_result(CkReductionMsg*);
+template void PartitionImpl<1>::reduce_result(int, int64_t, char*);
+template void PartitionImpl<2>::reduce_result(int, int64_t, char*);
+template void PartitionImpl<3>::reduce_result(int, int64_t, char*);

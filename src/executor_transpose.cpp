@@ -3,9 +3,8 @@
 
 #include <cstring>
 
-// TRANSPOSE: result axis k reads axis perm[k] of the (possibly strided) source
-// view. Source chares send their part, already permuted, to each overlapping
-// result chare; any tiles/offsets work.
+// TRANSPOSE: result axis k reads source axis perm[k]. Source chares send permuted
+// blocks to each overlapping result chare; any tiles/offsets work.
 
 template <int N>
 struct TransposeGeom {
@@ -55,13 +54,7 @@ static bool make_transpose_geom(ArrayDAGGroup* dag_group, ASTNode* root,
 /// View-index range [lo, hi) along source axis d held by source chare index c.
 template <int N>
 static bool src_block_1d(const TransposeGeom<N>& g, int d, int c, int& lo, int& hi) {
-    int cs = g.src.chare_start_global(d, c);
-    int ce = std::min((c + 1) * g.src.tile, g.src.offset[d] + g.src.global_shape[d]);
-    int a = cs - g.vstart[d];
-    int b = ce - g.vstart[d];
-    lo = a <= 0 ? 0 : (a + g.vstep[d] - 1) / g.vstep[d];
-    hi = b <= 0 ? 0 : std::min(g.vsize[d], (b + g.vstep[d] - 1) / g.vstep[d]);
-    return lo < hi;
+    return g.src.view_block(d, c, g.vstart[d], g.vstep[d], g.vsize[d], lo, hi);
 }
 
 /// Result chares [first, last] along axis k covering local indices [lo, hi).
@@ -151,7 +144,6 @@ static void transpose_send(PartitionImpl<N>* partition, DAGNode* node, int input
     auto* src = static_cast<Array<N, T>*>(arr_it->second);
     auto nd_idx = partition->nd_index();
 
-    // This chare's part of the view, in view-index space per source axis.
     std::array<int, N> blo, bhi;
     for (int d = 0; d < N; ++d)
         if (!src_block_1d(g, d, nd_idx[d], blo[d], bhi[d]))
@@ -177,7 +169,6 @@ static void transpose_send(PartitionImpl<N>* partition, DAGNode* node, int input
         sstride[k] = (int64_t)g.vstep[d] * lstride[d];
     }
 
-    // Iterate over the result chares covering [rlo, rhi).
     std::array<int, N> t = cfirst;
     while (true) {
         ChareIndex<N> target;
@@ -215,20 +206,10 @@ static void transpose_send(PartitionImpl<N>* partition, DAGNode* node, int input
 template <int N>
 static void dispatch_transpose_send(DType dt, PartitionImpl<N>* partition, DAGNode* node,
                              int input_name, const TransposeGeom<N>& g) {
-    switch (dt) {
-    case DType::FLOAT32:
-        transpose_send<N, float>(partition, node, input_name, g);
-        break;
-    case DType::FLOAT64:
-        transpose_send<N, double>(partition, node, input_name, g);
-        break;
-    case DType::INT32:
-        transpose_send<N, int32_t>(partition, node, input_name, g);
-        break;
-    case DType::INT64:
-        transpose_send<N, int64_t>(partition, node, input_name, g);
-        break;
-    }
+    cn_dispatch(dt, [&](auto tag) {
+        using T = decltype(tag);
+        transpose_send<N, T>(partition, node, input_name, g);
+    });
 }
 
 /// Messages the result chare owning `mine` expects; must match transpose_send.
@@ -276,7 +257,6 @@ void ArrayDAGExecutorND<N>::execute_transpose_node(DAGNode* node) {
 
     dispatch_transpose_send<N>(dt, partition, node, input_name, g);
 
-    // Receive side: only chares holding part of the result wait.
     auto mine = g.dst.chare_region_global(nd_idx);
     for (int k = 0; k < N; ++k) {
         if (mine.stop[k] <= mine.start[k]) {
@@ -370,19 +350,9 @@ template void ArrayDAGExecutorND<1>::execute_transpose_node(DAGNode*);
 template void ArrayDAGExecutorND<2>::execute_transpose_node(DAGNode*);
 template void ArrayDAGExecutorND<3>::execute_transpose_node(DAGNode*);
 
-template void transpose_place<2, float>(ArrayDAGGroup*, PartitionImpl<2>*, ASTNode*,
-                                        PendingComm<2>*);
-template void transpose_place<2, double>(ArrayDAGGroup*, PartitionImpl<2>*, ASTNode*,
-                                         PendingComm<2>*);
-template void transpose_place<2, int32_t>(ArrayDAGGroup*, PartitionImpl<2>*, ASTNode*,
-                                          PendingComm<2>*);
-template void transpose_place<2, int64_t>(ArrayDAGGroup*, PartitionImpl<2>*, ASTNode*,
-                                          PendingComm<2>*);
-template void transpose_place<3, float>(ArrayDAGGroup*, PartitionImpl<3>*, ASTNode*,
+#define CN_INST_TRANSPOSE_PLACE(T)                                                                 \
+    template void transpose_place<2, T>(ArrayDAGGroup*, PartitionImpl<2>*, ASTNode*,                 \
+                                        PendingComm<2>*);                                          \
+    template void transpose_place<3, T>(ArrayDAGGroup*, PartitionImpl<3>*, ASTNode*,                 \
                                         PendingComm<3>*);
-template void transpose_place<3, double>(ArrayDAGGroup*, PartitionImpl<3>*, ASTNode*,
-                                         PendingComm<3>*);
-template void transpose_place<3, int32_t>(ArrayDAGGroup*, PartitionImpl<3>*, ASTNode*,
-                                          PendingComm<3>*);
-template void transpose_place<3, int64_t>(ArrayDAGGroup*, PartitionImpl<3>*, ASTNode*,
-                                          PendingComm<3>*);
+CN_FOR_EACH_TYPE(CN_INST_TRANSPOSE_PLACE)

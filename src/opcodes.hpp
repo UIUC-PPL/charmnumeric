@@ -18,9 +18,8 @@ enum class Opcode {
     MATMATMUL = 9,
     DIAG = 10,
 
-    // Elementwise math (opcode range 20-49). Comparisons and predicates
-    // produce 0/1 masks in the kernel's element type (there is no bool dtype).
-    // greater/greater_equal are less/less_equal with swapped operands.
+    // Elementwise math (20-49). Comparisons produce bool; greater/greater_equal
+    // are less/less_equal with swapped operands.
     SQRT = 20,
     LOG = 21,
     LOG2 = 22,
@@ -51,7 +50,7 @@ enum class Opcode {
     NOT_EQUAL = 47,
     WHERE = 48, // where(cond, x, y): cond != 0 selects x
     CLIP = 49,  // clip(x, lo, hi) = minimum(maximum(x, lo), hi)
-    // Array creation (50-59): create a new array and fill it chare-locally.
+    // Array creation (50-59), filled chare-locally.
     UPLOAD = 50, // host data carried in the DAG (ASTNode::payload)
     RANDOM = 51, // counter-based RNG
     IOTA = 52,   // arange / linspace / indices / eye
@@ -60,18 +59,53 @@ enum class Opcode {
     BINCOUNT = 61,  // histogram of a non-negative int vector (optionally weighted)
     // Transpose (70): materialized axis permutation (executor_transpose.cpp).
     TRANSPOSE = 70,
-    // 80-89: executor_castscansort.cpp
-    CAST = 80,    // astype: operands (x); result dtype is the node dtype
+    // 80-89: executor_castscansort.cpp (80 is unused)
     SCAN = 81,    // operands (x, axis, kind); kind: 0 cumsum, 1 cumprod, 2 nancumsum, 3 nancumprod
     SORT = 82,    // operands (x, axis); sorted copy along axis (NaNs last)
     ARGSORT = 83, // operands (x, axis); stable int64 indices along axis
     // Dense linear algebra (100-119, executor_linalg.cpp).
-    LINALG = 100 // factorization/solve on one chare; kind is a scalar operand
+    LINALG = 100, // factorization/solve on one chare; kind is a scalar operand
+    // Data-dependent indexing (executor_indexing.cpp). Opcode range 120-139.
+    GATHER = 120,  // out[e] = src.flat[L[b] + sum(slice coords * strides)]
+    SCATTER = 121, // dst.flat[L[b] + ...] = v[e] (in place; result name unused)
+    EXPAND = 122,  // flat positions i of a view, each repeated count(x[i]) times
+    // 140-149: executor_shape.cpp. Operands (x, target shape...).
+    RESHAPE = 140,   // C-order reshape into a new array
+    BROADCAST = 141, // numpy.broadcast_to, materialized
+    // Signal processing (150-159, executor_signal.cpp).
+    CONVOLVE = 150, // operands (a, v, method, shift[nd], shape[nd]); method: 0 direct, 1 fft
+    FLIP = 151,     // operands (x, axis_mask)
+    // Elementwise dtype ops (160-169): fused astype, complex parts, bitwise.
+    CONVERT = 160, // astype: result dtype is the node dtype
+    REAL = 161,
+    IMAG = 162,
+    CONJ = 163,
+    BITWISE_AND = 164, // integers and bool
+    BITWISE_OR = 165,
+    BITWISE_XOR = 166,
+    INVERT = 167, // ~x; logical not on bool
+    LEFT_SHIFT = 168,
+    RIGHT_SHIFT = 169 // arithmetic for signed ints
 };
+
+/// Returns true for the ops handled by execute_signal_node.
+inline bool is_signal_op(Opcode op) {
+    return op == Opcode::CONVOLVE || op == Opcode::FLIP;
+}
+
+/// Returns true for ops handled by execute_index_node.
+inline bool is_index_op(Opcode op) {
+    return op == Opcode::GATHER || op == Opcode::SCATTER || op == Opcode::EXPAND;
+}
 
 /// Returns true for ops handled by execute_reduction_node.
 inline bool is_reduction_op(Opcode op) {
     return op == Opcode::REDUCTION || op == Opcode::BINCOUNT;
+}
+
+/// Returns true for ops handled by execute_shape_node.
+inline bool is_shape_op(Opcode op) {
+    return op == Opcode::RESHAPE || op == Opcode::BROADCAST;
 }
 
 /// Returns true for the ops that create and fill a new array (not CREATE).
@@ -103,6 +137,11 @@ inline bool is_binary_elementwise(Opcode op) {
     case Opcode::LESS_EQUAL:
     case Opcode::EQUAL:
     case Opcode::NOT_EQUAL:
+    case Opcode::BITWISE_AND:
+    case Opcode::BITWISE_OR:
+    case Opcode::BITWISE_XOR:
+    case Opcode::LEFT_SHIFT:
+    case Opcode::RIGHT_SHIFT:
         return true;
     default:
         return false;
@@ -131,13 +170,17 @@ inline bool is_unary_elementwise(Opcode op) {
     case Opcode::SIGN:
     case Opcode::ISNAN:
     case Opcode::ISINF:
+    case Opcode::CONVERT:
+    case Opcode::REAL:
+    case Opcode::IMAG:
+    case Opcode::CONJ:
+    case Opcode::INVERT:
         return true;
     default:
         return false;
     }
 }
 
-/// Returns true for ternary elementwise ops.
 inline bool is_ternary_elementwise(Opcode op) {
     switch (op) {
     case Opcode::WHERE:
@@ -148,10 +191,9 @@ inline bool is_ternary_elementwise(Opcode op) {
     }
 }
 
-/// Returns true for the cast/scan/sort ops (result shaped/decomposed like the input).
+/// Result has the input's shape.
 inline bool is_castscansort(Opcode op) {
     switch (op) {
-    case Opcode::CAST:
     case Opcode::SCAN:
     case Opcode::SORT:
     case Opcode::ARGSORT:
@@ -161,7 +203,6 @@ inline bool is_castscansort(Opcode op) {
     }
 }
 
-/// Returns true for any elementwise op (unary, binary or ternary).
 inline bool is_elementwise(Opcode op) {
     return is_binary_elementwise(op) || is_unary_elementwise(op) || is_ternary_elementwise(op);
 }

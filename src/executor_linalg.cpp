@@ -14,9 +14,8 @@
 #endif
 
 // LINALG (cnp.linalg): operand blocks are gathered to chare 0 of the result's
-// partition, factored there (Eigen; cuSOLVER/cuBLAS on NVIDIA) and the result
-// tiles are scattered back. Not scalable: the problem must fit on one PE/GPU,
-// which factors it alone; gather/scatter messages are staged through host memory.
+// partition, factored there (Eigen; cuSOLVER/cuBLAS on NVIDIA), and result tiles
+// are scattered back. Not scalable: the problem must fit on one PE/GPU.
 
 /// Kinds. Must match charmnumeric/linalg.py (_LA_*).
 enum LaOp : int {
@@ -270,9 +269,30 @@ struct LaProblem {
     T& at(int i, int j) { return out[i + static_cast<int64_t>(j) * R]; }
 };
 
+/// Real type of T (float for complex<float>).
+template <typename T>
+using la_real_t = decltype(cn_real_part(T()));
+
+template <typename T>
+T la_nan() {
+    la_real_t<T> q = std::numeric_limits<la_real_t<T>>::quiet_NaN();
+    if constexpr (cn_is_complex_v<T>)
+        return T(q, q);
+    else
+        return q;
+}
+
 template <typename T>
 void fill_nan(std::vector<T>& v) {
-    std::fill(v.begin(), v.end(), std::numeric_limits<T>::quiet_NaN());
+    std::fill(v.begin(), v.end(), la_nan<T>());
+}
+
+template <typename T>
+T la_conj(const T& x) {
+    if constexpr (cn_is_complex_v<T>)
+        return T(x.real(), -x.imag());
+    else
+        return x;
 }
 
 /// Packed tssvd output from the ascending eigenpairs (w, V) of A^T A.
@@ -293,23 +313,30 @@ void tssvd_pack(LaProblem<T>& P, const std::vector<T>& w, const std::vector<T>& 
 
 template <typename T>
 void slogdet_from_lu(LaProblem<T>& P, const T* lu, int n, int perm_sign) {
-    T sign = static_cast<T>(perm_sign), logdet = 0;
-    for (int i = 0; i < n; ++i) {
-        T d = lu[i + static_cast<int64_t>(i) * n];
-        if (d == T(0)) {
-            sign = 0;
-            logdet = -std::numeric_limits<T>::infinity();
-            break;
-        }
-        if (d < 0)
-            sign = -sign;
-        logdet += std::log(std::abs(d));
-    }
-    if (P.R == 1) {
-        P.out[0] = sign == T(0) ? T(0) : sign * std::exp(logdet);
+    if constexpr (cn_is_complex_v<T>) {
+        T det = T(static_cast<la_real_t<T>>(perm_sign), 0); // det only (slogdet is real-only)
+        for (int i = 0; i < n; ++i)
+            det = det * lu[i + static_cast<int64_t>(i) * n];
+        P.out[0] = det;
     } else {
-        P.out[0] = sign;
-        P.out[1] = logdet;
+        T sign = static_cast<T>(perm_sign), logdet = 0;
+        for (int i = 0; i < n; ++i) {
+            T d = lu[i + static_cast<int64_t>(i) * n];
+            if (d == T(0)) {
+                sign = 0;
+                logdet = -std::numeric_limits<T>::infinity();
+                break;
+            }
+            if (d < 0)
+                sign = -sign;
+            logdet += std::log(std::abs(d));
+        }
+        if (P.R == 1) {
+            P.out[0] = sign == T(0) ? T(0) : sign * std::exp(logdet);
+        } else {
+            P.out[0] = sign;
+            P.out[1] = logdet;
+        }
     }
 }
 
@@ -338,6 +365,9 @@ void put(LaProblem<T>& P, int r0, int c0, const LaMat<T>& X) {
         for (int i = 0; i < X.rows(); ++i)
             P.at(r0 + i, c0 + j) = X(i, j);
 }
+
+template <typename T>
+void la_compute_real(const LaSpec& s, LaProblem<T>& P);
 
 template <typename T>
 void la_compute(const LaSpec& s, LaProblem<T>& P) {
@@ -424,7 +454,7 @@ void la_compute(const LaSpec& s, LaProblem<T>& P) {
         put(P, 0, 0, Mat(svd.matrixU()));
         for (int i = 0; i < k; ++i)
             P.at(m, i) = svd.singularValues()(i);
-        put(P, m + 1, 0, Mat(svd.matrixV().transpose()));
+        put(P, m + 1, 0, Mat(svd.matrixV().adjoint()));
         break;
     }
     case LA_SOLVE_TRIANGULAR: {
@@ -451,6 +481,23 @@ void la_compute(const LaSpec& s, LaProblem<T>& P) {
         put(P, 0, 0, X);
         break;
     }
+    case LA_LSTSQ:
+    case LA_TSSVD:
+        if constexpr (cn_is_complex_v<T>)
+            CkAbort("linalg: lstsq/tssvd do not support complex input");
+        else
+            la_compute_real(s, P);
+        break;
+    }
+}
+
+/// lstsq and tssvd (real dtypes only).
+template <typename T>
+void la_compute_real(const LaSpec& s, LaProblem<T>& P) {
+    using Mat = LaMat<T>;
+    LaMap<T> A(P.a.data(), P.m, P.n);
+    int m = P.m, n = P.n, k = std::min(m, n);
+    switch (s.op) {
     case LA_LSTSQ: {
         Eigen::BDCSVD<Mat> svd(A, Eigen::ComputeThinU | Eigen::ComputeThinV);
         LaMap<T> B(P.b.data(), m, P.bn);
@@ -620,9 +667,79 @@ static LaHandles& la_handles(cudaStream_t st) {
         return cublas##P##dgmm(h, CUBLAS_SIDE_LEFT, m, n, A, lda, x, 1, C, ldc);                 \
     }
 
+// Complex overloads: T is cn_complex (layout of CT, the CUDA type), R the real
+// type of S/W/rwork. orgqr/syevd become ungqr/heevd.
+#define CT_LA_OVERLOADS_C(T, R, CT, P)                                                           \
+    inline CT* cu(T* p) { return reinterpret_cast<CT*>(p); }                                     \
+    inline const CT* cu(const T* p) { return reinterpret_cast<const CT*>(p); }                   \
+    inline cusolverStatus_t potrf_bs(cusolverDnHandle_t h, cublasFillMode_t u, int n, T* A,     \
+                                     int lda, int* lw) {                                         \
+        return cusolverDn##P##potrf_bufferSize(h, u, n, cu(A), lda, lw);                         \
+    }                                                                                            \
+    inline cusolverStatus_t potrf(cusolverDnHandle_t h, cublasFillMode_t u, int n, T* A,        \
+                                  int lda, T* w, int lw, int* info) {                            \
+        return cusolverDn##P##potrf(h, u, n, cu(A), lda, cu(w), lw, info);                       \
+    }                                                                                            \
+    inline cusolverStatus_t getrf_bs(cusolverDnHandle_t h, int m, int n, T* A, int lda,         \
+                                     int* lw) {                                                  \
+        return cusolverDn##P##getrf_bufferSize(h, m, n, cu(A), lda, lw);                         \
+    }                                                                                            \
+    inline cusolverStatus_t getrf(cusolverDnHandle_t h, int m, int n, T* A, int lda, T* w,      \
+                                  int* ipiv, int* info) {                                        \
+        return cusolverDn##P##getrf(h, m, n, cu(A), lda, cu(w), ipiv, info);                     \
+    }                                                                                            \
+    inline cusolverStatus_t getrs(cusolverDnHandle_t h, int n, int nrhs, const T* A, int lda,   \
+                                  const int* ipiv, T* B, int ldb, int* info) {                   \
+        return cusolverDn##P##getrs(h, CUBLAS_OP_N, n, nrhs, cu(A), lda, ipiv, cu(B), ldb,       \
+                                    info);                                                       \
+    }                                                                                            \
+    inline cusolverStatus_t geqrf_bs(cusolverDnHandle_t h, int m, int n, T* A, int lda,         \
+                                     int* lw) {                                                  \
+        return cusolverDn##P##geqrf_bufferSize(h, m, n, cu(A), lda, lw);                         \
+    }                                                                                            \
+    inline cusolverStatus_t geqrf(cusolverDnHandle_t h, int m, int n, T* A, int lda, T* tau,    \
+                                  T* w, int lw, int* info) {                                     \
+        return cusolverDn##P##geqrf(h, m, n, cu(A), lda, cu(tau), cu(w), lw, info);              \
+    }                                                                                            \
+    inline cusolverStatus_t orgqr_bs(cusolverDnHandle_t h, int m, int n, int k, const T* A,     \
+                                     int lda, const T* tau, int* lw) {                           \
+        return cusolverDn##P##ungqr_bufferSize(h, m, n, k, cu(A), lda, cu(tau), lw);             \
+    }                                                                                            \
+    inline cusolverStatus_t orgqr(cusolverDnHandle_t h, int m, int n, int k, T* A, int lda,     \
+                                  const T* tau, T* w, int lw, int* info) {                       \
+        return cusolverDn##P##ungqr(h, m, n, k, cu(A), lda, cu(tau), cu(w), lw, info);           \
+    }                                                                                            \
+    inline cusolverStatus_t syevd_bs(cusolverDnHandle_t h, cusolverEigMode_t j,                 \
+                                     cublasFillMode_t u, int n, const T* A, int lda,             \
+                                     const R* W, int* lw) {                                      \
+        return cusolverDn##P##heevd_bufferSize(h, j, u, n, cu(A), lda, W, lw);                   \
+    }                                                                                            \
+    inline cusolverStatus_t syevd(cusolverDnHandle_t h, cusolverEigMode_t j, cublasFillMode_t u, \
+                                  int n, T* A, int lda, R* W, T* w, int lw, int* info) {         \
+        return cusolverDn##P##heevd(h, j, u, n, cu(A), lda, W, cu(w), lw, info);                 \
+    }                                                                                            \
+    inline cusolverStatus_t gesvd_bs(cusolverDnHandle_t h, int m, int n, T*, int* lw) {         \
+        return cusolverDn##P##gesvd_bufferSize(h, m, n, lw);                                     \
+    }                                                                                            \
+    inline cusolverStatus_t gesvd(cusolverDnHandle_t h, signed char ju, signed char jv, int m,  \
+                                  int n, T* A, int lda, R* S, T* U, int ldu, T* VT, int ldvt,   \
+                                  T* w, int lw, R* rw, int* info) {                              \
+        return cusolverDn##P##gesvd(h, ju, jv, m, n, cu(A), lda, S, cu(U), ldu, cu(VT), ldvt,   \
+                                    cu(w), lw, rw, info);                                        \
+    }                                                                                            \
+    inline cublasStatus_t trsm(cublasHandle_t h, cublasFillMode_t u, cublasOperation_t t,       \
+                               cublasDiagType_t d, int m, int n, const T* A, int lda, T* B,     \
+                               int ldb) {                                                        \
+        const T one(1, 0);                                                                       \
+        return cublas##P##trsm(h, CUBLAS_SIDE_LEFT, u, t, d, m, n, cu(&one), cu(A), lda, cu(B),  \
+                               ldb);                                                             \
+    }
+
 namespace cula {
 CT_LA_OVERLOADS(float, S)
 CT_LA_OVERLOADS(double, D)
+CT_LA_OVERLOADS_C(cn_c64, float, cuComplex, C)
+CT_LA_OVERLOADS_C(cn_c128, double, cuDoubleComplex, Z)
 } // namespace cula
 
 static int la_info(const DevBuf<int>& info) { return info.download(1)[0]; }
@@ -631,16 +748,18 @@ static int la_info(const DevBuf<int>& info) { return info.download(1)[0]; }
 /// (full ? n : k) x n. gesvd needs m >= n, so m < n factors A^T instead.
 template <typename T>
 void gpu_svd(LaHandles& h, cudaStream_t st, const std::vector<T>& A, int m, int n, bool full,
-             bool uv, std::vector<T>& U, std::vector<T>& sv, std::vector<T>& VT) {
-    bool tr = m < n;
+             bool uv, std::vector<T>& U, std::vector<la_real_t<T>>& sv, std::vector<T>& VT) {
+    using R = la_real_t<T>;
+    bool tr = m < n; // factor A^H
     int mm = tr ? n : m, nn = tr ? m : n, k = nn;
     std::vector<T> At = A;
     if (tr)
         for (int j = 0; j < n; ++j)
             for (int i = 0; i < m; ++i)
-                At[j + static_cast<int64_t>(i) * n] = A[i + static_cast<int64_t>(j) * m];
-    DevBuf<T> dA(At, st), dS(k, st), dU(uv ? static_cast<size_t>(mm) * (full ? mm : k) : 1, st),
-        dVT(uv ? static_cast<size_t>(nn) * nn : 1, st), dRW(k, st);
+                At[j + static_cast<int64_t>(i) * n] = la_conj(A[i + static_cast<int64_t>(j) * m]);
+    DevBuf<T> dA(At, st), dU(uv ? static_cast<size_t>(mm) * (full ? mm : k) : 1, st),
+        dVT(uv ? static_cast<size_t>(nn) * nn : 1, st);
+    DevBuf<R> dS(k, st), dRW(k, st);
     DevBuf<int> dInfo(1, st);
     int lw = 0;
     CT_CUSOLVER_CHECK(cula::gesvd_bs(h.solver, mm, nn, dA.p, &lw));
@@ -660,15 +779,15 @@ void gpu_svd(LaHandles& h, cudaStream_t st, const std::vector<T>& A, int m, int 
         VT = std::move(Vd);
         return;
     }
-    // A = (A^T)^T = V' S U'^T: U = V'^T^T (m x m), VT = U'^T (uc x n)
+    // A = (A^H)^H = V' S U'^H: U = V'^H^H (m x m), VT = U'^H (uc x n)
     U.assign(static_cast<size_t>(m) * m, T(0));
     for (int j = 0; j < m; ++j)
         for (int i = 0; i < m; ++i)
-            U[i + static_cast<int64_t>(j) * m] = Vd[j + static_cast<int64_t>(i) * nn];
+            U[i + static_cast<int64_t>(j) * m] = la_conj(Vd[j + static_cast<int64_t>(i) * nn]);
     VT.assign(static_cast<size_t>(uc) * n, T(0));
     for (int j = 0; j < n; ++j)
         for (int i = 0; i < uc; ++i)
-            VT[i + static_cast<int64_t>(j) * uc] = Ud[j + static_cast<int64_t>(i) * mm];
+            VT[i + static_cast<int64_t>(j) * uc] = la_conj(Ud[j + static_cast<int64_t>(i) * mm]);
 }
 
 template <typename T, int N>
@@ -760,15 +879,22 @@ void la_compute(const LaSpec& s, LaProblem<T>& P, PartitionImpl<N>* partition) {
     }
     case LA_EIGH:
     case LA_TSSVD: {
+        using R = la_real_t<T>;
+        if constexpr (cn_is_complex_v<T>)
+            if (s.op == LA_TSSVD)
+                CkAbort("linalg: tssvd does not support complex input");
         bool vecs = s.op == LA_TSSVD || s.p[1] != 0;
         cusolverEigMode_t jz = vecs ? CUSOLVER_EIG_MODE_VECTOR : CUSOLVER_EIG_MODE_NOVECTOR;
         cublasFillMode_t u = (s.op == LA_EIGH && s.p[0] != 0) ? CUBLAS_FILL_MODE_UPPER
                                                                 : CUBLAS_FILL_MODE_LOWER;
-        DevBuf<T> dG(static_cast<size_t>(n) * n, st), dWv(std::max(n, 1), st);
+        DevBuf<T> dG(static_cast<size_t>(n) * n, st);
+        DevBuf<R> dWv(std::max(n, 1), st);
         if (s.op == LA_TSSVD) {
-            DevBuf<T> dA(P.a, st);
-            CT_CUBLAS_CHECK(cula::gemm(h.blas, CUBLAS_OP_T, CUBLAS_OP_N, n, n, m, dA.p, m, dA.p, m,
-                                       dG.p, n));
+            if constexpr (!cn_is_complex_v<T>) {
+                DevBuf<T> dA(P.a, st);
+                CT_CUBLAS_CHECK(cula::gemm(h.blas, CUBLAS_OP_T, CUBLAS_OP_N, n, n, m, dA.p, m,
+                                           dA.p, m, dG.p, n));
+            }
         } else {
             dG.upload(P.a);
         }
@@ -776,14 +902,15 @@ void la_compute(const LaSpec& s, LaProblem<T>& P, PartitionImpl<N>* partition) {
         CT_CUSOLVER_CHECK(cula::syevd_bs(h.solver, jz, u, n, dG.p, n, dWv.p, &lw));
         DevBuf<T> dW(std::max(lw, 1), st);
         CT_CUSOLVER_CHECK(cula::syevd(h.solver, jz, u, n, dG.p, n, dWv.p, dW.p, lw, dInfo.p));
-        std::vector<T> w = dWv.download(n);
+        std::vector<R> w = dWv.download(n);
         std::vector<T> V = vecs ? dG.download() : std::vector<T>();
-        if (s.op == LA_TSSVD) {
-            tssvd_pack(P, w, V);
-            break;
-        }
+        if constexpr (!cn_is_complex_v<T>)
+            if (s.op == LA_TSSVD) {
+                tssvd_pack(P, w, V);
+                break;
+            }
         for (int i = 0; i < n; ++i)
-            P.out[static_cast<int64_t>(i) * (vecs ? P.R : 1)] = w[i];
+            P.out[static_cast<int64_t>(i) * (vecs ? P.R : 1)] = T(w[i]);
         if (vecs)
             for (int j = 0; j < n; ++j)
                 for (int i = 0; i < n; ++i)
@@ -794,11 +921,12 @@ void la_compute(const LaSpec& s, LaProblem<T>& P, PartitionImpl<N>* partition) {
     }
     case LA_SVD: {
         bool full = s.p[0] != 0, uv = s.p[1] != 0;
-        std::vector<T> U, sv, VT;
+        std::vector<T> U, VT;
+        std::vector<la_real_t<T>> sv;
         gpu_svd(h, st, P.a, m, n, full, uv, U, sv, VT);
         if (!uv) {
             for (int i = 0; i < k; ++i)
-                P.out[i] = sv[i];
+                P.out[i] = T(sv[i]);
             break;
         }
         int uc = full ? m : k, vr = full ? n : k;
@@ -806,7 +934,7 @@ void la_compute(const LaSpec& s, LaProblem<T>& P, PartitionImpl<N>* partition) {
             for (int i = 0; i < m; ++i)
                 P.at(i, j) = U[i + static_cast<int64_t>(j) * m];
         for (int i = 0; i < k; ++i)
-            P.at(m, i) = sv[i];
+            P.at(m, i) = T(sv[i]);
         int ldvt = static_cast<int>(VT.size() / std::max(n, 1));
         for (int j = 0; j < n; ++j)
             for (int i = 0; i < vr; ++i)
@@ -824,6 +952,9 @@ void la_compute(const LaSpec& s, LaProblem<T>& P, PartitionImpl<N>* partition) {
         break;
     }
     case LA_LSTSQ: {
+        if constexpr (cn_is_complex_v<T>) {
+            CkAbort("linalg: lstsq does not support complex input");
+        } else {
         std::vector<T> U, sv, VT;
         gpu_svd(h, st, P.a, m, n, false, true, U, sv, VT);
         T cut = static_cast<T>(s.p[0]) * (k > 0 ? sv[0] : T(0));
@@ -842,6 +973,7 @@ void la_compute(const LaSpec& s, LaProblem<T>& P, PartitionImpl<N>* partition) {
         CT_CUBLAS_CHECK(cula::gemm(h.blas, CUBLAS_OP_T, CUBLAS_OP_N, n, P.bn, k, dVT.p, k, dT.p, k,
                                    dX.p, n));
         lstsq_pack(P, dX.download(), sv, rank);
+        }
         break;
     }
     }
@@ -859,26 +991,15 @@ void place_typed(std::vector<T>& dst, int rows, const LaMsgHeader& h, const char
             int r = h.start[0] + i, c = h.nd >= 2 ? h.start[1] + j : 0;
             S v;
             memcpy(&v, src + k++, sizeof(S));
-            dst[r + static_cast<int64_t>(c) * rows] = static_cast<T>(v);
+            dst[r + static_cast<int64_t>(c) * rows] = cn_cast<T>(v);
         }
 }
 
 template <typename T>
 void place_gather(std::vector<T>& dst, int rows, const LaMsgHeader& h, const char* payload) {
-    switch (static_cast<DType>(h.dtype)) {
-    case DType::FLOAT32:
-        place_typed<T, float>(dst, rows, h, payload);
-        break;
-    case DType::FLOAT64:
-        place_typed<T, double>(dst, rows, h, payload);
-        break;
-    case DType::INT32:
-        place_typed<T, int32_t>(dst, rows, h, payload);
-        break;
-    case DType::INT64:
-        place_typed<T, int64_t>(dst, rows, h, payload);
-        break;
-    }
+    cn_dispatch(static_cast<DType>(h.dtype), [&](auto tag) {
+        place_typed<T, decltype(tag)>(dst, rows, h, payload);
+    });
 }
 
 } // namespace
@@ -947,6 +1068,18 @@ static void la_write_piece(PartitionImpl<N>* partition, const LaSpec& s, LinalgS
     st.out_covered += h.count;
 }
 
+/// f(T{}) for the factorization dtypes (float32/64, complex64/128).
+template <typename F>
+static void la_dispatch(DType dt, F&& f) {
+    switch (dt) {
+    case DType::FLOAT32: f(float{}); break;
+    case DType::FLOAT64: f(double{}); break;
+    case DType::COMPLEX64: f(cn_c64{}); break;
+    case DType::COMPLEX128: f(cn_c128{}); break;
+    default: CkAbort("linalg: unsupported result dtype %d", (int)dt);
+    }
+}
+
 static LaSpec la_spec_of(DAGNode* node, ArrayDAGGroup* g) {
     for (ASTNode* root : node->ast->roots)
         if (static_cast<Opcode>(root->opcode) == Opcode::LINALG)
@@ -967,18 +1100,17 @@ static bool la_progress(PartitionImpl<N>* partition, ArrayDAGGroup* g, int node_
         if (h.kind == 0) {
             st.in_covered += h.count;
             st.inputs.push_back(std::move(msg));
-        } else if (s.dt == DType::FLOAT32) {
-            la_write_piece<N, float>(partition, s, st, h, msg.data() + sizeof(h));
         } else {
-            la_write_piece<N, double>(partition, s, st, h, msg.data() + sizeof(h));
+            la_dispatch(s.dt, [&](auto tag) {
+                la_write_piece<N, decltype(tag)>(partition, s, st, h, msg.data() + sizeof(h));
+            });
         }
     }
     if (st.root && !st.computed && st.in_covered == st.in_expected) {
         st.computed = true;
-        if (s.dt == DType::FLOAT32)
-            la_root_compute<N, float>(partition, g, node_id, s, st);
-        else
-            la_root_compute<N, double>(partition, g, node_id, s, st);
+        la_dispatch(s.dt, [&](auto tag) {
+            la_root_compute<N, decltype(tag)>(partition, g, node_id, s, st);
+        });
     }
     if (!st.owner || st.out_covered < st.out_expected)
         return false;
@@ -996,8 +1128,8 @@ template <int N>
 void ArrayDAGExecutorND<N>::execute_linalg_node(DAGNode* node) {
     auto* g = static_cast<ArrayDAGGroup*>(group);
     LaSpec s = la_spec_of(node, g);
-    if (s.dt != DType::FLOAT32 && s.dt != DType::FLOAT64)
-        CkAbort("linalg: result dtype must be float32 or float64");
+    if (s.dt != DType::FLOAT32 && s.dt != DType::FLOAT64 && !dtype_is_complex(s.dt))
+        CkAbort("linalg: unsupported result dtype %d", (int)s.dt);
     auto nd_idx = partition->nd_index();
 
     for (int i = 0; i < s.nin; ++i) {
@@ -1006,20 +1138,9 @@ void ArrayDAGExecutorND<N>::execute_linalg_node(DAGNode* node) {
         auto it = partition->arrays.find(s.in[i].name);
         if (it == partition->arrays.end())
             continue;
-        switch (it->second->dtype) {
-        case DType::FLOAT32:
-            la_send_dispatch<N, float>(partition, g, node->id, s, i, it->second);
-            break;
-        case DType::FLOAT64:
-            la_send_dispatch<N, double>(partition, g, node->id, s, i, it->second);
-            break;
-        case DType::INT32:
-            la_send_dispatch<N, int32_t>(partition, g, node->id, s, i, it->second);
-            break;
-        case DType::INT64:
-            la_send_dispatch<N, int64_t>(partition, g, node->id, s, i, it->second);
-            break;
-        }
+        cn_dispatch(it->second->dtype, [&](auto tag) {
+            la_send_dispatch<N, decltype(tag)>(partition, g, node->id, s, i, it->second);
+        });
     }
 
     if (N != s.out_nd) {

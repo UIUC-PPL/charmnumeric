@@ -1,32 +1,55 @@
 #!/usr/bin/env python
-"""charmnumeric port of cupynumeric/examples/lstm_backward.py.
 
-Verdict: port with workarounds (fully native). Changes:
-  * WLSTM.transpose() is the native transpose, as in the original.
-  * np.sum(dHin[t, :, word_size:], 0) is the native axis reduction
-    cnp.sum(..., axis=1): in charmnumeric the integer index keeps its dim, so
-    the view is (1, b, d) and the batch axis is axis 1; the result is the
-    (1, d) row that dh0[0] expects.
-  * np.random.randn is replaced by the native generator U.randn.
-The backward pass (lstm_backward(np, ...)) is shared with the NumPy
-reference.
-"""
+# Copyright 2024 NVIDIA Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 
 import argparse
-import os
-import sys
-import time
 
-import numpy
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-import charmnumeric as cnp  # noqa: E402
-import _cnum_util as U  # noqa: E402
-from _cnum_connect import get_interface  # noqa: E402
+# charmnumeric port: _benchmark is the local shim (_benchmark.py). It connects,
+# runs with np = charmnumeric and checks the result against NumPy.
+from _benchmark import benchmark_info, parse_with_harness
 
 
-def lstm_backward(np, WLSTM, dHout, IFOGf, C, Ct, Hin, n, b, d, word_size, batch_sum):
+@benchmark_info(name="LSTM Backward")
+def run_lstm(
+    np,
+    batch_size,
+    hidden_size,
+    sentence_length,
+    word_size,
+    *,
+    timer,
+    print_timing=False,
+):
+    timer.start()
+
+    WLSTM = np.random.randn(
+        word_size + hidden_size, 4 * hidden_size
+    ) / np.sqrt(word_size + hidden_size)
+
+    xphpb = WLSTM.shape[0]
+    d = hidden_size
+    n = sentence_length
+    b = batch_size
+
+    dHout = np.random.randn(n, b, d)
+    IFOGf = np.random.randn(n, b, d * 4)
+    C = np.random.randn(n, b, d)
+    Ct = np.random.randn(n, b, d)
+    Hin = np.random.randn(n, b, xphpb)
+
     dIFOG = np.zeros((n, b, d * 4))
     dIFOGf = np.zeros(IFOGf.shape)
     dHin = np.zeros(Hin.shape)
@@ -47,7 +70,9 @@ def lstm_backward(np, WLSTM, dHout, IFOGf, C, Ct, Hin, n, b, d, word_size, batch
         dIFOGf[t, :, 3 * d :] = IFOGf[t, :, :d] * dC[t]
 
         # backprop activation functions
-        dIFOG[t, :, 3 * d :] = (1 - IFOGf[t, :, 3 * d :] ** 2) * dIFOGf[t, :, 3 * d :]
+        dIFOG[t, :, 3 * d :] = (1 - IFOGf[t, :, 3 * d :] ** 2) * dIFOGf[
+            t, :, 3 * d :
+        ]
         y = IFOGf[t, :, : 3 * d]
         dIFOG[t, :, : 3 * d] = (y * (1.0 - y)) * dIFOGf[t, :, : 3 * d]
 
@@ -58,48 +83,68 @@ def lstm_backward(np, WLSTM, dHout, IFOGf, C, Ct, Hin, n, b, d, word_size, batch
         if t > 0:
             dHout[t - 1, :] += dHin[t, :, word_size:]
         else:
-            dh0[0] += batch_sum(dHin[t, :, word_size:])
-    return dIFOG, dIFOGf, dHin, dC, dh0, dHout
+            dh0[0] += np.sum(dHin[t, :, word_size:], 0)
 
-
-def main(chk):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-B", "--batch", type=int, default=32, dest="batch")
-    parser.add_argument("--hidden", type=int, default=10, dest="hidden")
-    parser.add_argument("-s", "--sentence", type=int, default=4, dest="sentence")
-    parser.add_argument("-w", "--word", type=int, default=10, dest="word")
-    parser.add_argument("-t", "--time", dest="timing", action="store_true")
-    args = parser.parse_args()
-    b, d, n, word_size = args.batch, args.hidden, args.sentence, args.word
-
-    interface = get_interface()
-    t0 = time.perf_counter()
-    scale = 1.0 / numpy.sqrt(word_size + d)
-    WLSTM = U.randn((word_size + d, 4 * d), seed=1) * scale
-    xphpb = WLSTM.shape[0]
-    dHout = U.randn((n, b, d), seed=2)
-    IFOGf = U.randn((n, b, d * 4), seed=3)
-    C = U.randn((n, b, d), seed=4)
-    Ct = U.randn((n, b, d), seed=5)
-    Hin = U.randn((n, b, xphpb), seed=6)
-    host_in = [x.get(interface) for x in (WLSTM, dHout, IFOGf, C, Ct, Hin)]
-
-    outs = lstm_backward(
-        cnp, WLSTM, dHout, IFOGf, C, Ct, Hin, n, b, d, word_size,
-        batch_sum=lambda x: cnp.sum(x, axis=1),
-    )
-    got = [o.get(interface) for o in outs]
-    if args.timing:
-        print(f"Elapsed Time: {(time.perf_counter() - t0) * 1e3:.3f} ms (incl. sync)")
-
-    Wh, dHouth, IFOGfh, Ch, Cth, Hinh = host_in
-    ref = lstm_backward(
-        numpy, Wh, dHouth.copy(), IFOGfh, Ch, Cth, Hinh, n, b, d, word_size,
-        batch_sum=lambda x: numpy.sum(x, 0),
-    )
-    for name, g, r in zip(("dIFOG", "dIFOGf", "dHin", "dC", "dh0", "dHout"), got, ref):
-        chk.close(name, g, r, rtol=1e-9, atol=1e-12)
+    total = timer.stop()
+    if print_timing:
+        print("Elapsed Time: " + str(total) + " ms")
+    return total
 
 
 if __name__ == "__main__":
-    U.run("lstm_backward", main)
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-B",
+        "--batch",
+        type=int,
+        nargs="+",
+        default=[32],
+        dest="batch",
+        help="batch size",
+    )
+    parser.add_argument(
+        "--hidden",
+        type=int,
+        nargs="+",
+        default=[10],
+        dest="hidden",
+        help="hidden size",
+    )
+    parser.add_argument(
+        "-s",
+        "--sentence",
+        type=int,
+        nargs="+",
+        default=[4],
+        dest="sentence",
+        help="sentence length",
+    )
+    parser.add_argument(
+        "-w",
+        "--word",
+        type=int,
+        nargs="+",
+        default=[10],
+        dest="word",
+        help="word size",
+    )
+    parser.add_argument(
+        "-t",
+        "--time",
+        dest="timing",
+        action="store_true",
+        help="perform timing",
+    )
+
+    args, harness = parse_with_harness(parser)
+
+    harness.run_timed(
+        run_lstm,
+        harness.np,
+        args.batch,
+        args.hidden,
+        args.sentence,
+        args.word,
+        timer=harness.timer,
+        print_timing=args.timing,
+    )

@@ -5,17 +5,14 @@
 
 // REDUCTION and BINCOUNT executors.
 //
-// Every chare of the input partition that owns part of the operand's view
-// folds its block into per-output-element accumulators (on the device in
-// Kokkos builds), then sends each piece of that small partial straight to the
-// output chare that owns it (receive_reduce_partial). An output chare knows it
-// is done when the partials it has folded in cover all input elements of its
-// output region: covered == |region| * reduced extent. That needs no knowledge
-// of the input's decomposition on the receiving side and no Charm++ reduction,
-// so independent reductions in one DAG may run in any order on any chare.
+// Each input chare folds its block of the operand into per-output-element
+// accumulators and sends each piece of the partial to the output chare that owns
+// it (receive_reduce_partial). An output chare is done when the partials folded
+// in cover its region: covered == |region| * reduced extent. No Charm++
+// reduction is needed, so independent reductions in one DAG may run in any order.
 //
-// Full reductions are the special case where every axis is reduced; the result
-// is a (1,) array on 1-D chare 0 (or a (1,...,1) array with keepdims).
+// Full reductions reduce every axis: the result is a (1,) array on chare 0 (or
+// (1,...,1) with keepdims).
 
 #ifdef USE_KOKKOS
 #define CT_RED_FN KOKKOS_INLINE_FUNCTION
@@ -43,8 +40,9 @@ enum RedOp : int {
     RED_NORM_NEGINF = 15 // min(|x|)
 };
 
-/// Accumulator for one output element. A is int64_t for exact integer
-/// reductions and double otherwise.
+/// Accumulator for one output element. A is int64_t (uint64_t for uint64
+/// input) for exact integer reductions, cn_c128 for complex input and double
+/// otherwise.
 template <typename A>
 struct RedAcc {
     A v;         // sum / product / extremum / running mean (VAR, STD)
@@ -64,20 +62,41 @@ struct RedMsgHeader {
     int64_t count;
 };
 
-static bool red_acc_is_int(int op, DType in_dt) {
-    if (in_dt != DType::INT32 && in_dt != DType::INT64)
-        return false;
-    return op != RED_MEAN && op != RED_VAR && op != RED_STD && op != RED_NORM2;
+enum RedAccKind : int { ACC_I64 = 0, ACC_U64 = 1, ACC_F64 = 2, ACC_C128 = 3 };
+
+/// Complex input supports SUM/PROD/MEAN/MAX/MIN/ARG*/COUNT_NONZERO/ALL/ANY; the
+/// frontend rewrites complex norms and var/std on real arrays.
+static int red_acc_kind(int op, DType in_dt) {
+    if (dtype_is_complex(in_dt))
+        return ACC_C128;
+    bool exact = op != RED_MEAN && op != RED_VAR && op != RED_STD && op != RED_NORM2;
+    if (exact && (dtype_is_int(in_dt) || in_dt == DType::BOOL))
+        return in_dt == DType::UINT64 ? ACC_U64 : ACC_I64;
+    return ACC_F64;
+}
+
+/// Call f(A{}) for an accumulator kind.
+template <typename F>
+static void with_acc(int kind, F&& f) {
+    switch (kind) {
+    case ACC_I64: f(int64_t{}); break;
+    case ACC_U64: f(uint64_t{}); break;
+    case ACC_F64: f(double{}); break;
+    default: f(cn_c128{}); break;
+    }
 }
 
 template <typename A>
 CT_RED_FN bool red_isnan(A x) {
-    return x != x; // always false for integers
+    return cn_isnan(x); // always false for integers
 }
 
 template <typename A>
 CT_RED_FN A red_abs(A x) {
-    return x < A(0) ? -x : x;
+    if constexpr (cn_is_complex_v<A> || std::is_unsigned_v<A>)
+        return x; // complex norms are rewritten by the frontend
+    else
+        return x < A(0) ? -x : x;
 }
 
 template <typename A>
@@ -98,7 +117,7 @@ CT_RED_FN bool red_prefer(bool max_like, A x, int64_t ix, A y, int64_t iy) {
         return (nx && ny) ? ix < iy : nx;
     if (x == y)
         return ix < iy;
-    return max_like ? (x > y) : (x < y);
+    return max_like ? cn_sort_lt(y, x) : cn_sort_lt(x, y);
 }
 
 template <typename A>
@@ -140,12 +159,12 @@ CT_RED_FN void red_accumulate(int op, RedAcc<A>& a, A x, int64_t ix) {
     case RED_VAR:
     case RED_STD: {
         // Welford update
-        double xd = static_cast<double>(x);
-        double mean = static_cast<double>(a.v);
+        double xd = cn_to_double(x);
+        double mean = cn_to_double(a.v);
         double delta = xd - mean;
         mean += delta / static_cast<double>(a.n + 1);
         a.m2 += delta * (xd - mean);
-        a.v = static_cast<A>(mean);
+        a.v = cn_cast<A>(mean);
         break;
     }
     }
@@ -181,10 +200,10 @@ CT_RED_FN void red_join(int op, RedAcc<A>& a, const RedAcc<A>& b) {
     case RED_STD: {
         // Chan et al. pairwise combination
         double na = static_cast<double>(a.n), nb = static_cast<double>(b.n);
-        double ma = static_cast<double>(a.v), mb = static_cast<double>(b.v);
+        double ma = cn_to_double(a.v), mb = cn_to_double(b.v);
         double delta = mb - ma;
         double nt = na + nb;
-        a.v = static_cast<A>(ma + delta * nb / nt);
+        a.v = cn_cast<A>(ma + delta * nb / nt);
         a.m2 = a.m2 + b.m2 + delta * delta * na * nb / nt;
         break;
     }
@@ -201,23 +220,26 @@ static T red_finalize(int op, const RedAcc<A>& a, int64_t extent, int ddof) {
     switch (op) {
     case RED_ARGMAX:
     case RED_ARGMIN:
-        return static_cast<T>(a.idx);
+        return cn_cast<T>(a.idx);
     case RED_ALL:
-        return static_cast<T>(static_cast<int64_t>(a.v) == extent ? 1 : 0);
+        return cn_cast<T>(cn_cast<int64_t>(a.v) == extent ? 1 : 0);
     case RED_ANY:
-        return static_cast<T>(a.v > A(0) ? 1 : 0);
+        return cn_cast<T>(cn_nonzero(a.v) ? 1 : 0);
     case RED_MEAN:
-        return static_cast<T>(static_cast<double>(a.v) / static_cast<double>(extent));
+        if constexpr (cn_is_complex_v<A>)
+            return cn_cast<T>(a.v / A(static_cast<double>(extent)));
+        else
+            return cn_cast<T>(cn_to_double(a.v) / static_cast<double>(extent));
     case RED_NORM2:
-        return static_cast<T>(std::sqrt(static_cast<double>(a.v)));
+        return cn_cast<T>(std::sqrt(cn_to_double(a.v)));
     case RED_VAR:
     case RED_STD: {
         double dof = static_cast<double>(std::max<int64_t>(a.n - ddof, 0));
         double var = a.m2 / dof;
-        return static_cast<T>(op == RED_STD ? std::sqrt(var) : var);
+        return cn_cast<T>(op == RED_STD ? std::sqrt(var) : var);
     }
     default:
-        return static_cast<T>(a.v);
+        return cn_cast<T>(a.v);
     }
 }
 
@@ -250,7 +272,7 @@ struct RedFullFunctor {
             off += static_cast<int64_t>(g.b0[d] + c * g.bstep[d]) * g.bstride[d];
             flat += static_cast<int64_t>(g.vb0[d] + c) * g.vstride[d];
         }
-        red_accumulate<A>(op, acc, static_cast<A>(data[off]), flat);
+        red_accumulate<A>(op, acc, cn_cast<A>(data[off]), flat);
     }
     CT_RED_FN void join(value_type& dst, const value_type& src) const {
         red_join<A>(op, dst, src);
@@ -297,7 +319,7 @@ struct RedPartialFunctor {
                 flat += static_cast<int64_t>(g.vb0[d] + c[d]) * g.vstride[d];
             }
             int64_t ix = arg_axis >= 0 ? static_cast<int64_t>(g.vb0[arg_axis] + c[arg_axis]) : flat;
-            red_accumulate<A>(op, acc, static_cast<A>(data[off]), ix);
+            red_accumulate<A>(op, acc, cn_cast<A>(data[off]), ix);
         }
         out[p] = acc;
     }
@@ -315,10 +337,10 @@ struct BincountFunctor {
 
     CT_RED_FN void operator()(const int e) const {
         int64_t off = static_cast<int64_t>(b0) + static_cast<int64_t>(e) * bstep;
-        int64_t bin = static_cast<int64_t>(x[off]);
+        int64_t bin = cn_cast<int64_t>(x[off]);
         if (bin < 0 || bin >= length)
             return;
-        A inc = w ? static_cast<A>(w[off]) : A(1);
+        A inc = w ? cn_cast<A>(w[off]) : A(1);
 #ifdef USE_KOKKOS
         Kokkos::atomic_add(&hist[bin], inc);
 #else
@@ -339,7 +361,6 @@ struct RedSpec {
     int ddof = 0;
     DType in_dt = DType::FLOAT64;
     DType out_dt = DType::FLOAT64;
-    bool acc_int = false;
     int in_name = -1;
     int in_nd = 1;
     std::array<int, 3> view_shape = {1, 1, 1};
@@ -347,6 +368,7 @@ struct RedSpec {
     int w_name = -1; // BINCOUNT weights (-1: none)
     Region* w_region = nullptr;
     DType w_dt = DType::FLOAT64;
+    int acc = ACC_F64; // RedAccKind
     int64_t length = 0; // BINCOUNT output length
     int out_name = -1;
     int out_nd = 1;
@@ -406,7 +428,7 @@ static RedSpec parse_reduction(ASTNode* root,
         s.keepdims = root->operands[3]->scalar != 0.0;
         s.ddof = static_cast<int>(root->operands[4]->scalar);
         s.in_dt = static_cast<DType>(static_cast<int>(root->operands[5]->scalar));
-        s.acc_int = red_acc_is_int(s.op, s.in_dt);
+        s.acc = red_acc_kind(s.op, s.in_dt);
         int m = 0;
         s.extent = 1;
         for (int d = 0; d < s.in_nd; ++d) {
@@ -436,7 +458,7 @@ static RedSpec parse_reduction(ASTNode* root,
         s.in_dt = static_cast<DType>(static_cast<int>(root->operands[i + 1]->scalar));
         if (s.w_name >= 0)
             s.w_dt = static_cast<DType>(static_cast<int>(root->operands[i + 2]->scalar));
-        s.acc_int = (s.w_name < 0);
+        s.acc = s.w_name < 0 ? ACC_I64 : ACC_F64;
         s.extent = 1;
         for (int d = 0; d < s.in_nd; ++d)
             s.extent *= s.view_shape[d];
@@ -694,20 +716,24 @@ static void dispatch_bincount_weights(PartitionImpl<N>* partition, ArrayDAGGroup
         bincount_block_and_send<N, T, T, A>(partition, dag_group, node_id, s, x_arr, nullptr, g);
         return;
     }
-    switch (w_arr->dtype) {
-    case DType::FLOAT32:
-        bincount_block_and_send<N, T, float, A>(partition, dag_group, node_id, s, x_arr, w_arr, g);
-        break;
-    case DType::FLOAT64:
-        bincount_block_and_send<N, T, double, A>(partition, dag_group, node_id, s, x_arr, w_arr, g);
-        break;
-    case DType::INT32:
-        bincount_block_and_send<N, T, int32_t, A>(partition, dag_group, node_id, s, x_arr, w_arr, g);
-        break;
-    case DType::INT64:
-        bincount_block_and_send<N, T, int64_t, A>(partition, dag_group, node_id, s, x_arr, w_arr, g);
-        break;
-    }
+    cn_dispatch(w_arr->dtype, [&](auto tag) {
+        if constexpr (!cn_is_complex_v<decltype(tag)>)
+            bincount_block_and_send<N, T, decltype(tag), A>(partition, dag_group, node_id, s,
+                                                            x_arr, w_arr, g);
+    });
+}
+
+/// Input/accumulator pairs red_acc_kind can produce (limits instantiations).
+template <typename T, typename A>
+constexpr bool red_combo_ok() {
+    if constexpr (cn_is_complex_v<T> || cn_is_complex_v<A>)
+        return cn_is_complex_v<T> && cn_is_complex_v<A>;
+    else if constexpr (std::is_same_v<A, uint64_t>)
+        return std::is_same_v<T, uint64_t>;
+    else if constexpr (std::is_same_v<A, int64_t>)
+        return !cn_is_real_float_v<T>;
+    else
+        return true;
 }
 
 template <int N, typename A>
@@ -716,29 +742,23 @@ static void dispatch_send_side(PartitionImpl<N>* partition, ArrayDAGGroup* dag_g
                                const RedGeom& g) {
     if (s.opc == Opcode::BINCOUNT) {
         if constexpr (N == 1) {
-            if (arr->dtype == DType::INT32)
-                dispatch_bincount_weights<N, int32_t, A>(partition, dag_group, node_id, s, arr, w_arr, g);
-            else if (arr->dtype == DType::INT64)
-                dispatch_bincount_weights<N, int64_t, A>(partition, dag_group, node_id, s, arr, w_arr, g);
-            else
-                CkAbort("bincount: input must be int32 or int64");
+            if (!dtype_is_int(arr->dtype) && arr->dtype != DType::BOOL)
+                CkAbort("bincount: input must have an integer dtype");
+            cn_dispatch(arr->dtype, [&](auto tag) {
+                using T = decltype(tag);
+                if constexpr (!cn_is_complex_v<T> && !cn_is_real_float_v<T> &&
+                              (std::is_same_v<A, int64_t> || std::is_same_v<A, double>))
+                    dispatch_bincount_weights<N, T, A>(partition, dag_group, node_id, s, arr,
+                                                       w_arr, g);
+            });
         }
         return;
     }
-    switch (arr->dtype) {
-    case DType::FLOAT32:
-        reduce_block_and_send<N, float, A>(partition, dag_group, node_id, s, arr, g);
-        break;
-    case DType::FLOAT64:
-        reduce_block_and_send<N, double, A>(partition, dag_group, node_id, s, arr, g);
-        break;
-    case DType::INT32:
-        reduce_block_and_send<N, int32_t, A>(partition, dag_group, node_id, s, arr, g);
-        break;
-    case DType::INT64:
-        reduce_block_and_send<N, int64_t, A>(partition, dag_group, node_id, s, arr, g);
-        break;
-    }
+    cn_dispatch(arr->dtype, [&](auto tag) {
+        using T = decltype(tag);
+        if constexpr (red_combo_ok<T, A>())
+            reduce_block_and_send<N, T, A>(partition, dag_group, node_id, s, arr, g);
+    });
 }
 
 // ---- Receive side ----
@@ -786,20 +806,9 @@ static void write_result(PartitionImpl<N>* partition, ReductionState<N>& st, con
 template <int N, typename A>
 static void write_result_dispatch(PartitionImpl<N>* partition, ReductionState<N>& st,
                                   const RedSpec& s) {
-    switch (s.out_dt) {
-    case DType::FLOAT32:
-        write_result<N, A, float>(partition, st, s);
-        break;
-    case DType::FLOAT64:
-        write_result<N, A, double>(partition, st, s);
-        break;
-    case DType::INT32:
-        write_result<N, A, int32_t>(partition, st, s);
-        break;
-    case DType::INT64:
-        write_result<N, A, int64_t>(partition, st, s);
-        break;
-    }
+    cn_dispatch(s.out_dt, [&](auto tag) {
+        write_result<N, A, decltype(tag)>(partition, st, s);
+    });
 }
 
 /// Fold stashed partials and finish the node once every input element of
@@ -807,19 +816,14 @@ static void write_result_dispatch(PartitionImpl<N>* partition, ReductionState<N>
 template <int N>
 static bool reduction_try_finish(PartitionImpl<N>* partition, ReductionState<N>& st,
                                  const RedSpec& s) {
-    for (auto& msg : st.stash) {
-        if (s.acc_int)
-            fold_partial<N, int64_t>(st, s.op, msg.data());
-        else
-            fold_partial<N, double>(st, s.op, msg.data());
-    }
+    with_acc(s.acc, [&](auto tag) {
+        for (auto& msg : st.stash)
+            fold_partial<N, decltype(tag)>(st, s.op, msg.data());
+    });
     st.stash.clear();
     if (st.covered < st.expected)
         return false;
-    if (s.acc_int)
-        write_result_dispatch<N, int64_t>(partition, st, s);
-    else
-        write_result_dispatch<N, double>(partition, st, s);
+    with_acc(s.acc, [&](auto tag) { write_result_dispatch<N, decltype(tag)>(partition, st, s); });
     return true;
 }
 
@@ -861,10 +865,10 @@ void ArrayDAGExecutorND<N>::execute_reduction_node(DAGNode* node) {
                     CkAbort("bincount: weights must have the same layout as x "
                             "(materialize both with .copy())");
             }
-            if (s.acc_int)
-                dispatch_send_side<N, int64_t>(partition, dag_group, node->id, s, it->second, w_arr, g);
-            else
-                dispatch_send_side<N, double>(partition, dag_group, node->id, s, it->second, w_arr, g);
+            with_acc(s.acc, [&](auto tag) {
+                dispatch_send_side<N, decltype(tag)>(partition, dag_group, node->id, s, it->second,
+                                                     w_arr, g);
+            });
         }
     }
 
@@ -892,14 +896,12 @@ void ArrayDAGExecutorND<N>::execute_reduction_node(DAGNode* node) {
             st.started = true;
             st.mine = mine;
             st.expected = mine.size() * s.extent;
-            size_t acc_size = s.acc_int ? sizeof(RedAcc<int64_t>) : sizeof(RedAcc<double>);
-            st.acc.assign(mine.size() * acc_size, 0);
-            for (int64_t i = 0; i < mine.size(); ++i) {
-                if (s.acc_int)
-                    red_init<int64_t>(s.op, reinterpret_cast<RedAcc<int64_t>*>(st.acc.data())[i]);
-                else
-                    red_init<double>(s.op, reinterpret_cast<RedAcc<double>*>(st.acc.data())[i]);
-            }
+            with_acc(s.acc, [&](auto tag) {
+                using A = decltype(tag);
+                st.acc.assign(mine.size() * sizeof(RedAcc<A>), 0);
+                for (int64_t i = 0; i < mine.size(); ++i)
+                    red_init<A>(s.op, reinterpret_cast<RedAcc<A>*>(st.acc.data())[i]);
+            });
             if (reduction_try_finish<N>(partition, st, s)) {
                 red_state.erase(node->id);
                 node_finished(node->id);

@@ -1,24 +1,18 @@
 """Random arrays generated on the backend (``numpy.random`` subset).
 
-Every draw is one RANDOM DAG node. Each chare fills its own tile with a
-counter-based generator (Philox4x32-10, see ``src/creation_kernels.hpp``):
-element ``g`` (its global row-major index) of the ``stream``-th draw after
-``seed(s)`` is a pure function of ``(s, stream, g)``. Results therefore do
-not depend on the decomposition, the over-decomposition factor or the number
-of PEs, and CPU and GPU builds produce identical values.
+Every draw is one RANDOM DAG node. Element ``g`` (global row-major index) of the
+``stream``-th draw after ``seed(s)`` is a pure function of ``(s, stream, g)``
+(Philox4x32-10, ``src/creation_kernels.hpp``), so results do not depend on the
+decomposition or PE count, and CPU and GPU builds match.
 
-The values are NOT NumPy's MT19937 / PCG64 streams: ``cnp.random.seed(1)``
-followed by ``cnp.random.rand(4)`` does not reproduce ``np.random``. Fetch
-inputs with ``.get()`` when a NumPy reference needs the same data.
-``charmnumeric._rng_reference`` reproduces the stream on the host.
+The values are NOT NumPy's MT19937 / PCG64 streams: ``seed(1)`` then ``rand(4)``
+does not reproduce ``np.random``. Use ``.get()`` to fetch inputs for a NumPy
+reference; ``charmnumeric._rng_reference`` reproduces the stream on the host.
 
-Without a call to ``seed`` the generator starts from a fixed seed (0), so
-programs are reproducible by default. ``seed(None)`` draws a seed from the OS.
+Without ``seed`` the generator starts from seed 0; ``seed(None)`` draws from the OS.
 
-charmnumeric extensions: the float functions take ``dtype=`` (float32 or
-float64; NumPy's legacy API always returns float64, and charmnumeric has no
-astype yet), and ``transposed(x)`` regenerates the transpose of a random
-array without a transpose op.
+Extensions: float functions take ``dtype=`` (float32 or float64), and
+``transposed(x)`` regenerates the transpose of a random array.
 """
 
 import operator
@@ -58,7 +52,6 @@ __all__ = [
 
 _DEFAULT_SEED = 0
 _FLOAT_DTYPES = (np.dtype(np.float32), np.dtype(np.float64))
-_INT_DTYPES = (np.dtype(np.int32), np.dtype(np.int64))
 
 
 def _seed_value(seed):
@@ -108,8 +101,7 @@ def _emit(recipe):
 class Generator(object):
     """A seeded stream of draws (subset of ``numpy.random.Generator``).
 
-    Draw ``k`` of a generator seeded with ``s`` uses Philox key ``s`` and
-    stream counter ``k``.
+    Draw ``k`` uses Philox key ``s`` and stream counter ``k``.
     """
 
     def __init__(self, seed=_DEFAULT_SEED):
@@ -121,8 +113,7 @@ class Generator(object):
         stream = self._stream
         self._stream += 1
         if shape is None:
-            # NumPy returns a Python scalar here; draw it on the host from the
-            # same stream (element 0 of a one-element draw).
+            # Python scalar result: draw it on the host from the same stream.
             value = _ref.generate(kind, np.zeros(1, dtype=np.int64), self._seed, stream, dtype,
                                   _scalar_param(a, kind, 0), _scalar_param(b, kind, 1))
             return value[0].item()
@@ -162,15 +153,15 @@ class Generator(object):
         return self._randint(low, high, size, dtype)
 
     def _randint(self, low, high, size, dtype):
-        dtype = np.dtype(dtype)
-        if dtype not in _INT_DTYPES:
-            raise TypeError(f"randint: unsupported dtype {dtype} (int32 or int64)")
+        dtype = _normalize_dtype(dtype)
+        if dtype.kind not in "biu":
+            raise TypeError(f"randint: unsupported dtype {dtype}")
         if low >= high:
             raise ValueError("low >= high")
-        info = np.iinfo(dtype)
-        if low < info.min:
+        lo, hi = (0, 1) if dtype.kind == "b" else (np.iinfo(dtype).min, np.iinfo(dtype).max)
+        if low < lo:
             raise ValueError(f"low is out of bounds for {dtype}")
-        if high > info.max + 1:
+        if high > hi + 1:
             raise ValueError(f"high is out of bounds for {dtype}")
         return self._draw(_ref.KIND_RANDINT, size, dtype, _u64_from_int(low), _u64_from_int(high))
 
@@ -261,9 +252,8 @@ def randint(low, high=None, size=None, dtype=np.int64):
 def transposed(x, axes=None):
     """``x.transpose(axes)`` for an array produced directly by this module.
 
-    charmnumeric has no transpose op yet; this regenerates the draw with the
-    element indices permuted, so the result equals the transpose of ``x``
-    bit for bit and costs no communication.
+    Regenerates the draw with permuted element indices (no transpose op yet),
+    so the result equals the transpose of ``x`` bit for bit.
     """
     recipe = getattr(x, "_rng_recipe", None)
     if recipe is None:

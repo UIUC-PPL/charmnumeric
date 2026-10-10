@@ -1,25 +1,10 @@
 #!/usr/bin/env python
-"""Tests for the native array-creation ops: bulk upload, RNG, arange & co.
+"""Tests for native array creation: uploads, RNG, arange/linspace/eye/indices/meshgrid.
 
-Covers
-  * cnp.array / cnp.asarray / slice assignment from host data (UPLOAD):
-    1-D/2-D/3-D, all four dtypes, non-tile-aligned shapes, MB-sized arrays,
-    ordering against other writes of the same array, uploads into views;
-  * cnp.random: rand, random, randn, uniform, normal, randint (int32 and the
-    full int64 range), seed, default_rng, transposed. Values are checked
-    bit for bit against charmnumeric._rng_reference (the host model of the
-    backend generator) and statistically (mean/var/range). A digest of the
-    draws is printed so runs at +p1/+p2 and different odf can be compared:
-    it must not change;
-  * arange (int/float/negative/fractional steps), linspace, eye/identity,
-    indices, meshgrid: exact equality with NumPy.
-
-Environment: CNUM_HOST, CNUM_PORT, CNUM_ODF (default 4); CNUM_SIM=1 runs the
-host simulator; CREATION_TESTS=upload,arange,random,size1 selects sections. Run with e.g.
-    harness/run_one.sh server.out 2 32901 examples/ops/test_creation.py
-Prints PASS test_creation / FAIL test_creation: ... (exit status 0 / 1).
-On the CPU build the minimum tiles are 262144 (1-D), 512 (2-D) and 64 (3-D),
-so the larger shapes here span several chares.
+RNG values are checked bit for bit against charmnumeric._rng_reference, and a digest
+of the draws is printed; it must not change across PE counts or odf.
+Env: CNUM_HOST, CNUM_PORT, CNUM_ODF (default 4); CNUM_SIM=1 runs the host simulator;
+CREATION_TESTS=upload,arange,random,size1 selects sections.
 """
 
 import hashlib
@@ -39,9 +24,7 @@ import _cnum_util as U  # noqa: E402
 
 DTYPES = (np.float32, np.float64, np.int32, np.int64)
 SHAPES = [(7,), (1000,), (300007,), (37, 53), (600, 700), (3, 4, 5), (70, 65, 66)]
-# Size-1 arrays go last: with a size-1 1-D array alive, a later 1-D array that
-# needs a bigger chare grid hangs the backend (pre-existing, also with plain
-# cnp.zeros((1,)) + 1; not related to the creation ops).
+# Size-1 arrays go last: a live size-1 1-D array makes later bigger chare grids hang.
 SIZE1_SHAPES = [(1,), (1, 1), (1, 1, 1)]
 
 
@@ -337,7 +320,6 @@ SECTIONS = {"upload": test_upload, "arange": test_arange_family, "random": test_
 
 def main(chk):
     iface = _cnum_connect.get_interface()
-    # CREATION_TESTS=upload,random runs a subset (size1 always runs last)
     names = os.environ.get("CREATION_TESTS", "upload,arange,random,size1").split(",")
     for name in names:
         SECTIONS[name](chk, iface)

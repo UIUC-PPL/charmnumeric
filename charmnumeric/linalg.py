@@ -1,20 +1,17 @@
 """``numpy.linalg`` subset (plus cuPyNumeric's ``solve_triangular`` and ``tssvd``).
 
 Factorizations and solves are LINALG nodes (opcode 100, ``src/executor_linalg.cpp``):
-the operands are gathered to one chare, factored there (Eigen on CPU builds,
-cuSOLVER/cuBLAS on NVIDIA builds) and the result is scattered back to its tile
-decomposition. Results with several factors are computed into one packed 2-D
-array and sliced natively. The problem must fit on one chare (one PE or GPU).
+operands are gathered to one chare, factored there (Eigen on CPU, cuSOLVER/cuBLAS on
+NVIDIA), and scattered back. The problem must fit on one chare.
 
 Deviations from NumPy:
 
-- 2-D operands only (no stacked/batched matrices); float32/float64 results
-  (integer inputs are factored in float64, as in NumPy);
+- 2-D operands only; float32/float64/complex64/complex128 results (integer and bool
+  inputs are factored in float64; float16 is rejected); lstsq, slogdet and tssvd are
+  real-only;
 - failures do not raise: a non-positive-definite ``cholesky`` returns NaNs, a
   singular ``solve``/``inv`` returns inf/NaN;
-- ``det`` returns a ``(1,)`` array, ``slogdet`` two ``(1,)`` arrays (like full
-  reductions); ``lstsq`` returns ``rank`` as a ``(1,)`` array in the result dtype
-  and its residuals even when ``rank < N`` (NumPy returns an empty array then).
+- ``lstsq`` returns ``rank`` as a 0-d array, and residuals even when ``rank < N``.
 """
 
 import builtins
@@ -23,9 +20,7 @@ from collections import namedtuple
 import numpy as np
 from numpy.linalg import LinAlgError
 
-from charmtyles.operation import nonfusible_op
-
-from .charmnumeric import ArrayOperation, asarray
+from .charmnumeric import ArrayOperation, asarray, nonfusible_op
 from .reductions import norm, sum as _sum
 
 __all__ = [
@@ -66,22 +61,32 @@ SVDResult = namedtuple("SVDResult", ["U", "S", "Vh"])
 SlogdetResult = namedtuple("SlogdetResult", ["sign", "logabsdet"])
 
 
-def _result_dtype(*arrays):
-    dts = [a.dtype for a in arrays]
-    if all(d == np.float32 for d in dts):
-        return np.dtype("float32")
-    return np.dtype("float64")
+def _result_dtype(*arrays, real_only=False):
+    dt = np.result_type(*[a.dtype for a in arrays])
+    if dt == np.float16:
+        raise TypeError("array type float16 is unsupported in linalg")
+    if dt.kind == "c":
+        if real_only:
+            raise NotImplementedError("charmnumeric: this linalg function is real-only")
+        return dt
+    return np.dtype("float32") if dt == np.float32 else np.dtype("float64")
+
+
+def _real_part(x):
+    """Real part of a packed complex result (eigenvalues, singular values)."""
+    return x.real if x.dtype.kind == "c" else x
 
 
 def _la(kind, arrays, shape, dtype, params=()):
     shape = tuple(int(s) for s in shape)
+    st = shape or (1,)  # 0-d results are stored as (1,)
     p = tuple(float(x) for x in params) + (0.0,) * (3 - len(params))
     return nonfusible_op(
         *arrays,
         kind,
-        len(shape),
-        shape[0],
-        shape[1] if len(shape) > 1 else 0,
+        len(st),
+        st[0],
+        st[1] if len(st) > 1 else 0,
         *p,
         operation=ArrayOperation.linalg,
         shape=shape,
@@ -167,17 +172,17 @@ def inv(a):
 
 
 def det(a):
-    """Determinant, as a (1,) array."""
+    """Determinant, as a 0-d array."""
     a = _matrix(a, square=True)
-    return _la(_LA_DET, [a], (1,), _result_dtype(a))
+    return _la(_LA_DET, [a], (), _result_dtype(a))
 
 
 def slogdet(a):
-    """(sign, logabsdet), each a (1,) array."""
+    """(sign, logabsdet), each a 0-d array."""
     a = _matrix(a, square=True)
-    P = _la(_LA_SLOGDET, [a], (2,), _result_dtype(a))
-    sign = _la(_LA_RESHAPE, [P[0:1]], (1,), P.dtype)
-    logabsdet = _la(_LA_RESHAPE, [P[1:2]], (1,), P.dtype)
+    P = _la(_LA_SLOGDET, [a], (2,), _result_dtype(a, real_only=True))
+    sign = _la(_LA_RESHAPE, [P[0:1]], (), P.dtype)
+    logabsdet = _la(_LA_RESHAPE, [P[1:2]], (), P.dtype)
     return SlogdetResult(sign, logabsdet)
 
 
@@ -192,13 +197,13 @@ def eigh(a, UPLO="L"):
     a = _matrix(a, square=True)
     n = a.shape[0]
     P = _la(_LA_EIGH, [a], (n + 1, n), _result_dtype(a), (_uplo(UPLO), 1))
-    return EighResult(_vec(P, 0, 0, n), _block(P, 1, n + 1, 0, n))
+    return EighResult(_real_part(_vec(P, 0, 0, n)), _block(P, 1, n + 1, 0, n))
 
 
 def eigvalsh(a, UPLO="L"):
     a = _matrix(a, square=True)
     n = a.shape[0]
-    return _la(_LA_EIGH, [a], (n,), _result_dtype(a), (_uplo(UPLO), 0))
+    return _real_part(_la(_LA_EIGH, [a], (n,), _result_dtype(a), (_uplo(UPLO), 0)))
 
 
 def svd(a, full_matrices=True, compute_uv=True, hermitian=False):
@@ -208,11 +213,12 @@ def svd(a, full_matrices=True, compute_uv=True, hermitian=False):
     k = builtins.min(m, n)
     dt = _result_dtype(a)
     if not compute_uv:
-        return _la(_LA_SVD, [a], (k,), dt, (bool(full_matrices), 0))
+        return _real_part(_la(_LA_SVD, [a], (k,), dt, (bool(full_matrices), 0)))
     uc = m if full_matrices else k
     vr = n if full_matrices else k
     P = _la(_LA_SVD, [a], (m + 1 + vr, builtins.max(uc, n)), dt, (bool(full_matrices), 1))
-    return SVDResult(_block(P, 0, m, 0, uc), _vec(P, m, 0, k), _block(P, m + 1, m + 1 + vr, 0, n))
+    return SVDResult(_block(P, 0, m, 0, uc), _real_part(_vec(P, m, 0, k)),
+                     _block(P, m + 1, m + 1 + vr, 0, n))
 
 
 def svdvals(x, /):
@@ -227,7 +233,7 @@ def lstsq(a, b, rcond=None):
         raise LinAlgError("Incompatible dimensions")
     m, n = a.shape
     k = builtins.min(m, n)
-    dt = _result_dtype(a, b)
+    dt = _result_dtype(a, b, real_only=True)
     eps = np.finfo(dt).eps
     if rcond is None:
         rcond = eps * builtins.max(m, n)
@@ -240,12 +246,12 @@ def lstsq(a, b, rcond=None):
     else:
         x = _block(P, 0, n, 0, nrhs)
     s = _vec(P, n, 0, k)
-    rank = _vec(P, n + 1, 0, 1)
+    rank = _la(_LA_RESHAPE, [P[n + 1:n + 2, 0:1]], (), dt)
     if m <= n:
         residuals = np.empty((0,), dtype=dt)
     else:
         r = b - a @ x
-        residuals = _sum(r * r, axis=0) if b.ndim == 2 else _sum(r * r)
+        residuals = _sum(r * r, axis=0) if b.ndim == 2 else _sum(r * r).reshape((1,))
     return x, residuals, rank, s
 
 
@@ -257,6 +263,8 @@ def solve_triangular(a, b, trans=0, lower=False, unit_diagonal=False, overwrite_
     trans = {"N": 0, "T": 1, "C": 2}.get(trans, trans)
     if trans not in (0, 1, 2):
         raise ValueError("trans must be one of 0, 1, 2, 'N', 'T', 'C'")
+    if trans == 2 and np.result_type(a.dtype, b.dtype).kind == "c":
+        raise NotImplementedError("solve_triangular: trans='C' with complex input")
     return _la(_LA_SOLVE_TRIANGULAR, [a, b], b.shape, _result_dtype(a, b),
                (trans != 0, bool(lower), bool(unit_diagonal)))
 
@@ -268,7 +276,7 @@ def tssvd(a):
     if a.ndim != 2 or a.size <= 1:
         raise ValueError(f"Invalid input shape for tssvd: {a.shape}")
     n = a.shape[1]
-    dt = _result_dtype(a)
+    dt = _result_dtype(a, real_only=True)
     P = _la(_LA_TSSVD, [a], (1 + 2 * n, n), dt)
     s = _vec(P, 0, 0, n)
     vh = _block(P, 1, n + 1, 0, n)

@@ -17,35 +17,12 @@
 #define CSS_FN inline
 #endif
 
-// CAST / SCAN / SORT / ARGSORT executors (opcodes 80-83). The result has the
+// SCAN / SORT / ARGSORT executors (opcodes 81-83). The result has the
 // input's decomposition (pinned in dag_group_receive.cpp).
-//   CAST  local conversion, no communication.
-//   SCAN  local scan along the axis; each chare sends its per-line totals to
-//         the later chares of its grid line, then adds the received carry.
-//   SORT  NOT SCALABLE: gather to the chare holding element 0, sort each line
-//         (NaNs last, stable), scatter back.
+// SORT is not scalable: it gathers to the chare holding element 0.
 
 // Named namespace: these types are captured by device lambdas.
 namespace castscansort_detail {
-
-/// Call f(T{}) for dt; f must not contain device lambdas (nvcc).
-template <typename F>
-void with_dtype(DType dt, F&& f) {
-    switch (dt) {
-    case DType::FLOAT32:
-        f(float{});
-        break;
-    case DType::FLOAT64:
-        f(double{});
-        break;
-    case DType::INT32:
-        f(int32_t{});
-        break;
-    case DType::INT64:
-        f(int64_t{});
-        break;
-    }
-}
 
 ASTNode* castscansort_root(DAGNode* node) {
     for (ASTNode* root : node->ast->roots)
@@ -111,11 +88,11 @@ struct ScanOp {
     CSS_FN bool is_mul() const { return kind == 1 || kind == 3; }
     CSS_FN T identity() const { return is_mul() ? T(1) : T(0); }
     // nan*: NaN acts as the identity.
-    CSS_FN T input(T x) const { return (kind >= 2 && x != x) ? identity() : x; }
+    CSS_FN T input(T x) const { return (kind >= 2 && cn_isnan(x)) ? identity() : x; }
     CSS_FN T apply(T a, T b) const { return is_mul() ? T(a * b) : T(a + b); }
 };
 
-/// Order of flat indices: line, then key (NaNs last), then position (stable).
+/// Order of flat indices: line, then key (NumPy order, NaNs last), then position (stable).
 template <typename T>
 struct SortLess {
     const T* keys;
@@ -130,11 +107,10 @@ struct SortLess {
         if (la != lb)
             return la < lb;
         T x = keys[a], y = keys[b];
-        bool xnan = !(x == x), ynan = !(y == y);
-        if (xnan != ynan)
-            return ynan;
-        if (!xnan && x != y)
-            return x < y;
+        if (cn_sort_lt(x, y))
+            return true;
+        if (cn_sort_lt(y, x))
+            return false;
         return a < b;
     }
 };
@@ -180,35 +156,6 @@ void region_to_data(const ArrayRegion<N>& r, int* region_data) {
 
 // ---- device/host buffer helpers ----
 
-/// Device memory under USE_KOKKOS, host memory otherwise.
-char* alloc_buffer(int64_t bytes) {
-#ifdef USE_KOKKOS
-    return static_cast<char*>(Kokkos::kokkos_malloc<DeviceSpace>(bytes));
-#else
-    return new char[bytes];
-#endif
-}
-
-void free_buffer(char* buf) {
-#ifdef USE_KOKKOS
-    Kokkos::kokkos_free<DeviceSpace>(buf);
-#else
-    delete[] buf;
-#endif
-}
-
-/// Wait for every kernel this chare queued on its compute stream.
-template <int N>
-void compute_fence(PartitionImpl<N>* partition) {
-#if defined(USE_NVIDIA)
-    partition->compute_exec.fence();
-#elif defined(USE_KOKKOS)
-    Kokkos::fence();
-#else
-    (void)partition;
-#endif
-}
-
 template <int N>
 void copy_bytes(PartitionImpl<N>* partition, char* dst, const char* src, int64_t bytes) {
 #ifdef USE_KOKKOS
@@ -246,21 +193,6 @@ void send_buffer(PartitionImpl<N>* partition, const std::array<int, N>& target, 
     proxy_at<N>(partition->thisProxy, ci)
         .receive_data(node_id, input_index, name, N, region_data, bytes, buf);
     delete[] buf;
-#endif
-}
-
-// ---- CAST ----
-
-template <int N, typename Tin, typename Tout>
-void cast_tile(PartitionImpl<N>* partition, const Tin* in, Tout* out, int64_t n) {
-#ifdef USE_KOKKOS
-    Kokkos::parallel_for(
-        CT_COMPUTE_POLICY(partition, n),
-        KOKKOS_LAMBDA(int64_t i) { out[i] = static_cast<Tout>(in[i]); });
-#else
-    (void)partition;
-    for (int64_t i = 0; i < n; ++i)
-        out[i] = static_cast<Tout>(in[i]);
 #endif
 }
 
@@ -323,7 +255,6 @@ void scan_tile(PartitionImpl<N>* partition, const T* in, T* out, const LineGeom<
 #endif
 }
 
-/// buf[l] = out[l, len-1].
 template <int N, typename T>
 void pack_line_totals(PartitionImpl<N>* partition, const T* out, T* buf, const LineGeom<N>& g) {
 #ifdef USE_KOKKOS
@@ -353,7 +284,6 @@ void fold_totals(PartitionImpl<N>* partition, T* carry, const T* totals, int64_t
 #endif
 }
 
-/// out[l, p] = op(carry[l], out[l, p]).
 template <int N, typename T>
 void apply_carry(PartitionImpl<N>* partition, T* out, const T* carry, const LineGeom<N>& g,
                  ScanOp<T> op) {
@@ -512,7 +442,7 @@ void gather_sorted(PartitionImpl<N>* partition, const T* full, const int64_t* id
             int64_t base = g.phys(l, 0);
             int64_t src = idx[k];
             res[g.phys(l, k % g.len)] =
-                arg ? static_cast<Tout>((src - base) / astride) : static_cast<Tout>(full[src]);
+                arg ? cn_cast<Tout>((src - base) / astride) : cn_cast<Tout>(full[src]);
         });
 #else
     (void)partition;
@@ -521,7 +451,7 @@ void gather_sorted(PartitionImpl<N>* partition, const T* full, const int64_t* id
         int64_t base = g.phys(l, 0);
         int64_t src = idx[k];
         res[g.phys(l, k % g.len)] =
-            arg ? static_cast<Tout>((src - base) / astride) : static_cast<Tout>(full[src]);
+            arg ? cn_cast<Tout>((src - base) / astride) : cn_cast<Tout>(full[src]);
     }
 #endif
 }
@@ -594,9 +524,7 @@ void ArrayDAGExecutorND<N>::execute_castscansort_node(DAGNode* node) {
     CTArrayBase<N>* in = in_it->second;
     if (op == Opcode::SCAN && root->dtype != in->dtype)
         CkAbort("SCAN: result dtype %d != input dtype %d", (int)root->dtype, (int)in->dtype);
-    DType out_dt = op == Opcode::ARGSORT ? DType::INT64
-                   : op == Opcode::CAST  ? root->dtype
-                                         : in->dtype;
+    DType out_dt = op == Opcode::ARGSORT ? DType::INT64 : in->dtype;
     CTArrayBase<N>* out =
         partition->ensure_array(in->region, in->global_shape, out_name, out_dt, in->decomp);
 
@@ -604,7 +532,7 @@ void ArrayDAGExecutorND<N>::execute_castscansort_node(DAGNode* node) {
     if (op == Opcode::SCAN) {
         int axis = scalar_param(root, 1, 0);
         int kind = scalar_param(root, 2, 0);
-        with_dtype(in->dtype, [&](auto tag) {
+        cn_dispatch(in->dtype, [&](auto tag) {
             using T = decltype(tag);
             expected = scan_execute<N, T>(partition, node, out_name, in, out, axis, kind);
         });
@@ -650,23 +578,10 @@ void ArrayDAGExecutorND<N>::finish_castscansort_node(PendingComm<N>& comm) {
     CTArrayBase<N>* in = partition->arrays.at(root->operands[0]->result_name);
     CTArrayBase<N>* out = partition->arrays.at(root->result_name);
 
-    if (op == Opcode::CAST) {
-        with_dtype(in->dtype, [&](auto in_tag) {
-            using Tin = decltype(in_tag);
-            with_dtype(out->dtype, [&](auto out_tag) {
-                using Tout = decltype(out_tag);
-                cast_tile<N, Tin, Tout>(partition, static_cast<const Tin*>(in->device_data_ptr()),
-                                        static_cast<Tout*>(out->device_data_ptr()),
-                                        in->local_size());
-            });
-        });
-        return;
-    }
-
     int axis = scalar_param(root, 1, 0);
     if (op == Opcode::SCAN) {
         int kind = scalar_param(root, 2, 0);
-        with_dtype(out->dtype, [&](auto tag) {
+        cn_dispatch(out->dtype, [&](auto tag) {
             using T = decltype(tag);
             scan_finish<N, T>(partition, out, axis, kind, comm);
         });
@@ -689,7 +604,7 @@ void ArrayDAGExecutorND<N>::finish_castscansort_node(PendingComm<N>& comm) {
         return;
     }
     bool arg = op == Opcode::ARGSORT;
-    with_dtype(in->dtype, [&](auto tag) {
+    cn_dispatch(in->dtype, [&](auto tag) {
         using T = decltype(tag);
         if (arg)
             sort_root<N, T, int64_t>(partition, comm.node->id, root->result_name, in, out, axis,

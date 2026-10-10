@@ -153,6 +153,9 @@ set(BACKEND_EXECUTOR_SOURCES
     executor_creation.cpp
     executor_castscansort.cpp
     executor_linalg.cpp
+    executor_signal.cpp
+    executor_indexing.cpp
+    executor_shape.cpp
 )
 
 set(BACKEND_PARTITION_SOURCES
@@ -205,7 +208,7 @@ if(DEFINED GPU_BACKEND)
         find_package(CUDAToolkit REQUIRED)
         target_link_libraries(jit_obj     PRIVATE CUDA::cuda_driver)
         target_link_libraries(backend_obj PRIVATE CUDA::cuda_driver)
-        # cuSOLVER/cuBLAS for the LINALG executor (CUDA toolkit or the HPC SDK math_libs)
+        # cuSOLVER/cuBLAS (LINALG) and cuFFT (CONVOLVE): CUDA toolkit or the HPC SDK math_libs
         set(CT_MATH_LIBS_DIR "/opt/nvidia/hpc_sdk/Linux_x86_64/26.5/math_libs/12.9"
             CACHE PATH "Directory with include/ and lib64/ of cuSOLVER and cuBLAS")
         find_path(CUSOLVER_INCLUDE_DIR cusolverDn.h
@@ -214,7 +217,10 @@ if(DEFINED GPU_BACKEND)
             HINTS ${CUDAToolkit_LIBRARY_DIR} ${CT_MATH_LIBS_DIR}/lib64 REQUIRED)
         find_library(CUBLAS_LIB cublas
             HINTS ${CUDAToolkit_LIBRARY_DIR} ${CT_MATH_LIBS_DIR}/lib64 REQUIRED)
+        find_library(CUFFT_LIB cufft
+            HINTS ${CUDAToolkit_LIBRARY_DIR} ${CT_MATH_LIBS_DIR}/lib64 REQUIRED)
         get_filename_component(CUSOLVER_LIB_DIR ${CUSOLVER_LIB} DIRECTORY)
+        get_filename_component(CUFFT_LIB_DIR ${CUFFT_LIB} DIRECTORY)
         get_filename_component(CUBLAS_LIB_DIR ${CUBLAS_LIB} DIRECTORY)
         target_include_directories(backend_obj PRIVATE ${CUSOLVER_INCLUDE_DIR})
     elseif(GPU_BACKEND_UPPER STREQUAL "AMD")
@@ -260,7 +266,8 @@ if(DEFINED GPU_BACKEND)
             "-L${CUDAToolkit_LIBRARY_DIR}" "-L${CUDAToolkit_LIBRARY_DIR}/stubs"
             "-Wl,-rpath,${CUDAToolkit_LIBRARY_DIR}" -lcudart -lcuda
             "-L${CUSOLVER_LIB_DIR}" "-Wl,-rpath,${CUSOLVER_LIB_DIR}"
-            "-L${CUBLAS_LIB_DIR}" "-Wl,-rpath,${CUBLAS_LIB_DIR}" -lcusolver -lcublas)
+            "-L${CUBLAS_LIB_DIR}" "-Wl,-rpath,${CUBLAS_LIB_DIR}" -lcusolver -lcublas
+            "-L${CUFFT_LIB_DIR}" "-Wl,-rpath,${CUFFT_LIB_DIR}" -lcufft)
     endif()
 endif()
 

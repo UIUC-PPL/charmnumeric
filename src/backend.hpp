@@ -69,25 +69,7 @@ using HostSpace = Kokkos::HostSpace;
 #endif
 #endif
 
-/// Map C++ type to DType enum at compile time.
-template <typename T>
-constexpr DType dtype_of();
-template <>
-constexpr DType dtype_of<float>() {
-    return DType::FLOAT32;
-}
-template <>
-constexpr DType dtype_of<double>() {
-    return DType::FLOAT64;
-}
-template <>
-constexpr DType dtype_of<int32_t>() {
-    return DType::INT32;
-}
-template <>
-constexpr DType dtype_of<int64_t>() {
-    return DType::INT64;
-}
+#include "dtypes.hpp"
 
 /// Type-erased base class for N-D arrays.
 template <int N>
@@ -115,7 +97,7 @@ class Array : public CTArrayBase<N> {
   public:
 #ifdef USE_KOKKOS
     Kokkos::View<T*, DeviceSpace> d_view;
-    typename Kokkos::View<T*, DeviceSpace>::HostMirror h_view;
+    typename Kokkos::View<T*, DeviceSpace>::HostMirror h_view; // zeroed, allocated on first host use
 #else
     T* data; // host pointer (always allocated, used for gather/get)
 #endif
@@ -135,9 +117,6 @@ class Array : public CTArrayBase<N> {
         int n = this->region.size();
 #ifdef USE_KOKKOS
         d_view = Kokkos::View<T*, DeviceSpace>("array_device", n);
-        h_view = Kokkos::create_mirror_view(HostSpace{}, d_view);
-        Kokkos::deep_copy(d_view, T(0));
-        Kokkos::deep_copy(h_view, T(0));
 #else
         data = new T[n];
         for (int i = 0; i < n; i++)
@@ -169,8 +148,16 @@ class Array : public CTArrayBase<N> {
         // Kokkos Views are RAII — automatic cleanup
     }
 
+#ifdef USE_KOKKOS
+    void ensure_host() {
+        if (h_view.data() == nullptr && d_view.extent(0) > 0)
+            h_view = Kokkos::create_mirror_view(HostSpace{}, d_view);
+    }
+#endif
+
     void* data_ptr() override {
 #ifdef USE_KOKKOS
+        ensure_host();
         return h_view.data();
 #else
         return data;
@@ -189,12 +176,14 @@ class Array : public CTArrayBase<N> {
 
     void copyToHost() override {
 #ifdef USE_KOKKOS
+        ensure_host();
         Kokkos::deep_copy(h_view, d_view);
 #endif
     }
 
     void copyToDevice() override {
 #ifdef USE_KOKKOS
+        ensure_host();
         Kokkos::deep_copy(d_view, h_view);
 #endif
     }
@@ -249,8 +238,15 @@ struct ReductionState {
     int64_t expected = 0;   // mine.size() * reduced extent
 };
 
-/// State of a LINALG node on one chare of the result's partition
-/// (executor_linalg.cpp). Messages that arrive early wait in `stash`.
+/// REDUCE (dot) state on chare 0; partials are summed as they arrive.
+struct DotState {
+    std::vector<char> acc;   // ReduceContrib: metadata of the first partial, summed value
+    int got = 0;
+    int expected = 0;
+    bool started = false;
+};
+
+/// LINALG state on one result chare; early messages wait in `stash`.
 template <int N>
 struct LinalgState {
     DAGNode* node = nullptr;
@@ -265,7 +261,42 @@ struct LinalgState {
     int64_t out_covered = 0, out_expected = 0;
 };
 
+/// GATHER/SCATTER/EXPAND state per chare; early messages wait in `stash`.
+template <int N>
+struct IndexState {
+    DAGNode* node = nullptr;
+    bool started = false;
+    std::vector<std::vector<char>> stash;
+    bool holder = false, flushed = false;
+    int req_left = 0;  // holder: request lists still expected
+    int val_left = 0;  // target: value lists still expected
+    int seg_left = 0;  // EXPAND coordinator: segment lists still expected
+    bool wait_offsets = false; // EXPAND driver: segment offsets not yet received
+    std::unordered_map<int64_t, std::vector<int64_t>> outgoing; // holder: value lists per target
+    std::vector<int64_t> updates; // target: received entries
+    int upd_width = 0;
+    std::vector<std::vector<char>> segs; // coordinator: received segment lists
+    std::vector<int64_t> counts, seg_start; // EXPAND driver: element counts, row starts
+    int64_t row = 1;
+};
+
+/// RESHAPE/BROADCAST state per result chare; early messages wait in `stash`.
+template <int N>
+struct ShapeState {
+    DAGNode* node = nullptr;
+    bool started = false;
+    std::vector<std::vector<char>> stash;
+    int64_t covered = 0;
+    int64_t expected = 0;
+    std::vector<char> block; // BROADCAST: the source block this chare expands
+    char* d_block = nullptr; // its device copy (GPU builds)
+};
+
 // ---- ArrayDAGGroup ----
+
+/// GET of this array name: a barrier, answered (with no data) once every chare
+/// of every partition has finished all earlier epochs.
+constexpr int kBarrierName = -1;
 
 class ArrayDAGGroup : public CBase_ArrayDAGGroup {
   public:
@@ -289,6 +320,10 @@ class ArrayDAGGroup : public CBase_ArrayDAGGroup {
         char* data; // owned copy (bytes)
     };
     std::unordered_map<int, std::vector<GatherFragment>> gather_early;
+    // Barrier GETs (name kBarrierName): the chare grids they wait for, and on
+    // PE 0 the number of chares still to arrive, per epoch
+    std::unordered_map<int, std::unordered_map<int, PartitionGrid>> barrier_grids;
+    std::unordered_map<int, int64_t> barrier_pending;
 
     // Global metadata for arrays referenced by the current DAG.
     // Maps array name -> metadata (ndims, global_shape, decomposition).
@@ -339,6 +374,7 @@ class ArrayDAGGroup : public CBase_ArrayDAGGroup {
     void receive_dag(int epoch, int size, char* serialized_dag);
     void receive_get_request(int ndims, int epoch, int name, int size, int dtype = 0);
     void gather(int epoch, int name, int64_t offset, int64_t size, char* data);
+    void barrier_arrive(int epoch);
 
     // Templated execute_node — dispatched by dtype at call site
     template <int N, typename T = float>
@@ -363,6 +399,12 @@ int reduction_result_meta(ASTNode* root,
 int linalg_result_meta(ASTNode* root,
                        const std::unordered_map<int, ArrayDAGGroup::ArrayMetadata>& meta,
                        std::array<int, 3>& shape_out);
+/// Result ndims/shape of a GATHER/EXPAND root (0 for SCATTER), and the ranks of
+/// the partitions taking part in an index node (executor_indexing.cpp).
+int index_result_meta(ASTNode* root,
+                      const std::unordered_map<int, ArrayDAGGroup::ArrayMetadata>& meta,
+                      std::array<int, 3>& shape_out);
+std::vector<int> index_op_ndims(ASTNode* root);
 
 // ---- Unified Executor (templated on N only) ----
 
@@ -374,7 +416,10 @@ class ArrayDAGExecutorND : public DAGExecutor {
   public:
     std::unordered_map<int, PendingComm<N>> pending;
     std::unordered_map<int, ReductionState<N>> red_state;
+    std::unordered_map<int, DotState> dot_state;
     std::unordered_map<int, LinalgState<N>> la_state;
+    std::unordered_map<int, IndexState<N>> ix_state;
+    std::unordered_map<int, ShapeState<N>> shape_state;
 
     ArrayDAGExecutorND(ArrayDAGGroup* group_, PartitionImpl<N>* partition_)
         : DAGExecutor(group_, N), partition(partition_) {}
@@ -385,6 +430,8 @@ class ArrayDAGExecutorND : public DAGExecutor {
     void execute_matmul_node(DAGNode* node);
     void execute_matmatmul_node(DAGNode* node);
     void execute_reduce_node(DAGNode* node);
+    void on_dot_partial(int node_id, char* data, int64_t size);
+    void finish_dot(int node_id);
     void execute_cross_set_region_node(DAGNode* node);
     void execute_diag_node(DAGNode* node);
     void execute_tile_node(DAGNode* node);
@@ -394,8 +441,15 @@ class ArrayDAGExecutorND : public DAGExecutor {
     void on_linalg_msg(int node_id, char* data, int64_t size);
     void execute_creation_node(DAGNode* node);
     void execute_transpose_node(DAGNode* node);
+    void execute_shape_node(DAGNode* node);
+    void on_shape_msg(int node_id, char* data, int64_t size);
     void execute_castscansort_node(DAGNode* node);
     void finish_castscansort_node(PendingComm<N>& comm);
+    void execute_signal_node(DAGNode* node);
+    void finish_signal_node(PendingComm<N>& comm);
+    void execute_index_node(DAGNode* node);
+    void on_index_msg(int node_id, char* data, int64_t size);
+    void index_progress(int node_id);
     void on_comm_done(int node_id);
     void on_matmatmul_receive(int node_id, int input_index);
     void on_matmul_partial(int node_id, RemoteBuffer<N>& partial_buf);
@@ -546,7 +600,7 @@ class PartitionImpl {
 
 #ifdef USE_KOKKOS
         Kokkos::deep_copy(arr->d_view, T(0));
-        Kokkos::deep_copy(arr->h_view, T(0));
+        arr->h_view = {};
 #else
         T* data = static_cast<T*>(arr->data_ptr());
         for (int i = 0; i < arr->local_size(); ++i)
@@ -560,17 +614,11 @@ class PartitionImpl {
                                       int name,
                                       DType dtype,
                                       const ArrayDecomp<N>& decomp) {
-        switch (dtype) {
-        case DType::FLOAT32:
-            return allocate_or_reuse_typed<float>(region, global_shape, name, decomp);
-        case DType::FLOAT64:
-            return allocate_or_reuse_typed<double>(region, global_shape, name, decomp);
-        case DType::INT32:
-            return allocate_or_reuse_typed<int32_t>(region, global_shape, name, decomp);
-        case DType::INT64:
-            return allocate_or_reuse_typed<int64_t>(region, global_shape, name, decomp);
-        }
-        return nullptr;
+        CTArrayBase<N>* arr = nullptr;
+        cn_dispatch(dtype, [&](auto tag) {
+            arr = allocate_or_reuse_typed<decltype(tag)>(region, global_shape, name, decomp);
+        });
+        return arr;
     }
 
     template <typename T>
@@ -602,9 +650,7 @@ class PartitionImpl {
     }
 #ifdef USE_KOKKOS
     std::unordered_map<int, void*> pending_sends; // send_id → device ptr
-    // Device buffers handed out by the receive_data post entry, keyed by message
-    // identity (node_id, input_index, name, region_data...). Charm++ passes a null
-    // data pointer to the regular nocopydevice entry, so it looks the buffer up here.
+    // Posted device recv buffers, keyed by message identity; nocopydevice passes a null data pointer.
     std::map<std::vector<int>, std::deque<char*>> posted_recv_bufs;
     int next_send_id = 0;
 #ifdef USE_NVIDIA
@@ -638,9 +684,11 @@ class PartitionImpl {
     void send_complete(int send_id);
 #endif
     void comm_done(int node_id);
-    void reduce_result(CkReductionMsg* msg);
+    void reduce_result(int node_id, int64_t size, char* data);
     void receive_reduce_partial(int node_id, int64_t size, char* data);
     void receive_linalg(int node_id, int64_t size, char* data);
+    void receive_index_msg(int node_id, int64_t size, char* data);
+    void receive_shape(int node_id, int64_t size, char* data);
     void process_get(int epoch);
 };
 
@@ -675,12 +723,20 @@ class Partition1D : public CBase_Partition1D {
     }
 #endif
     void comm_done(int node_id) { impl.comm_done(node_id); }
-    void reduce_result(CkReductionMsg* msg) { impl.reduce_result(msg); }
+    void reduce_result(int node_id, int64_t size, char* data) {
+        impl.reduce_result(node_id, size, data);
+    }
     void receive_reduce_partial(int node_id, int64_t size, char* data) {
         impl.receive_reduce_partial(node_id, size, data);
     }
     void receive_linalg(int node_id, int64_t size, char* data) {
         impl.receive_linalg(node_id, size, data);
+    }
+    void receive_index_msg(int node_id, int64_t size, char* data) {
+        impl.receive_index_msg(node_id, size, data);
+    }
+    void receive_shape(int node_id, int64_t size, char* data) {
+        impl.receive_shape(node_id, size, data);
     }
 };
 
@@ -713,12 +769,20 @@ class Partition2D : public CBase_Partition2D {
     }
 #endif
     void comm_done(int node_id) { impl.comm_done(node_id); }
-    void reduce_result(CkReductionMsg* msg) { impl.reduce_result(msg); }
+    void reduce_result(int node_id, int64_t size, char* data) {
+        impl.reduce_result(node_id, size, data);
+    }
     void receive_reduce_partial(int node_id, int64_t size, char* data) {
         impl.receive_reduce_partial(node_id, size, data);
     }
     void receive_linalg(int node_id, int64_t size, char* data) {
         impl.receive_linalg(node_id, size, data);
+    }
+    void receive_index_msg(int node_id, int64_t size, char* data) {
+        impl.receive_index_msg(node_id, size, data);
+    }
+    void receive_shape(int node_id, int64_t size, char* data) {
+        impl.receive_shape(node_id, size, data);
     }
 };
 
@@ -751,11 +815,19 @@ class Partition3D : public CBase_Partition3D {
     }
 #endif
     void comm_done(int node_id) { impl.comm_done(node_id); }
-    void reduce_result(CkReductionMsg* msg) { impl.reduce_result(msg); }
+    void reduce_result(int node_id, int64_t size, char* data) {
+        impl.reduce_result(node_id, size, data);
+    }
     void receive_reduce_partial(int node_id, int64_t size, char* data) {
         impl.receive_reduce_partial(node_id, size, data);
     }
     void receive_linalg(int node_id, int64_t size, char* data) {
         impl.receive_linalg(node_id, size, data);
+    }
+    void receive_index_msg(int node_id, int64_t size, char* data) {
+        impl.receive_index_msg(node_id, size, data);
+    }
+    void receive_shape(int node_id, int64_t size, char* data) {
+        impl.receive_shape(node_id, size, data);
     }
 };

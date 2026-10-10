@@ -1,17 +1,8 @@
 #!/usr/bin/env python
-"""Tests for cnp.linalg factorizations and solves (LINALG executor).
+"""Tests for cnp.linalg (LINALG executor) against NumPy on the fetched inputs.
 
-cholesky (lower/upper), qr (reduced/complete/r), solve (vector and matrix
-rhs), inv, det, slogdet, eigh/eigvalsh (UPLO L/U), svd (full/reduced,
-compute_uv), svdvals, lstsq, solve_triangular (trans/lower/unit_diagonal) and
-tssvd, against NumPy on the fetched inputs. Shapes include non-tile-aligned
-sizes and sizes above the CPU 2-D minimum tile (512), so that +p2 runs gather
-from several chares; operands include offset and strided views and int64
-inputs; float32 and float64. Factors that are unique only up to signs
-(Q, eigenvectors, singular vectors) are checked through their invariants.
-
-Environment: CNUM_HOST, CNUM_PORT, CNUM_ODF (default 4).
-Prints PASS test_linalg / FAIL test_linalg: ... (exit status 0 / 1).
+Factors unique only up to signs (Q, eigenvectors, singular vectors) are checked
+through their invariants. Env: CNUM_HOST, CNUM_PORT, CNUM_ODF (default 4).
 """
 
 import os
@@ -130,17 +121,17 @@ def check_solve(chk, n, dt):
     close(chk, f"inv n={n} {dt}", get(cnp.linalg.inv(a)), np.linalg.inv(ah), tol(dt) * 10)
     s, ld = cnp.linalg.slogdet(a)
     sn, ldn = np.linalg.slogdet(ah)
-    close(chk, f"slogdet n={n} {dt}", np.concatenate([get(s), get(ld)]), [sn, ldn], tol(dt) * 10)
+    close(chk, f"slogdet n={n} {dt}", np.array([get(s), get(ld)]), [sn, ldn], tol(dt) * 10)
     # residual, natively: ||b - a x||_inf (the solve.py check)
     res = cnp.linalg.norm(b1 - a @ x1, np.inf)
-    close(chk, f"solve native residual n={n} {dt}", get(res), [0.0], tol(dt) * 10)
+    close(chk, f"solve native residual n={n} {dt}", get(res), 0.0, tol(dt) * 10)
 
 
 def check_det(chk, n, dt):
     a = rand(n, n, dt)
     ah = get(a).astype(np.float64)
     d = cnp.linalg.det(a)
-    close(chk, f"det n={n} {dt}", get(d), [np.linalg.det(ah)], tol(dt) * 10)
+    close(chk, f"det n={n} {dt}", get(d), np.linalg.det(ah), tol(dt) * 10)
 
 
 def check_eigh(chk, n, dt):
@@ -196,7 +187,7 @@ def check_lstsq(chk, m, n, dt):
         lbl = f"lstsq {nm} {m}x{n} {dt}"
         close(chk, lbl + " x", get(x), xn, t)
         close(chk, lbl + " s", get(s), sn, t)
-        close(chk, lbl + " rank", get(rank), [rankn], 0)
+        close(chk, lbl + " rank", get(rank), rankn, 0)
         resh = np.asarray(res) if isinstance(res, np.ndarray) else get(res)
         close(chk, lbl + " residuals", resh, resn, t)
 
@@ -251,7 +242,7 @@ def check_views_and_ints(chk):
     aih = get(ai)
     d = cnp.linalg.det(ai + 20 * cnp.eye(9, dtype=np.int64))
     dtype_ok(chk, "det int64", d, np.float64)
-    close(chk, "det int64", get(d), [np.linalg.det(aih + 20 * np.eye(9))], 1e-9)
+    close(chk, "det int64", get(d), np.linalg.det(aih + 20 * np.eye(9)), 1e-9)
     # mixed float32/float64 operands promote to float64
     a32 = rand(12, 12, np.float32, shift=5.0)
     b64 = cnp.random.rand(12)
@@ -314,9 +305,7 @@ def main():
     check_eigh(chk, 700, np.float64)
     check_solve_triangular(chk, 900, np.float32)
     check_tssvd(chk, 2000, 40, np.float64)
-    # Size-1 operands are covered with constant inputs only: random 1x1 inputs
-    # hit backend bugs outside linalg (after r + eye(1), a later DAG that grows
-    # the 2-D grid hangs; 1x1 @ (1,) hangs; fetched 1x1 arrays can be garbage).
+    # Size-1 operands use constant inputs only; random 1x1 inputs hit backend hangs.
     check_views_and_ints(chk)
     chk.finish()
 

@@ -9,9 +9,35 @@ import numpy as np
 from charmtyles.interface import CCSInterface
 
 
+_default_interface = None
+
+
+def default_interface():
+    """The most recently created interface (ops with data-dependent sizes sync on it)."""
+    if _default_interface is None:
+        raise RuntimeError(
+            "this operation has a data-dependent result size and needs a "
+            "CharmNumericInterface; create (and connect) one first"
+        )
+    return _default_interface
+
+
+_BARRIER_NAME = -1  # kBarrierName in src/backend.hpp
+
+
+def synchronize(interface=None):
+    """Block until the backend has finished every operation recorded so far."""
+    from charmtyles.core import execute
+
+    interface = interface or default_interface()
+    execute(interface)
+    interface.get(1, _BARRIER_NAME, 0, dtype=np.bool_)
+
 class CharmNumericInterface(CCSInterface):
     def __init__(self, *args, **kwargs):
+        global _default_interface
         super().__init__(*args, **kwargs)
+        _default_interface = self
 
     def from_bytes(self, payload, **kwargs):
         reply_type = kwargs.pop("reply_type", "array")

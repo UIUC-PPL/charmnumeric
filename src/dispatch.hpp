@@ -1,6 +1,7 @@
 #pragma once
 
 #include "backend.hpp"
+#include "jit_api.hpp"
 
 // ---- Stream policy helpers (USE_KOKKOS) ----
 // Under USE_NVIDIA: Kokkos::Cuda exec space instances bound to per-chare streams.
@@ -86,8 +87,7 @@ static void deferred_send_cb(void* param, void* msg) {
     ChareIndex<N_sender> self_ci;
     for (int d = 0; d < N_sender; ++d)
         self_ci.idx[d] = p->partition->index[d];
-    // The source callback fires on the receiver with an empty message, so the
-    // send_id rides along as the callback's refnum.
+    // send_id is the refnum: the source callback fires on the receiver, empty.
     CkCallback cb(PartitionTraits<N_sender>::CkIndexType::send_complete(nullptr),
                   proxy_at<N_sender>(p->partition->thisProxy, self_ci));
     cb.setRefnum(static_cast<CMK_REFNUM_TYPE>(p->send_id));
@@ -189,15 +189,12 @@ static void dispatch_kernel(void* func_ptr, int n_memrefs, std::vector<MemRef<N,
 
 #if defined(USE_NVIDIA)
     {
-        // func_ptr is the JIT'd host launcher (see MLIRJitCompiler::generateNVIDIAHost):
-        // it takes the same packed arguments as the CPU path and launches the
-        // kernels synchronously on its own stream, so first drain this chare's
-        // stream (inputs may still be in flight there).
-        cudaStreamSynchronize(stream);
+        // func_ptr is the JIT'd host launcher (MLIRJitCompiler::generateNVIDIAHost);
+        // it queues kernels on this chare's compute stream without waiting.
+        jit_set_stream(stream);
         static const bool check_memrefs = getenv("CNUM_CHECK_MEMREFS") != nullptr;
         if (check_memrefs) {
-            // Debug aid: verify each descriptor's accessed range lies inside the
-            // device allocation its pointer belongs to.
+            // Debug aid: each descriptor's range must lie in its device allocation.
             for (int i = 0; i < n_memrefs; ++i) {
                 const auto& m = descs[i];
                 int64_t lo = m.offset, hi = m.offset;

@@ -1,20 +1,13 @@
 """Native reductions: sum, prod, mean, var, std, max, min, argmax, argmin,
 count_nonzero, all, any, bincount and norm.
 
-Every reduction is one REDUCTION (or BINCOUNT) node executed by
-``src/executor_reduction.cpp``. A full reduction (``axis=None``) returns a
-``(1,)`` array, like ``dot``, so it can feed later expressions as a broadcast
-operand; ``keepdims=True`` returns ``(1,) * ndim`` instead. Axis reductions
-return an ``(ndim - len(axis))``-D array (``keepdims`` keeps the reduced axes
-with size 1). Views and slices reduce only their region.
+Each reduction is one REDUCTION (or BINCOUNT) node run by
+``src/executor_reduction.cpp``. ``axis=None`` returns a 0-d device array (NumPy
+returns a host scalar), so it can feed later expressions without a sync.
+Views reduce only their region.
 
-Deviations from NumPy:
-
-- full reductions return a ``(1,)`` array instead of a scalar;
-- ``all``/``any`` return 0/1 in the input dtype (there is no bool dtype);
-- ``bincount`` needs ``minlength`` (or ``interface=`` to compute ``max(x) + 1``
-  with a native max reduction first); values outside ``[0, length)`` are
-  ignored.
+Deviations from NumPy: ``bincount`` needs ``minlength`` or ``interface=``
+(which runs a native max first); values outside ``[0, length)`` are ignored.
 """
 
 import builtins
@@ -22,15 +15,22 @@ import numbers
 
 import numpy as np
 
-from charmtyles.operation import nonfusible_op
 
 from .charmnumeric import (
     Array,
     ArrayOperation,
     ArrayView,
+    DType,
+    _array_abs,
+    _NDBase,
+    _imag,
+    _is_array_nd,
+    _squeeze_shape,
     _is_scalar_like,
     _normalize_dtype,
+    _real,
     asarray,
+    nonfusible_op,
 )
 
 # Reduction kinds. Must match enum RedOp in src/executor_reduction.cpp.
@@ -51,13 +51,7 @@ _RED_NORM1 = 13
 _RED_NORM_INF = 14
 _RED_NORM_NEGINF = 15
 
-_INT_DTYPES = (np.dtype("int32"), np.dtype("int64"))
-_WIRE_DTYPE = {
-    np.dtype("float32"): 0,
-    np.dtype("float64"): 1,
-    np.dtype("int32"): 2,
-    np.dtype("int64"): 3,
-}
+_NORMS = (_RED_NORM2, _RED_NORM1, _RED_NORM_INF, _RED_NORM_NEGINF)
 
 
 def _normalize_axes(axis, ndim, single=False):
@@ -94,29 +88,38 @@ def _result_shape(shape, axes, keepdims):
                 out.append(1)
         else:
             out.append(n)
-    return tuple(out) if out else (1,)
+    return tuple(out)
 
 
 def _float_dtype(dtype):
-    return np.dtype("float64") if dtype in _INT_DTYPES else dtype
+    """Result dtype of a norm (float64 for ints, real for complex)."""
+    return np.linalg.norm(np.zeros(1, dtype)).dtype
 
 
 def _default_out_dtype(op, dtype):
-    if op in (_RED_SUM, _RED_PROD):
-        # NumPy accumulates int32 in the platform int (int64).
-        return np.dtype("int64") if dtype in _INT_DTYPES else dtype
+    """NumPy's result dtype of the reduction (sum of int8 is int64, etc.)."""
+    z = np.zeros(1, dtype)
+    if op == _RED_SUM:
+        return np.sum(z).dtype
+    if op == _RED_PROD:
+        return np.prod(z).dtype
     if op in (_RED_ARGMAX, _RED_ARGMIN, _RED_COUNT_NONZERO):
         return np.dtype("int64")
-    if op in (_RED_MEAN, _RED_VAR, _RED_STD, _RED_NORM2, _RED_NORM1, _RED_NORM_INF,
-              _RED_NORM_NEGINF):
+    if op == _RED_MEAN:
+        return np.mean(z).dtype
+    if op in (_RED_VAR, _RED_STD):
+        return np.var(z).dtype
+    if op in _NORMS:
         return _float_dtype(dtype)
-    return dtype  # max, min, all, any
+    if op in (_RED_ALL, _RED_ANY):
+        return np.dtype(bool)
+    return dtype  # max, min
 
 
 def _write_out(result, out):
     if out is None:
         return result
-    if not isinstance(out, (Array, ArrayView)):
+    if not _is_array_nd(out):
         raise TypeError("out must be a charmnumeric Array or ArrayView")
     if tuple(out.shape) != tuple(result.shape):
         raise ValueError(f"out has shape {out.shape}, expected {result.shape}")
@@ -126,11 +129,26 @@ def _write_out(result, out):
 
 def _reduce(a, op, axis=None, keepdims=False, dtype=None, out=None, ddof=0, single=False):
     a = asarray(a)
+    if isinstance(a, _NDBase):
+        from .folded import reduce_nd
+
+        return _write_out(reduce_nd(a, op, axis, keepdims, dtype, ddof, single), out)
     axes = _normalize_axes(axis, a.ndims, single=single)
     if a.size == 0:
         raise ValueError("zero-size arrays are not supported by charmnumeric reductions")
     if op in (_RED_ARGMAX, _RED_ARGMIN) and len(axes) not in (1, a.ndims):
         raise ValueError("argmax/argmin reduce over one axis or all axes")
+
+    if a.dtype.kind == "c" and (op in _NORMS or op in (_RED_VAR, _RED_STD)):
+        # complex: norms of |a|; var(a) = var(a.real) + var(a.imag)
+        if op in _NORMS:
+            result = _reduce(_array_abs(a), op, axis, keepdims, dtype, None, ddof, single)
+        else:
+            result = (_reduce(_real(a), _RED_VAR, axis, keepdims, dtype, None, ddof, single)
+                      + _reduce(_imag(a), _RED_VAR, axis, keepdims, dtype, None, ddof, single))
+            if op == _RED_STD:
+                result = result.sqrt()
+        return _write_out(result, out)
 
     out_dtype = _default_out_dtype(op, a.dtype)
     if dtype is not None:
@@ -145,7 +163,7 @@ def _reduce(a, op, axis=None, keepdims=False, dtype=None, out=None, ddof=0, sing
         mask,
         1 if keepdims else 0,
         int(ddof),
-        _WIRE_DTYPE[a.dtype],
+        DType.from_numpy(a.dtype),
         operation=ArrayOperation.reduction,
         shape=_result_shape(a.shape, axes, keepdims),
         dtype=out_dtype,
@@ -204,10 +222,9 @@ min = amin
 
 
 def argmax(a, axis=None, out=None, keepdims=False, *, dtype=None):
-    """Index of the first maximum (flat index into ``a`` when ``axis=None``).
+    """Index of the first maximum (flat index when ``axis=None``).
 
-    ``dtype`` is a charmnumeric extension (there is no astype yet): the
-    indices are produced directly in that dtype instead of int64.
+    ``dtype`` is a charmnumeric extension giving the index dtype (default int64).
     """
 
     if _is_scalar_like(a):
@@ -216,10 +233,9 @@ def argmax(a, axis=None, out=None, keepdims=False, *, dtype=None):
 
 
 def argmin(a, axis=None, out=None, keepdims=False, *, dtype=None):
-    """Index of the first minimum (flat index into ``a`` when ``axis=None``).
+    """Index of the first minimum (flat index when ``axis=None``).
 
-    ``dtype`` is a charmnumeric extension (there is no astype yet): the
-    indices are produced directly in that dtype instead of int64.
+    ``dtype`` is a charmnumeric extension giving the index dtype (default int64).
     """
 
     if _is_scalar_like(a):
@@ -234,7 +250,7 @@ def count_nonzero(a, axis=None, keepdims=False):
 
 
 def all(a, axis=None, out=None, keepdims=False):
-    """1 where every element is nonzero, else 0, in the dtype of ``a``."""
+    """True where every element is nonzero."""
 
     if _is_scalar_like(a):
         return _scalar_reduce(np.all, a, axis=axis, keepdims=keepdims)
@@ -242,7 +258,7 @@ def all(a, axis=None, out=None, keepdims=False):
 
 
 def any(a, axis=None, out=None, keepdims=False):
-    """1 where some element is nonzero, else 0, in the dtype of ``a``."""
+    """True where some element is nonzero."""
 
     if _is_scalar_like(a):
         return _scalar_reduce(np.any, a, axis=axis, keepdims=keepdims)
@@ -252,41 +268,43 @@ def any(a, axis=None, out=None, keepdims=False):
 def bincount(x, weights=None, minlength=0, interface=None):
     """Count occurrences of each value in a non-negative int vector.
 
-    The output length must be known when the graph is built: it is
-    ``minlength``, or ``max(minlength, max(x) + 1)`` when ``interface`` is
-    given (that runs a native max reduction and fetches one value). Values
-    outside ``[0, length)`` are ignored.
+    Length is ``minlength``, or ``max(minlength, max(x) + 1)`` when ``interface``
+    is given. Values outside ``[0, length)`` are ignored.
     """
 
     x = asarray(x)
     if x.ndims != 1:
         raise ValueError("object too deep for desired array: bincount requires a 1-D array")
-    if x.dtype not in _INT_DTYPES:
+    if x.dtype.kind not in "biu":
         raise TypeError(f"Cannot cast array data from dtype('{x.dtype}') to dtype('int64')")
     minlength = int(minlength)
     if minlength < 0:
         raise ValueError("'minlength' must not be negative")
     length = minlength
     if interface is not None:
-        length = builtins.max(length, int(amax(x).get(interface)[0]) + 1)
+        length = builtins.max(length, int(amax(x).get(interface)) + 1)
     if length <= 0:
         raise ValueError(
             "charmnumeric bincount needs minlength > 0 (or interface= to compute max(x) + 1)"
         )
 
     if weights is None:
-        operands = (x, length, _WIRE_DTYPE[x.dtype], -1)
+        operands = (x, length, DType.from_numpy(x.dtype), -1)
         out_dtype = np.dtype("int64")
     else:
         weights = asarray(weights)
         if tuple(weights.shape) != tuple(x.shape):
-            raise ValueError("The weights and list don't have the same length.")
-        # The executor pairs x and weights tile by tile, so give both the
-        # same layout (fresh arrays are decomposed identically).
+            if _squeeze_shape(weights.shape) != _squeeze_shape(x.shape):
+                raise ValueError("The weights and list don't have the same length.")
+            weights = weights.reshape(x.shape)
+        # The executor pairs x and weights tile by tile, so both need one layout.
         if isinstance(x, ArrayView) or isinstance(weights, ArrayView):
             x = x.copy()
             weights = weights.copy()
-        operands = (x, weights, length, _WIRE_DTYPE[x.dtype], _WIRE_DTYPE[weights.dtype])
+        if weights.dtype.kind == "c":
+            raise TypeError("bincount: complex weights are not supported")
+        operands = (x, weights, length, DType.from_numpy(x.dtype),
+                    DType.from_numpy(weights.dtype))
         out_dtype = np.dtype("float64")
 
     return nonfusible_op(
@@ -342,9 +360,104 @@ def norm(x, ord=None, axis=None, keepdims=False):
     return _reduce(sums, op, axes, keepdims)
 
 
+def quantile(a, q, axis=None, out=None, overwrite_input=False, method="linear",
+             keepdims=False, *, weights=None, interpolation=None):
+    """``numpy.quantile``: native sort, then NumPy's interpolation of order statistics.
+
+    ``q`` is host data (device arrays are fetched); ``axis`` is None or an int.
+    """
+    from numpy.lib import _function_base_impl as npq
+
+    from .charmnumeric import _reshape, _sort, _transpose, _where, _write_out
+    from .indexing import take
+
+    if weights is not None:
+        raise NotImplementedError("quantile(weights=...) is not supported")
+    if interpolation is not None:
+        method = interpolation
+    a = asarray(a)
+    if a.dtype.kind == "c":
+        raise TypeError("a must be an array of real numbers")
+    weak_q = isinstance(q, (int, float)) and not isinstance(q, bool)
+    q = np.asanyarray(q)
+    if q.dtype.kind not in "biuf":
+        q = q.astype(np.float64)
+    if not npq._quantile_is_valid(q):
+        raise ValueError("Quantiles must be in the range [0, 1]")
+    if q.ndim > 2:
+        raise ValueError("q must be a scalar or 1d")
+    if method not in npq._QuantileMethods:
+        raise ValueError(f"{method!r} is not a valid method. Use one of: "
+                         f"{npq._QuantileMethods.keys()}")
+    in_shape = tuple(a.shape)
+    if axis is None:
+        a, ax = _reshape(a, (-1,)), 0
+    elif isinstance(axis, numbers.Integral):
+        ax = int(axis)
+        if not -a.ndim <= ax < a.ndim:
+            raise np.exceptions.AxisError(ax, a.ndim)
+        ax %= a.ndim
+    else:
+        raise NotImplementedError("quantile: axis must be None or an int")
+
+    n = a.shape[ax]
+    rest = tuple(a.shape[:ax]) + tuple(a.shape[ax + 1:])
+    props = npq._QuantileMethods[method]
+    vi = np.asanyarray(props["get_virtual_index"](n, q))
+    s = _sort(a, ax)
+
+    def at(idx):
+        # s[idx] along ax, with the q dims first
+        flat = np.asarray(idx, dtype=np.int64).reshape(-1) % n
+        t = take(s, flat, axis=ax)
+        if ax != 0:
+            perm = (ax,) + tuple(d for d in range(t.ndim) if d != ax)
+            t = _transpose(t, perm)
+        return _reshape(t, np.shape(idx) + rest)
+
+    if props["fix_gamma"] is None or (method == "linear" and vi.dtype.kind in "iu"):
+        result = at(vi)
+    else:
+        prev, nxt = npq._get_indexes(np.empty(0, a.dtype), vi, n)
+        gamma = npq._get_gamma(vi, prev, props)
+        if weak_q:
+            gamma = float(gamma)
+        else:
+            gamma = gamma.reshape(vi.shape + (1,) * len(rest))
+        lo, hi = at(prev), at(nxt)
+        diff = hi - lo
+        lerp = lo + diff * gamma
+        alt = hi - diff * (1 - gamma)
+        if weak_q:
+            result = alt if gamma >= 0.5 else lerp
+        else:
+            result = _where(asarray(gamma >= 0.5), alt, lerp)
+        if result.dtype != lerp.dtype:
+            result = result.astype(lerp.dtype)
+    if a.dtype.kind == "f":
+        # slices holding a NaN (sorted last) give NaN
+        last = at(np.full(vi.shape, -1))
+        result = _where(last != last, last, result)
+    if keepdims:
+        kept = ((1,) * len(in_shape) if axis is None
+                else tuple(1 if d == ax else m for d, m in enumerate(in_shape)))
+        result = _reshape(result, q.shape + kept)
+    return _write_out(result, out)
+
+
+def percentile(a, q, axis=None, out=None, overwrite_input=False, method="linear",
+               keepdims=False, *, weights=None, interpolation=None):
+    """``numpy.percentile`` (``quantile`` of ``q / 100``)."""
+    weak_q = isinstance(q, (int, float)) and not isinstance(q, bool)
+    q = np.true_divide(q, 100)
+    q = q.item() if weak_q else np.asanyarray(q)
+    return quantile(a, q, axis, out, overwrite_input, method, keepdims, weights=weights,
+                    interpolation=interpolation)
+
+
 def _normalize_axes_ordered(axis, ndim):
     axes = tuple(int(ax) % ndim for ax in axis)
-    _normalize_axes(axes, ndim)  # range and duplicate checks
+    _normalize_axes(axes, ndim)
     return axes
 
 
@@ -372,10 +485,7 @@ def _method_std(self, axis=None, dtype=None, out=None, ddof=0, keepdims=False):
 
 
 def _is_elementwise_other(axis):
-    # The older charmnumeric method API (branch fix-temporaries) used
-    # a.max(other) / a.min(other) for the elementwise maximum/minimum. An array
-    # or a non-integral scalar cannot be an axis, so treat those as that form;
-    # anything else follows NumPy's ndarray.max(axis=...) reduction.
+    # Legacy a.max(other) form: an array or non-integral scalar cannot be an axis.
     return isinstance(axis, (Array, ArrayView)) or (
         isinstance(axis, numbers.Real) and not isinstance(axis, numbers.Integral))
 
@@ -438,7 +548,9 @@ __all__ = [
     "mean",
     "min",
     "norm",
+    "percentile",
     "prod",
+    "quantile",
     "std",
     "sum",
     "var",

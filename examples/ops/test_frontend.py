@@ -1,20 +1,8 @@
 #!/usr/bin/env python
-"""Tests for the frontend-only ops and fixes, checked against NumPy.
+"""Frontend ops and fixes checked against NumPy: joins, out=, take, newaxis, assignment.
 
-Covers: concatenate/hstack/vstack/stack, out= on elementwise functions and
-matmul/dot, eye/identity through DIAG, take with host indices, newaxis,
-1-D @ 2-D, (M,K) @ (K,1), cross-ndim assignment (offsets, views, size-1
-dims), size-1 assignment sources, views fed to REDUCE/TILE/DIAG, the 1-3 dim
-limit, and frontend names above the old 65536 cap.
-
-Inputs are generated natively from index grids (no per-element upload),
-fetched with .get(), and the NumPy reference is computed from the fetched
-values. Prints PASS/FAIL per case and a final "PASS test_frontend" or
-"FAIL test_frontend: ...".
-
-Environment: CNUM_HOST / CNUM_PORT / CNUM_ODF select the server (the
-harness's run_example.py also redirects connect()). CNUM_SIM=1 runs against
-the NumPy simulator in ../cupynumeric/_cnum_sim.py instead (no backend).
+Inputs are generated natively and fetched with .get(); the NumPy reference uses the fetched values.
+Env: CNUM_HOST / CNUM_PORT / CNUM_ODF select the server; CNUM_SIM=1 uses the simulator.
 """
 
 import itertools
@@ -27,9 +15,7 @@ import numpy as np
 import charmtyles.core as ct_core
 from charmtyles.ast import get_execution_state
 
-# Start frontend names close to the int32 limit: every array in this test
-# then has a name far above the old 1 << 16 cap, which exercises the wire
-# format and the backend maps with large names.
+# Start names near the int32 limit to exercise large names on the wire.
 # CNUM_TEST_NAME_BASE overrides the starting name (0 keeps the default).
 _NAME_BASE = int(os.environ.get("CNUM_TEST_NAME_BASE", str((1 << 31) - 20_000_000)))
 ct_core.next_name = max(ct_core.next_name, _NAME_BASE)
@@ -191,7 +177,11 @@ def concatenate_views_int_host():
     cnp.concatenate((C[4:8], C[0:4]), out=C)
     check("concatenate out aliasing input", get(C), np.concatenate((Ch[4:8], Ch[0:4])))
 
-    raises("dtype mismatch", TypeError, lambda: cnp.concatenate((A, data((20, 12)))))
+    F = data((20, 12))
+    Fh = made(F)
+    mixed = cnp.concatenate((A, F))
+    check("concatenate int64 + float64 -> float64", get(mixed), np.concatenate((Ah, Fh)))
+    assert mixed.dtype == np.float64
     raises("ndim mismatch", ValueError, lambda: cnp.concatenate((A, data((20,), dtype=np.int64))))
     raises("shape mismatch", ValueError, lambda: cnp.concatenate((A, B), axis=0))
 
@@ -201,7 +191,6 @@ def hstack_vstack():
     N, F = 600, 5
     X = data((N, F))
     Xh = made(X)
-    # linreg/logreg: np.hstack((intercept, features))
     f2 = cnp.hstack((cnp.ones((N, 1), dtype=np.float64), X))
     check("hstack intercept", get(f2), np.hstack((np.ones((N, 1)), Xh)))
 
@@ -242,7 +231,8 @@ def stack_new_axis():
     out = cnp.zeros((2, 40), dtype=np.float64)
     cnp.stack((u, v), out=out)
     check("stack out=", get(out), np.stack((uh, vh)))
-    raises("stack to 4-D", NotImplementedError, lambda: cnp.stack((data((2, 3, 4)), data((2, 3, 4)))))
+    s1, s2 = data((2, 3, 4)), data((2, 3, 4), seed=2)
+    check("stack to 4-D", get(cnp.stack((s1, s2))), np.stack(made(s1, s2)))
     raises("stack shape mismatch", ValueError, lambda: cnp.stack((u, data((41,)))))
 
 
@@ -287,8 +277,9 @@ def elementwise_out():
     check("scalar+scalar out=", get(s), np.full(5, 3.0))
 
     raises("out shape mismatch", ValueError, lambda: cnp.add(a, b, out=cnp.zeros((299,))))
-    raises("out dtype mismatch", TypeError,
-           lambda: cnp.add(a, b, out=cnp.zeros((300,), dtype=np.float32)))
+    o32 = cnp.zeros((300,), dtype=np.float32)
+    cnp.add(a, b, out=o32)  # same-kind cast, as NumPy's ufunc out=
+    check("out dtype cast", get(o32), (get(a) + get(b)).astype(np.float32))
     raises("out not an array", TypeError, lambda: cnp.add(a, b, out=np.zeros(300)))
 
 
@@ -355,11 +346,11 @@ def take_1d():
     ]:
         check(f"take 1-D {list(idx)[:6]}...", get(cnp.take(a, idx)), np.take(ah, idx))
     check("take 2-D index on 1-D", get(cnp.take(a, [[1, 2, 3], [7, 7, 0]])), np.take(ah, [[1, 2, 3], [7, 7, 0]]))
-    check("take scalar on 1-D (as (1,))", get(cnp.take(a, 17)), np.take(ah, [17]))
+    check("take scalar on 1-D", get(cnp.take(a, 17)), np.take(ah, 17))
     check("take mode=wrap", get(cnp.take(a, [101, -105, 3], mode="wrap")), np.take(ah, [101, -105, 3], mode="wrap"))
     check("take mode=clip", get(cnp.take(a, [101, -5, 3], mode="clip")), np.take(ah, [101, -5, 3], mode="clip"))
     raises("take out of bounds", IndexError, lambda: cnp.take(a, [100]))
-    raises("take device indices", NotImplementedError, lambda: cnp.take(a, data((3,), dtype=np.int64)))
+    check("take device indices", get(cnp.take(a, cnp.array([5, 0, 99, -1]))), np.take(ah, [5, 0, 99, -1]))
 
 
 @case
@@ -381,7 +372,7 @@ def take_2d_3d():
     out = cnp.zeros((70, 5, 2), dtype=np.float64)
     cnp.take(T, [3, 1], axis=2, out=out)
     check("take out=", get(out), np.take(Th, [3, 1], axis=2))
-    raises("take to 4-D", NotImplementedError, lambda: cnp.take(T, [[0, 1]], axis=1))
+    check("take to 4-D", get(cnp.take(T, [[0, 1]], axis=1)), np.take(Th, [[0, 1]], axis=1))
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +394,8 @@ def vecmat_and_column():
         raise AssertionError(f"(40,5) @ (5,1) has shape {r.shape}")
     check("(M,K) @ (K,1)", get(r), Ah @ Bh, rtol=1e-12)
     check("(M,K) @ (K,1) view", get(X @ M[:, 3:4]), Xh @ Mh[:, 3:4], rtol=1e-12)
-    check("dot of views", get(cnp.dot(v2[10:20], v2[20:30])), np.array([v2h[10:20] @ v2h[20:30]]), rtol=1e-12)
+    check("dot of views", get(cnp.dot(v2[10:20], v2[20:30])), np.asarray(v2h[10:20] @ v2h[20:30]),
+          rtol=1e-12)
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +416,7 @@ def newaxis():
     c = cnp.zeros((50,), dtype=np.float64)
     c[:, None] = v[:, None]
     check("setitem with newaxis", get(c), vh)
-    raises("newaxis to 4-D", NotImplementedError, lambda: A[None, :, None, :])
+    check("newaxis to 4-D", get(A[None, :, None, :]), Ah[None, :, None, :])
 
 
 @case
@@ -433,7 +425,7 @@ def cross_ndim_assignment():
     M = data((70, 3))
     Mh = made(M)
     exp = np.zeros((4, 70, 9))
-    Z[1, :, 2:5] = M            # offset in a non-singleton dim (README Q8)
+    Z[1, :, 2:5] = M            # offset in a non-singleton dim
     exp[1, :, 2:5] = Mh
     Z[2, 10:40, 6:9] = M[5:35]   # view source + offsets
     exp[2, 10:40, 6:9] = Mh[5:35]
@@ -478,7 +470,7 @@ def views_into_diag_tile():
 
 @case
 def dim_limit():
-    raises("zeros 4-D", NotImplementedError, lambda: cnp.zeros((2, 2, 2, 2)))
+    check("zeros 4-D", get(cnp.zeros((2, 2, 2, 2))), np.zeros((2, 2, 2, 2)))
     raises("tile to 4-D", NotImplementedError, lambda: cnp.tile(data((2, 2)), (2, 1, 1, 1)))
     if ct_core.max_name < (1 << 31) - 1:
         raise AssertionError(f"max_name is {ct_core.max_name}")
@@ -486,6 +478,395 @@ def dim_limit():
     if a.name < (1 << 16):
         raise AssertionError("test expected large frontend names")
     check("large names round trip", get(a + 1.0), np.full(3, 2.0))
+
+
+# ---------------------------------------------------------------------------
+# NumPy semantics used by the cuPyNumeric example programs
+# ---------------------------------------------------------------------------
+@case
+def zero_d_results():
+    x = data((300001,))
+    A = data((37, 41))
+    B = data((5, 7, 9))
+    xh, Ah, Bh = made(x, A, B)
+    s = cnp.sum(A)
+    sh = Ah.sum()
+    for label, got, exp in [("sum", s, sh), ("dot", x @ x, xh @ xh), ("max", B.max(), Bh.max()),
+                            ("argmin", cnp.argmin(B), np.argmin(Bh)),
+                            ("norm", cnp.linalg.norm(x), np.linalg.norm(xh)),
+                            ("matrix inf-norm", cnp.linalg.norm(A, np.inf),
+                             np.linalg.norm(Ah, np.inf))]:
+        if got.shape != () or got.ndim != 0:
+            raise AssertionError(f"{label}: shape {got.shape}")
+        check(label, get(got), np.asarray(exp), rtol=1e-12)
+    # 0-d with arrays of every rank, and with views (size-1 operand of another rank)
+    check("A * s", get(A * s), Ah * sh, rtol=1e-12)
+    check("s - B", get(s - B), sh - Bh, rtol=1e-12)
+    check("B[1:3, 2:5] / s", get(B[1:3, 2:5] / s), Bh[1:3, 2:5] / sh, rtol=1e-12)
+    check("x + s", get(x + s), xh + sh, rtol=1e-12)
+    t = s / cnp.sum(x)
+    check("0-d / 0-d", get(t), np.asarray(sh / xh.sum()), rtol=1e-12)
+    for name in ("sqrt", "exp", "tanh", "log", "abs", "floor"):
+        th = np.asarray(sh / xh.sum())
+        check(f"{name} of 0-d", get(getattr(cnp, name)(t)), getattr(np, name)(th), rtol=1e-12)
+    check("0-d into (1, 1) region", get(A[2:3, 4:5] * 0 + s), np.full((1, 1), sh), rtol=1e-12)
+    # host conversions fetch the value
+    if (abs(float(s) - sh) > 1e-9 * abs(sh) or not bool(s > sh - 1)
+            or int(cnp.sum(cnp.ones((5,)))) != 5):
+        raise AssertionError("float/bool/int of a 0-d array")
+    if str(cnp.sum(cnp.ones((4,)))) != str(np.sum(np.ones(4))) or f"{s:.3f}" != f"{sh:.3f}":
+        raise AssertionError("str/format of a 0-d array")
+    raises("bool of a larger array", ValueError, lambda: bool(x > 0))
+    if not np.allclose(np.asarray(A), Ah):
+        raise AssertionError("__array__")
+    z = cnp.array(2.5)
+    if z.shape != () or float(z) != 2.5:
+        raise AssertionError("array(scalar)")
+    z[...] = 4.0
+    z += 1
+    check("0-d setitem / in-place", get(z), np.asarray(5.0))
+
+
+@case
+def integer_indices():
+    A = data((37, 41))
+    B = data((5, 7, 9))
+    v = data((50,))
+    Ah, Bh, vh = made(A, B, v)
+    for key in [3, -1, (2, slice(1, 30, 3)), (slice(None), 7), (slice(2, 9), -4)]:
+        check(f"A[{key}]", get(A[key]), Ah[key])
+    for key in [1, (slice(None), 2), (2, slice(None), slice(1, 4)), (Ellipsis, 3), (1, 2),
+                (slice(None, None, -1), 2), (1, None, slice(None)), (4, 6, 8)]:
+        check(f"B[{key}]", get(B[key]), Bh[key])
+    check("v[7]", get(v[7]), vh[7])
+    check("A[2][5]", get(A[2][5]), Ah[2][5])
+    check("take scalar along axis", get(cnp.take(B, 3, axis=1)), np.take(Bh, 3, axis=1))
+    check("A[2:9, 3:30:4].T", get(A[2:9, 3:30:4].T), Ah[2:9, 3:30:4].T)
+    check("B[1].T", get(B[1].T), Bh[1].T)
+    check("B[:, 2:5, 1:8].transpose(2, 0, 1)", get(B[:, 2:5, 1:8].transpose(2, 0, 1)),
+          Bh[:, 2:5, 1:8].transpose(2, 0, 1))
+    # writes through an integer-indexed result reach the array
+    r = A[4]
+    r += 1.0
+    Ah = Ah.copy()
+    Ah[4] += 1.0
+    check("A[4] += 1 via a row", get(A), Ah)
+    B[2] += B[3]
+    Bh = Bh.copy()
+    Bh[2] += Bh[3]
+    check("B[2] += B[3]", get(B), Bh)
+    p = A[:, 5]
+    p[1:3] = -7.0
+    Ah[1:3, 5] = -7.0
+    check("column write-through", get(A), Ah)
+    e = v[3]
+    e += 100.0  # a scalar result: no write back (NumPy returns a copy)
+    check("v[3] scalar copy", get(v), vh)
+
+
+@case
+def shifted_assignment_results():
+    # Write into a region that spans another chare.
+    V = cnp.full((16, 8, 12), 0.1, dtype=np.float32)
+    P = cnp.zeros((112, 8, 12))
+    d = V * 2.0
+    P[96:112] = d + 1.0
+    Ph = np.zeros((112, 8, 12))
+    Ph[96:112] = np.float32(0.1) * 2.0 + 1.0
+    check("P[96:112] = d + 1", get(P), Ph)
+    check("kept d", get(d), np.full((16, 8, 12), np.float32(0.1) * 2.0))
+    check("d reused", get(d * 3.0), np.full((16, 8, 12), np.float32(0.1) * 6.0))
+    F = cnp.zeros((7, 16, 8, 12), dtype=np.float32)  # 4-D: F[6] is a shifted storage view
+    e = -1 * (V * cnp.sqrt(d))
+    F[6][...] = e * d
+    eh = -1 * (np.float32(0.1) * np.sqrt(np.float32(0.1) * 2.0))
+    Fh = np.zeros((7, 16, 8, 12), dtype=np.float32)
+    Fh[6] = eh * (np.float32(0.1) * 2.0)
+    check("F[6][...] = e * d", get(F), Fh, rtol=1e-6)
+    check("kept e", get(e), np.full((16, 8, 12), eh), rtol=1e-12)
+    # the region is far larger than the result, at an offset off the tile grid
+    W = cnp.full((365, 8, 12), 0.5)
+    Q = cnp.zeros((2555, 8, 12))
+    g = W * 3.0
+    Q[2190:] = g - 1.0
+    Qh = np.zeros((2555, 8, 12))
+    Qh[2190:] = 0.5
+    check("Q[2190:] = g - 1", get(Q), Qh)
+    check("kept g", get(g), np.full((365, 8, 12), 1.5))
+
+
+@case
+def numpy_interop():
+    x = data((40,))
+    xh = made(x)
+    y = np.sqrt(x)  # NumPy ufunc on a device array runs natively
+    if not isinstance(y, cnp.Array):
+        raise AssertionError(f"np.sqrt returned {type(y).__name__}")
+    check("np.sqrt(x)", get(y), np.sqrt(xh), rtol=1e-14)
+    check("np.float32 * x", get(np.float32(2.0) * x), np.float32(2.0) * xh)
+    hx = np.ones(40)
+    hx += x  # NumPy in-place with a device operand
+    check("host += device", hx, 1.0 + xh)
+    check("numpy.cumsum(x)", np.cumsum(x), np.cumsum(xh), rtol=1e-12)
+    check("arange(4.0)", get(cnp.arange(4.0)), np.arange(4.0))
+    check("arange(np.float32(1), 5)", get(cnp.arange(np.float32(1), 5)),
+          np.arange(np.float32(1), 5))
+    check("arange(0, 3, 0.5)", get(cnp.arange(0, 3, 0.5)), np.arange(0, 3, 0.5))
+    hn = np.array([1.0, np.nan, np.inf, -np.inf, 1e-9, 5.0])
+    hm = np.array([1.0 + 1e-6, np.nan, np.inf, np.inf, 0.0, 5.1])
+    for kw in ({}, {"equal_nan": True}, {"rtol": 0.05}, {"atol": 1e-5}):
+        check(f"isclose {kw}", get(cnp.isclose(cnp.array(hn), cnp.array(hm), **kw)),
+              np.isclose(hn, hm, **kw))
+        if bool(cnp.allclose(cnp.array(hn), hm, **kw)) != np.allclose(hn, hm, **kw):
+            raise AssertionError(f"allclose {kw}")
+    hi = np.arange(6)
+    check("isclose int", get(cnp.isclose(cnp.array(hi), cnp.array(hi + 1), atol=1)),
+          np.isclose(hi, hi + 1, atol=1))
+    counts = cnp.array(np.array([0, 3, 1], dtype=np.int64))
+    check("maximum(int64, uint64)", get(cnp.maximum(counts, cnp.ones((1,), dtype=np.uint64))),
+          np.maximum(np.array([0, 3, 1]), np.ones((1,), dtype=np.uint64)))
+    big = np.array([2**63 + 5, 7], dtype=np.uint64)
+    check("uint64 above 2**63", get(cnp.array(big) + np.uint64(1)), big + np.uint64(1))
+    cnp.synchronize(iface)
+
+
+@case
+def transpose_is_linked_view():
+    # transpose results write through to the base, and follow later writes to it
+    rng = np.random.default_rng(1)
+    h = rng.integers(-4, 5, (33, 33)).astype(np.int64)
+    base = cnp.array(h)
+    x = base.T
+    x -= x
+    check("isub on transpose", get(base), np.zeros_like(h))
+    h = rng.integers(-4, 5, (33, 513)).astype(np.int64)
+    base = cnp.array(h)
+    x = cnp.transpose(base, (1, 0))
+    x **= 0
+    check("ipow on transpose", get(base), np.ones_like(h))
+    h = rng.uniform(-2, 2, (7, 2, 9))
+    base = cnp.array(h)
+    t = base.transpose(1, 2, 0)
+    t[-2, 3:4] = -3.0
+    e = h.copy()
+    e.transpose(1, 2, 0)[-2, 3:4] = -3.0
+    check("setitem on transpose", get(base), e)
+    check("transpose after write", get(t), e.transpose(1, 2, 0))
+    base[0] = 5.0
+    e[0] = 5.0
+    check("transpose refreshed", get(t), e.transpose(1, 2, 0))
+    s = cnp.swapaxes(base, 0, 2)
+    s[1:3, 0, 1] = 9.0
+    e.swapaxes(0, 2)[1:3, 0, 1] = 9.0
+    check("swapaxes write", get(base), e)
+
+
+@case
+def inplace_bitwise_size1():
+    for shape in ((1, 1), (1, 1, 1), (37,), (5, 7)):
+        h = np.arange(int(np.prod(shape)), dtype=np.int64).reshape(shape) - 3
+        for name in ("__ior__", "__ixor__", "__iand__"):
+            x = cnp.array(h)
+            getattr(x, name)(5)
+            e = h.copy()
+            getattr(e, name)(5)
+            check(f"{name} {shape}", get(x), e)
+        x = cnp.array(h)
+        x ^= x
+        check(f"x ^= x {shape}", get(x), np.zeros_like(h))
+    m = cnp.array(np.array([True, False, True]))
+    m |= cnp.array(np.array([False, False, True]))
+    check("bool |=", get(m), np.array([True, False, True]))
+
+
+@case
+def shifts():
+    rng = np.random.default_rng(2)
+    for dt in (np.int8, np.int16, np.int32, np.int64, np.uint8, np.uint16, np.uint32, np.uint64):
+        info = np.iinfo(dt)
+        bits = info.bits
+        h = rng.integers(max(info.min, -(2**62)), min(info.max, 2**62), 100, dtype=np.int64).astype(dt)
+        n = rng.integers(0, bits + 3, 100).astype(dt)  # includes counts >= width
+        a, c = cnp.array(h), cnp.array(n)
+        check(f"<< {np.dtype(dt)}", get(a << c), h << n)
+        check(f">> {np.dtype(dt)}", get(a >> c), h >> n)
+        check(f"<< scalar {np.dtype(dt)}", get(a << 3), h << 3)
+        check(f">> scalar {np.dtype(dt)}", get(a >> 2), h >> 2)
+        check(f"left_shift {np.dtype(dt)}", get(cnp.left_shift(a, c)), np.left_shift(h, n))
+        check(f"right_shift {np.dtype(dt)}", get(cnp.right_shift(a, c)), np.right_shift(h, n))
+    h = np.arange(-20, 20, dtype=np.int64)
+    a = cnp.array(h)
+    check("reflected <<", get(3 << cnp.array(np.arange(0, 70, dtype=np.int64))),
+          3 << np.arange(0, 70, dtype=np.int64))
+    check("reflected >>", get(-1000 >> cnp.array(np.arange(0, 70, dtype=np.int64))),
+          -1000 >> np.arange(0, 70, dtype=np.int64))
+    n = np.array([-1, -5, 64, 100, 63, 0])
+    check("negative counts <<", get(cnp.array(np.ones(6, np.int64)) << cnp.array(n)), np.ones(6, np.int64) << n)
+    check("negative counts >>", get(cnp.array(-np.ones(6, np.int64) * 8) >> cnp.array(n)),
+          -np.ones(6, np.int64) * 8 >> n)
+    x = cnp.array(h)
+    x <<= 2
+    y = h.copy()
+    y <<= 2
+    check("<<=", get(x), y)
+    x >>= 1
+    y >>= 1
+    check(">>=", get(x), y)
+    one = cnp.array(np.array([[-7]], dtype=np.int64))
+    check("size-1 <<", get(one << 3), np.array([[-7]]) << 3)
+    b = cnp.array(np.array([True, False]))
+    check("bool << int", get(b << 2), np.array([True, False]) << 2)
+    h4 = np.arange(24, dtype=np.int32).reshape(2, 3, 2, 2) - 7
+    a4 = cnp.array(h4)
+    check("4-D <<", get(a4 << 2), h4 << 2)
+    check("4-D bitwise_right_shift", get(cnp.bitwise_right_shift(a4, a4 & 3)), np.right_shift(h4, h4 & 3))
+    a4 |= 1
+    check("4-D |=", get(a4), h4 | 1)
+    raises("float <<", TypeError, lambda: cnp.array(np.ones(3)) << 1)
+    raises("float >>", TypeError, lambda: cnp.right_shift(cnp.array(np.ones(3)), 1))
+
+
+@case
+def where_python_scalar_is_weak():
+    c = np.arange(6.0).reshape(2, 3) - 2
+    for shape in ((2, 3), (1, 2, 3, 1)):
+        x = cnp.array(c.reshape(shape))
+        r = cnp.where(x, -0.22, np.float32(0.45))
+        check(f"where pyfloat/np32 {shape}", get(r), np.where(c.reshape(shape), -0.22, np.float32(0.45)))
+        r = cnp.where(x, np.float32(0.45), -0.22)
+        check(f"where np32/pyfloat {shape}", get(r), np.where(c.reshape(shape), np.float32(0.45), -0.22))
+
+
+@case
+def folded_take_and_dot():
+    h = np.arange(9.0).reshape(9, 1, 1, 1)
+    x = cnp.array(h)
+    check("take folded", get(cnp.take(x, [3])), np.take(h, [3]))
+    check("take folded idx", get(cnp.take(x, cnp.array(np.array([8, 0, 4])))), np.take(h, [8, 0, 4]))
+    a = np.arange(4.0).reshape(2, 2, 1)
+    b = np.array([[3]])
+    check("dot 3-D x 2-D", get(cnp.dot(cnp.array(a), cnp.array(b))), np.dot(a, b))
+    a = np.arange(60.0).reshape(3, 4, 5)
+    b = np.arange(30.0).reshape(5, 6)
+    check("dot 3-D x 2-D", get(cnp.array(a).dot(cnp.array(b))), np.dot(a, b))
+    b = np.arange(2 * 5 * 3.0).reshape(2, 5, 3)
+    check("dot 3-D x 3-D", get(cnp.dot(cnp.array(a), cnp.array(b))), np.dot(a, b))
+    v = np.arange(5.0)
+    check("dot 3-D x 1-D", get(cnp.dot(cnp.array(a), cnp.array(v))), np.dot(a, v))
+    check("dot 1-D x 3-D", get(cnp.dot(cnp.array(v), cnp.array(b))), np.dot(v, b))
+    a4 = np.arange(24.0).reshape(2, 3, 2, 2)
+    b2 = np.arange(6.0).reshape(2, 3)
+    check("dot 4-D x 2-D", get(cnp.dot(cnp.array(a4), cnp.array(b2))), np.dot(a4, b2))
+
+
+@case
+def negative_step_folded():
+    h = np.arange(6 * 5 * 4 * 3).reshape(3, 2, 5, 4, 3).astype(np.int64)
+    x = cnp.array(h)
+    for key in ((slice(2, 0, -1),), (slice(None), slice(None, None, -1)),
+                (slice(None), 1, slice(3, 0, -2)), (Ellipsis, slice(None, None, -1)),
+                (slice(None, None, -1), slice(None, None, -1), 2, slice(None), slice(2, None, -1))):
+        check(f"get {key}", get(x[key]), h[key])
+    y = x[:][2:1:-1]
+    check("chained", get(y), h[:][2:1:-1])
+    e = h.copy()
+    x[::-1, 1, 1:4] = 7
+    e[::-1, 1, 1:4] = 7
+    check("set negative step", get(x), e)
+    x[:, :, ::-2] = cnp.array(np.arange(3 * 2 * 3 * 4 * 3).reshape(3, 2, 3, 4, 3).astype(np.int64))
+    e[:, :, ::-2] = np.arange(3 * 2 * 3 * 4 * 3).reshape(3, 2, 3, 4, 3)
+    check("set negative step array", get(x), e)
+    z = cnp.array(np.arange(6).reshape(3, 2, 1, 1).astype(np.int64))
+    check("chained 4-D", get(z[:][2:1:-1]), np.arange(6).reshape(3, 2, 1, 1)[:][2:1:-1])
+
+
+@case
+def zero_d_operands():
+    v = np.arange(1000.0) / 7
+    s = cnp.amax(cnp.array(v), axis=-1)
+    check("inner 0-d x 1-D", get(cnp.inner(s, cnp.array(v))), np.inner(v.max(), v))
+    check("inner 1-D x 0-d", get(cnp.inner(cnp.array(v), s)), np.inner(v, v.max()))
+    check("inner 0-d x 0-d", get(cnp.inner(s, s)), np.inner(v.max(), v.max()))
+    t = cnp.amin(cnp.array(np.arange(7)), axis=0)
+    check("x[None]", get(t[None]), np.array(0)[None])
+    check("x[None, None]", get(t[None, None]), np.array(0)[None, None])
+    check("x[..., None]", get(t[..., None]), np.array(0)[..., None])
+    t[None] = 4
+    check("x[None] = v", get(t), np.array(4))
+    check("transpose(0-d, ())", get(cnp.transpose(t, ())), np.array(4))
+    check("0-d.transpose()", get(t.transpose()), np.array(4))
+    check("0-d.T", get(t.T), np.array(4))
+    w = np.arange(5.0)
+    check("einsum ,e->e", get(cnp.einsum(",e->e", t.astype(np.float64), cnp.array(w))), np.einsum(",e->e", 4.0, w))
+    a = np.arange(33 * 70.0).reshape(33, 1, 70)
+    x = cnp.transpose(cnp.array(a), (1, 0, 2))
+    check("einsum abc,ebc->ae", get(cnp.einsum("abc,ebc->ae", x, x)),
+          np.einsum("abc,ebc->ae", a.transpose(1, 0, 2), a.transpose(1, 0, 2)), rtol=1e-9)
+    a = np.arange(9 * 5 * 13.0).reshape(9, 5, 1, 13)
+    b = np.arange(9 * 5 * 9.0).reshape(9, 5, 1, 9)
+    check("einsum abcd,dfga->fca", get(cnp.einsum("abcd,dfga->fca", cnp.array(a[..., 2:11]), cnp.array(b))),
+          np.einsum("abcd,dfga->fca", a[..., 2:11], b), rtol=1e-9)
+
+
+@case
+def mask_with_slices_and_newaxis():
+    rng = np.random.default_rng(3)
+    h = rng.integers(-5, 5, (6, 7, 5)).astype(np.int64)
+    x = cnp.array(h)
+    m = rng.integers(0, 2, 6).astype(bool)
+    m2 = rng.integers(0, 2, 7).astype(bool)
+    keys = [
+        (m, slice(6, 1, -2), slice(0, 3, 2)),
+        (slice(1, 5), m2, slice(None, None, -1)),
+        (m, None),
+        (None, m),
+        (m, None, slice(1, 4)),
+        (slice(None), m2, None),
+        (m, slice(None), None, 2),
+        (Ellipsis, None, slice(1, 3)),
+    ]
+    for key in keys:
+        hk = tuple(k if not isinstance(k, np.ndarray) else k for k in key)
+        ck = tuple(cnp.array(k) if isinstance(k, np.ndarray) else k for k in key)
+        check(f"get {key}", get(x[ck]), h[hk])
+    for key, val in (((m, None), 3), ((slice(None), m2, None), 6), ((m, slice(6, 1, -2), slice(0, 3, 2)), -1)):
+        hk = key
+        ck = tuple(cnp.array(k) if isinstance(k, np.ndarray) else k for k in key)
+        y = cnp.array(h)
+        e = h.copy()
+        y[ck] = val
+        e[hk] = val
+        check(f"set {key}", get(y), e)
+    # >3-D arrays: index arrays and masks with slices
+    h4 = rng.integers(-5, 5, (7, 7, 3, 3)).astype(np.int64)
+    x4 = cnp.array(h4)
+    m4 = rng.integers(0, 2, 7).astype(bool)
+    for key in ((m4, slice(6, 3, -2), slice(0, 3, 2)), (slice(None), m4, 1), (m4, None, slice(None), 2)):
+        ck = tuple(cnp.array(k) if isinstance(k, np.ndarray) else k for k in key)
+        check(f"get 4-D {key}", get(x4[ck]), h4[key])
+    idx = np.array([5, -1, 0])
+    check("get 4-D fancy", get(x4[cnp.array(idx), :, 1:]), h4[idx, :, 1:])
+    y4 = cnp.array(h4)
+    e4 = h4.copy()
+    y4[m4, :, 1] = 9
+    e4[m4, :, 1] = 9
+    check("set 4-D mask", get(y4), e4)
+    z = cnp.array(np.arange(4.0).reshape(1, 1, 2, 2))
+    r = z[cnp.array(np.array([True])), slice(6, 3, -2), slice(0, 3, 2)]
+    check("empty 4-D", get(r), np.arange(4.0).reshape(1, 1, 2, 2)[np.array([True]), 6:3:-2, 0:3:2])
+
+
+@case
+def dot_after_partition_growth():
+    # a 1-D dot, then dots over larger arrays (the partition gains chares), then small ones again
+    for n in (33, 262145, 700001, 33, 300000, 7):
+        h = (np.arange(n) % 13 - 6).astype(np.float64)
+        x = cnp.array(h)
+        check(f"dot n={n}", get(cnp.dot(x, x)), np.dot(h, h))
+        check(f"inner strided n={n}", get(cnp.inner(x[::2], x[::2])), np.inner(h[::2], h[::2]))
+    h32 = (np.arange(524290) % 7 - 3).astype(np.float32)
+    v = cnp.array(h32)[0:524289:2]
+    check("inner float32 view", get(cnp.inner(v, v)), np.inner(h32[0:524289:2], h32[0:524289:2]))
 
 
 def main():

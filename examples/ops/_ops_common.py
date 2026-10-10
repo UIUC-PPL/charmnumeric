@@ -1,15 +1,10 @@
-"""Shared helpers for the elementwise-op tests in this directory.
+"""Shared helpers for the elementwise-op tests.
 
-Environment (same as examples/cupynumeric):
-    CNUM_HOST, CNUM_PORT, CNUM_ODF   backend to connect to
-    CNUM_SIM=1                       run against the NumPy simulator in
-                                     ../cupynumeric/_cnum_sim.py instead
+Env: CNUM_HOST, CNUM_PORT, CNUM_ODF select the backend; CNUM_SIM=1 uses the
+NumPy simulator in ../cupynumeric/_cnum_sim.py instead.
 
-Inputs are generated on the backend from index grids (no per-element
-upload), fetched with .get(), and the NumPy reference is computed from the
-fetched values. Every check prints PASS/FAIL; the last line is
-``PASS <test>`` or ``FAIL <test>: <n> failures``.
-
+Inputs are generated on the backend from index grids and fetched with .get();
+the NumPy reference is computed from the fetched values.
 """
 
 import os
@@ -41,18 +36,12 @@ def connect():
     return iface
 
 
-# Shapes: 1-D/2-D/3-D, non-tile-aligned sizes, and sizes above the CPU
-# minimum tiles (1-D 262144, 2-D 512, 3-D 64) so that +p2 runs split arrays
-# over several chares.
+# Sizes above the CPU minimum tiles so +p2 runs split arrays over several chares.
 SHAPES = [(37,), (1000,), (300001,), (37, 41), (600, 7), (5, 7, 9), (70, 3, 5)]
 
 
 def _axis_index(shape, axis, dtype):
-    """g[...] = index along `axis`, as a Hillis-Steele prefix sum of ones.
-
-    Every slice used has length >= 2 unless the axis itself is short, which
-    keeps clear of size-1 (broadcast) operand views.
-    """
+    """Index along `axis`, as a Hillis-Steele prefix sum of ones."""
     nd = len(shape)
     n = shape[axis]
 
@@ -103,12 +92,12 @@ def halves(shape, dtype=np.float64):
 
 
 def ints(shape, lo=-5, hi=5, dtype=np.int64, mult=1):
-    """Integers cycling through [lo, hi] (truncating int division on L >= 0)."""
+    """Integers cycling through [lo, hi] (floor division on L >= 0)."""
     L = linear_index(shape, dtype)
     if mult != 1:
         L = L * mult
     m = hi - lo + 1
-    return L - (L / m) * m + lo
+    return L - (L // m) * m + lo
 
 
 def with_specials(x, values=(np.nan, np.inf, -np.inf, -0.0, 0.0)):
@@ -145,7 +134,7 @@ class Checker:
             msg = f"dtype {got.dtype} != {np.dtype(want_dtype)}"
         else:
             exp = expected.astype(got.dtype) if expected.dtype != got.dtype else expected
-            if np.issubdtype(got.dtype, np.floating):
+            if np.issubdtype(got.dtype, np.inexact):
                 ok = np.allclose(got, exp, rtol=rtol, atol=atol, equal_nan=True)
                 if rtol == 0.0 and atol == 0.0:
                     ok = np.array_equal(got, exp, equal_nan=True)

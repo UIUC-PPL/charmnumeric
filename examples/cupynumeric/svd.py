@@ -1,34 +1,29 @@
 #!/usr/bin/env python
-"""charmnumeric port of cupynumeric/examples/svd.py.
 
-Verdict: direct. a = random((m, n)) (randint for integer dtypes) and
-u, s, vh = cnp.linalg.svd(a, full_matrices), as in the original (native
-LINALG executor: divide-and-conquer SVD on CPU builds, gesvd on GPU builds).
-The original's check, allclose(a, (u * s) @ vh), runs natively, with u * s
-written as u @ diag(s) (no general broadcasting); s is also compared with
-numpy.linalg.svd. The original trims vh only when k < m, which breaks m < n;
-here vh is trimmed when k < n. Integer inputs are factored in float64, as in
-NumPy; their reconstruction check runs natively too (a promotes to float64 in
-a - a2). Complex dtypes are not supported.
-"""
+# Copyright 2024 NVIDIA Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 
 import argparse
-import itertools
-import os
-import sys
-import time
 
 import numpy
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-import charmnumeric as cnp  # noqa: E402
-import _cnum_util as U  # noqa: E402
-from _cnum_connect import get_interface  # noqa: E402
-from charmtyles.core import sync  # noqa: E402
+# charmnumeric port: _benchmark is the local shim (_benchmark.py). It connects,
+# runs with np = charmnumeric and checks the result against NumPy.
+from _benchmark import benchmark_info, parse_with_harness
 
 
-def check_result(chk, interface, a, u, s, vh, dtype):
+def check_result(np, a, u, s, vh):
     print("Checking result...")
 
     # (u * s) @ vh
@@ -37,60 +32,113 @@ def check_result(chk, interface, a, u, s, vh, dtype):
     k = min(m, n)
 
     u = u[:, :k] if k < m else u
-    vh = vh[:k, :] if k < n else vh
-    a2 = cnp.matmul(cnp.matmul(u, cnp.diag(s)), vh)
-    work = numpy.dtype(dtype) if numpy.dtype(dtype).kind == "f" else numpy.dtype("float64")
-    rtol, atol = U.tolerances(work)
-    atol *= max(1, k) ** 0.5
-    ok = U.allclose(a, a2, interface, rtol=rtol, atol=atol)  # int a promotes natively
-    chk.true(f"allclose(a, (u * s) @ vh) {m}x{n} {dtype}", ok)
-    s_ref = numpy.linalg.svd(a.get(interface).astype(numpy.float64), compute_uv=False)
-    chk.close("singular values vs numpy", s.get(interface), s_ref, rtol=rtol * 10,
-              atol=atol * max(1.0, float(s_ref.max())))
+    vh = vh[:k, :] if k < m else vh
+    a2 = np.matmul(u * s, vh)
+    print("PASS!" if np.allclose(a, a2) else "FAIL!")
 
 
-def make_input(m, n, dtype):
+@benchmark_info(name="SVD")
+def svd(
+    np,
+    m,
+    n,
+    full_matrices,
+    dtype,
+    *,
+    timer,
+    perform_check=False,
+    print_timing=False,
+):
     if numpy.issubdtype(dtype, numpy.integer):
-        return cnp.random.randint(0, 1000, size=(m, n), dtype=dtype)
-    return cnp.random.random((m, n), dtype=dtype)
+        a = np.random.randint(0, 1000, size=m * n).astype(dtype)
+        a = a.reshape((m, n))
+    elif numpy.issubdtype(dtype, numpy.floating):
+        a = np.random.random((m, n)).astype(dtype)
+    elif numpy.issubdtype(dtype, numpy.complexfloating):
+        a = np.array(
+            np.random.random((m, n)) + np.random.random((m, n)) * 1j
+        ).astype(dtype)
+    else:
+        print("unsupported type " + str(dtype))
+        assert False
 
+    timer.start()
+    u, s, vh = np.linalg.svd(a, full_matrices)
+    total = timer.stop()
 
-def svd(chk, interface, m, n, full_matrices, dtype, print_timing=False):
-    a = make_input(m, n, dtype)
-    sync(interface)
-
-    t0 = time.perf_counter()
-    u, s, vh = cnp.linalg.svd(a, full_matrices)
-    sync(interface)
-    total = (time.perf_counter() - t0) * 1e3
-
-    check_result(chk, interface, a, u, s, vh, dtype)
+    if perform_check:
+        check_result(np, a, u, s, vh)
 
     if print_timing:
         print(f"Elapsed Time: {total} ms")
+
     return total
 
 
-def main(chk):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-t", "--time", dest="timing", action="store_true", help="perform timing")
-    parser.add_argument("-m", "--rows", type=int, nargs="+", default=[10], dest="m",
-                        help="number of rows in the matrix")
-    parser.add_argument("-n", "--cols", type=int, nargs="+", default=[10], dest="n",
-                        help="number of cols in the matrix")
-    parser.add_argument("--no-full-matrices", dest="full_matrices", action="store_false",
-                        help="return u as (m,k)")
-    parser.add_argument("-d", "--dtype", default="float64",
-                        choices=["int32", "int64", "float32", "float64"], dest="dtype",
-                        help="data type")
-    parser.add_argument("--check", dest="check", action="store_true",
-                        help="compare result to numpy (always done)")
-    args = parser.parse_args()
-
-    interface = get_interface()
-    for m, n in itertools.product(args.m, args.n):
-        svd(chk, interface, m, n, args.full_matrices, numpy.dtype(args.dtype), args.timing)
-
-
 if __name__ == "__main__":
-    U.run("svd", main)
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-t",
+        "--time",
+        dest="timing",
+        action="store_true",
+        help="perform timing",
+    )
+    parser.add_argument(
+        "-m",
+        "--rows",
+        type=int,
+        nargs="+",
+        default=[10],
+        dest="m",
+        help="number of rows in the matrix",
+    )
+    parser.add_argument(
+        "-n",
+        "--cols",
+        type=int,
+        nargs="+",
+        default=[10],
+        dest="n",
+        help="number of cols in the matrix",
+    )
+    parser.add_argument(
+        "--no-full-matrices",
+        dest="full_matrices",
+        action="store_false",
+        help="return u as (m,k)",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        default="float64",
+        choices=[
+            "int32",
+            "int64",
+            "float32",
+            "float64",
+            "complex64",
+            "complex128",
+        ],
+        dest="dtype",
+        help="data type",
+    )
+    parser.add_argument(
+        "--check",
+        dest="check",
+        action="store_true",
+        help="compare result to numpy",
+    )
+    args, harness = parse_with_harness(parser)
+
+    harness.run_timed(
+        svd,
+        harness.np,
+        args.m,
+        args.n,
+        args.full_matrices,
+        args.dtype,
+        timer=harness.timer,
+        perform_check=args.check,
+        print_timing=args.timing,
+    )

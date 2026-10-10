@@ -4,11 +4,9 @@
 
 #include <cstring>
 
-// Array-creation ops: UPLOAD, RANDOM and IOTA. Each creates a fresh array and
-// fills it chare-locally, with no communication. RANDOM and IOTA compute every
-// element from its global array index (creation_kernels.hpp). UPLOAD tiles are
-// cut out of the DAG payload when the DAG arrives (stage_uploads), so a PE
-// keeps only the tiles of its own chares and frees each tile once it is used.
+// Array-creation ops (UPLOAD, RANDOM, IOTA) fill each array chare-locally, without communication.
+// RANDOM/IOTA derive elements from the global index. UPLOAD tiles are cut from the DAG
+// payload in stage_uploads and freed after use.
 
 namespace {
 
@@ -38,7 +36,6 @@ CkArrayIndex chare_array_index(const std::array<int, N>& idx) {
         return CkArrayIndex3D(idx[0], idx[1], idx[2]);
 }
 
-/// Copy the tiles of this PE's chares out of an UPLOAD payload.
 template <int N>
 void stage_upload_nd(ArrayDAGGroup* group, ASTNode* root, CkLocMgr* loc_mgr) {
     int name = root->result_name;
@@ -99,7 +96,7 @@ void stage_upload_nd(ArrayDAGGroup* group, ASTNode* root, CkLocMgr* loc_mgr) {
     }
 }
 
-// ---- fill kernels (named templates: nvcc cannot take KOKKOS_LAMBDA in generic lambdas) ----
+// Fill kernels are named templates: nvcc rejects KOKKOS_LAMBDA in generic lambdas.
 
 template <int N>
 struct TileGeometry {
@@ -279,20 +276,10 @@ void ArrayDAGExecutorND<N>::execute_creation_node(DAGNode* node) {
             t.size[d] = d < N ? local.size(d) : 1;
         }
 
-        switch (root->dtype) {
-        case DType::FLOAT32:
-            fill_typed<N, float>(opc, partition, arr_it->second, root, t, tile);
-            break;
-        case DType::FLOAT64:
-            fill_typed<N, double>(opc, partition, arr_it->second, root, t, tile);
-            break;
-        case DType::INT32:
-            fill_typed<N, int32_t>(opc, partition, arr_it->second, root, t, tile);
-            break;
-        case DType::INT64:
-            fill_typed<N, int64_t>(opc, partition, arr_it->second, root, t, tile);
-            break;
-        }
+        cn_dispatch(root->dtype, [&](auto tag) {
+            using T = decltype(tag);
+            fill_typed<N, T>(opc, partition, arr_it->second, root, t, tile);
+        });
     }
 
 #ifdef USE_NVIDIA

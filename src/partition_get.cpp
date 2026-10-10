@@ -12,6 +12,16 @@ void PartitionImpl<N>::process_get(int epoch) {
         return;
     }
     int name = req->name;
+    if (name == kBarrierName) {
+        // chares inserted after the barrier replay it: only those in its grid arrive
+        auto* group = static_cast<ArrayDAGGroup*>(executor->group);
+        const auto& grid = group->barrier_grids[epoch][N];
+        for (int d = 0; d < N; ++d)
+            if (nd_idx[d] >= grid.grid[d])
+                return;
+        dag_proxy[0].barrier_arrive(epoch);
+        return;
+    }
     if (arrays.find(name) == arrays.end()) {
         // This partition doesn't own any portion of the array (e.g. the array
         // is smaller than the chare grid).  Nothing to contribute.
@@ -20,16 +30,21 @@ void PartitionImpl<N>::process_get(int epoch) {
         return;
     }
 
+    // Position in the gathered (array-local, row-major) result: the chare
+    // region is decomp-global, so remove the decomposition offset (nonzero
+    // when the solver shifted the array to align with a sliced use, e.g.
+    // X in lstm_forward); otherwise fragments land past the buffer end.
+    // Only the chares owning part of the array in its decomposition contribute.
+    auto global_region = arrays[name]->decomp.chare_region_local(nd_idx);
+    for (int d = 0; d < N; ++d)
+        if (global_region.size(d) <= 0)
+            return;
+
     arrays[name]->copyToHost();
 
     {
         CTArrayBase<N>* arr = arrays[name];
         int esz = arr->elem_size();
-        // Position in the gathered (array-local, row-major) result: the chare
-        // region is decomp-global, so remove the decomposition offset (nonzero
-        // when the solver shifted the array to align with a sliced use, e.g.
-        // X in lstm_forward); otherwise fragments land past the buffer end.
-        auto global_region = arr->decomp.chare_region_local(nd_idx);
 
         std::array<int64_t, N> global_strides;
         global_strides[N - 1] = 1;

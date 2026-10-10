@@ -1,6 +1,4 @@
-"""Unary elementwise ops vs NumPy: sqrt, log*, exp2, expm1, log1p, sin, cos,
-abs, floor, ceil, rint/round, trunc, sign, square, reciprocal, negative,
-and the old-backend Array methods (log(base), sqrt(), abs(), ...)."""
+"""Unary elementwise ops vs NumPy, including the old-backend Array methods."""
 
 import numpy as np
 
@@ -81,9 +79,7 @@ with np.errstate(all="ignore"):
             continue
         C.check(f"{name} f32", f(x32), nf(h32), **({} if exact else TOL32))
 
-    # broadcast (size-1) inputs: unary op on a scalar operand inside a kernel.
-    # The size-1 array has the kernel's ndim: a 1-D (1,) array broadcast into a
-    # 2-D kernel hangs the backend (also plain ``b + x``; not an op issue).
+    # Size-1 operand inside a kernel; a 1-D (1,) array hangs the backend, so use (1, 1).
     b = cnp.full((1, 1), 2.25)
     C.fetch(b)
     xa = floats((37, 41), seed=6)
@@ -102,13 +98,15 @@ with np.errstate(all="ignore"):
         C.check(f"sign {np.dtype(dt)}", cnp.sign(xi), np.sign(hi), dtype=dt)
         C.check(f"floor {np.dtype(dt)}", cnp.floor(xi), hi, dtype=dt)
         C.check(f"ceil {np.dtype(dt)}", cnp.ceil(xi), hi, dtype=dt)
-        C.check(f"rint {np.dtype(dt)}", cnp.rint(xi), hi, dtype=dt)
+        C.check(f"rint {np.dtype(dt)}", cnp.rint(xi), np.rint(hi), dtype=np.float64)
         C.check(f"round {np.dtype(dt)}", cnp.round(xi), hi, dtype=dt)
         C.check(f"square {np.dtype(dt)}", cnp.square(xi), np.square(hi), dtype=dt)
         C.check(f"reciprocal {np.dtype(dt)}", cnp.reciprocal(xi),
                 np.where(np.abs(hi) == 1, hi, 0), dtype=dt)
-        C.raises(f"sqrt {np.dtype(dt)} rejected", TypeError, lambda: cnp.sqrt(xi))
-        C.raises(f"log {np.dtype(dt)} rejected", TypeError, lambda: cnp.log(xi))
+        C.check(f"sqrt {np.dtype(dt)} -> float64", cnp.sqrt(xi), np.sqrt(hi), rtol=1e-15,
+                dtype=np.float64)
+        C.check(f"log {np.dtype(dt)} -> float64", cnp.log(xi), np.log(hi), rtol=1e-14,
+                dtype=np.float64)
 
     # old-backend (fix-temporaries) method API
     x = floats((37, 41), 0.5, 9.0, seed=7)

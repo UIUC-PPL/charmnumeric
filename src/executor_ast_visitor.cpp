@@ -112,36 +112,19 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
         if (!has_source_array) {
             // Scalar fill — convert scalar to target dtype
             if (has_overlap && node->operands.size() > 1 && node->operands[1]->is_scalar) {
-                char scalar_buf[8];
+                char scalar_buf[16];
                 double s = node->operands[1]->scalar;
-                switch (dtype) {
-                case DType::FLOAT32: {
-                    float v = (float)s;
+                cn_dispatch(target->dtype, [&](auto tag) {
+                    auto v = cn_cast<decltype(tag)>(s);
                     memcpy(scalar_buf, &v, sizeof(v));
-                    break;
-                }
-                case DType::FLOAT64: {
-                    memcpy(scalar_buf, &s, sizeof(s));
-                    break;
-                }
-                case DType::INT32: {
-                    int32_t v = (int32_t)s;
-                    memcpy(scalar_buf, &v, sizeof(v));
-                    break;
-                }
-                case DType::INT64: {
-                    int64_t v = (int64_t)s;
-                    memcpy(scalar_buf, &v, sizeof(v));
-                    break;
-                }
-                }
+                });
 
 #ifdef USE_KOKKOS
                 // Device-side scalar fill
                 char* tgt_device = static_cast<char*>(target->device_data_ptr());
-                // Copy scalar_buf to device (8 bytes as int64_t for capture)
-                int64_t scalar_bits;
-                memcpy(&scalar_bits, scalar_buf, sizeof(scalar_bits));
+                int64_t bits0, bits1; // captured by value (up to 16 bytes)
+                memcpy(&bits0, scalar_buf, 8);
+                memcpy(&bits1, scalar_buf + 8, 8);
 
                 int64_t overlap_total = overlap.size();
                 int ol_start[N], ol_step[N], tgt_s[N], ol_sizes[N], tgt_cs_arr[N];
@@ -164,7 +147,8 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
                             flat += (global_d - tgt_cs_arr[d]) * tgt_s[d];
                         }
                         char* dst = tgt_device + flat * esz;
-                        const char* src = reinterpret_cast<const char*>(&scalar_bits);
+                        int64_t bits[2] = {bits0, bits1};
+                        const char* src = reinterpret_cast<const char*>(bits);
                         for (int b = 0; b < esz; b++)
                             dst[b] = src[b];
                     });
@@ -380,47 +364,18 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
                     d_res(static_cast<VT*>(result_base->device_data_ptr()), local_rows);
                 KokkosBlas::gemv("N", VT(1), d_sub, d_vec, VT(0), d_res);
             };
-            switch (dtype) {
-            case DType::FLOAT32:
-                kokkos_gemv(float{});
-                break;
-            case DType::FLOAT64:
-                kokkos_gemv(double{});
-                break;
-            case DType::INT32:
-                kokkos_gemv(int32_t{});
-                break;
-            case DType::INT64:
-                kokkos_gemv(int64_t{});
-                break;
-            }
+            cn_dispatch_blas(dtype, kokkos_gemv);
 #else
             // Perform matmul on host using Eigen gemv
             mat_base->copyToHost();
             vec_base->copyToHost();
 
-            switch (dtype) {
-            case DType::FLOAT32:
-                eigen_gemv(static_cast<float*>(mat_base->data_ptr()), local_rows, local_cols,
-                           static_cast<float*>(vec_base->data_ptr()), actual_cols,
-                           static_cast<float*>(result_base->data_ptr()));
-                break;
-            case DType::FLOAT64:
-                eigen_gemv(static_cast<double*>(mat_base->data_ptr()), local_rows, local_cols,
-                           static_cast<double*>(vec_base->data_ptr()), actual_cols,
-                           static_cast<double*>(result_base->data_ptr()));
-                break;
-            case DType::INT32:
-                eigen_gemv(static_cast<int32_t*>(mat_base->data_ptr()), local_rows, local_cols,
-                           static_cast<int32_t*>(vec_base->data_ptr()), actual_cols,
-                           static_cast<int32_t*>(result_base->data_ptr()));
-                break;
-            case DType::INT64:
-                eigen_gemv(static_cast<int64_t*>(mat_base->data_ptr()), local_rows, local_cols,
-                           static_cast<int64_t*>(vec_base->data_ptr()), actual_cols,
-                           static_cast<int64_t*>(result_base->data_ptr()));
-                break;
-            }
+            cn_dispatch_blas(dtype, [&](auto tag) {
+                using VT = decltype(tag);
+                eigen_gemv(static_cast<VT*>(mat_base->data_ptr()), local_rows, local_cols,
+                           static_cast<VT*>(vec_base->data_ptr()), actual_cols,
+                           static_cast<VT*>(result_base->data_ptr()));
+            });
 #endif
             DBG_PRINT("[Chare %d] MATMUL ast_visitor: %dx%d @ %d done\n", partition->index[0],
                       local_rows, actual_cols, vec_len);
@@ -540,54 +495,18 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
                         sub_cols);
                 KokkosBlas::gemm("N", "N", VT(1), d_a_sub, d_b_sub, VT(1), d_c);
             };
-            switch (dtype) {
-            case DType::FLOAT32:
-                kokkos_gemm(float{});
-                break;
-            case DType::FLOAT64:
-                kokkos_gemm(double{});
-                break;
-            case DType::INT32:
-                kokkos_gemm(int32_t{});
-                break;
-            case DType::INT64:
-                kokkos_gemm(int64_t{});
-                break;
-            }
+            cn_dispatch_blas(dtype, kokkos_gemm);
 #else
             a_base->copyToHost();
             b_base->copyToHost();
 
-            switch (dtype) {
-            case DType::FLOAT32:
-                eigen_gemm_sub(static_cast<float*>(a_base->data_ptr()), a_local_cols, a_row_offset,
-                               a_col_offset, sub_rows, k_size,
-                               static_cast<float*>(b_base->data_ptr()), b_local_cols, b_row_offset,
-                               b_col_offset, sub_cols,
-                               static_cast<float*>(partition->arrays[result_name]->data_ptr()));
-                break;
-            case DType::FLOAT64:
-                eigen_gemm_sub(static_cast<double*>(a_base->data_ptr()), a_local_cols, a_row_offset,
-                               a_col_offset, sub_rows, k_size,
-                               static_cast<double*>(b_base->data_ptr()), b_local_cols, b_row_offset,
-                               b_col_offset, sub_cols,
-                               static_cast<double*>(partition->arrays[result_name]->data_ptr()));
-                break;
-            case DType::INT32:
-                eigen_gemm_sub(static_cast<int32_t*>(a_base->data_ptr()), a_local_cols, a_row_offset,
-                               a_col_offset, sub_rows, k_size,
-                               static_cast<int32_t*>(b_base->data_ptr()), b_local_cols, b_row_offset,
-                               b_col_offset, sub_cols,
-                               static_cast<int32_t*>(partition->arrays[result_name]->data_ptr()));
-                break;
-            case DType::INT64:
-                eigen_gemm_sub(static_cast<int64_t*>(a_base->data_ptr()), a_local_cols, a_row_offset,
-                               a_col_offset, sub_rows, k_size,
-                               static_cast<int64_t*>(b_base->data_ptr()), b_local_cols, b_row_offset,
-                               b_col_offset, sub_cols,
-                               static_cast<int64_t*>(partition->arrays[result_name]->data_ptr()));
-                break;
-            }
+            cn_dispatch_blas(dtype, [&](auto tag) {
+                using VT = decltype(tag);
+                eigen_gemm_sub(static_cast<VT*>(a_base->data_ptr()), a_local_cols, a_row_offset,
+                               a_col_offset, sub_rows, k_size, static_cast<VT*>(b_base->data_ptr()),
+                               b_local_cols, b_row_offset, b_col_offset, sub_cols,
+                               static_cast<VT*>(partition->arrays[result_name]->data_ptr()));
+            });
 #endif
             DBG_PRINT("[Chare %d] MATMATMUL ast_visitor: (%dx%d) @ (%dx%d) done\n",
                       partition->index[0], sub_rows, k_size, k_size, sub_cols);
@@ -605,10 +524,19 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
     case Opcode::REDUCTION:
     case Opcode::BINCOUNT:
     case Opcode::TRANSPOSE:
+    case Opcode::CONVOLVE:
+    case Opcode::FLIP:
+    case Opcode::RESHAPE:
+    case Opcode::BROADCAST:
         // Handled by their own executors.
         return node->result_name;
     case Opcode::LINALG:
         // Always handled by execute_linalg_node.
+        return node->result_name;
+    case Opcode::GATHER:
+    case Opcode::SCATTER:
+    case Opcode::EXPAND:
+        // Always handled by execute_index_node.
         return node->result_name;
     default:
         CkAbort("Unknown opcode in interpreter: %d", node->opcode);

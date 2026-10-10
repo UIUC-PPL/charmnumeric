@@ -1,178 +1,235 @@
-# cuPyNumeric examples ported to charmnumeric
+# cuPyNumeric examples on charmnumeric
 
-These are ports of every top-level program in `cupynumeric/examples/`, excluding
-`benchmark.py`, which is the timing harness. Each port keeps the same filename,
-the same algorithm and loop structure, and the original argparse flags where
-they make sense. Defaults are small so that a run takes seconds. Every port
-checks itself against plain NumPy on the same inputs. The last line it prints
-is exactly `PASS <name>` or `FAIL <name>: <reason>`, and it exits non-zero on
-FAIL.
+Every top-level program of
+[`cupynumeric/examples`](https://github.com/nv-legate/cupynumeric/tree/main/examples)
+except `benchmark.py` (the old harness) is here, unchanged: each file is the
+upstream file plus one 2-line comment above its `from _benchmark import ...`
+line. `upstream/` holds the unmodified originals (fetched 2026-10-09 from
+`main`, with the `_benchmark` package they import), so
+`diff upstream/<name>.py <name>.py` shows only that comment. The programs run
+with `np` = charmnumeric through `_benchmark.py`, a stand-in for cuPyNumeric's
+`_benchmark` package, which also checks every run against NumPy.
 
 ## Running
 
 ```bash
-module load python/3.13.5-gcc13.3.1; . /u/atahilyani/cnum-gpu/venv/bin/activate
+. /u/atahilyani/cnum-gpu/wt/ports/env_ports.sh   # or the main tree's environment
 cd example/charmnumeric/examples/cupynumeric
 
 # against a running backend (server.out ++server ++server-port $CNUM_PORT)
-CNUM_HOST=127.0.0.1 CNUM_PORT=1234 CNUM_ODF=4 python stencil.py
+CNUM_HOST=127.0.0.1 CNUM_PORT=1234 CNUM_ODF=4 python cg.py --check
 CNUM_AUTO_FLUSH=1000 python cfd.py          # optional: charmtyles set_auto_flush
 
 # without a backend: host-side reference simulator (static/semantic check)
 CNUM_SIM=1 python kmeans.py
 python _static_check.py [--quick] [name ...]   # all ports + variants, tabulated
+
+# NumPy only (no backend, no comparison)
+python cg.py --package numpy
 ```
+
+The programs take their original flags and the harness flags of
+cuPyNumeric's `parse_with_harness` (`-b/--benchmark`, `--package`, ...). The
+last line printed is exactly `PASS <name>` or `FAIL <name>: <reasons>`
+(`<name>` is the file name); the exit status is non-zero on FAIL.
+
+## Regression flags
+
+Flags the regression passes to each program; "(defaults)" means none. A
+runner reads them from the code span in the second column
+(`wt/ports/run_suite.sh` splits the row on backticks and takes field 4;
+"(defaults)" yields nothing). All upstream defaults finish in well under 2
+minutes on the CPU build at +p1 and +p2 (times: one `harness/run_one.sh`
+run, server start included), so no program needs smaller sizes.
+
+| program | flags | +p1 | +p2 |
+|---|---|---|---|
+| `black_scholes` | (defaults) | PASS 2 s | PASS 2 s |
+| `black_scholes_greeks` | (defaults) | PASS 26 s | PASS 34 s |
+| `cfd` | (defaults) | PASS 70 s | PASS 74 s |
+| `cg` | (defaults) | PASS 2 s | PASS 2 s |
+| `cholesky` | (defaults) | PASS 2 s | PASS 2 s |
+| `einsum` | (defaults) | PASS 4 s | PASS 5 s |
+| `gemm` | (defaults) | PASS 2 s | PASS 3 s |
+| `indexing_routines` | (defaults) | PASS 20 s | PASS 20 s |
+| `jacobi` | (defaults) | PASS 3 s | PASS 3 s |
+| `kmeans` | (defaults) | PASS 3 s | PASS 4 s |
+| `kmeans_slow` | (defaults) | PASS 5 s | PASS 5 s |
+| `linreg` | (defaults) | PASS 3 s | PASS 3 s |
+| `logreg` | (defaults) | PASS 4 s | PASS 5 s |
+| `lstm_backward` | (defaults) | PASS 2 s | PASS 3 s |
+| `lstm_forward` | (defaults) | PASS 2 s | PASS 2 s |
+| `qr` | (defaults) | PASS 3 s | PASS 3 s |
+| `quantiles` | (defaults) | PASS 2 s | PASS 2 s |
+| `richardson_lucy` | (defaults) | PASS 2 s | PASS 3 s |
+| `scan` | (defaults) | PASS 2 s | PASS 3 s |
+| `solve` | (defaults) | PASS 2 s | PASS 3 s |
+| `sort` | (defaults) | PASS 3 s | PASS 2 s |
+| `stencil` | (defaults) | PASS 3 s | PASS 2 s |
+| `svd` | (defaults) | PASS 3 s | PASS 2 s |
+| `take_pairs` | (defaults) | PASS 15 s | PASS 34 s |
+| `tssvd` | (defaults) | PASS 5 s | PASS 5 s |
+
+## The `_benchmark` shim
+
+`_benchmark.py` provides what the programs import from cuPyNumeric's
+`_benchmark` (`benchmark_info`, `get_benchmark_info`, `format_dtype`,
+`get_numpy`, `parse_with_harness`, `timed_loop`, `get_timer`, `nthroot`) and
+the harness object (`np`, `timer`, `package`, `repeat`, `run`, `run_timed`,
+`run_timed_with_info`, ...).
+
+- **Connect.** `parse_with_harness` adds the harness flags, parses with
+  `parse_known_args` as upstream does, and connects
+  (`_cnum_connect.get_interface`: `CNUM_HOST`/`CNUM_PORT`/`CNUM_ODF`, or the
+  simulator with `CNUM_SIM=1`). `harness.package` is `"charmnumeric"`, so
+  the `package == "legate"` branches (`stencil_hint`) are skipped.
+- **Timing.** `timer.stop()` calls `charmnumeric.synchronize()`, a backend
+  barrier that returns once every chare of every partition has finished all
+  earlier work, so the times include backend completion.
+- **NumPy comparison.** `run_timed*` runs the benchmark function with
+  `np` = charmnumeric, then once more with `np` = NumPy, and compares:
+  - *Inputs.* `np.random.*` draws (and `default_rng()` generator draws) of
+    the charmnumeric run are recorded (a device copy, fetched at the end) and
+    replayed in the NumPy run, which checks that NumPy's draw has the same
+    shape and dtype. charmnumeric's counter-based streams differ from
+    NumPy's, so both runs see the charmnumeric values.
+  - *Results.* Every function of the program records its locals when it
+    returns (`sys.monitoring`, events only on the program's own code objects,
+    so the library runs at full speed). The last record of each function is
+    compared between the runs: device arrays and NumPy values by shape, dtype
+    and value, Python ints exactly; Python floats (timings) are skipped.
+    Floating values are compared with `|got - want| <= rtol * (|want| + S)`,
+    `S` the largest magnitude in the same record, `rtol` 1e-2/2e-5/1e-6 for
+    float16/float32/float64 (and the complex types).
+  - *Results NumPy leaves partly unspecified.* QR/SVD/TSSVD/eigh factors
+    (signs) and `argsort` (order of ties unless `kind="stable"`): the NumPy
+    run checks the charmnumeric result against its own input (Q R = A,
+    orthonormal Q/U/V, triangular R, singular values / eigenvalues vs NumPy,
+    U S V^H = A; `argsort` sorts its input and is a permutation) and then
+    continues with it. `np.linalg.tssvd` (cuPyNumeric only) is checked as
+    NumPy's thin SVD; `np.convolve(a, v, mode, method)` (cuPyNumeric's N-D
+    convolve) runs as a direct N-D convolution in NumPy.
+  - A line the program prints starting with `FAIL` (`FAIL!` of its own
+    `--check`) or an exception also fails the run.
+  The per-function records make the comparison generic: no program needs a
+  hook.
+- `CNUM_BENCH_TRACE=1` prints each fetched value to stderr (to locate a hang).
 
 Support files:
 
 | file | purpose |
 |---|---|
-| `_cnum_connect.py` | `get_interface()`. Connects with `cnp.CharmNumericInterface().connect(CNUM_HOST, CNUM_PORT, CNUM_ODF)`. With `CNUM_SIM=1` it returns the simulator instead. |
-| `_cnum_util.py` | Native input generators, thin wrappers over the native elementwise ops (kept for compatibility), reductions built from dots, the `upload` host-upload helper (bulk `cnp.array` into a block of a target), and the Checker/`run` PASS/FAIL harness. |
-| `_cnum_sim.py` | Simulator. Hooks the charmtyles `ExecutionState` to evaluate every recorded op eagerly with NumPy. Ops are still fused and serialized normally. It also flags patterns that the frontend accepts but the backend mishandles. |
-| `_static_check.py` | Runs every port and variant under the simulator and prints a table. |
+| `_benchmark.py` | The harness stand-in described above. |
+| `_cnum_connect.py` | `get_interface()`: connects with `cnp.CharmNumericInterface().connect(CNUM_HOST, CNUM_PORT, CNUM_ODF)`, or returns the simulator with `CNUM_SIM=1`. |
+| `_cnum_sim.py` | Simulator. Hooks the charmtyles `ExecutionState` to evaluate every recorded op eagerly with NumPy; ops are still fused and serialized normally. Flags patterns the backend mishandles. |
+| `_static_check.py` | Runs every program and variant (upstream flags) under the simulator and prints a table. |
+| `_cnum_util.py` | Index-grid / pseudo-random input helpers and the `Checker`/`run` PASS/FAIL harness used by some `examples/ops` tests. |
+| `upstream/` | The unmodified cuPyNumeric originals (`upstream/_benchmark/`: their harness package, for reference). |
 
-### Inputs and verification
+## Programs
 
-charmnumeric now has a native counter-based RNG (`cnp.random.rand`,
-`random`, `randn`, `uniform`, `normal`, `randint`, `seed`, `default_rng`)
-and a bulk host upload (`cnp.array` / `cnp.asarray` / `A[...] = ndarray` is one
-UPLOAD DAG node carrying the data; each chare copies its tile). Ports whose
-original calls `np.random.*` with a direct equivalent (cholesky, qr, solve,
-svd, tssvd, jacobi, gemm, black_scholes, scan) use `cnp.random`, and
-take_pairs builds `arange(M*N).reshape(M, N)` with `cnp.meshgrid` +
-`cnp.arange`. The random streams differ from NumPy's, so every port fetches its
-inputs with `.get()` and computes the NumPy reference from exactly those
-values.
+All 25 are upstream-exact (the file is the original plus the 2-line
+comment). Notes list the NumPy behavior each one depends on; all of it runs
+natively on the backend.
 
-The other ports still use the older native generators
-(`_cnum_util.uniform` / `randn` / `rand_int`):
+| program | upstream-exact | notes |
+|---|---|---|
+| black_scholes | yes | `random.random(N).astype(D)`, `absolute/exp/sqrt/log`, `where(d > 0, ...)`; float32 default, `--precision 16/64` |
+| black_scholes_greeks | yes | 4-D CALL/PUT (FoldedArray); `CALL[g]` is a view, written with `out[...] =`; `arange(dtype=int) % n`, `.reshape(steps)`; `V[:, i, :] += ...` (integer index, written back) |
+| cfd | yes | integer column indices (`u[1:-1, 0]` is 1-D), `np.sum(u)` 0-d, `math.isnan(udiff)` and f-strings of 0-d values, `empty_like`, `copy` |
+| cg | yes | `diag(v, k)`, `full`, `eye`; `rsold`, `alpha`, `beta` are 0-d device scalars; `np.sqrt(rsnew) < threshold` is a host bool at check points; `--check` uses `allclose`, `--pre` the Jacobi preconditioner |
+| cholesky | yes | `eye(n, dtype="float64")`, `linalg.cholesky`; `--check` runs `numpy.linalg.cholesky(get_numpy(...))` and `numpy.allclose` on a device array |
+| einsum | yes | `einsum` (string form, `out` via cupy-compatibility path), `ones`; f16/f32/f64/c64/c128 |
+| gemm | yes | `random.uniform(size=)`, `dot(A, B, out=C)` |
+| indexing_routines | yes | `diag`, `choose(mode="wrap")`, `repeat` (scalar and array counts), `A1[indx] =`, `A1[mask] =`, `A2[b, b] =`, `A2[:, indx] =`, `A3[indx, :, indx] =`, `math.isnan(np.sum(...))` |
+| jacobi | yes | `random.rand`, `eye`, `diag`, `dot`; NaN assertion through `float(np.sum(x))` |
+| kmeans | yes | `linalg.norm(axis=1)`, `square`, `newaxis`, `.T`, `argmin`, `bincount(weights=data[:, idx])`, `amin`, `maximum(int64, uint64)` (float64), `str()` of 0-d values, `delta > 1 - 1e-6` |
+| kmeans_slow | yes | `labels == idx`, `where(mask[..., newaxis], ...)`, `sum(axis=0)` into `centroids[idx, :]`, `pairwise_distances[:, idx]`, `0.0 += np.sum(...)` |
+| linreg | yes | `randn/random`, `hstack`, `dot`, vecmat `error.dot(features)`, `power`, `len(features)` |
+| logreg | yes | as linreg plus `floor`, `exp`, `log`, `astype(copy=False)`, NaN assertion |
+| lstm_backward | yes | 3-D integer indices (`Ct[t]`, `dHin[t, :, w:]`), augmented assignment through integer keys, `transpose()`, `sum(axis=0)`, `dh0[0] +=` |
+| lstm_forward | yes | `tile`, `Hin[t, :, w:] = prev`, `Hin[t].dot(WLSTM)`, `tanh`, `exp` |
+| qr | yes | `rand(...).astype(dtype=)`, `linalg.qr`; `--check`: `matmul`, `allclose`, `max` |
+| quantiles | yes | `random.seed/randint`, `.astype().reshape()`, `np.quantile(a, q, axis, method)` (all NumPy methods); `--check`: `get_numpy`, `allclose(host, device)` |
+| richardson_lucy | yes | `rand(*shape)`, `flip`, `convolve(mode="same", method=)`, `im_deconv *=` |
+| scan | yes | `randint(1000, size=, dtype=int32)`, `zeros(shape=)`, `cumsum/cumprod/nancumsum/nancumprod(A, out=B, axis=)`; `--check` runs NumPy on the device arrays |
+| solve | yes | `linalg.solve`; `--check`: `linalg.norm(res, inf)` (0-d), `max_res < 1e-4`, f-string |
+| sort | yes | `random.seed`, `iinfo`, `randint`, `sort`/`argsort` (uint32 default, 1M elements) |
+| stencil | yes | views and in-place view assignment |
+| svd | yes | `randint/random`, complex inputs `array(x + y * 1j).astype()`, `linalg.svd`; `--check`: `u[:, :k]`, `matmul(u * s, vh)`, `allclose` |
+| take_pairs | yes | `arange(dtype=int32).reshape`, `array(list of tuples)`, `take(axis=1)`, `.sum()` (0-d int64), f-string |
+| tssvd | yes | `random.seed/rand`, `mat[i, i] = 1.0 + np.sum(np.abs(mat[i, :]))`, `linalg.tssvd` |
 
-- index grids are built with ceil(log2 n) shifted-slice adds,
-- then a monotone warp,
-- then 24 steps of the chaotic logistic map `x <- 3.99 x (1-x)`.
+Upstream bugs behave as upstream (the same exception as with cuPyNumeric):
+`sort.py --check` (calls `check_sorted` with three arguments),
+`scan.py -t float|complex` (`len()` of the int shape) and
+`svd.py --check` with `m < n` and full matrices (shape mismatch in
+`check_result`). `_static_check.py` avoids these combinations.
 
-The resulting matrices are conditioned like `np.random.rand` output (checked:
-cond ~2e3 to 4e3 for 128x128, no lag or cross-seed correlation). Each port then
-fetches the generated inputs with `.get()` and computes the NumPy reference from
-exactly those values.
+Not ported: the upstream subdirectories. `cpp/` (C++ programs against the
+cuPyNumeric C++ API), `dlpack/` and `inline_task/` (Legate/DLPack interop and
+Legate tasks) have no charmnumeric counterpart; `microbenchmarks/` is a
+separate benchmark suite with its own driver (`main.py`), not example
+programs; `_benchmark/` is the harness, replaced by `_benchmark.py`.
 
-Transposes (`X.T`, `transpose`, `swapaxes`) and vecmat (`x @ A`) are native
-(TRANSPOSE executor, `src/executor_transpose.cpp`). Earlier versions of the
-ports generated `X.T` of an input from the same draw with permuted indices
-(`cnp.random.transposed(X)`, `perm=` for the `_cnum_util` generators) or used
-symmetry tricks; they now use `.T` as the originals do.
+## Library changes made for these programs
 
-## Feasibility table
+All NumPy-exact, each with regression checks in `examples/ops`:
 
-Verdict meanings:
+- **0-d arrays.** Full reductions, 1-D dot/inner, vector/matrix norms,
+  `det`/`slogdet`, scalar `take` and integer-only indexing return 0-d arrays
+  (stored as (1,) on the backend; `shape == ()`, `ndim == 0`). They combine
+  with arrays of any rank, and `str`, `format`, `float`, `int`, `complex`,
+  `bool`, `operator.index` and `__array__` fetch the value, so `if x < tol`,
+  `math.isnan(x)` and f-strings work as in NumPy (`test_frontend.py
+  zero_d_results`). `np.sum` etc. stay device values (NumPy returns host
+  scalars), so they feed later expressions without a sync.
+- **Basic indexing.** An integer index drops its dim (NumPy) instead of
+  keeping it; integer-only keys give 0-d arrays, `x[()]` of a 0-d array a
+  copy and `x[...]` the array. Results that NumPy returns as views but a
+  charmnumeric view cannot express (a dropped dim, newaxis, a negative step)
+  are copies linked to their array: writes to them go back to it, and they
+  are refreshed from it before use when it has been written since
+  (`_basic_getitem`, `_fresh`, `_wrote` in `charmnumeric.py`). `__setitem__`
+  takes values shaped like NumPy's target (`test_frontend.py
+  integer_indices`, `test_fuzz_frontend.py`).
+- **Size-1 operands of another rank.** A fused kernel with a size-1 operand
+  of a different storage rank hung the backend (cross-partition broadcast);
+  such operands now move to the kernel's rank first (`_size1_to_rank`).
+  `test_fuzz_frontend.py` no longer skips these cases (`KNOWN_BUGS_SKIP`
+  removed).
+- **NumPy interop.** `__array__` fetches (so NumPy functions accept device
+  arrays), `__array_ufunc__` runs NumPy ufuncs natively (also
+  `numpy_scalar * array`), and `add/subtract/multiply/divide` keep NumPy
+  scalars typed (NEP 50) (`test_frontend.py numpy_interop`).
+- **New functions.** `allclose`/`isclose` (NumPy's formula, `equal_nan`; device
+  results), `quantile`/`percentile` (native sort, NumPy's index and
+  interpolation rules for every method, `axis` None/int, `keepdims`, `out`),
+  `true_divide`, `iinfo`/`finfo`, and `synchronize()` (backend barrier: a GET
+  of the reserved name -1 answered once every chare of every partition has
+  reached it; `src/partition_get.cpp`, `src/dag_group_runtime.cpp`).
+- **Fixes.** `arange` takes its dtype from start, stop and step
+  (`arange(4.0)` was int64); `lstsq` residuals of a vector right-hand side
+  have shape (1,). Backend: a fused kernel that writes a shifted region
+  (`P[96:112] = d + 1`, or `out[...] = ...` into `CALL[g]` in
+  black_scholes_greeks) runs over that region and allocates its other kept
+  results (`d`) there, but their decomposition placed them elsewhere, so a
+  later read of `d` hung; the decomposition solver now places such results
+  with the region (`src/decomposition_solver.hpp`, `test_frontend.py
+  shifted_assignment_results`).
 
-- **direct**: same NumPy calls, only trivial syntax changes.
-- **workarounds**: fully native, using EMULATED primitives or transposed inputs.
-- **needs backend**: the faithful port needs a missing primitive. It is ported
-  with clearly marked `HOST-FALLBACK`s or a supported subset.
+## Remaining deviations
 
-| example | NumPy ops needed | missing in charmnumeric | verdict | port status |
-|---|---|---|---|---|
-| black_scholes | random, sqrt, log, exp, abs, where(d>0) | none (random) | direct | native: cnp.sqrt/log/absolute/where, `d > 0` is a 0/1 mask |
-| black_scholes_greeks | 4-D arrays, arange/%/reshape, sqrt, log, exp, abs, where | >3-D, reshape | workarounds | native. The greek axis is folded into dim 0; `arange(..).reshape` is the native int64 linear index, `%` is native, int * float promotes natively and K/T are converted with native `astype`. |
-| cfd | slicing stencils, `**2`, `sum` | none | direct | native (`x**2`, native `cnp.sum`) |
-| cg | diag(v,k), eye, matvec, dot, sqrt(scalar) | none (random) | direct | native. Convergence test is a host scalar. |
-| cholesky | linalg.cholesky (input eye) | none | direct | native `cnp.linalg.cholesky` (LINALG executor). `--input spd` for a non-trivial input. |
-| einsum | einsum (batched contraction), ones | einsum | needs backend | every single-contraction matrix product (2-D, or 3-D with a leading batch mode, any mode order) lowered to native transposes + (batched) matmul; 2-D ones with an untransposed output use `cnp.matmul(..., out=C)`. Others raise NotImplementedError. |
-| gemm | dot(out=) | none | direct | native (`cnp.dot(A, B, out=C)`) |
-| indexing_routines | diag, choose, repeat, fancy/bool-mask indexing, `%`, arange | choose, repeat, gather/scatter, mask indexing | needs backend | diag native. choose = native `%` + chain of native where (int64, exact). Uniform repeat via strided slices. ai1/2/3 index patterns lowered to slices (HOST-FALLBACK). |
-| jacobi | rand, eye, diag, dot, sum (NaN assertion) | none (random) | direct | native (NaN assertion via native `cnp.sum`) |
-| kmeans | norm(axis=1), newaxis broadcast, `.T`, argmin, bincount, amin, maximum, not_equal | broadcasting | workarounds | native. Native argmin(axis=1) (as float labels), one-hot via native `==`, native amin+sum, maximum and count_nonzero; counts int64 via native `astype`; centroid sums = native `M.T @ data`; native `.T` |
-| kmeans_slow | same, plus `labels == idx`, where, sum(axis=0) | as above | workarounds | native (native argmin/sum/count_nonzero/`==`; mask = M@e_idx, where(m,x,0) = m*x, row sums = native vecmat `mask @ data`) |
-| linreg | randn, hstack, matvec, vecmat (`err.dot(X)`), power, sum | none | workarounds | native (native vecmat `error.dot(features)`, `cnp.hstack` for the intercept, native power and `cnp.sum`) |
-| logreg | as linreg + exp, log, floor | none | workarounds | native (native vecmat, `cnp.hstack`, log, floor and `cnp.sum`) |
-| lstm_backward | 3-D slicing, `**2`, `.transpose()`, sum(axis 0), dot | none | workarounds | native (native `WLSTM.transpose()`, native `**2`, native batch `cnp.sum(axis=1)`) |
-| lstm_forward | 3-D slicing, tile, exp, tanh, dot | none | direct | native (h0 tiled to 3-D (1,b,d)) |
-| qr | linalg.qr | none | direct | native `cnp.linalg.qr` (Householder on one chare); allclose(a, q @ r) and Q^T Q (native `q.T @ q`) checked natively. |
-| quantiles | quantile (sort + interpolation), astype | reshape | direct | native `cnp.sort` + native interpolation; int inputs via native `astype(float64)` |
-| richardson_lucy | 3-D convolve(mode=same), flip, `/`, `*` | convolve, flip / negative strides | workarounds | native direct convolution (f^3 broadcast-scalar MACs); psf_mirror from the reversed index |
-| scan | cumsum/cumprod/nancumsum/nancumprod, axis=None flatten | reshape | direct | native `cnp.cumsum/cumprod/nancumsum/nancumprod` (with `out=`). axis=None on 2-D composed from native axis scans (no reshape). |
-| solve | linalg.solve | none | direct | native `cnp.linalg.solve` (partial-pivoted LU on one chare); residual norm native. |
-| sort | sort/argsort (uint32 default) | uint32 | direct | native `cnp.sort/argsort` (gather-to-one-chare executor, stable). |
-| stencil | slicing views, in-place view assignment | none | direct | native |
-| svd | linalg.svd | general broadcasting (`u * s`), complex | direct | native `cnp.linalg.svd` (full_matrices; int inputs factored in float64, int/float promotion native in the check); `u * s` written `u @ diag(s)`. |
-| take_pairs | arange.reshape, take(axis=1), sum | reshape | workarounds | data grid native (meshgrid of aranges). `data.take(indices, axis=1)` is native (host indices lowered to column-slice copies). Native 3-D `result.sum()`. |
-| tssvd | rand, abs, sum, linalg.tssvd | general broadcasting (`u * s`) | direct | original make_random_matrix loop + native `cnp.linalg.tssvd` (eigh of A^T A on one chare, U = A V S^-1 by SUMMA). |
+None in the programs. Library-level differences from NumPy that the
+programs do not observe:
 
-### Summary
-
-- **Direct, fully native, no emulation (15):** stencil, jacobi, gemm, cg, cfd,
-  lstm_forward, black_scholes, scan, sort, quantiles, cholesky, qr, solve,
-  svd, tssvd.
-- **Fully native with workarounds, no host step in the algorithm (9):**
-  black_scholes_greeks, lstm_backward, linreg, logreg, kmeans, kmeans_slow,
-  richardson_lucy, einsum (subset), take_pairs (native take with host
-  indices).
-- **Native bulk work with marked HOST-FALLBACKs (1):** indexing_routines
-  (advanced-indexing patterns).
-- **Partially blocked:**
-  - einsum: anything but a single-contraction matrix product (2-D, or 3-D
-    with a leading batch mode).
-  - quantiles: axis=None on N-D.
-  - sort/quantiles: uint32.
-  - scan/sort/svd/tssvd/cholesky/qr/solve: complex dtypes.
-  - --precision 16 everywhere.
-
-## Per-example notes
-
-- **Elementwise math, comparisons, where.** Native since 2026-10-08
-  (opcodes 20-49, tests in `examples/ops/`). Comparisons and predicates
-  return **0/1 masks in the operands' dtype**, not bool arrays (one element
-  type per fused kernel, no bool dtype); masks work directly as `where`
-  conditions and in arithmetic. The tanh-step, Newton/Halley and
-  integer-division emulations are gone; the old `_cnum_util` helper names
-  (`step`, `absolute`, `select`, `maximum`, `sqrt`, `log`, `int_mod`,
-  `greater`, ...) remain as thin native wrappers.
-- **black_scholes / greeks.** float32 by default, as in the original;
-  tolerance rtol 2e-4. In greeks, `np.sqrt(T)` is computed once per call and
-  reused. K and T stay in the working dtype; NumPy would promote them to
-  float64.
-- **cfd.** Integer column indices are written as length-1 slices so that the
-  same function runs under NumPy and charmnumeric. In charmnumeric `u[1:-1, 0]`
-  already keeps the dim.
-- **cg.** The convergence test fetches `rsnew` only at check points. Verifies
-  A (exact), `A.dot(x) ~ b`, and `x ~ linalg.solve`.
-- **cholesky / qr / solve / svd / tssvd.** Same calls as the originals
-  (`cnp.linalg.*`, see `examples/ops/test_linalg.py`), default sizes as in the
-  originals, `nargs="+"` size lists. The verification always runs, natively
-  where possible (`U.allclose`), plus a NumPy reference on the fetched inputs,
-  with dtype-aware tolerances (`U.tolerances`; solve's fixed 1e-4 residual
-  limit becomes n eps ||a|| ||x|| for float32). cholesky keeps the original
-  identity input by default (`--input spd` for a random SPD matrix).
-- **einsum.** Inputs are pseudo-random/N instead of ones so that the check is
-  meaningful (`--ones` gives the original). A transposed operand is
-  recomputed only when it changes; B never changes under the A<->C swap, so
-  B.T is transposed once.
-- **indexing_routines.** The ai2 and ai3 final states are fully overwritten
-  (all-true masks), as in the original.
-- **kmeans / kmeans_slow.** Default precision is 64. A float32 near-tie could
-  make the native argmin differ from the NumPy reference. The frontend name
-  limit is now the int32 limit, so the iteration count is not name-bound.
-- **linreg / logreg.** `--num` is in thousands, default 1 (1000 points).
-- **lstm_forward.** Tiling h0 to 3-D avoids a 2-D->3-D set_region at a nonzero
-  column offset. See the suspected backend issue below. The existing
-  `examples/lstm_forward.py` does exactly that pattern.
-- **quantiles / sort.** `cnp.sort`/`cnp.argsort` gather the array on one
-  chare, sort each line along the axis there (NaNs last, stable) and scatter
-  it back: exact, O(n log n), but not scalable (no distributed sample sort).
-  argsort is compared exactly with `numpy.argsort(kind="stable")`. The old
-  O(n^2) odd-even network was removed from `_cnum_util.py`.
-- **richardson_lucy.** Assumes cuPyNumeric's N-D `convolve(mode="same")`
-  follows the scipy.signal.convolve centering (start index (f-1)//2).
-- **scan.** Native SCAN executor. For `axis=None` on 2-D, the port computes
-  the flattened-order scan from native axis scans but keeps the 2-D shape,
-  since there is no reshape.
-- **take_pairs.** `cnp.take` with the host index list (N=16, P=120 pairs):
-  index column 1 is 15 contiguous runs (15 slice copies), index column 0
-  repeats indices (120 single-column copies, which fuse); each (M, P) column
-  result then goes into the 3-D result with one 2-D -> 3-D copy. The result
-  sum is checked exactly.
+- Linked copies (above) are not NumPy views: `y.base` is unset, a write to
+  the array is seen by `y` only when `y` is next used by an operation (it is
+  then refreshed), and each refresh is a copy.
+- Full reductions return 0-d device arrays, not host scalars
+  (`type(np.sum(x))` differs; values, printing and conversions match).
+- `bincount` without `minlength` still needs `interface=` (data-dependent
+  length); values outside `[0, minlength)` are ignored.
 
 ## Missing backend/frontend ops, ranked by examples they would unblock or simplify
 
@@ -183,7 +240,7 @@ Verdict meanings:
    directly instead of generated transposed inputs or symmetry tricks. A
    fused transposed-operand SUMMA (no materialized copy) is still open.
 2. ~~**Comparisons + `where`/select, `minimum`/`maximum`.**~~ Native since
-   2026-10-08 (0/1 masks in the operand dtype). Ports switched: black_scholes,
+   2026-10-08 (bool results since 2026-10-09). Ports switched: black_scholes,
    black_scholes_greeks, kmeans, kmeans_slow, logreg, sort, quantiles, scan,
    indexing_routines.
 3. ~~**Bulk host->device upload and a native RNG**~~ Done: `cnp.array`
@@ -205,39 +262,42 @@ Verdict meanings:
 6. ~~**Elementwise math: sqrt, log, abs, pow (`__pow__`), floor.**~~ Native
    since 2026-10-08; black_scholes, black_scholes_greeks, logreg, tssvd, cfd,
    lstm_backward and linreg use them.
-7. **Gather/scatter: fancy and boolean-mask indexing, row permutation, take
-   with device indices.** 1 example: indexing_routines (bincount is native;
-   kmeans uses the one-hot form; solve's pivoting is inside `cnp.linalg.solve`). `take` with host indices is native
-   now; take_pairs uses it.
-8. **reshape/flatten, more than 3 dims, arange on device** (`%` is native).
-   4 examples:
-   black_scholes_greeks, scan (axis=None), quantiles, take_pairs.
+7. ~~**Gather/scatter: fancy and boolean-mask indexing, row permutation, take
+   with device indices.**~~ Native (GATHER/SCATTER/EXPAND, opcodes 120-122,
+   `src/executor_indexing.cpp`, `charmnumeric/indexing.py`); indexing_routines
+   and take_pairs use them (bincount is native; kmeans keeps the one-hot form;
+   solve's pivoting is inside `cnp.linalg.solve`).
+8. ~~**reshape/flatten, more than 3 dims, arange on device**~~ Done:
+   RESHAPE/BROADCAST (opcodes 140-141, `src/executor_shape.cpp`) and
+   FoldedArray (`charmnumeric/folded.py`) for >3-D arrays. black_scholes_greeks,
+   scan, quantiles, take_pairs use them.
 9. ~~sort/argsort~~ (native since the castscansort ops; a distributed sample
    sort is still missing for scaling).
-10. ~~astype (dtype conversion)~~ (native CAST executor; mixed int/float
-    operands are cast implicitly).
-11. **One example each:** ~~scan (cumsum/cumprod)~~ (native), convolve (richardson_lucy),
-    einsum, flip/negative-step slicing (richardson_lucy), general broadcasting
-    / newaxis (kmeans), complex dtypes (scan/sort/svd), float16 (gemm,
-    black_scholes, linreg, logreg, kmeans).
+10. ~~astype (dtype conversion)~~ (fused CONVERT op; mixed dtypes are converted
+    in-kernel with NumPy's promotion rules).
+11. **One example each:** ~~scan (cumsum/cumprod)~~ (native), ~~convolve~~ (native),
+    ~~einsum~~ (frontend lowering), ~~flip/negative-step slicing~~ (native, copies),
+    ~~general broadcasting / newaxis (kmeans)~~ (native). ~~complex dtypes, float16,
+    unsigned ints, bool~~ (native).
 
 ## Frontend issues found (file:line, paths relative to `charmtyles/`)
 
 1. `example/charmnumeric/charmnumeric/charmnumeric.py:291-292`:
    `np.newaxis`/`None` in an index raises NotImplementedError, although
    `__init__.py:37` exports `newaxis = None`.
-   **Fixed:** `x[:, newaxis]` returns a *copy* with the size-1 dims inserted
-   (a view cannot change ndims); newaxis in a setitem key is dropped.
+   **Fixed:** `x[:, newaxis]` returns a linked copy with the size-1 dims
+   inserted (see "Basic indexing" below).
 2. (fixed) `random.randn` used to return a zero-filled array; `cnp.random` is
    now a native generator.
 3. `charmtyles/core.py:9,23-28`: names are never recycled. **Fixed:**
    `max_name` is now the int32 limit (names are int32 on the wire and in
    every backend map), and host data no longer costs one name per element
    (uploads, arange and eye are single nodes).
-4. `charmnumeric.py:346-358`: `_broadcast_shape` accepts full NumPy
+4. The frontend accepted full NumPy
    broadcasting, e.g. (4,8)+(8,). The backend only broadcasts size-1 operands
    (`BROADCAST_OBJECT` in `charmtyles/ast.py:95,101`). Such expressions are
    accepted silently and produce wrong results or crash in the backend.
+   **Fixed:** such operands are materialized with a native BROADCAST node.
 5. `charmnumeric.py:497-508` (1-D @ 1-D REDUCE), `operations.py:52` (tile) and
    `operations.py:125` (diag) accept views. The backend executors read the
    operands by array name and ignore the view region
@@ -254,7 +314,8 @@ Verdict meanings:
    **Fixed:** the result is (M, 1).
 8. `charmnumeric.py:851-860`: `create_array` accepts more than 3 dims (e.g.
    `zeros((2,2,2,2))`), but the backend only has `Partition1D/2D/3D`.
-   **Fixed:** every Array with 0 or more than 3 dims raises NotImplementedError.
+   **Fixed:** arrays with more than 3 dims are FoldedArrays (3-D storage);
+   0-d arrays are stored as (1,) arrays.
 9. `charmtyles/interface.py:88`: `CCSInterface.connect` has no timeout. With no
    backend listening, a port hangs instead of failing.
 10. `charmtyles/ast.py:494`: `_ancestor_bits` uses `1 << node_id` with global,
@@ -271,8 +332,21 @@ views / offsets / offset decompositions, `get()` of offset-decomposed arrays,
 and partitions first used by a MATMUL/MATMATMUL result never starting (hang
 in einsum's batched path). `examples/ops/test_frontend.py` covers each.
 
-Known remaining backend limit: unary math on an all-broadcast (size-1) kernel
-crashes the JIT (`tanh(ones((1,)))`), see MISSING_OPS Recipe A.
+Backend bugs found while porting kmeans_slow (column views `pw[:, idx:idx+1]`
+of a fresh result give it a column decomposition offset), fixed in the
+`hard-shape` worktree: the partition grid ignored a result's decomposition
+offset (tiles past the last chare were never computed), a chare holding none
+of a kernel's arrays could not size its output tile (`extract_regions_nd` now
+falls back to the array metadata), and the solver could pick a negative
+offset (now moved into [0, tile)). Each one hung the run.
+
+Found while testing einsum: SUMMA and matvec ignore the step of a strided
+view operand (`A[::2] @ B` gave wrong rows, larger cases crashed the server
+in `gather`). The frontend now copies such views first (`_unstrided` in
+`charmnumeric.py`); offset views were already correct.
+
+Unary math on an all-broadcast (size-1) kernel (`tanh(ones((1,)))`) used to
+crash the JIT; it works now (`test_frontend.py zero_d_results`).
 
 Suspected backend issue (fixed by the bug-fix patches; kept for reference):
 `src/backend_internal.hpp:345-351` (`cross_set_region_send`) maps source-local
@@ -287,29 +361,34 @@ Backend issues reproduced on the CPU build while testing the creation ops
 (all also happen with plain `cnp.zeros` + arithmetic, i.e. independent of the
 new ops; `examples/ops/test_creation.py` avoids them):
 
-- After any size-1 1-D array (e.g. `cnp.zeros((1,)) + 1`) has been
+- ~~After any size-1 1-D array (e.g. `cnp.zeros((1,)) + 1`) has been
   materialized, a later 1-D array that needs a larger 1-D chare grid (e.g.
-  300007 elements) hangs its `.get()`.
-- `.get()` of a 0-size array (e.g. `cnp.arange(3, 1)`) hangs.
+  300007 elements) hangs its `.get()`.~~ Fixed: chares inserted later replay
+  old DAGs and waited for size-1 broadcasts sent before they existed;
+  broadcasts now use the chare grid of the DAG's epoch
+  (`ArrayDAGGroup::grid_at`), and a size-1 `set_region` target is no longer
+  treated as a broadcast input.
+- ~~`.get()` of a 0-size array (e.g. `cnp.arange(3, 1)`) hangs.~~ Fixed in the
+  frontend (`Array.get` returns an empty ndarray).
 
 ## Static check results
 
-`python _static_check.py` runs 46 cases (all 25 ports plus variants) with
-`CNUM_SIM=1`. Result (2026-10-09, after merging native transpose/vecmat,
-the frontend ops (hstack/vstack, take, `out=`), astype/scan/sort and
-`cnp.linalg` into the native elementwise/creation/reduction tree): **46/46
-PASS, 0 simulator errors, 0 warnings.** The simulator knows the elementwise
-opcodes 20-49 (math, comparisons as 0/1 masks, where, clip), creation 50-52,
-reductions 60-61, transpose 70, CAST/SCAN/SORT/ARGSORT 80-83 and LINALG 100.
+`python _static_check.py` runs 57 cases (all 25 programs with their default
+flags and variants using the original flags: precisions, dtypes including
+complex, `--check` paths, other routines/methods/axes) with `CNUM_SIM=1`:
+**57/57 PASS, 0 simulator errors.** The simulator stores 0-d arrays as (1,)
+arrays like the backend and answers the `synchronize()` barrier. Its
+complex linalg model is incomplete (complex SVD and the complex cases of
+`examples/ops/test_dtypes.py` fail under the simulator but pass on the
+backend), so the complex SVD variant runs only on the backend.
+
 This checks:
 
 - frontend graph construction, shapes and dtypes,
 - fusion and DAG serialization (every DAG is serialized and handed to
   `run_async`),
-- the algorithms and their NumPy verification under the intended charmnumeric
+- the programs and their NumPy comparison under the intended charmnumeric
   semantics,
 - the absence of patterns the backend is known not to support.
 
-It does **not** run the C++ backend. Backend semantics, such as fused-kernel
-aliasing, must be confirmed by real runs (CPU build: see the native-op status
-in `MISSING_OPS.md` section 1).
+It does **not** run the C++ backend.

@@ -102,10 +102,11 @@ with np.errstate(all="ignore"):
             C.check("2 ** e" + s, 2 ** e, 2 ** eh, dtype=dt)
             C.check("maximum" + s, cnp.maximum(a, b), np.maximum(ah, bh), dtype=dt)
             C.check("minimum(a, 3)" + s, cnp.minimum(a, 3), np.minimum(ah, 3), dtype=dt)
-            C.check("maximum(a, 1.0)" + s, cnp.maximum(a, 1.0), np.maximum(ah, 1), dtype=dt)
+            C.check("maximum(a, 1.0)" + s, cnp.maximum(a, 1.0), np.maximum(ah, 1.0),
+                    dtype=np.float64)
             C.check("fmax" + s, cnp.fmax(a, b), np.fmax(ah, bh), dtype=dt)
         C.raises(f"int ** negative {n}", ValueError, lambda: a ** -1)
-        C.raises(f"int % 1.5 {n}", TypeError, lambda: a % 1.5)
+        C.check(f"int % 1.5 {n} -> float64", a % 1.5, C.fetch(a) % 1.5, dtype=np.float64)
     # int64 wraparound and INT_MIN // -1 (NumPy wraps; must not trap)
     big = ints((40,), 0, 39, dtype=np.int64) + (2**62)
     bigh = C.fetch(big)

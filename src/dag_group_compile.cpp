@@ -5,12 +5,9 @@
 
 #if !defined(USE_NVIDIA) && !defined(USE_AMD) && !defined(USE_INTEL)
 namespace {
-// LLVM codegen recursion (e.g. ScalarEvolution walking dominating loop
-// guards) grows with the number of loops in a fused kernel, and large fused
-// kernels (black_scholes_greeks) overflow the 8 MB main-thread stack, killing
-// the server without a message.  CPU builds therefore compile on a helper
-// thread with a large stack and wait for it.  (GPU builds keep compiling on
-// the calling thread, which owns the device context used to load modules.)
+// LLVM codegen recursion grows with loop count and can overflow the 8 MB main
+// stack. CPU builds compile on a large-stack helper thread. GPU builds stay on
+// the calling thread, which owns the device context.
 constexpr size_t JIT_COMPILE_STACK_BYTES = size_t(1) << 30;
 
 struct JitCompileJob {
@@ -59,9 +56,7 @@ void* ArrayDAGGroup::compile_node(DAGNode* node) {
     return funcPtr;
 }
 
-/// Cross-ndims SET_REGION nodes are executed by execute_cross_set_region_node
-/// (a copy), never by a JIT kernel; compiling them only fails with MLIR rank
-/// errors ("'affine.load' op expects as many subscripts ...").
+/// Cross-ndims SET_REGION runs as a copy, not a JIT kernel; compiling it fails with MLIR rank errors.
 static bool is_cross_ndims_set_region(DAGNode* node) {
     for (ASTNode* root : node->ast->roots)
         if (static_cast<Opcode>(root->opcode) == Opcode::SET_REGION && root->operands.size() >= 2 &&

@@ -1,126 +1,190 @@
 #!/usr/bin/env python
-"""charmnumeric port of cupynumeric/examples/logreg.py (logistic regression, GD).
 
-Verdict: port with workarounds (fully native). Changes:
-  * sigmoid is 1/(1+exp(-x)) (native exp), as in the original.
-  * np.dot(error, features) is the native vecmat (cached native transpose
-    of features + matvec).
-  * np.log and np.floor are native. np.sum is the native full reduction
-    (cnp.sum).
-  * np.hstack is native (cnp.hstack). --precision 16 is not supported.
-No backend ops are missing for this port (vecmat/transpose, hstack, log,
-floor and sum are all native); only float16 remains unsupported.
-"""
+# Copyright 2024 NVIDIA Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 
 import argparse
 import math
-import os
-import sys
-import time
 
-import numpy
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-import charmnumeric as cnp  # noqa: E402
-import _cnum_util as U  # noqa: E402
-from _cnum_connect import get_interface  # noqa: E402
+# charmnumeric port: _benchmark is the local shim (_benchmark.py). It connects,
+# runs with np = charmnumeric and checks the result against NumPy.
+from _benchmark import (
+    benchmark_info,
+    format_dtype,
+    get_benchmark_info,
+    parse_with_harness,
+)
 
 
-def initialize(N, F, T):
-    x = U.randn((N, F), seed=1, dtype=T)
+def initialize(np, N, F, T):
+    # We'll generate some random inputs here
+    # since we don't need it to converge
+    x = np.random.randn(N, F).astype(T, copy=False)
     # Give the results either a 0 or 1 value
-    y = cnp.floor(2.0 * U.uniform((N,), seed=2, dtype=T))
+    y = np.floor(2.0 * np.random.random(N).astype(T, copy=False))
     return x, y
 
 
-def sigmoid(x):
-    return 1.0 / (1.0 + cnp.exp(-x))
+def sigmoid(np, x):
+    return 1.0 / (1.0 + np.exp(-x))
 
 
-def log_likelihood(features, target, weights):
-    scores = cnp.dot(features, weights)
-    # np.sum(target*scores - np.log(1 + np.exp(scores)))
-    return cnp.sum(target * scores - cnp.log(1.0 + cnp.exp(scores)))
+def log_likelihood(np, features, target, weights):
+    scores = np.dot(features, weights)
+    return np.sum(target * scores - np.log(1.0 + np.exp(scores)))
 
 
-def run_logistic_regression(interface, N, F, T, I, warmup, S, B):  # noqa: E741
+@benchmark_info(
+    input_names={
+        "N": "problem size",
+        "F": "features",
+        "T": "precision",
+        "I": "iterations",
+        "warmup": "warmup iterations",
+        "S": "sample intervals",
+        "B": "include intercept",
+    },
+    formats={"precision": format_dtype},
+)
+def run_logistic_regression(np, N, F, T, I, warmup, S, B, *, timer):  # noqa: E741
     print("Running logistic regression...")
-    print("Number of data points: " + str(N))
+    print("Number of data points: " + str(N) + "K")
     print("Number of features: " + str(F))
     print("Number of iterations: " + str(I))
 
     learning_rate = 1e-5
-    features, target = initialize(N, F, T)
+    features, target = initialize(np, N * 1000, F, T)
     if B:
-        features = cnp.hstack((cnp.ones((N, 1), dtype=T), features))
-    weights = cnp.zeros((features.shape[1],), dtype=T)
-
-    lls = []
-    for step in range(-warmup, I):
-        scores = cnp.dot(features, weights)
-        predictions = sigmoid(scores)
-        error = target - predictions
-        gradient = cnp.dot(error, features)  # native vecmat
-        weights += learning_rate * gradient
-        if step >= 0 and step % S == 0:
-            ll = U.to_float(log_likelihood(features, target, weights), interface)
-            lls.append(ll)
-            print("Log Likelihood of step " + str(step) + ": " + str(ll))
-    return features, target, weights, lls
-
-
-def reference(features, target, T, I, warmup, S):  # noqa: E741
-    np = numpy
-    learning_rate = 1e-5
+        intercept = np.ones((features.shape[0], 1), dtype=T)
+        features = np.hstack((intercept, features))
     weights = np.zeros(features.shape[1], dtype=T)
-    lls = []
+
+    timer.start()
     for step in range(-warmup, I):
+        if step == 0:
+            timer.start()
         scores = np.dot(features, weights)
-        predictions = 1.0 / (1.0 + np.exp(-scores))
+        predictions = sigmoid(np, scores)
         error = target - predictions
         gradient = np.dot(error, features)
         weights += learning_rate * gradient
         if step >= 0 and step % S == 0:
-            s = np.dot(features, weights)
-            lls.append(np.sum(target * s - np.log(1.0 + np.exp(s))))
-    return weights, lls
+            print(
+                "Log Likelihood of step "
+                + str(step)
+                + ": "
+                + str(log_likelihood(np, features, target, weights))
+            )
+    total = timer.stop()
 
-
-def main(chk):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-B", "--intercept", dest="B", action="store_true")
-    parser.add_argument("-f", "--features", type=int, default=32, dest="F")
-    parser.add_argument("-i", "--iterations", type=int, default=20, dest="I")
-    parser.add_argument("-w", "--warmup", type=int, default=2, dest="warmup")
-    parser.add_argument("-n", "--num", type=int, default=1, dest="N",
-                        help="number of data points in thousands")
-    parser.add_argument("--precision", type=int, default=32, dest="P")
-    parser.add_argument("-s", "--sample", type=int, default=10, dest="S")
-    args = parser.parse_args()
-    T = {32: numpy.float32, 64: numpy.float64}.get(args.P)
-    if T is None:
-        raise TypeError("Precision must be one of 32 or 64 (no float16 in charmnumeric)")
-
-    interface = get_interface()
-    t0 = time.perf_counter()
-    features, target, weights, lls = run_logistic_regression(
-        interface, args.N * 1000, args.F, T, args.I, args.warmup, args.S, args.B
+    assert not math.isnan(np.sum(weights)), (
+        f"{np.count_nonzero(np.isnan(weights))} NaNs, "
+        f"{np.count_nonzero(np.isinf(weights))} infs in weights"
     )
-    w = weights.get(interface)
-    print(f"Elapsed Time: {(time.perf_counter() - t0) * 1e3:.3f} ms (incl. sync)")
 
-    # the original's assertion, with the native sum
-    chk.true("no NaN in weights (native sum)",
-             not math.isnan(U.to_float(cnp.sum(weights), interface)))
-    Fh, yh = features.get(interface), target.get(interface)
-    chk.close("native features.T", features.T.get(interface), Fh.T, rtol=0, atol=0)
-    chk.true("target is exactly 0/1", bool(numpy.all((yh == 0) | (yh == 1))))
-    w_ref, ll_ref = reference(Fh, yh, T, args.I, args.warmup, args.S)
-    rtol = 1e-4 if T == numpy.float32 else 1e-10
-    chk.close("weights", w, w_ref, rtol=rtol, atol=rtol * numpy.abs(w_ref).max())
-    chk.close("log likelihood samples", lls, ll_ref, rtol=rtol, atol=0)
+    print(f"Elapsed Time: {total} ms")
+    return total
 
 
 if __name__ == "__main__":
-    U.run("logreg", main)
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-B",
+        "--intercept",
+        dest="B",
+        action="store_true",
+        help="include an intercept in the calculation",
+    )
+    parser.add_argument(
+        "-f",
+        "--features",
+        type=int,
+        nargs="+",
+        default=[32],
+        dest="F",
+        help="number of features for each input data point",
+    )
+    parser.add_argument(
+        "-i",
+        "--iterations",
+        type=int,
+        default=1000,
+        dest="I",
+        help="number of iterations to run the algorithm for",
+    )
+    parser.add_argument(
+        "-w",
+        "--warmup",
+        type=int,
+        default=5,
+        dest="warmup",
+        help="warm-up iterations",
+    )
+    parser.add_argument(
+        "-n",
+        "--num",
+        type=int,
+        nargs="+",
+        default=[10],
+        dest="N",
+        help="number of elements in the data set in thousands",
+    )
+    parser.add_argument(
+        "--precision",
+        type=int,
+        default=32,
+        dest="P",
+        help="precision of the computation in bits",
+    )
+    parser.add_argument(
+        "-s",
+        "--sample",
+        type=int,
+        default=100,
+        dest="S",
+        help="number of iterations between sampling the log likelihood",
+    )
+
+    args, harness = parse_with_harness(parser)
+    np = harness.np
+
+    name = None
+    dtype = None
+    if args.P == 16:
+        name = "LOGREG(H)"
+        dtype = np.float16
+    elif args.P == 32:
+        name = "LOGREG(S)"
+        dtype = np.float32
+    elif args.P == 64:
+        name = "LOGREG(D)"
+        dtype = np.float64
+    else:
+        raise TypeError("Precision must be one of 16, 32, or 64")
+
+    info = get_benchmark_info(run_logistic_regression).replace(name=name)
+    harness.run_timed_with_info(
+        info,
+        run_logistic_regression,
+        np,
+        args.N,
+        args.F,
+        dtype,
+        args.I,
+        args.warmup,
+        args.S,
+        args.B,
+        timer=harness.timer,
+    )

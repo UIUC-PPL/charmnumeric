@@ -10,7 +10,6 @@ ArrayDAGGroup::ArrayDAGGroup() {
     if (!Kokkos::is_initialized())
         Kokkos::initialize();
 #endif
-    register_reduce_dot_sum();
     if (CkMyPe() == 0) {
         partition_proxy_1 = CProxy_Partition1D::ckNew();
         partition_proxy_2 = CProxy_Partition2D::ckNew();
@@ -56,6 +55,27 @@ void ArrayDAGGroup::compute_decompositions(DAG* dag) {
 }
 
 void ArrayDAGGroup::receive_get_request(int ndims, int epoch, int name, int size, int dtype) {
+    if (name == kBarrierName) {
+        int64_t chares = 0;
+        for (auto& [nd, pg] : partition_grid) {
+            if (pg.grid[0] <= 0)
+                continue;
+            DAGGroup::receive_get_request(nd, epoch, name, 0, dtype);
+            barrier_grids[epoch][nd] = pg;
+            int64_t n = 1;
+            for (int d = 0; d < nd; ++d)
+                n *= pg.grid[d];
+            chares += n;
+        }
+        partition_proxy_1.run();
+        partition_proxy_2.run();
+        partition_proxy_3.run();
+        if (CkMyPe() == 0) {
+            barrier_pending[epoch] += chares + 1; // early arrivals made it negative
+            barrier_arrive(epoch);
+        }
+        return;
+    }
     DAGGroup::receive_get_request(ndims, epoch, name, size, dtype);
 
     // Store empty DAGs for ndims that have active partitions but aren't involved in this GET.
@@ -97,6 +117,14 @@ void ArrayDAGGroup::receive_get_request(int ndims, int epoch, int name, int size
             }
         }
     }
+}
+
+void ArrayDAGGroup::barrier_arrive(int epoch) {
+    if (--barrier_pending[epoch] != 0)
+        return;
+    barrier_pending.erase(epoch);
+    char none = 0;
+    Server<CProxy_ArrayDAGGroup>::send_reply(epoch, 1, &none); // CCS needs a non-empty reply
 }
 
 void ArrayDAGGroup::gather(int epoch, int name, int64_t offset, int64_t size, char* data) {

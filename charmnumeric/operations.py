@@ -2,18 +2,21 @@ import builtins
 
 import numpy as np
 
-from charmtyles.operation import fusible_op, nonfusible_op
-
 from .charmnumeric import (
     Array,
     ArrayOperation,
     ArrayView,
     _astype,
+    _axis_index,
     _clip,
     _coerce_scalar,
     _compare,
+    _ew,
     _ew_binary,
     _ew_unary,
+    _imag,
+    _is_array_nd,
+    _real,
     _is_scalar_like,
     _log,
     _logical_and,
@@ -21,15 +24,16 @@ from .charmnumeric import (
     _logical_or,
     _logical_xor,
     _materialize,
+    _nd_aware,
     _normalize_dtype,
     _power,
     _reciprocal,
-    _reshape_copy,
     _round,
     _scan,
     _sort,
+    _square,
     _swapaxes,
-    _transpose,
+    _transpose_view,
     _trunc,
     _where,
     _write_out,
@@ -45,6 +49,7 @@ from .charmnumeric import (
     full,
     full_like,
     identity,
+    nonfusible_op,
     ones,
     ones_like,
     zeros,
@@ -63,19 +68,13 @@ def _coerce_binary_operand(value):
 def tanh(x, out=None):
     if _is_scalar_like(x):
         return _write_out(np.tanh(_coerce_scalar(x)), out)
-    x = asarray(x)
-    return _write_out(
-        fusible_op(x, operation=ArrayOperation.tanh, shape=x.shape, dtype=x.dtype), out
-    )
+    return _write_out(_ew_unary(asarray(x), ArrayOperation.tanh, "tanh"), out)
 
 
 def exp(x, out=None):
     if _is_scalar_like(x):
         return _write_out(np.exp(_coerce_scalar(x)), out)
-    x = asarray(x)
-    return _write_out(
-        fusible_op(x, operation=ArrayOperation.exp, shape=x.shape, dtype=x.dtype), out
-    )
+    return _write_out(_ew_unary(asarray(x), ArrayOperation.exp, "exp"), out)
 
 
 def tile(x, reps):
@@ -101,28 +100,22 @@ def tile(x, reps):
     )
 
 
-def add(x1, x2, out=None):
-    if _is_scalar_like(x1) and _is_scalar_like(x2):
-        return _write_out(_coerce_scalar(x1) + _coerce_scalar(x2), out)
-    return _write_out(_coerce_binary_operand(x1) + _coerce_binary_operand(x2), out)
+def _arith(operation, name, ufunc):
+    def func(x1, x2, out=None):
+        if _is_scalar_like(x1) and _is_scalar_like(x2):
+            return _write_out(ufunc(x1, x2), out)
+        # NumPy scalars stay typed (NEP 50), as with the operators
+        return _write_out(_ew(operation, x1, x2, name=name, ufunc=ufunc), out)
+
+    func.__name__ = func.__qualname__ = name
+    func.__doc__ = f"Elementwise ``numpy.{name}``."
+    return func
 
 
-def subtract(x1, x2, out=None):
-    if _is_scalar_like(x1) and _is_scalar_like(x2):
-        return _write_out(_coerce_scalar(x1) - _coerce_scalar(x2), out)
-    return _write_out(_coerce_binary_operand(x1) - _coerce_binary_operand(x2), out)
-
-
-def multiply(x1, x2, out=None):
-    if _is_scalar_like(x1) and _is_scalar_like(x2):
-        return _write_out(_coerce_scalar(x1) * _coerce_scalar(x2), out)
-    return _write_out(_coerce_binary_operand(x1) * _coerce_binary_operand(x2), out)
-
-
-def divide(x1, x2, out=None):
-    if _is_scalar_like(x1) and _is_scalar_like(x2):
-        return _write_out(_coerce_scalar(x1) / _coerce_scalar(x2), out)
-    return _write_out(_coerce_binary_operand(x1) / _coerce_binary_operand(x2), out)
+add = _arith(ArrayOperation.add, "add", np.add)
+subtract = _arith(ArrayOperation.sub, "subtract", np.subtract)
+multiply = _arith(ArrayOperation.mul, "multiply", np.multiply)
+divide = _arith(ArrayOperation.div, "divide", np.true_divide)
 
 
 def matmul(x1, x2, out=None):
@@ -178,9 +171,8 @@ def diag(v, k=0):
 
 
 # ---------------------------------------------------------------------------
-# Elementwise math, comparisons and selection (see charmnumeric.py, opcodes
-# 20-49). Comparisons/predicates return 0/1 masks in the operands' dtype
-# (no bool dtype). With only scalar arguments they fall back to NumPy.
+# Elementwise math, comparisons and selection. Dtypes follow NumPy; scalar-only
+# calls use NumPy directly.
 # ---------------------------------------------------------------------------
 
 
@@ -195,13 +187,13 @@ def _with_out(result, out):
     return out
 
 
-def _unary_function(name, operation, float_only=False, np_name=None):
+def _unary_function(name, operation, np_name=None):
     np_func = getattr(np, np_name or name)
 
     def func(x, out=None):
         if _is_scalar_like(x):
             return np_func(_coerce_scalar(x))
-        return _with_out(_ew_unary(x, operation, name, float_only=float_only), out)
+        return _with_out(_ew_unary(x, operation, name), out)
 
     func.__name__ = name
     func.__qualname__ = name
@@ -209,15 +201,25 @@ def _unary_function(name, operation, float_only=False, np_name=None):
     return func
 
 
-sqrt = _unary_function("sqrt", ArrayOperation.sqrt, float_only=True)
-log2 = _unary_function("log2", ArrayOperation.log2, float_only=True)
-log10 = _unary_function("log10", ArrayOperation.log10, float_only=True)
-log1p = _unary_function("log1p", ArrayOperation.log1p, float_only=True)
-exp2 = _unary_function("exp2", ArrayOperation.exp2, float_only=True)
-expm1 = _unary_function("expm1", ArrayOperation.expm1, float_only=True)
-sin = _unary_function("sin", ArrayOperation.sin, float_only=True)
-cos = _unary_function("cos", ArrayOperation.cos, float_only=True)
-fabs = _unary_function("fabs", ArrayOperation.abs, float_only=True)
+sqrt = _unary_function("sqrt", ArrayOperation.sqrt)
+log2 = _unary_function("log2", ArrayOperation.log2)
+log10 = _unary_function("log10", ArrayOperation.log10)
+log1p = _unary_function("log1p", ArrayOperation.log1p)
+exp2 = _unary_function("exp2", ArrayOperation.exp2)
+expm1 = _unary_function("expm1", ArrayOperation.expm1)
+sin = _unary_function("sin", ArrayOperation.sin)
+cos = _unary_function("cos", ArrayOperation.cos)
+
+
+def fabs(x, out=None):
+    if _is_scalar_like(x):
+        return np.fabs(_coerce_scalar(x))
+    x = asarray(x)
+    np.fabs.resolve_dtypes((x.dtype, None))  # TypeError for complex
+    dtype = np.fabs(np.zeros(1, x.dtype)).dtype
+    return _with_out(_ew_unary(x, ArrayOperation.abs, "fabs").astype(dtype, copy=False), out)
+
+
 absolute = _unary_function("absolute", ArrayOperation.abs)
 abs = absolute
 floor = _unary_function("floor", ArrayOperation.floor)
@@ -227,10 +229,36 @@ sign = _unary_function("sign", ArrayOperation.sign)
 isnan = _unary_function("isnan", ArrayOperation.isnan)
 isinf = _unary_function("isinf", ArrayOperation.isinf)
 isfinite = _unary_function("isfinite", ArrayOperation.isfinite)
+conjugate = _unary_function("conjugate", ArrayOperation.conj)
+conj = conjugate
+invert = _unary_function("invert", ArrayOperation.invert)
+bitwise_not = invert
+
+
+def real(val):
+    """Real part (``numpy.real``)."""
+    if _is_scalar_like(val):
+        return np.real(_coerce_scalar(val))
+    return _real(asarray(val))
+
+
+def imag(val):
+    """Imaginary part (``numpy.imag``)."""
+    if _is_scalar_like(val):
+        return np.imag(_coerce_scalar(val))
+    return _imag(asarray(val))
+
+
+def iscomplexobj(x):
+    return np.dtype(getattr(x, "dtype", np.asarray(x).dtype)).kind == "c"
+
+
+def isrealobj(x):
+    return not iscomplexobj(x)
 
 
 def log(x, out=None, base=None):
-    """Elementwise natural log (``base`` as in the old charmnumeric ``Array.log``)."""
+    """Elementwise natural log; ``base`` sets the logarithm base."""
 
     if _is_scalar_like(x):
         value = np.log(_coerce_scalar(x))
@@ -261,8 +289,7 @@ around = round
 def square(x, out=None):
     if _is_scalar_like(x):
         return np.square(_coerce_scalar(x))
-    x = asarray(x)
-    return _with_out(x * x, out)
+    return _with_out(_square(asarray(x)), out)
 
 
 def reciprocal(x, out=None):
@@ -304,6 +331,13 @@ fmin = _binary_function("fmin", ArrayOperation.fmin)
 remainder = _binary_function("remainder", ArrayOperation.mod)
 mod = remainder
 floor_divide = _binary_function("floor_divide", ArrayOperation.floor_divide)
+bitwise_and = _binary_function("bitwise_and", ArrayOperation.bitwise_and)
+bitwise_or = _binary_function("bitwise_or", ArrayOperation.bitwise_or)
+bitwise_xor = _binary_function("bitwise_xor", ArrayOperation.bitwise_xor)
+left_shift = _binary_function("left_shift", ArrayOperation.left_shift)
+right_shift = _binary_function("right_shift", ArrayOperation.right_shift)
+bitwise_left_shift = left_shift
+bitwise_right_shift = right_shift
 
 
 def power(x1, x2, out=None):
@@ -329,9 +363,7 @@ def _comparison_function(name):
 
     func.__name__ = name
     func.__qualname__ = name
-    func.__doc__ = (
-        f"Elementwise ``numpy.{name}`` as a 0/1 mask in the operands' dtype."
-    )
+    func.__doc__ = f"Elementwise ``numpy.{name}`` (bool result)."
     return func
 
 
@@ -360,11 +392,7 @@ def logical_xor(x1, x2, out=None):
 
 
 def where(condition, x=None, y=None):
-    """``numpy.where(condition, x, y)``: nonzero (or NaN) condition selects x.
-
-    The condition is usually a 0/1 mask from a comparison and must have the
-    same dtype as array operands x/y (one element type per kernel).
-    """
+    """``numpy.where(condition, x, y)``: nonzero (or NaN) condition selects x."""
 
     if x is None and y is None:
         raise NotImplementedError("where(condition) without x and y (nonzero) is not supported")
@@ -387,23 +415,44 @@ def clip(a, a_min=None, a_max=None, out=None, *, min=None, max=None):
     return _with_out(_clip(a, a_min, a_max), out)
 
 
-def transpose(a, axes=None):
-    """``numpy.transpose`` for 1-3D arrays; returns a new array, not a view."""
+def isclose(a, b, rtol=1e-05, atol=1e-08, equal_nan=False):
+    """``numpy.isclose``: ``|a - b| <= atol + rtol * |b|`` (bool array)."""
+    if _all_scalars(a, b):
+        return np.isclose(_coerce_scalar(a), _coerce_scalar(b), rtol=rtol, atol=atol,
+                          equal_nan=equal_nan)
+    x, y = _coerce_binary_operand(a), _coerce_binary_operand(b)
+    # as NumPy: b in its inexact type, so integer differences cannot overflow
+    if isinstance(y, (Array, ArrayView)):
+        y = _astype(y, np.result_type(y.dtype, 1.0))
+    elif isinstance(y, int):
+        y = float(y)
+    result = (_compare(absolute(x - y), atol + rtol * absolute(y), "less_equal")
+              & isfinite(y)) | _compare(x, y, "equal")
+    if equal_nan:
+        result = result | (isnan(x) & isnan(y))
+    return result
 
-    return _transpose(asarray(a), axes)
+
+def allclose(a, b, rtol=1e-05, atol=1e-08, equal_nan=False):
+    """``numpy.allclose``, as a 0-d bool array (``bool()`` fetches it)."""
+    from .reductions import all as _all
+
+    result = isclose(a, b, rtol=rtol, atol=atol, equal_nan=equal_nan)
+    if _is_scalar_like(result):
+        return bool(result)
+    return _all(result)
+
+
+def transpose(a, axes=None):
+    """``numpy.transpose``; a copy linked to ``a`` like a view."""
+
+    return _transpose_view(asarray(a), axes)
 
 
 def swapaxes(a, axis1, axis2):
     """Interchange two axes of an array (``numpy.swapaxes``)."""
 
     return _swapaxes(asarray(a), axis1, axis2)
-
-
-def _normalize_axis(axis, ndim):
-    axis = int(axis)
-    if not -ndim <= axis < ndim:
-        raise np.exceptions.AxisError(axis, ndim)
-    return axis % ndim
 
 
 def _axis_key(ndim, axis, item):
@@ -413,33 +462,21 @@ def _axis_key(ndim, axis, item):
 
 
 def _join_inputs(arrays, dtype):
-    """Inputs as device arrays / host arrays of one dtype (device dtype wins)."""
+    """Inputs cast to their common dtype (``numpy.result_type``)."""
 
-    if isinstance(arrays, (Array, ArrayView)):
+    if _is_array_nd(arrays):
         raise TypeError("expected a sequence of arrays, not a single charmnumeric array")
     pieces = [
-        a if isinstance(a, (Array, ArrayView)) else np.asarray(a) for a in arrays
+        a if _is_array_nd(a) else np.asarray(a) for a in arrays
     ]
     if not pieces:
         raise ValueError("need at least one array to concatenate")
 
     if dtype is None:
-        device = [a.dtype for a in pieces if isinstance(a, (Array, ArrayView))]
-        dtype = np.result_type(*(device or [a.dtype for a in pieces]))
+        dtype = np.result_type(*[a.dtype for a in pieces])
     dtype = _normalize_dtype(dtype)
 
-    result = []
-    for a in pieces:
-        if isinstance(a, (Array, ArrayView)):
-            if a.dtype != dtype:
-                raise TypeError(
-                    f"cannot join a {a.dtype} array into a {dtype} result "
-                    "(dtype conversion is not implemented yet)"
-                )
-            result.append(a)
-        else:
-            result.append(a.astype(dtype, copy=False))
-    return result, dtype
+    return [a.astype(dtype, copy=False) for a in pieces], dtype
 
 
 def _join(pieces, shapes, axis, dtype, out):
@@ -451,7 +488,7 @@ def _join(pieces, shapes, axis, dtype, out):
             "all the input arrays must have same number of dimensions, but got "
             + ", ".join(str(len(shape)) for shape in shapes)
         )
-    axis = _normalize_axis(axis, ndim)
+    axis = _axis_index(axis, ndim)
     for shape in shapes[1:]:
         for d in range(ndim):
             if d != axis and shape[d] != shapes[0][d]:
@@ -463,11 +500,6 @@ def _join(pieces, shapes, axis, dtype, out):
 
     total = sum(shape[axis] for shape in shapes)
     result_shape = shapes[0][:axis] + (total,) + shapes[0][axis + 1:]
-    if len(result_shape) > 3:
-        raise NotImplementedError(
-            f"charmnumeric arrays must have 1 to 3 dimensions, got shape {result_shape}"
-        )
-
     # Write straight into out when no input aliases it.
     direct = (
         out is not None
@@ -510,8 +542,7 @@ def concatenate(arrays, axis=0, out=None, *, dtype=None, casting="same_kind"):
         dtype = out.dtype
     pieces, dtype = _join_inputs(arrays, dtype)
     if axis is None:
-        if any(np.ndim(p) != 1 for p in pieces):
-            raise NotImplementedError("concatenate(axis=None) of N-D arrays needs reshape (flatten)")
+        pieces = [p.ravel() for p in pieces]
         axis = 0
     if any(np.ndim(p) == 0 for p in pieces):
         raise ValueError("zero-dimensional arrays cannot be concatenated")
@@ -544,117 +575,13 @@ def stack(arrays, axis=0, out=None, *, dtype=None, casting="same_kind"):
     shape = tuple(pieces[0].shape)
     if any(tuple(p.shape) != shape for p in pieces):
         raise ValueError("all input arrays must have the same shape")
-    axis = _normalize_axis(axis, len(shape) + 1)
+    axis = _axis_index(axis, len(shape) + 1)
     logical = shape[:axis] + (1,) + shape[axis:]
     return _join(pieces, [logical] * len(pieces), axis, dtype, out)
 
 
-def _index_runs(flat):
-    """(dst, src, length, step) slice copies: step-1 runs, or constant-step runs of >= 3."""
-
-    runs = []
-    count = len(flat)
-    j = 0
-    while j < count:
-        if j + 1 < count:
-            step = int(flat[j + 1] - flat[j])
-            if step >= 1:
-                k = j + 1
-                while k + 1 < count and int(flat[k + 1] - flat[k]) == step:
-                    k += 1
-                length = k - j + 1
-                if step == 1 or length >= 3:
-                    runs.append((j, int(flat[j]), length, step))
-                    j = k + 1
-                    continue
-        runs.append((j, int(flat[j]), 1, 1))
-        j += 1
-    return runs
-
-
-def _take_1d(a, flat, axis):
-    """a.take(flat, axis) for 1-D host indices: one slice copy per index run."""
-
-    ndim = a.ndim
-    result = empty(a.shape[:axis] + (len(flat),) + a.shape[axis + 1:], dtype=a.dtype)
-    for dst, src, length, step in _index_runs(flat):
-        stop = src + (length - 1) * step + 1
-        result[_axis_key(ndim, axis, slice(dst, dst + length))] = a[
-            _axis_key(ndim, axis, slice(src, stop, step))
-        ]
-    return result
-
-
-def take(a, indices, axis=None, out=None, mode="raise"):
-    """take() with host indices, lowered to slice copies (one per index run).
-
-    A scalar index on a 1-D array gives a (1,) array (no 0-D arrays).
-    """
-
-    if isinstance(indices, (Array, ArrayView)):
-        raise NotImplementedError(
-            "take with a device index array needs a native gather op; "
-            "fetch the indices with .get() first"
-        )
-    if not isinstance(a, (Array, ArrayView)):
-        a = asarray(a)
-
-    idx = np.asarray(indices)
-    if idx.size == 0:
-        raise NotImplementedError("take with an empty index list (empty result) is not supported")
-    if idx.dtype.kind not in "iu":
-        raise IndexError("arrays used as indices must be of integer type")
-    idx = idx.astype(np.int64)
-
-    if axis is None:
-        if a.ndim != 1:
-            raise NotImplementedError("take with axis=None on an N-D array needs reshape (flatten)")
-        axis = 0
-    axis = _normalize_axis(axis, a.ndim)
-    n = a.shape[axis]
-    if mode == "raise":
-        bad = idx[(idx < -n) | (idx >= n)]
-        if bad.size:
-            raise IndexError(f"index {int(bad[0])} is out of bounds for axis {axis} with size {n}")
-        idx = np.where(idx < 0, idx + n, idx)
-    elif mode == "wrap":
-        idx = np.mod(idx, n)
-    elif mode == "clip":
-        idx = np.clip(idx, 0, n - 1)
-    else:
-        raise ValueError(f"clipmode must be one of 'clip', 'raise', or 'wrap' (got {mode!r})")
-
-    out_shape = a.shape[:axis] + idx.shape + a.shape[axis + 1:]
-    if len(out_shape) > 3:
-        raise NotImplementedError(
-            f"take result would have shape {out_shape}; charmnumeric supports at most 3 dims"
-        )
-
-    if idx.ndim <= 1:
-        result = _take_1d(a, idx.reshape(-1), axis)
-        if idx.ndim == 0 and len(out_shape) > 0:
-            # drop the size-1 axis left by the scalar index
-            result = _reshape_copy(result, out_shape)
-        return _write_out(result, out)
-
-    # multi-dim indices: one 1-D take per line along the longest index dim
-    free = int(np.argmax(idx.shape))
-    result = empty(out_shape, dtype=a.dtype)
-    lead_shape = tuple(1 if d == free else idx.shape[d] for d in range(idx.ndim))
-    for lead in np.ndindex(*lead_shape):
-        sel = list(lead)
-        sel[free] = slice(None)
-        part = _take_1d(a, idx[tuple(sel)], axis)
-        key = [slice(None)] * len(out_shape)
-        for d in range(idx.ndim):
-            if d != free:
-                key[axis + d] = slice(lead[d], lead[d] + 1)
-        result[tuple(key)] = part
-    return _write_out(result, out)
-
-
 def astype(x, dtype, /, *, copy=True):
-    """Copy of ``x`` converted to ``dtype``; float -> int truncates."""
+    """Copy of ``x`` converted to ``dtype`` (NumPy astype semantics)."""
     return asarray(x).astype(dtype, copy=copy)
 
 
@@ -688,7 +615,40 @@ def argsort(a, axis=-1, kind=None, order=None):
     return _sort(a, axis, kind, order, arg=True)
 
 
+# >3-D (folded) operands for every elementwise function
+for _name in (
+    "tanh", "exp", "add", "subtract", "multiply", "divide", "sqrt", "log2", "log10", "log1p",
+    "exp2", "expm1", "sin", "cos", "fabs", "absolute", "abs", "floor", "ceil", "rint", "sign",
+    "isnan", "isinf", "isfinite", "log", "trunc", "fix", "round", "around", "square",
+    "reciprocal", "negative", "positive", "maximum", "minimum", "fmax", "fmin", "remainder",
+    "mod", "floor_divide", "power", "pow", "divmod", "less", "less_equal", "greater",
+    "greater_equal", "equal", "not_equal", "logical_not", "logical_and", "logical_or",
+    "logical_xor", "where", "clip", "left_shift", "right_shift", "bitwise_left_shift",
+    "bitwise_right_shift",
+):
+    globals()[_name] = _nd_aware(globals()[_name])
+del _name
+true_divide = divide
+
+
 __all__ = [
+    "allclose",
+    "isclose",
+    "bitwise_and",
+    "bitwise_not",
+    "bitwise_or",
+    "bitwise_xor",
+    "bitwise_left_shift",
+    "bitwise_right_shift",
+    "left_shift",
+    "right_shift",
+    "conj",
+    "conjugate",
+    "imag",
+    "invert",
+    "iscomplexobj",
+    "isrealobj",
+    "real",
     "abs",
     "absolute",
     "add",
@@ -770,10 +730,10 @@ __all__ = [
     "stack",
     "subtract",
     "swapaxes",
-    "take",
     "tanh",
     "tile",
     "transpose",
+    "true_divide",
     "trunc",
     "vstack",
     "where",

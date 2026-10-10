@@ -1,15 +1,21 @@
 #include "jit.hpp"
+#include "dtype_info.hpp"
 #include "jit_api.hpp"
 
 #include "mlir/IR/Verifier.h"
 
+#include <chrono>
 #include <limits>
+
+#include "llvm/Support/FormatVariadic.h"
 
 #ifdef JIT_ENABLE_GPU_BACKEND
 #include "llvm/IR/LegacyPassManager.h"
 #endif
 #ifdef USE_NVIDIA
 #include "mlir/Dialect/GPU/Pipelines/Passes.h"
+#include "mlir/Dialect/GPU/Utils/GPUUtils.h"
+#include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 #include "mlir/InitAllExtensions.h"
 #include "mlir/Dialect/SCF/Transforms/Passes.h"
 #include "mlir/Target/LLVM/NVVM/Target.h"
@@ -18,10 +24,32 @@
 
 namespace {
 void declareExternalCallees(mlir::ModuleOp module);
-}
+mlir::Type storageType(mlir::MLIRContext* ctx, DType dt);
+mlir::Value convertValue(mlir::OpBuilder& b, mlir::Location loc, mlir::Value v, DType from,
+                         DType to);
+} // namespace
 
 namespace {
-// One context per process: creating one (dialect loading, thread pool) per kernel dominated compile time.
+// CNUM_JIT_TIME=1 prints each kernel compile's phase times (ms) to stderr.
+struct JitTimer {
+    std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+    std::string line;
+    void mark(const char* what) {
+        auto now = std::chrono::steady_clock::now();
+        line += llvm::formatv(" {0}={1:F1}", what,
+                              std::chrono::duration<double, std::milli>(now - t).count());
+        t = now;
+    }
+};
+thread_local JitTimer* jitTimer = nullptr;
+void jitMark(const char* what) {
+    if (jitTimer)
+        jitTimer->mark(what);
+}
+} // namespace
+
+namespace {
+// One context per process: per-kernel creation dominated compile time.
 mlir::MLIRContext& sharedContext() {
     static mlir::MLIRContext* ctx = [] {
         mlir::DialectRegistry registry;
@@ -44,6 +72,7 @@ mlir::MLIRContext& sharedContext() {
         c->getOrLoadDialect<mlir::ROCDL::ROCDLDialect>();
         c->getOrLoadDialect<mlir::spirv::SPIRVDialect>();
         c->getOrLoadDialect<mlir::math::MathDialect>();
+        c->getOrLoadDialect<mlir::complex::ComplexDialect>();
         return c;
     }();
     return *ctx;
@@ -85,47 +114,25 @@ void MLIRJitCompiler::buildFromAST(void* astPtr) {
             outputRoots.push_back(op);
     }
 
-    // Determine element type from the AST's dtype
-    mlir::Type elemType;
-    DType astDtype = DType::FLOAT32;
-    for (ASTNode* op : ast->roots)
-        if (op->dtype != DType::FLOAT32) {
-            astDtype = op->dtype;
-            break;
-        }
-    switch (astDtype) {
-    case DType::FLOAT64:
-        elemType = Float64Type::get(&context);
-        break;
-    case DType::INT32:
-        elemType = IntegerType::get(&context, 32);
-        break;
-    case DType::INT64:
-        elemType = IntegerType::get(&context, 64);
-        break;
-    default:
-        elemType = Float32Type::get(&context);
-        break;
-    }
-
-    auto dynamicStridedMemRefType = [&](int64_t rank) {
+    // Each memref, broadcast scalar and output has its own storageType; scalar leaves are f64.
+    auto dynamicStridedMemRefType = [&](int64_t rank, DType dt) {
         SmallVector<int64_t> dynShape(rank, ShapedType::kDynamic);
         SmallVector<int64_t> dynStrides(rank, ShapedType::kDynamic);
         auto layout = StridedLayoutAttr::get(&context, ShapedType::kDynamic, dynStrides);
-        return MemRefType::get(dynShape, elemType, layout);
+        return MemRefType::get(dynShape, storageType(&context, dt), layout);
     };
 
     // --- 2. Create a func.func: memref inputs, broadcast scalars, then output memrefs ---
     SmallVector<Type> argTypes;
     for (const LeafUse& leaf : memrefLeaves)
-        argTypes.push_back(dynamicStridedMemRefType(leaf.operand->ndims));
+        argTypes.push_back(dynamicStridedMemRefType(leaf.operand->ndims, leaf.operand->dtype));
     // Broadcast leaves are scalar function arguments (runtime values, not constants)
-    for (size_t i = 0; i < broadcastLeaves.size(); ++i)
-        argTypes.push_back(elemType);
+    for (ASTNode* leaf : broadcastLeaves)
+        argTypes.push_back(storageType(&context, leaf->dtype));
     for (size_t i = 0; i < scalarLeaves.size(); ++i)
-        argTypes.push_back(elemType);
+        argTypes.push_back(builder->getF64Type());
     for (ASTNode* root : outputRoots)
-        argTypes.push_back(dynamicStridedMemRefType(root->ndims));
+        argTypes.push_back(dynamicStridedMemRefType(root->ndims, root->dtype));
     auto funcType = FunctionType::get(&context, argTypes, /*results=*/{});
     auto funcOp = func::FuncOp::create(loc, "fused_kernel", funcType);
     module->push_back(funcOp);
@@ -199,6 +206,9 @@ void MLIRJitCompiler::buildFromAST(void* astPtr) {
 bool MLIRJitCompiler::optimizeAndFuse() {
     mlir::PassManager pm(&context);
     pm.enableVerifier(false); // the module is verified once, after building
+    // Complex arithmetic becomes arith/math on the parts (the GPU pipeline
+    // only lowers complex.create/re/im).
+    pm.addPass(mlir::createConvertComplexToStandardPass());
     auto& funcPM = pm.nest<mlir::func::FuncOp>();
 
 #if defined(USE_NVIDIA) || defined(USE_AMD) || defined(USE_INTEL)
@@ -224,6 +234,35 @@ bool MLIRJitCompiler::optimizeAndFuse() {
     return mlir::succeeded(pm.run(*module));
 }
 
+#if !defined(USE_AMD) && !defined(USE_INTEL)
+namespace {
+// Half-precision conversions LLVM emits as libgcc calls on x86 (no F16C); the
+// static libgcc is not visible to the JIT.
+extern "C" _Float16 cn_truncdfhf2(double x) { return (_Float16)x; }
+extern "C" _Float16 cn_truncsfhf2(float x) { return (_Float16)x; }
+extern "C" float cn_extendhfsf2(_Float16 x) { return (float)x; }
+extern "C" double cn_extendhfdf2(_Float16 x) { return (double)x; }
+
+llvm::orc::SymbolMap halfRuntimeSymbols(llvm::orc::MangleAndInterner interner) {
+    llvm::orc::SymbolMap map;
+    auto add = [&](const char* name, void* fn) {
+        map[interner(name)] = {llvm::orc::ExecutorAddr::fromPtr(fn),
+                               llvm::JITSymbolFlags::Exported};
+    };
+    add("__truncdfhf2", (void*)&cn_truncdfhf2);
+    add("__truncsfhf2", (void*)&cn_truncsfhf2);
+    add("__extendhfsf2", (void*)&cn_extendhfsf2);
+    add("__extendhfdf2", (void*)&cn_extendhfdf2);
+#ifdef USE_NVIDIA
+    // libdevice names for host-side scalar ops
+    add("__nv_fmodf", (void*)static_cast<float (*)(float, float)>(&fmodf));
+    add("__nv_fmod", (void*)static_cast<double (*)(double, double)>(&fmod));
+#endif
+    return map;
+}
+} // namespace
+#endif
+
 std::unique_ptr<mlir::ExecutionEngine> MLIRJitCompiler::generateCPU() {
     if (!lowerToCPU())
         return nullptr;
@@ -238,6 +277,9 @@ std::unique_ptr<mlir::ExecutionEngine> MLIRJitCompiler::generateCPU() {
         llvm::errs() << "Failed to create ExecutionEngine\n";
         return nullptr;
     }
+#if !defined(USE_AMD) && !defined(USE_INTEL)
+    (*maybeEngine)->registerSymbols(halfRuntimeSymbols);
+#endif
 
     return std::move(*maybeEngine);
 }
@@ -338,11 +380,90 @@ mlir::Value MLIRJitCompiler::lookupOperand(ASTNode* operand, Region* region) {
     return {}; // should not happen if AST is well-formed
 }
 
+namespace {
+/// i1 inside op bodies (comparison and predicate results).
+constexpr DType DT_PRED = static_cast<DType>(100);
+
+enum class BodyKind { Float, SInt, UInt, Bool, Complex };
+
+BodyKind bodyKind(DType dt) {
+    if (dtype_is_float(dt))
+        return BodyKind::Float;
+    if (dtype_is_complex(dt))
+        return BodyKind::Complex;
+    if (dt == DType::BOOL)
+        return BodyKind::Bool;
+    return dtype_is_unsigned(dt) ? BodyKind::UInt : BodyKind::SInt;
+}
+
+bool isComparison(Opcode op) {
+    return op == Opcode::LESS || op == Opcode::LESS_EQUAL || op == Opcode::EQUAL ||
+           op == Opcode::NOT_EQUAL;
+}
+
+bool isPredicate(Opcode op) {
+    return isComparison(op) || op == Opcode::ISNAN || op == Opcode::ISINF ||
+           op == Opcode::ISFINITE;
+}
+
+/// Unary ops that compute in their operand's dtype; the result dtype may differ.
+bool computesInOperandType(Opcode op) {
+    return op == Opcode::ISNAN || op == Opcode::ISINF || op == Opcode::ISFINITE ||
+           op == Opcode::ABS || op == Opcode::REAL || op == Opcode::IMAG || op == Opcode::CONVERT;
+}
+
+/// The registry body for a compute kind, or nullptr if the op has none.
+template <typename Entry>
+const typename Entry::Fn* pickBody(const Entry& e, BodyKind k) {
+    const typename Entry::Fn* f = nullptr;
+    switch (k) {
+    case BodyKind::Float: f = &e.float_body; break;
+    case BodyKind::SInt: f = &e.int_body; break;
+    case BodyKind::UInt: f = e.uint_body ? &e.uint_body : &e.int_body; break;
+    case BodyKind::Bool: f = e.bool_body ? &e.bool_body : &e.int_body; break;
+    case BodyKind::Complex: f = &e.complex_body; break;
+    }
+    return (f && *f) ? f : nullptr;
+}
+
+DType realOf(DType dt) {
+    return dt == DType::COMPLEX64 ? DType::FLOAT32 : DType::FLOAT64;
+}
+} // namespace
+
+mlir::Value MLIRJitCompiler::allocLike(mlir::Value arrayOperand, DType dt) {
+    using namespace mlir;
+    auto loc = builder->getUnknownLoc();
+    int64_t rank = mlir::cast<MemRefType>(arrayOperand.getType()).getRank();
+    SmallVector<int64_t> dynShape(rank, ShapedType::kDynamic);
+    SmallVector<Value> dimSizes;
+    for (int64_t d = 0; d < rank; ++d)
+        dimSizes.push_back(memref::DimOp::create(*builder, loc, arrayOperand, d).getResult());
+    auto type = MemRefType::get(dynShape, storageType(&context, dt));
+    return memref::AllocOp::create(*builder, loc, type, ValueRange(dimSizes));
+}
+
+mlir::Value MLIRJitCompiler::convertArray(mlir::Value v, DType from, DType to, bool is_temp) {
+    if (from == to)
+        return v;
+    mlir::Value out = allocLike(v, to);
+    emitGenericUnaryOp(v, out, [&](mlir::OpBuilder& b, mlir::Location l, mlir::Value x) {
+        return convertValue(b, l, x, from, to);
+    });
+    if (is_temp)
+        tempValues.push_back(out);
+    return out;
+}
+
 void MLIRJitCompiler::emitOp(ASTNode* node, mlir::Location loc) {
     using namespace mlir;
 
     auto op = static_cast<Opcode>(node->opcode);
     Value result;
+    // Scalar leaves are weak f64 values: they take no part in type promotion.
+    auto operandDType = [](ASTNode* operand) {
+        return operand->is_scalar ? DType::FLOAT64 : operand->dtype;
+    };
 
     switch (op) {
     case Opcode::NOOP:
@@ -350,133 +471,122 @@ void MLIRJitCompiler::emitOp(ASTNode* node, mlir::Location loc) {
         return;
 
     case Opcode::SET_REGION: {
-        result = lookupOperand(node->operands[1], node->get_operand_region(1));
+        ASTNode* rhs = node->operands[1];
+        Value v = lookupOperand(rhs, node->get_operand_region(1));
+        if (mlir::isa<MemRefType>(v.getType()))
+            result = convertArray(v, operandDType(rhs), node->dtype, true);
+        else
+            result = convertValue(*builder, loc, v, operandDType(rhs), node->dtype);
         break;
     }
 
     default: {
-        // Binary elementwise ops
-        auto& binReg = binaryOpRegistry();
-        auto binIt = binReg.find(node->opcode);
-        if (binIt != binReg.end()) {
-            Value lhs = lookupOperand(node->operands[0], node->get_operand_region(0));
-            Value rhs = lookupOperand(node->operands[1], node->get_operand_region(1));
-
-            bool lhsIsScalar = !mlir::isa<MemRefType>(lhs.getType());
-            bool rhsIsScalar = !mlir::isa<MemRefType>(rhs.getType());
-
-            auto elemType = lhsIsScalar ? lhs.getType() :
-                mlir::cast<MemRefType>(lhs.getType()).getElementType();
-            bool isInt = mlir::isa<IntegerType>(elemType);
-            const auto& entry = binIt->second;
-            const auto& bodyFn = (isInt && entry.int_body) ? entry.int_body : entry.float_body;
-
-            if (lhsIsScalar && rhsIsScalar) {
-                // Both operands are scalars — emit a plain scalar op
-                result = bodyFn(*builder, loc, lhs, rhs);
-                break;
-            }
-
-            Value arrayOperand = lhsIsScalar ? rhs : lhs;
-            auto srcType = mlir::cast<MemRefType>(arrayOperand.getType());
-            int64_t rank = srcType.getRank();
-            SmallVector<int64_t> dynShape(rank, ShapedType::kDynamic);
-            auto outType = MemRefType::get(dynShape, elemType);
-
-            SmallVector<Value> dimSizes;
-            for (int64_t d = 0; d < rank; ++d)
-                dimSizes.push_back(memref::DimOp::create(*builder, loc, arrayOperand, d).getResult());
-            result = memref::AllocOp::create(*builder, loc, outType, ValueRange(dimSizes));
-
-            emitGenericArrayOp(lhs, rhs, result, bodyFn);
-
-            if (node->is_temp)
-                tempValues.push_back(result);
-            break;
+        const BinaryOpEntry* be = nullptr;
+        const UnaryOpEntry* ue = nullptr;
+        const TernaryOpEntry* te = nullptr;
+        int arity = 0;
+        if (auto it = binaryOpRegistry().find(node->opcode); it != binaryOpRegistry().end()) {
+            be = &it->second;
+            arity = 2;
+        } else if (auto it2 = unaryOpRegistry().find(node->opcode); it2 != unaryOpRegistry().end()) {
+            ue = &it2->second;
+            arity = 1;
+        } else if (auto it3 = ternaryOpRegistry().find(node->opcode);
+                   it3 != ternaryOpRegistry().end()) {
+            te = &it3->second;
+            arity = 3;
+        } else {
+            llvm::errs() << "Unknown opcode in JIT emitOp: " << node->opcode << "\n";
+            return;
         }
 
-        // Unary elementwise ops
-        auto& unReg = unaryOpRegistry();
-        auto unIt = unReg.find(node->opcode);
-        if (unIt != unReg.end()) {
-            Value input = lookupOperand(node->operands[0], node->get_operand_region(0));
-            bool inputIsScalar = !mlir::isa<MemRefType>(input.getType());
-            auto elemType = inputIsScalar ? input.getType()
-                                          : mlir::cast<MemRefType>(input.getType()).getElementType();
-            bool isInt = mlir::isa<IntegerType>(elemType);
-            const auto& entry = unIt->second;
-            const auto& bodyFn = (isInt && entry.int_body) ? entry.int_body : entry.float_body;
-
-            if (inputIsScalar) {
-                // Broadcast (size-1) or scalar input — emit a plain scalar op
-                result = bodyFn(*builder, loc, input);
-                break;
-            }
-
-            auto srcType = mlir::cast<MemRefType>(input.getType());
-            int64_t rank = srcType.getRank();
-            SmallVector<int64_t> dynShape(rank, ShapedType::kDynamic);
-            auto outType = MemRefType::get(dynShape, elemType);
-
-            SmallVector<Value> dimSizes;
-            for (int64_t d = 0; d < rank; ++d)
-                dimSizes.push_back(memref::DimOp::create(*builder, loc, input, d).getResult());
-            result = memref::AllocOp::create(*builder, loc, outType, ValueRange(dimSizes));
-
-            emitGenericUnaryOp(input, result, bodyFn);
-
-            if (node->is_temp)
-                tempValues.push_back(result);
-            break;
+        SmallVector<Value, 3> ins;
+        SmallVector<DType, 3> dts;
+        for (int i = 0; i < arity; ++i) {
+            ins.push_back(lookupOperand(node->operands[i], node->get_operand_region(i)));
+            dts.push_back(operandDType(node->operands[i]));
         }
 
-        // Ternary elementwise ops (where, clip); any operand may be a scalar
-        auto& terReg = ternaryOpRegistry();
-        auto terIt = terReg.find(node->opcode);
-        if (terIt != terReg.end()) {
-            SmallVector<Value, 3> ins;
-            Value arrayOperand;
-            for (int i = 0; i < 3; ++i) {
-                ins.push_back(lookupOperand(node->operands[i], node->get_operand_region(i)));
-                if (!arrayOperand && mlir::isa<MemRefType>(ins.back().getType()))
-                    arrayOperand = ins.back();
-            }
-            // Single element type per kernel: take it from the value operand
-            Value typeSrc = ins[1];
-            auto elemType = mlir::isa<MemRefType>(typeSrc.getType())
-                                ? mlir::cast<MemRefType>(typeSrc.getType()).getElementType()
-                                : typeSrc.getType();
-            bool isInt = mlir::isa<IntegerType>(elemType);
-            const auto& entry = terIt->second;
-            const auto& bodyFn = (isInt && entry.int_body) ? entry.int_body : entry.float_body;
-            auto naryBody = [&](OpBuilder& b, Location l, ValueRange args) {
-                return bodyFn(b, l, args[0], args[1], args[2]);
+        // Compute dtype C: comparisons promote non-scalar operands; some unary ops keep input dtype.
+        DType R = node->dtype;
+        DType C = R;
+        if (isComparison(op)) {
+            bool any = false;
+            for (int i = 0; i < arity; ++i)
+                if (!node->operands[i]->is_scalar) {
+                    C = any ? dtype_promote(C, dts[i]) : dts[i];
+                    any = true;
+                }
+            if (!any)
+                C = DType::FLOAT64;
+        } else if (computesInOperandType(op)) {
+            C = dts[0];
+        }
+        DType K = C == DType::FLOAT16 ? DType::FLOAT32 : C; // half math runs in float
+        BodyKind kind = bodyKind(K);
+
+        std::function<Value(OpBuilder&, Location, ValueRange)> body;
+        if (be) {
+            if (auto* f = pickBody(*be, kind))
+                body = [f](OpBuilder& b, Location l, ValueRange a) { return (*f)(b, l, a[0], a[1]); };
+        } else if (ue) {
+            if (auto* f = pickBody(*ue, kind))
+                body = [f](OpBuilder& b, Location l, ValueRange a) { return (*f)(b, l, a[0]); };
+        } else if (auto* f = pickBody(*te, kind)) {
+            body = [f](OpBuilder& b, Location l, ValueRange a) {
+                return (*f)(b, l, a[0], a[1], a[2]);
             };
+        }
+        if (!body)
+            llvm::report_fatal_error(llvm::Twine("JIT: opcode ") + llvm::Twine(node->opcode) +
+                                     " is not defined for dtype " + llvm::Twine((int)C));
 
-            if (!arrayOperand) {
-                // All operands are scalars — emit a plain scalar op
-                result = naryBody(*builder, loc, ins);
-                break;
-            }
+        // Operands convert to K (where's condition to i1); the body result
+        // (i1 for predicates, real for complex abs/real/imag, 0/1 i8 for
+        // bool math) converts to R.
+        SmallVector<DType, 3> tgt(arity, K);
+        if (op == Opcode::WHERE)
+            tgt[0] = DT_PRED;
+        DType RB = K;
+        if (isPredicate(op))
+            RB = DT_PRED;
+        else if ((op == Opcode::ABS || op == Opcode::REAL || op == Opcode::IMAG) &&
+                 dtype_is_complex(K))
+            RB = realOf(K);
+        else if (K == DType::BOOL)
+            RB = DType::INT8;
+        auto typed = [&](OpBuilder& b, Location l, ValueRange args) -> Value {
+            SmallVector<Value, 3> conv;
+            for (int i = 0; i < arity; ++i)
+                conv.push_back(convertValue(b, l, args[i], dts[i], tgt[i]));
+            return convertValue(b, l, body(b, l, conv), RB, R);
+        };
 
-            int64_t rank = mlir::cast<MemRefType>(arrayOperand.getType()).getRank();
-            SmallVector<int64_t> dynShape(rank, ShapedType::kDynamic);
-            auto outType = MemRefType::get(dynShape, elemType);
-            SmallVector<Value> dimSizes;
-            for (int64_t d = 0; d < rank; ++d)
-                dimSizes.push_back(
-                    memref::DimOp::create(*builder, loc, arrayOperand, d).getResult());
-            result = memref::AllocOp::create(*builder, loc, outType, ValueRange(dimSizes));
-
-            emitGenericNaryOp(ins, result, naryBody);
-
-            if (node->is_temp)
-                tempValues.push_back(result);
+        Value arrayOperand;
+        for (Value v : ins)
+            if (!arrayOperand && mlir::isa<MemRefType>(v.getType()))
+                arrayOperand = v;
+        if (!arrayOperand) {
+            // Scalar and broadcast operands only: emit a plain scalar op
+            result = typed(*builder, loc, ins);
             break;
         }
 
-        llvm::errs() << "Unknown opcode in JIT emitOp: " << node->opcode << "\n";
-        return;
+        result = allocLike(arrayOperand, R);
+        if (arity == 2)
+            emitGenericArrayOp(ins[0], ins[1], result, [&](OpBuilder& b, Location l, Value x, Value y) {
+                return typed(b, l, ValueRange{x, y});
+            });
+        else if (arity == 1)
+            emitGenericUnaryOp(ins[0], result, [&](OpBuilder& b, Location l, Value x) {
+                return typed(b, l, ValueRange{x});
+            });
+        else
+            emitGenericNaryOp(ins, result, typed);
+
+        // freed at the end; root results are copied to their outputs first
+        tempValues.push_back(result);
+        break;
     }
     }
 
@@ -496,8 +606,10 @@ bool MLIRJitCompiler::lowerToCPU() {
     pm.addPass(mlir::memref::createExpandStridedMetadataPass());
     // Lower CF, Arith, MemRef, Func to LLVM dialect
     pm.addPass(mlir::createConvertControlFlowToLLVMPass());
+    pm.addPass(mlir::createConvertComplexToStandardPass());
     pm.addPass(mlir::createConvertMathToLLVMPass());
     pm.addPass(mlir::createArithToLLVMConversionPass());
+    pm.addPass(mlir::createConvertComplexToLLVMPass());
     pm.addPass(mlir::createConvertIndexToLLVMPass());
     pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
     pm.addPass(mlir::createConvertFuncToLLVMPass());
@@ -512,13 +624,191 @@ bool MLIRJitCompiler::lowerToCPU() {
 #error "MLIR_CUDA_RUNTIME_LIB must point to libmlir_cuda_runtime.so"
 #endif
 
+namespace {
+using mlir::Operation;
+
+/// Memref -> function argument it provably shares a shape with (identity-map linalg ops).
+llvm::DenseMap<mlir::Value, mlir::Value> sameShapeArgs(mlir::func::FuncOp f) {
+    using namespace mlir;
+    llvm::DenseMap<Value, Value> parent;
+    std::function<Value(Value)> find = [&](Value v) -> Value {
+        auto it = parent.find(v);
+        if (it == parent.end() || it->second == v)
+            return v;
+        Value r = find(it->second);
+        parent[v] = r;
+        return r;
+    };
+    f.walk([&](linalg::LinalgOp op) {
+        if (!llvm::all_of(op.getIndexingMapsArray(), [](AffineMap m) { return m.isIdentity(); }))
+            return;
+        Value root;
+        for (Value v : op->getOperands()) {
+            if (!isa<MemRefType>(v.getType()))
+                continue;
+            Value r = find(v);
+            if (!root) {
+                root = r;
+                continue;
+            }
+            if (r == root)
+                continue;
+            if (isa<BlockArgument>(r))
+                std::swap(r, root);
+            parent[r] = root;
+        }
+    });
+    llvm::DenseMap<Value, Value> out;
+    for (auto& [v, unused] : parent) {
+        Value r = find(v);
+        if (r != v && isa<BlockArgument>(r))
+            out[v] = r;
+    }
+    return out;
+}
+
+bool sameIvs(mlir::ValueRange idx, mlir::scf::ParallelOp loop) {
+    auto ivs = loop.getInductionVars();
+    if (idx.size() != ivs.size())
+        return false;
+    for (size_t i = 0; i < ivs.size(); ++i)
+        if (idx[i] != ivs[i])
+            return false;
+    return true;
+}
+
+mlir::Value memrefRoot(mlir::Value v) {
+    while (auto view = v.getDefiningOp<mlir::ViewLikeOpInterface>())
+        v = view.getViewSource();
+    return v;
+}
+
+struct MemAccess {
+    mlir::Value mem;
+    bool write;
+    bool identity;
+};
+
+/// Loads/stores of a loop body; false if it has other side effects.
+bool collectAccesses(mlir::scf::ParallelOp loop, llvm::SmallVectorImpl<MemAccess>& out) {
+    using namespace mlir;
+    bool ok = true;
+    loop.getBody()->walk([&](Operation* op) {
+        if (auto ld = dyn_cast<memref::LoadOp>(op))
+            out.push_back({ld.getMemRef(), false, sameIvs(ld.getIndices(), loop)});
+        else if (auto st = dyn_cast<memref::StoreOp>(op))
+            out.push_back({st.getMemRef(), true, sameIvs(st.getIndices(), loop)});
+        else if (!op->hasTrait<OpTrait::HasRecursiveMemoryEffects>() && !isa<func::CallOp>(op) &&
+                 !isMemoryEffectFree(op))
+            ok = false;
+    });
+    return ok;
+}
+
+/// Adjacent loops can share one body if every buffer written by either one is
+/// accessed by both only at the iteration's own index. Distinct kernel
+/// arguments never alias: outputs are fresh arrays.
+bool canFuse(mlir::scf::ParallelOp a, mlir::scf::ParallelOp b) {
+    if (a.getNumResults() || b.getNumResults() || a.getLowerBound() != b.getLowerBound() ||
+        a.getUpperBound() != b.getUpperBound() || a.getStep() != b.getStep())
+        return false;
+    llvm::SmallVector<MemAccess> accA, accB;
+    if (!collectAccesses(a, accA) || !collectAccesses(b, accB))
+        return false;
+    auto conflicts = [](llvm::ArrayRef<MemAccess> x, llvm::ArrayRef<MemAccess> y) {
+        for (const MemAccess& p : x)
+            for (const MemAccess& q : y)
+                if ((p.write || q.write) && memrefRoot(p.mem) == memrefRoot(q.mem) &&
+                    !(p.identity && q.identity && p.mem == q.mem))
+                    return true;
+        return false;
+    };
+    return !conflicts(accA, accB);
+}
+
+/// Fuse the elementwise loops of the kernel function into as few loops as
+/// possible and drop the temporaries that fusion makes thread-local.
+void fuseElementwiseLoops(mlir::func::FuncOp f) {
+    using namespace mlir;
+    Block& body = f.getBody().front();
+
+    // Hoist allocations and scalar code above the first loop so loops become adjacent.
+    scf::ParallelOp first;
+    for (Operation& op : body)
+        if ((first = dyn_cast<scf::ParallelOp>(op)))
+            break;
+    if (!first)
+        return;
+    auto definedAbove = [&](Value v) {
+        Operation* d = v.getDefiningOp();
+        return !d || d->getBlock() != &body || d->isBeforeInBlock(first);
+    };
+    for (Operation& op : llvm::make_early_inc_range(
+             llvm::make_range(std::next(first->getIterator()), body.end()))) {
+        if (op.getNumRegions() || op.hasTrait<OpTrait::IsTerminator>() ||
+            !(isMemoryEffectFree(&op) || isa<memref::AllocOp, memref::AllocaOp, func::CallOp>(op)))
+            continue;
+        if (llvm::all_of(op.getOperands(), definedAbove))
+            op.moveBefore(first);
+    }
+
+    for (Operation& op : body) {
+        auto a = dyn_cast<scf::ParallelOp>(op);
+        if (!a)
+            continue;
+        while (auto b = dyn_cast_or_null<scf::ParallelOp>(a->getNextNode())) {
+            if (!canFuse(a, b))
+                break;
+            for (auto [ivB, ivA] : llvm::zip(b.getInductionVars(), a.getInductionVars()))
+                ivB.replaceAllUsesWith(ivA);
+            Block* src = b.getBody();
+            a.getBody()->getOperations().splice(a.getBody()->getTerminator()->getIterator(),
+                                                src->getOperations(), src->begin(),
+                                                src->getTerminator()->getIterator());
+            b.erase();
+        }
+    }
+
+    // Forward stores to temporaries into later loads of the same element.
+    f.walk([&](scf::ParallelOp loop) {
+        llvm::DenseMap<Value, memref::StoreOp> last;
+        for (Operation& op : llvm::make_early_inc_range(*loop.getBody())) {
+            if (auto st = dyn_cast<memref::StoreOp>(op)) {
+                if (st.getMemRef().getDefiningOp<memref::AllocOp>())
+                    last[st.getMemRef()] = st;
+            } else if (auto ld = dyn_cast<memref::LoadOp>(op)) {
+                auto it = last.find(ld.getMemRef());
+                if (it != last.end() && llvm::equal(it->second.getIndices(), ld.getIndices())) {
+                    ld.getResult().replaceAllUsesWith(it->second.getValueToStore());
+                    ld.erase();
+                }
+            } else if (op.getNumRegions()) {
+                op.walk([&](memref::StoreOp st) { last.erase(st.getMemRef()); });
+            }
+        }
+    });
+
+    // Temporaries that are only written are dead.
+    for (Operation& op : llvm::make_early_inc_range(body)) {
+        auto alloc = dyn_cast<memref::AllocOp>(op);
+        if (!alloc || !llvm::all_of(alloc->getUsers(), [](Operation* u) {
+                return isa<memref::StoreOp, memref::DeallocOp>(u);
+            }))
+            continue;
+        for (Operation* u : llvm::make_early_inc_range(alloc->getUsers()))
+            u->erase();
+        alloc.erase();
+    }
+}
+} // namespace
+
 bool MLIRJitCompiler::lowerToNVIDIAHost() {
     using namespace mlir;
 
-    // 1. Every linalg op becomes one multi-dim scf.parallel (parallel by
-    //    construction, so nothing is left to run on the host), tiled so the
-    //    innermost tile maps to threads and the rest to blocks. Tile sizes keep
-    //    blockDim within limits (x,y <= 1024, z <= 64).
+    // 1. Every linalg op becomes one multi-dim scf.parallel; adjacent loops over
+    //    the same index space are fused. The rest is tiled so the innermost
+    //    tile maps to threads and the rest to blocks. Tile sizes keep blockDim
+    //    within limits (x,y <= 1024, z <= 64).
     int64_t rank = 1;
     module->walk([&](linalg::LinalgOp op) {
         rank = std::max<int64_t>(rank, op.getNumLoops());
@@ -526,18 +816,57 @@ bool MLIRJitCompiler::lowerToNVIDIAHost() {
     SmallVector<int64_t> tiles(rank, 1);
     tiles.back() = (rank >= 3) ? 64 : 256;
 
+    auto kernelFn = module->lookupSymbol<func::FuncOp>("fused_kernel");
+    auto shapeArg = sameShapeArgs(kernelFn);
+    PassManager pm0(&context);
+    pm0.addPass(createConvertLinalgToParallelLoopsPass());
+    if (failed(pm0.run(*module)))
+        return false;
+    // Loop bounds of same-shaped arrays become the same SSA values.
+    kernelFn.walk([&](memref::DimOp d) {
+        auto it = shapeArg.find(d.getSource());
+        if (it != shapeArg.end())
+            d.getSourceMutable().assign(it->second);
+    });
+    PassManager pm1(&context);
+    pm1.addPass(createCanonicalizerPass());
+    pm1.addPass(createCSEPass());
+    if (failed(pm1.run(*module)))
+        return false;
+    fuseElementwiseLoops(kernelFn);
+
     PassManager pm(&context);
-    pm.addPass(createConvertLinalgToParallelLoopsPass());
     pm.nest<func::FuncOp>().addPass(createParallelLoopTilingPass(tiles, /*noMinMaxBounds=*/true));
     pm.nest<func::FuncOp>().addPass(createGpuMapParallelLoopsPass());
     pm.addPass(createConvertParallelLoopToGpuPass());
     if (failed(pm.run(*module)))
         return false;
 
-    // 2. Temporaries (memref.alloc / host-side memref.alloca) are read by kernels,
-    //    and the host may initialize scalar buffers, so put them in managed
-    //    (host_shared) memory. The sync gpu.alloc lowering requires host_shared;
-    //    gpu.dealloc lowers only in async form, so wrap it in gpu.wait.
+    // 2. Scalar code (e.g. ops on broadcast or scalar leaves) runs in the
+    //    kernels, so the host only launches.
+    auto sinkable = [](Operation* op) {
+        return op->getNumRegions() == 0 && !op->hasTrait<OpTrait::IsTerminator>() &&
+               !isa<memref::AllocOp, memref::AllocaOp>(op) &&
+               (isMemoryEffectFree(op) || isa<func::CallOp>(op));
+    };
+    module->walk([&](gpu::LaunchOp launch) { (void)sinkOperationsIntoLaunchOp(launch, sinkable); });
+    for (Operation& op : llvm::make_early_inc_range(llvm::reverse(kernelFn.getBody().front())))
+        if (op.use_empty() && sinkable(&op))
+            op.erase();
+
+    // Launches are asynchronous: the host must not read what kernels write.
+    bool hostLoad = false;
+    kernelFn.walk([&](memref::LoadOp ld) {
+        hostLoad |= !ld->getParentOfType<gpu::LaunchOp>();
+    });
+    if (hostLoad) {
+        llvm::errs() << "lowerToNVIDIAHost: host-side load left after kernel outlining\n";
+        return false;
+    }
+
+    // 3. Remaining temporaries are device memory, unless the host touches them
+    //    (then managed). gpu.alloc/dealloc lower only in async form (or sync
+    //    host_shared alloc), so wrap them in gpu.wait.
     SmallVector<Operation*> allocs;
     SmallVector<memref::DeallocOp> deallocs;
     module->walk([&](Operation* op) {
@@ -549,8 +878,8 @@ bool MLIRJitCompiler::lowerToNVIDIAHost() {
             deallocs.push_back(d);
     });
     OpBuilder b(&context);
+    Type tokTy = gpu::AsyncTokenType::get(&context);
     auto emitDealloc = [&](Location loc, Value mem) {
-        Type tokTy = gpu::AsyncTokenType::get(&context);
         Value t0 = gpu::WaitOp::create(b, loc, tokTy, ValueRange{}).getAsyncToken();
         Value t1 = gpu::DeallocOp::create(b, loc, tokTy, ValueRange{t0}, mem).getAsyncToken();
         gpu::WaitOp::create(b, loc, Type(), ValueRange{t1});
@@ -567,15 +896,28 @@ bool MLIRJitCompiler::lowerToNVIDIAHost() {
             dynSizes = aa.getDynamicSizes();
             symOps = aa.getSymbolOperands();
         }
-        auto gpuAlloc = gpu::AllocOp::create(b, op->getLoc(), type, /*asyncToken=*/Type(),
-                                             ValueRange{}, dynSizes, symOps, /*hostShared=*/true);
-        op->getResult(0).replaceAllUsesWith(gpuAlloc.getMemref());
+        bool hostUse = llvm::any_of(op->getUsers(), [](Operation* u) {
+            return !isa<memref::DeallocOp>(u) && !u->getParentOfType<gpu::LaunchOp>();
+        });
+        Value mem;
+        if (hostUse) {
+            mem = gpu::AllocOp::create(b, op->getLoc(), type, /*asyncToken=*/Type(), ValueRange{},
+                                       dynSizes, symOps, /*hostShared=*/true)
+                      .getMemref();
+        } else {
+            Value t0 = gpu::WaitOp::create(b, op->getLoc(), tokTy, ValueRange{}).getAsyncToken();
+            auto ga = gpu::AllocOp::create(b, op->getLoc(), type, tokTy, ValueRange{t0}, dynSizes,
+                                           symOps, /*hostShared=*/false);
+            gpu::WaitOp::create(b, op->getLoc(), Type(), ValueRange{ga.getAsyncToken()});
+            mem = ga.getMemref();
+        }
+        op->getResult(0).replaceAllUsesWith(mem);
         // allocas have no dealloc: free them before the function returns
         if (isa<memref::AllocaOp>(op)) {
-            auto func = gpuAlloc->getParentOfType<func::FuncOp>();
+            auto func = mem.getParentRegion()->getParentOfType<func::FuncOp>();
             func.walk([&](func::ReturnOp ret) {
                 b.setInsertionPoint(ret);
-                emitDealloc(ret.getLoc(), gpuAlloc.getMemref());
+                emitDealloc(ret.getLoc(), mem);
             });
         }
         op->erase();
@@ -586,9 +928,8 @@ bool MLIRJitCompiler::lowerToNVIDIAHost() {
         op.erase();
     }
 
-    // 3. Standard GPU pipeline: outline kernels, lower them to NVVM and embed
-    //    PTX (the driver JITs it for the actual device), lower the host side to
-    //    LLVM with mgpu* runtime calls.
+    // 4. NVVM pipeline: kernels embed PTX (driver JITs it); host uses mgpu* calls.
+    jitMark("gpu-map");
     PassManager pm2(&context);
     gpu::GPUToNVVMPipelineOptions opts;
     opts.cubinChip = "sm_80";
@@ -600,8 +941,61 @@ bool MLIRJitCompiler::lowerToNVIDIAHost() {
             module->dump();
         return false;
     }
+    jitMark("nvvm");
     return true;
 }
+
+namespace {
+// Redirects the launcher's mgpu* stream/alloc calls to the calling chare's
+// compute stream, without host syncs.
+thread_local CUstream jitStream = nullptr;
+
+extern "C" CUstream cn_mgpuStreamCreate() { return jitStream; }
+extern "C" void cn_mgpuStreamSynchronize(CUstream s) {
+    if (s != jitStream)
+        cuStreamSynchronize(s);
+}
+extern "C" void cn_mgpuStreamDestroy(CUstream) {}
+extern "C" void* cn_mgpuMemAlloc(uint64_t bytes, CUstream s, bool hostShared) {
+    CUdeviceptr p = 0;
+    if (bytes == 0)
+        return nullptr;
+    CUresult r = hostShared ? cuMemAllocManaged(&p, bytes, CU_MEM_ATTACH_GLOBAL)
+                            : cuMemAllocAsync(&p, bytes, s);
+    if (r != CUDA_SUCCESS)
+        llvm::report_fatal_error(llvm::Twine("JIT temporary allocation failed: ") + llvm::Twine(r));
+    return reinterpret_cast<void*>(p);
+}
+extern "C" void cn_mgpuMemFree(void* ptr, CUstream s) {
+    if (!ptr)
+        return;
+    unsigned managed = 0;
+    auto p = reinterpret_cast<CUdeviceptr>(ptr);
+    cuPointerGetAttribute(&managed, CU_POINTER_ATTRIBUTE_IS_MANAGED, p);
+    if (managed) {
+        cuStreamSynchronize(s);
+        cuMemFree(p);
+    } else {
+        cuMemFreeAsync(p, s);
+    }
+}
+
+llvm::orc::SymbolMap streamRuntimeSymbols(llvm::orc::MangleAndInterner interner) {
+    llvm::orc::SymbolMap map = halfRuntimeSymbols(interner);
+    auto add = [&](const char* name, void* fn) {
+        map[interner(name)] = {llvm::orc::ExecutorAddr::fromPtr(fn),
+                               llvm::JITSymbolFlags::Exported};
+    };
+    add("mgpuStreamCreate", (void*)&cn_mgpuStreamCreate);
+    add("mgpuStreamSynchronize", (void*)&cn_mgpuStreamSynchronize);
+    add("mgpuStreamDestroy", (void*)&cn_mgpuStreamDestroy);
+    add("mgpuMemAlloc", (void*)&cn_mgpuMemAlloc);
+    add("mgpuMemFree", (void*)&cn_mgpuMemFree);
+    return map;
+}
+} // namespace
+
+void jit_set_stream(void* stream) { jitStream = static_cast<CUstream>(stream); }
 
 std::unique_ptr<mlir::ExecutionEngine> MLIRJitCompiler::generateNVIDIAHost() {
     if (!lowerToNVIDIAHost()) {
@@ -615,16 +1009,29 @@ std::unique_ptr<mlir::ExecutionEngine> MLIRJitCompiler::generateNVIDIAHost() {
     mlir::ExecutionEngineOptions engineOptions;
     static const llvm::StringRef runtimeLibs[] = {MLIR_CUDA_RUNTIME_LIB};
     engineOptions.sharedLibPaths = runtimeLibs;
-    auto maybeEngine = mlir::ExecutionEngine::create(*module, engineOptions);
+    // Host only launches: O0. jitCodeGenOptLevel alone is ignored; the target machine counts.
+    engineOptions.jitCodeGenOptLevel = llvm::CodeGenOptLevel::None;
+    std::unique_ptr<llvm::TargetMachine> tm;
+    if (auto jtmb = llvm::orc::JITTargetMachineBuilder::detectHost()) {
+        jtmb->setCodeGenOptLevel(llvm::CodeGenOptLevel::None);
+        if (auto t = jtmb->createTargetMachine())
+            tm = std::move(*t);
+        else
+            llvm::consumeError(t.takeError());
+    } else {
+        llvm::consumeError(jtmb.takeError());
+    }
+    auto maybeEngine = mlir::ExecutionEngine::create(*module, engineOptions, std::move(tm));
     if (!maybeEngine) {
         llvm::errs() << "generateNVIDIAHost: failed to create ExecutionEngine: "
                      << llvm::toString(maybeEngine.takeError()) << "\n";
         return nullptr;
     }
-    // Run the global constructors that load the embedded PTX module (only
-    // invokePacked() does this implicitly; the dispatcher calls the packed
-    // function pointer directly).
+    (*maybeEngine)->registerSymbols(streamRuntimeSymbols);
+    // Runs ctors that load the embedded PTX; we call the packed pointer, not invokePacked().
+    jitMark("engine");
     (*maybeEngine)->initialize();
+    jitMark("init");
     return std::move(*maybeEngine);
 }
 
@@ -662,51 +1069,45 @@ Value sel(OpBuilder& b, Location loc, Value c, Value t, Value f) {
     return arith::SelectOp::create(b, loc, c, t, f).getResult();
 }
 
-/// i1 predicate -> 0/1 in element type `t` (masks: there is no bool dtype).
-Value toMask(OpBuilder& b, Location loc, Value pred, mlir::Type t) {
-    if (mlir::isa<mlir::FloatType>(t))
-        return arith::UIToFPOp::create(b, loc, t, pred).getResult();
-    return arith::ExtUIOp::create(b, loc, t, pred).getResult();
-}
-
 /// i1: v != 0 (NaN counts as true, like NumPy's bool(nan)).
 Value isNonzero(OpBuilder& b, Location loc, Value v) {
+    if (v.getType().isInteger(1))
+        return v;
     Value zero = constLike(b, loc, v, 0.0);
     if (mlir::isa<mlir::FloatType>(v.getType()))
         return fcmp(b, loc, arith::CmpFPredicate::UNE, v, zero);
     return icmp(b, loc, arith::CmpIPredicate::ne, v, zero);
 }
 
-/// Float compare op producing a 0/1 mask in the operand type.
-BinaryOpEntry::Fn fcmpMask(arith::CmpFPredicate p) {
-    return [p](OpBuilder& b, Location loc, Value x, Value y) {
-        return toMask(b, loc, fcmp(b, loc, p, x, y), x.getType());
-    };
+/// Float compare op (i1 result).
+BinaryOpEntry::Fn fcmpPred(arith::CmpFPredicate p) {
+    return [p](OpBuilder& b, Location loc, Value x, Value y) { return fcmp(b, loc, p, x, y); };
 }
 
-/// Integer compare op producing a 0/1 mask in the operand type.
-BinaryOpEntry::Fn icmpMask(arith::CmpIPredicate p) {
-    return [p](OpBuilder& b, Location loc, Value x, Value y) {
-        return toMask(b, loc, icmp(b, loc, p, x, y), x.getType());
-    };
+/// Integer compare op (i1 result).
+BinaryOpEntry::Fn icmpPred(arith::CmpIPredicate p) {
+    return [p](OpBuilder& b, Location loc, Value x, Value y) { return icmp(b, loc, p, x, y); };
 }
 
 /// Integer x**e by square-and-multiply over every exponent bit (branch-free,
 /// so it lowers the same on CPU and GPU). Wraps on overflow like NumPy. For
-/// e < 0 the result is 1 for x == 1, +-1 for x == -1 and 0 otherwise (NumPy
-/// raises instead).
-Value intPow(OpBuilder& b, Location loc, Value x, Value e) {
+/// signed e < 0 the result is 1 for x == 1, +-1 for x == -1 and 0 otherwise
+/// (NumPy raises instead).
+Value intPow(OpBuilder& b, Location loc, Value x, Value e, bool isUnsigned = false) {
     unsigned bits = mlir::cast<mlir::IntegerType>(x.getType()).getWidth();
     Value one = constLike(b, loc, x, 1.0);
     Value zero = constLike(b, loc, x, 0.0);
     Value r = one, base = x;
-    for (unsigned i = 0; i + 1 < bits; ++i) {
-        Value sh = arith::ShRSIOp::create(b, loc, e, constLike(b, loc, e, i)).getResult();
+    unsigned nbits = isUnsigned ? bits : bits - 1;
+    for (unsigned i = 0; i < nbits; ++i) {
+        Value sh = arith::ShRUIOp::create(b, loc, e, constLike(b, loc, e, i)).getResult();
         Value bit = arith::TruncIOp::create(b, loc, b.getI1Type(), sh).getResult();
         r = sel(b, loc, bit, arith::MulIOp::create(b, loc, r, base).getResult(), r);
-        if (i + 2 < bits)
+        if (i + 1 < nbits)
             base = arith::MulIOp::create(b, loc, base, base).getResult();
     }
+    if (isUnsigned)
+        return r;
     Value eOdd = arith::TruncIOp::create(b, loc, b.getI1Type(), e).getResult();
     Value minusOne = constLike(b, loc, x, -1.0);
     Value negRes = sel(b, loc, icmp(b, loc, arith::CmpIPredicate::eq, x, one), one,
@@ -744,11 +1145,8 @@ Value intDivMod(OpBuilder& b, Location loc, Value x, Value y, bool wantMod) {
     return sel(b, loc, yZero, zero, sel(b, loc, yNegOne, negX, qFixed));
 }
 
-/// C fmod(x, y), exact. arith.remf cannot be used: the NVVM pipeline lowers
-/// arith to LLVM before convert-gpu-to-nvvm, and llvm.frem is illegal there.
-/// So call libm's fmod on the host and libdevice's __nv_fmod on NVIDIA GPUs.
-/// (The callee is declared afterwards by declareExternalCallees: the body is
-/// built before the linalg.generic is attached to the module.)
+/// C fmod. arith.remf is unusable (llvm.frem is illegal in the NVVM pipeline), so
+/// this calls libm fmod on host and libdevice __nv_fmod on NVIDIA.
 Value fmodCall(OpBuilder& b, Location loc, Value x, Value y) {
     mlir::Type t = x.getType();
     bool isF32 = t.isF32();
@@ -761,7 +1159,7 @@ Value fmodCall(OpBuilder& b, Location loc, Value x, Value y) {
         .getResult(0);
 }
 
-/// Add private declarations for callees (e.g. fmod) that are called but not defined.
+/// Declares private callees (e.g. fmod) that are called but not defined.
 void declareExternalCallees(mlir::ModuleOp module) {
     OpBuilder b(module.getContext());
     b.setInsertionPointToStart(module.getBody());
@@ -844,13 +1242,11 @@ Value expm1Accurate(OpBuilder& b, Location loc, Value x) {
     return sel(b, loc, fcmp(b, loc, arith::CmpFPredicate::OEQ, u, one), x, r);
 }
 
-/// Wraps a math dialect unary op as a registry body.
 template <typename OpT>
 UnaryOpEntry::Fn mathUnary() {
     return [](OpBuilder& b, Location loc, Value v) { return OpT::create(b, loc, v).getResult(); };
 }
 
-/// Wraps an arith binary op as a registry body.
 template <typename OpT>
 BinaryOpEntry::Fn arithBinary() {
     return [](OpBuilder& b, Location loc, Value x, Value y) {
@@ -859,94 +1255,321 @@ BinaryOpEntry::Fn arithBinary() {
 }
 
 Value identityUnary(OpBuilder&, Location, Value v) { return v; }
+
+/// Integer shift with NumPy semantics: a count outside [0, width) gives 0
+/// (sign fill for signed >>) instead of an undefined shift.
+Value intShift(OpBuilder& b, Location loc, Value x, Value y, bool left, bool isSigned) {
+    unsigned bits = mlir::cast<mlir::IntegerType>(x.getType()).getWidth();
+    Value inRange = icmp(b, loc, arith::CmpIPredicate::ult, y, constLike(b, loc, y, bits));
+    Value cnt = sel(b, loc, inRange, y, constLike(b, loc, y, 0.0));
+    if (left)
+        return sel(b, loc, inRange, arith::ShLIOp::create(b, loc, x, cnt).getResult(),
+                   constLike(b, loc, x, 0.0));
+    if (!isSigned)
+        return sel(b, loc, inRange, arith::ShRUIOp::create(b, loc, x, cnt).getResult(),
+                   constLike(b, loc, x, 0.0));
+    Value sign = arith::ShRSIOp::create(b, loc, x, constLike(b, loc, x, bits - 1)).getResult();
+    return sel(b, loc, inRange, arith::ShRSIOp::create(b, loc, x, cnt).getResult(), sign);
+}
+
+/// Unsigned floor division / remainder; division by zero gives 0 (as NumPy).
+Value uintDivMod(OpBuilder& b, Location loc, Value x, Value y, bool wantMod) {
+    Value zero = constLike(b, loc, x, 0.0);
+    Value yZero = icmp(b, loc, arith::CmpIPredicate::eq, y, zero);
+    Value ySafe = sel(b, loc, yZero, constLike(b, loc, x, 1.0), y);
+    Value r = wantMod ? arith::RemUIOp::create(b, loc, x, ySafe).getResult()
+                      : arith::DivUIOp::create(b, loc, x, ySafe).getResult();
+    return sel(b, loc, yZero, zero, r);
+}
+
+// ---- complex helpers (complex<f32|f64> values) ----
+
+Value re(OpBuilder& b, Location loc, Value z) {
+    return mlir::complex::ReOp::create(b, loc, z).getResult();
+}
+Value im(OpBuilder& b, Location loc, Value z) {
+    return mlir::complex::ImOp::create(b, loc, z).getResult();
+}
+Value mkComplex(OpBuilder& b, Location loc, mlir::Type t, Value r, Value i) {
+    return mlir::complex::CreateOp::create(b, loc, t, r, i).getResult();
+}
+Value fisnan(OpBuilder& b, Location loc, Value x) {
+    return fcmp(b, loc, arith::CmpFPredicate::UNO, x, x);
+}
+Value andI(OpBuilder& b, Location loc, Value x, Value y) {
+    return arith::AndIOp::create(b, loc, x, y).getResult();
+}
+Value orI(OpBuilder& b, Location loc, Value x, Value y) {
+    return arith::OrIOp::create(b, loc, x, y).getResult();
+}
+Value notI(OpBuilder& b, Location loc, Value x) {
+    return arith::XOrIOp::create(b, loc, x, constLike(b, loc, x, 1.0)).getResult();
+}
+/// select on complex values, part by part.
+Value selC(OpBuilder& b, Location loc, Value c, Value x, Value y) {
+    return mkComplex(b, loc, x.getType(), sel(b, loc, c, re(b, loc, x), re(b, loc, y)),
+                     sel(b, loc, c, im(b, loc, x), im(b, loc, y)));
+}
+/// z with both parts scaled by s.
+Value scaleC(OpBuilder& b, Location loc, Value z, double s) {
+    Value r = re(b, loc, z), i = im(b, loc, z);
+    Value k = constLike(b, loc, r, s);
+    return mkComplex(b, loc, z.getType(), arith::MulFOp::create(b, loc, r, k).getResult(),
+                     arith::MulFOp::create(b, loc, i, k).getResult());
+}
+/// NumPy's complex orderings: CLT/CLE are lexicographic and false on NaN;
+/// CGE/CLE with NaN guards select for maximum/minimum.
+Value clt(OpBuilder& b, Location loc, Value x, Value y, bool orEqual) {
+    Value xr = re(b, loc, x), xi = im(b, loc, x), yr = re(b, loc, y), yi = im(b, loc, y);
+    return orI(b, loc, fcmp(b, loc, arith::CmpFPredicate::OLT, xr, yr),
+               andI(b, loc, fcmp(b, loc, arith::CmpFPredicate::OEQ, xr, yr),
+                    fcmp(b, loc, orEqual ? arith::CmpFPredicate::OLE : arith::CmpFPredicate::OLT,
+                         xi, yi)));
+}
+Value cAnyNan(OpBuilder& b, Location loc, Value z) {
+    return orI(b, loc, fisnan(b, loc, re(b, loc, z)), fisnan(b, loc, im(b, loc, z)));
+}
+/// x >= y (ge) or x <= y (!ge) as in NumPy's CGE/CLE.
+Value cge(OpBuilder& b, Location loc, Value x, Value y, bool ge) {
+    Value xr = re(b, loc, x), xi = im(b, loc, x), yr = re(b, loc, y), yi = im(b, loc, y);
+    Value strict = fcmp(b, loc, ge ? arith::CmpFPredicate::OGT : arith::CmpFPredicate::OLT, xr, yr);
+    Value noNan = notI(b, loc, orI(b, loc, fisnan(b, loc, xi), fisnan(b, loc, yi)));
+    Value eq = andI(b, loc, fcmp(b, loc, arith::CmpFPredicate::OEQ, xr, yr),
+                    fcmp(b, loc, ge ? arith::CmpFPredicate::OGE : arith::CmpFPredicate::OLE, xi, yi));
+    return orI(b, loc, andI(b, loc, strict, noNan), eq);
+}
+/// maximum/minimum (propagate NaN of x first) and fmax/fmin (ignore NaN of y).
+BinaryOpEntry::Fn cMinMax(bool max, bool fm) {
+    return [max, fm](OpBuilder& b, Location loc, Value x, Value y) {
+        Value nan = cAnyNan(b, loc, fm ? y : x);
+        return selC(b, loc, orI(b, loc, nan, cge(b, loc, x, y, max)), x, y);
+    };
+}
+/// Predicate on both parts of z combined with and/or.
+UnaryOpEntry::Fn cParts(UnaryOpEntry::Fn realPred, bool both) {
+    return [realPred, both](OpBuilder& b, Location loc, Value z) {
+        Value pr = realPred(b, loc, re(b, loc, z)), pi = realPred(b, loc, im(b, loc, z));
+        return both ? andI(b, loc, pr, pi) : orI(b, loc, pr, pi);
+    };
+}
+Value fIsInf(OpBuilder& b, Location loc, Value v) {
+    Value a = math::AbsFOp::create(b, loc, v).getResult();
+    Value inf = constLike(b, loc, v, std::numeric_limits<double>::infinity());
+    return fcmp(b, loc, arith::CmpFPredicate::OEQ, a, inf);
+}
+Value fIsFinite(OpBuilder& b, Location loc, Value v) {
+    Value a = math::AbsFOp::create(b, loc, v).getResult();
+    Value inf = constLike(b, loc, v, std::numeric_limits<double>::infinity());
+    return fcmp(b, loc, arith::CmpFPredicate::OLT, a, inf);
+}
+Value constI1(OpBuilder& b, Location loc, bool v) {
+    return arith::ConstantOp::create(b, loc, b.getBoolAttr(v)).getResult();
+}
+
+template <typename OpT>
+UnaryOpEntry::Fn complexUnary() {
+    return [](OpBuilder& b, Location loc, Value z) { return OpT::create(b, loc, z).getResult(); };
+}
+mlir::Type storageType(mlir::MLIRContext* ctx, DType dt) {
+    switch (dt) {
+    case DType::FLOAT32: return mlir::Float32Type::get(ctx);
+    case DType::FLOAT64: return mlir::Float64Type::get(ctx);
+    case DType::FLOAT16: return mlir::Float16Type::get(ctx);
+    case DType::BOOL:
+    case DType::INT8:
+    case DType::UINT8: return mlir::IntegerType::get(ctx, 8);
+    case DType::INT16:
+    case DType::UINT16: return mlir::IntegerType::get(ctx, 16);
+    case DType::INT32:
+    case DType::UINT32: return mlir::IntegerType::get(ctx, 32);
+    case DType::INT64:
+    case DType::UINT64: return mlir::IntegerType::get(ctx, 64);
+    case DType::COMPLEX64: return mlir::ComplexType::get(mlir::Float32Type::get(ctx));
+    case DType::COMPLEX128: return mlir::ComplexType::get(mlir::Float64Type::get(ctx));
+    default: return mlir::IntegerType::get(ctx, 1); // DT_PRED
+    }
+}
+
+/// Convert an element from dtype `from` to `to` with NumPy astype semantics
+/// (x -> bool is x != 0, complex -> real takes the real part, float -> int
+/// truncates). DT_PRED (i1) converts like bool.
+Value convertValue(OpBuilder& b, Location loc, Value v, DType from, DType to) {
+    if (from == to)
+        return v;
+    mlir::MLIRContext* ctx = b.getContext();
+    mlir::Type tt = storageType(ctx, to);
+    bool fromC = dtype_is_complex(from), toC = dtype_is_complex(to);
+    if (to == DType::BOOL || to == DT_PRED) {
+        Value p = fromC ? orI(b, loc, isNonzero(b, loc, re(b, loc, v)), isNonzero(b, loc, im(b, loc, v)))
+                        : isNonzero(b, loc, v);
+        return to == DT_PRED ? p : arith::ExtUIOp::create(b, loc, tt, p).getResult();
+    }
+    if (fromC && toC) {
+        DType fr = realOf(from), tr = realOf(to);
+        return mkComplex(b, loc, tt, convertValue(b, loc, re(b, loc, v), fr, tr),
+                         convertValue(b, loc, im(b, loc, v), fr, tr));
+    }
+    if (fromC)
+        return convertValue(b, loc, re(b, loc, v), realOf(from), to);
+    if (toC) {
+        DType tr = realOf(to);
+        Value r = convertValue(b, loc, v, from, tr);
+        return mkComplex(b, loc, tt, r, constLike(b, loc, r, 0.0));
+    }
+    bool fromF = dtype_is_float(from), toF = dtype_is_float(to);
+    bool fromU = dtype_is_unsigned(from) || from == DType::BOOL || from == DT_PRED;
+    unsigned fw = v.getType().getIntOrFloatBitWidth(), tw = tt.getIntOrFloatBitWidth();
+    if (fromF && toF) {
+        if (fw < tw)
+            return arith::ExtFOp::create(b, loc, tt, v).getResult();
+        if (fw > tw)
+            return arith::TruncFOp::create(b, loc, tt, v).getResult();
+        return v;
+    }
+    if (!fromF && !toF) {
+        if (fw < tw)
+            return fromU ? arith::ExtUIOp::create(b, loc, tt, v).getResult()
+                         : arith::ExtSIOp::create(b, loc, tt, v).getResult();
+        if (fw > tw)
+            return arith::TruncIOp::create(b, loc, tt, v).getResult();
+        return v;
+    }
+    if (toF)
+        return fromU ? arith::UIToFPOp::create(b, loc, tt, v).getResult()
+                     : arith::SIToFPOp::create(b, loc, tt, v).getResult();
+    // float -> int: through int64 (wraps like a C cast on x86); uint64 values
+    // >= 2^63 need fptoui
+    Value i64 = arith::FPToSIOp::create(b, loc, b.getI64Type(), v).getResult();
+    if (to == DType::UINT64) {
+        Value big = fcmp(b, loc, arith::CmpFPredicate::OGE, v, constLike(b, loc, v, 9223372036854775808.0));
+        i64 = sel(b, loc, big, arith::FPToUIOp::create(b, loc, b.getI64Type(), v).getResult(), i64);
+    }
+    return tw < 64 ? arith::TruncIOp::create(b, loc, tt, i64).getResult() : i64;
+}
 } // namespace
 
 const std::unordered_map<int, BinaryOpEntry>& MLIRJitCompiler::binaryOpRegistry() {
+    namespace cx = mlir::complex;
+    using P = arith::CmpIPredicate;
     static const std::unordered_map<int, BinaryOpEntry> registry = {
+        // {float, int, uint, complex, bool}; missing uint/bool bodies use int
         {(int)Opcode::ADD,
-         {[](mlir::OpBuilder& b, mlir::Location loc, mlir::Value lhs, mlir::Value rhs) {
-              return mlir::arith::AddFOp::create(b, loc, lhs, rhs).getResult();
-          },
-          [](mlir::OpBuilder& b, mlir::Location loc, mlir::Value lhs, mlir::Value rhs) {
-              return mlir::arith::AddIOp::create(b, loc, lhs, rhs).getResult();
-          }}},
+         {arithBinary<arith::AddFOp>(), arithBinary<arith::AddIOp>(), nullptr,
+          arithBinary<cx::AddOp>()}},
         {(int)Opcode::SUB,
-         {[](mlir::OpBuilder& b, mlir::Location loc, mlir::Value lhs, mlir::Value rhs) {
-              return mlir::arith::SubFOp::create(b, loc, lhs, rhs).getResult();
-          },
-          [](mlir::OpBuilder& b, mlir::Location loc, mlir::Value lhs, mlir::Value rhs) {
-              return mlir::arith::SubIOp::create(b, loc, lhs, rhs).getResult();
-          }}},
+         {arithBinary<arith::SubFOp>(), arithBinary<arith::SubIOp>(), nullptr,
+          arithBinary<cx::SubOp>()}},
         {(int)Opcode::MUL,
-         {[](mlir::OpBuilder& b, mlir::Location loc, mlir::Value lhs, mlir::Value rhs) {
-              return mlir::arith::MulFOp::create(b, loc, lhs, rhs).getResult();
-          },
-          [](mlir::OpBuilder& b, mlir::Location loc, mlir::Value lhs, mlir::Value rhs) {
-              return mlir::arith::MulIOp::create(b, loc, lhs, rhs).getResult();
-          }}},
+         {arithBinary<arith::MulFOp>(), arithBinary<arith::MulIOp>(), nullptr,
+          arithBinary<cx::MulOp>()}},
         {(int)Opcode::DIV,
-         {[](mlir::OpBuilder& b, mlir::Location loc, mlir::Value lhs, mlir::Value rhs) {
-              return mlir::arith::DivFOp::create(b, loc, lhs, rhs).getResult();
-          },
-          [](mlir::OpBuilder& b, mlir::Location loc, mlir::Value lhs, mlir::Value rhs) {
-              return mlir::arith::DivSIOp::create(b, loc, lhs, rhs).getResult();
-          }}},
+         {arithBinary<arith::DivFOp>(), arithBinary<arith::DivSIOp>(),
+          arithBinary<arith::DivUIOp>(), arithBinary<cx::DivOp>()}},
         {(int)Opcode::POW,
-         {arithBinary<math::PowFOp>(), [](OpBuilder& b, Location loc, Value x, Value e) {
-              return intPow(b, loc, x, e);
-          }}},
-        {(int)Opcode::MAXIMUM, {arithBinary<arith::MaximumFOp>(), arithBinary<arith::MaxSIOp>()}},
-        {(int)Opcode::MINIMUM, {arithBinary<arith::MinimumFOp>(), arithBinary<arith::MinSIOp>()}},
-        {(int)Opcode::FMAX, {arithBinary<arith::MaxNumFOp>(), arithBinary<arith::MaxSIOp>()}},
-        {(int)Opcode::FMIN, {arithBinary<arith::MinNumFOp>(), arithBinary<arith::MinSIOp>()}},
+         {arithBinary<math::PowFOp>(),
+          [](OpBuilder& b, Location loc, Value x, Value e) { return intPow(b, loc, x, e); },
+          [](OpBuilder& b, Location loc, Value x, Value e) { return intPow(b, loc, x, e, true); },
+          arithBinary<cx::PowOp>()}},
+        {(int)Opcode::MAXIMUM,
+         {arithBinary<arith::MaximumFOp>(), arithBinary<arith::MaxSIOp>(),
+          arithBinary<arith::MaxUIOp>(), cMinMax(true, false)}},
+        {(int)Opcode::MINIMUM,
+         {arithBinary<arith::MinimumFOp>(), arithBinary<arith::MinSIOp>(),
+          arithBinary<arith::MinUIOp>(), cMinMax(false, false)}},
+        {(int)Opcode::FMAX,
+         {arithBinary<arith::MaxNumFOp>(), arithBinary<arith::MaxSIOp>(),
+          arithBinary<arith::MaxUIOp>(), cMinMax(true, true)}},
+        {(int)Opcode::FMIN,
+         {arithBinary<arith::MinNumFOp>(), arithBinary<arith::MinSIOp>(),
+          arithBinary<arith::MinUIOp>(), cMinMax(false, true)}},
         {(int)Opcode::MOD,
          {floatMod,
-          [](OpBuilder& b, Location loc, Value x, Value y) { return intDivMod(b, loc, x, y, true); }}},
+          [](OpBuilder& b, Location loc, Value x, Value y) { return intDivMod(b, loc, x, y, true); },
+          [](OpBuilder& b, Location loc, Value x, Value y) { return uintDivMod(b, loc, x, y, true); }}},
         {(int)Opcode::FLOOR_DIV,
-         {floatFloorDiv, [](OpBuilder& b, Location loc, Value x, Value y) {
-              return intDivMod(b, loc, x, y, false);
+         {floatFloorDiv,
+          [](OpBuilder& b, Location loc, Value x, Value y) { return intDivMod(b, loc, x, y, false); },
+          [](OpBuilder& b, Location loc, Value x, Value y) {
+              return uintDivMod(b, loc, x, y, false);
           }}},
-        // Comparisons: ordered for <, <=, == (NaN -> 0), unordered for != (NaN -> 1)
+        // Comparisons (i1): ordered for <, <=, == (NaN -> false), unordered for !=;
+        // complex < and <= are lexicographic
         {(int)Opcode::LESS,
-         {fcmpMask(arith::CmpFPredicate::OLT), icmpMask(arith::CmpIPredicate::slt)}},
+         {fcmpPred(arith::CmpFPredicate::OLT), icmpPred(P::slt), icmpPred(P::ult),
+          [](OpBuilder& b, Location loc, Value x, Value y) { return clt(b, loc, x, y, false); }}},
         {(int)Opcode::LESS_EQUAL,
-         {fcmpMask(arith::CmpFPredicate::OLE), icmpMask(arith::CmpIPredicate::sle)}},
+         {fcmpPred(arith::CmpFPredicate::OLE), icmpPred(P::sle), icmpPred(P::ule),
+          [](OpBuilder& b, Location loc, Value x, Value y) { return clt(b, loc, x, y, true); }}},
         {(int)Opcode::EQUAL,
-         {fcmpMask(arith::CmpFPredicate::OEQ), icmpMask(arith::CmpIPredicate::eq)}},
+         {fcmpPred(arith::CmpFPredicate::OEQ), icmpPred(P::eq), nullptr,
+          arithBinary<cx::EqualOp>()}},
         {(int)Opcode::NOT_EQUAL,
-         {fcmpMask(arith::CmpFPredicate::UNE), icmpMask(arith::CmpIPredicate::ne)}},
+         {fcmpPred(arith::CmpFPredicate::UNE), icmpPred(P::ne), nullptr,
+          arithBinary<cx::NotEqualOp>()}},
+        // Bitwise ops: integers and bool only
+        {(int)Opcode::BITWISE_AND, {nullptr, arithBinary<arith::AndIOp>()}},
+        {(int)Opcode::BITWISE_OR, {nullptr, arithBinary<arith::OrIOp>()}},
+        {(int)Opcode::BITWISE_XOR, {nullptr, arithBinary<arith::XOrIOp>()}},
+        {(int)Opcode::LEFT_SHIFT,
+         {nullptr,
+          [](OpBuilder& b, Location loc, Value x, Value y) { return intShift(b, loc, x, y, true, true); },
+          [](OpBuilder& b, Location loc, Value x, Value y) { return intShift(b, loc, x, y, true, false); }}},
+        {(int)Opcode::RIGHT_SHIFT,
+         {nullptr,
+          [](OpBuilder& b, Location loc, Value x, Value y) { return intShift(b, loc, x, y, false, true); },
+          [](OpBuilder& b, Location loc, Value x, Value y) { return intShift(b, loc, x, y, false, false); }}},
     };
     return registry;
 }
 
 const std::unordered_map<int, UnaryOpEntry>& MLIRJitCompiler::unaryOpRegistry() {
+    namespace cx = mlir::complex;
     static const std::unordered_map<int, UnaryOpEntry> registry = {
-        {(int)Opcode::TANH,
-         {[](mlir::OpBuilder& b, mlir::Location loc, mlir::Value v) {
-              return mlir::math::TanhOp::create(b, loc, v).getResult();
-          },
-          nullptr}},
-        {(int)Opcode::EXP,
-         {[](mlir::OpBuilder& b, mlir::Location loc, mlir::Value v) {
-              return mlir::math::ExpOp::create(b, loc, v).getResult();
-          },
-          nullptr}},
-        // Float-only math (the frontend rejects integer inputs: NumPy would
-        // return float64, and there is no in-kernel dtype conversion).
-        {(int)Opcode::SQRT, {mathUnary<math::SqrtOp>(), nullptr}},
-        {(int)Opcode::LOG, {mathUnary<math::LogOp>(), nullptr}},
-        {(int)Opcode::LOG2, {mathUnary<math::Log2Op>(), nullptr}},
-        {(int)Opcode::LOG10, {mathUnary<math::Log10Op>(), nullptr}},
-        {(int)Opcode::LOG1P, {log1pAccurate, nullptr}},
-        {(int)Opcode::EXP2, {mathUnary<math::Exp2Op>(), nullptr}},
-        {(int)Opcode::EXPM1, {expm1Accurate, nullptr}},
-        {(int)Opcode::SIN, {mathUnary<math::SinOp>(), nullptr}},
-        {(int)Opcode::COS, {mathUnary<math::CosOp>(), nullptr}},
-        // Integer inputs keep their dtype (rounding is the identity on ints)
-        {(int)Opcode::ABS, {mathUnary<math::AbsFOp>(), mathUnary<math::AbsIOp>()}},
+        // {float, int, uint, complex, bool}. Float-only math has no int body:
+        // the frontend gives integer inputs a float result dtype (as NumPy).
+        {(int)Opcode::TANH, {mathUnary<math::TanhOp>(), nullptr, nullptr, complexUnary<cx::TanhOp>()}},
+        {(int)Opcode::EXP, {mathUnary<math::ExpOp>(), nullptr, nullptr, complexUnary<cx::ExpOp>()}},
+        {(int)Opcode::SQRT, {mathUnary<math::SqrtOp>(), nullptr, nullptr, complexUnary<cx::SqrtOp>()}},
+        {(int)Opcode::LOG, {mathUnary<math::LogOp>(), nullptr, nullptr, complexUnary<cx::LogOp>()}},
+        {(int)Opcode::LOG2,
+         {mathUnary<math::Log2Op>(), nullptr, nullptr,
+          [](OpBuilder& b, Location loc, Value z) {
+              return scaleC(b, loc, cx::LogOp::create(b, loc, z).getResult(), 1.0 / M_LN2);
+          }}},
+        {(int)Opcode::LOG10,
+         {mathUnary<math::Log10Op>(), nullptr, nullptr,
+          [](OpBuilder& b, Location loc, Value z) {
+              return scaleC(b, loc, cx::LogOp::create(b, loc, z).getResult(), 1.0 / M_LN10);
+          }}},
+        {(int)Opcode::LOG1P, {log1pAccurate, nullptr, nullptr, complexUnary<cx::Log1pOp>()}},
+        {(int)Opcode::EXP2,
+         {mathUnary<math::Exp2Op>(), nullptr, nullptr,
+          [](OpBuilder& b, Location loc, Value z) {
+              return cx::ExpOp::create(b, loc, scaleC(b, loc, z, M_LN2)).getResult();
+          }}},
+        {(int)Opcode::EXPM1, {expm1Accurate, nullptr, nullptr, complexUnary<cx::Expm1Op>()}},
+        {(int)Opcode::SIN, {mathUnary<math::SinOp>(), nullptr, nullptr, complexUnary<cx::SinOp>()}},
+        {(int)Opcode::COS, {mathUnary<math::CosOp>(), nullptr, nullptr, complexUnary<cx::CosOp>()}},
+        // Integer inputs keep their dtype (rounding is the identity on ints);
+        // complex abs is real (the result converts to the node dtype)
+        {(int)Opcode::ABS,
+         {mathUnary<math::AbsFOp>(), mathUnary<math::AbsIOp>(), identityUnary,
+          [](OpBuilder& b, Location loc, Value z) {
+              // hypot semantics: an infinite part gives inf even if the other is NaN
+              Value a = cx::AbsOp::create(b, loc, z).getResult();
+              Value inf = orI(b, loc, fIsInf(b, loc, re(b, loc, z)), fIsInf(b, loc, im(b, loc, z)));
+              return sel(b, loc, inf, constLike(b, loc, a, std::numeric_limits<double>::infinity()),
+                         a);
+          }}},
         {(int)Opcode::FLOOR, {mathUnary<math::FloorOp>(), identityUnary}},
         {(int)Opcode::CEIL, {mathUnary<math::CeilOp>(), identityUnary}},
-        {(int)Opcode::RINT, {mathUnary<math::RoundEvenOp>(), identityUnary}},
+        {(int)Opcode::RINT,
+         {mathUnary<math::RoundEvenOp>(), identityUnary, nullptr,
+          [](OpBuilder& b, Location loc, Value z) {
+              return mkComplex(b, loc, z.getType(),
+                               math::RoundEvenOp::create(b, loc, re(b, loc, z)).getResult(),
+                               math::RoundEvenOp::create(b, loc, im(b, loc, z)).getResult());
+          }}},
         {(int)Opcode::SIGN,
          {[](OpBuilder& b, Location loc, Value v) {
               // sign(+-0) = +-0 and sign(NaN) = NaN, as in NumPy
@@ -962,40 +1585,54 @@ const std::unordered_map<int, UnaryOpEntry>& MLIRJitCompiler::unaryOpRegistry() 
               Value neg = icmp(b, loc, arith::CmpIPredicate::slt, v, zero);
               return sel(b, loc, pos, constLike(b, loc, v, 1.0),
                          sel(b, loc, neg, constLike(b, loc, v, -1.0), zero));
-          }}},
-        // Predicates: 0/1 masks in the input type
+          },
+          [](OpBuilder& b, Location loc, Value v) {
+              Value zero = constLike(b, loc, v, 0.0);
+              return sel(b, loc, icmp(b, loc, arith::CmpIPredicate::ne, v, zero),
+                         constLike(b, loc, v, 1.0), zero);
+          },
+          complexUnary<cx::SignOp>()}},
+        // Predicates (i1)
         {(int)Opcode::ISNAN,
-         {[](OpBuilder& b, Location loc, Value v) {
-              return toMask(b, loc, fcmp(b, loc, arith::CmpFPredicate::UNO, v, v), v.getType());
-          },
-          [](OpBuilder& b, Location loc, Value v) { return constLike(b, loc, v, 0.0); }}},
+         {fisnan, [](OpBuilder& b, Location loc, Value) { return constI1(b, loc, false); },
+          nullptr, cParts(fisnan, false)}},
         {(int)Opcode::ISINF,
-         {[](OpBuilder& b, Location loc, Value v) {
-              Value a = math::AbsFOp::create(b, loc, v).getResult();
-              Value inf = constLike(b, loc, v, std::numeric_limits<double>::infinity());
-              return toMask(b, loc, fcmp(b, loc, arith::CmpFPredicate::OEQ, a, inf), v.getType());
-          },
-          [](OpBuilder& b, Location loc, Value v) { return constLike(b, loc, v, 0.0); }}},
+         {fIsInf, [](OpBuilder& b, Location loc, Value) { return constI1(b, loc, false); },
+          nullptr, cParts(fIsInf, false)}},
         {(int)Opcode::ISFINITE,
-         {[](OpBuilder& b, Location loc, Value v) {
-              Value a = math::AbsFOp::create(b, loc, v).getResult();
-              Value inf = constLike(b, loc, v, std::numeric_limits<double>::infinity());
-              return toMask(b, loc, fcmp(b, loc, arith::CmpFPredicate::OLT, a, inf), v.getType());
+         {fIsFinite, [](OpBuilder& b, Location loc, Value) { return constI1(b, loc, true); },
+          nullptr, cParts(fIsFinite, true)}},
+        // astype (the conversion happens around the body), real/imag/conj
+        {(int)Opcode::CONVERT, {identityUnary, identityUnary, nullptr, identityUnary}},
+        {(int)Opcode::REAL, {identityUnary, identityUnary, nullptr, complexUnary<cx::ReOp>()}},
+        {(int)Opcode::IMAG,
+         {[](OpBuilder& b, Location loc, Value v) { return constLike(b, loc, v, 0.0); },
+          [](OpBuilder& b, Location loc, Value v) { return constLike(b, loc, v, 0.0); }, nullptr,
+          complexUnary<cx::ImOp>()}},
+        {(int)Opcode::CONJ, {identityUnary, identityUnary, nullptr, complexUnary<cx::ConjOp>()}},
+        // ~x: bitwise not; logical not on bool
+        {(int)Opcode::INVERT,
+         {nullptr,
+          [](OpBuilder& b, Location loc, Value v) {
+              return arith::XOrIOp::create(b, loc, v, constLike(b, loc, v, -1.0)).getResult();
           },
-          [](OpBuilder& b, Location loc, Value v) { return constLike(b, loc, v, 1.0); }}},
+          nullptr, nullptr,
+          [](OpBuilder& b, Location loc, Value v) {
+              return arith::XOrIOp::create(b, loc, v, constLike(b, loc, v, 1.0)).getResult();
+          }}},
     };
     return registry;
 }
 
 const std::unordered_map<int, TernaryOpEntry>& MLIRJitCompiler::ternaryOpRegistry() {
     static const std::unordered_map<int, TernaryOpEntry> registry = {
-        // where(cond, x, y): any nonzero cond (including NaN) selects x
+        // where(cond, x, y): cond arrives as i1 (nonzero, NaN included, is true)
         {(int)Opcode::WHERE,
-         {[](OpBuilder& b, Location loc, Value c, Value x, Value y) {
-              return sel(b, loc, isNonzero(b, loc, c), x, y);
-          },
+         {[](OpBuilder& b, Location loc, Value c, Value x, Value y) { return sel(b, loc, c, x, y); },
+          [](OpBuilder& b, Location loc, Value c, Value x, Value y) { return sel(b, loc, c, x, y); },
+          nullptr,
           [](OpBuilder& b, Location loc, Value c, Value x, Value y) {
-              return sel(b, loc, isNonzero(b, loc, c), x, y);
+              return selC(b, loc, c, x, y);
           }}},
         // clip(x, lo, hi) = minimum(maximum(x, lo), hi), NaN-propagating like NumPy
         {(int)Opcode::CLIP,
@@ -1006,6 +1643,10 @@ const std::unordered_map<int, TernaryOpEntry>& MLIRJitCompiler::ternaryOpRegistr
           [](OpBuilder& b, Location loc, Value x, Value lo, Value hi) {
               Value m = arith::MaxSIOp::create(b, loc, x, lo).getResult();
               return arith::MinSIOp::create(b, loc, m, hi).getResult();
+          },
+          [](OpBuilder& b, Location loc, Value x, Value lo, Value hi) {
+              Value m = arith::MaxUIOp::create(b, loc, x, lo).getResult();
+              return arith::MinUIOp::create(b, loc, m, hi).getResult();
           }}},
     };
     return registry;
@@ -1221,7 +1862,20 @@ std::unordered_map<std::string, std::pair<void*, void*>>& kernelCache() {
 }
 } // namespace
 
+static void* jit_compile_ast_impl(void* ast, void** moduleHandleOut);
+
 void* jit_compile_ast(void* ast, void** moduleHandleOut) {
+    static const bool timeIt = getenv("CNUM_JIT_TIME") != nullptr;
+    JitTimer timer;
+    jitTimer = timeIt ? &timer : nullptr;
+    void* fn = jit_compile_ast_impl(ast, moduleHandleOut);
+    if (timeIt && !timer.line.empty())
+        llvm::errs() << "jit:" << timer.line << "\n";
+    jitTimer = nullptr;
+    return fn;
+}
+
+static void* jit_compile_ast_impl(void* ast, void** moduleHandleOut) {
     MLIRJitCompiler node_jit;
     node_jit.buildFromAST(ast);
     // Kernels take every array as a dynamic memref, so equal IR means an equal kernel.
@@ -1235,9 +1889,11 @@ void* jit_compile_ast(void* ast, void** moduleHandleOut) {
         *moduleHandleOut = hit->second.first;
         return hit->second.second;
     }
+    jitMark("build");
     if (!node_jit.verify())
         return nullptr;
     node_jit.optimizeAndFuse();
+    jitMark("opt");
     void* moduleHandle = nullptr;
     void* funcPtr = nullptr;
 
@@ -1267,6 +1923,7 @@ void* jit_compile_ast(void* ast, void** moduleHandleOut) {
         return nullptr;
 #endif
 
+    jitMark("load");
     kernelCache().emplace(std::move(key), std::make_pair(moduleHandle, funcPtr));
     *moduleHandleOut = moduleHandle;
     return funcPtr;

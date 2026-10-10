@@ -3,6 +3,8 @@
 #include "backend.hpp"
 #include "dispatch.hpp"
 
+#include <algorithm>
+
 #ifdef USE_KOKKOS
 #include <KokkosBlas1_axpby.hpp>
 #include <KokkosBlas3_gemm.hpp>
@@ -126,7 +128,10 @@ template <typename T>
 inline T eigen_dot(T* a_data, T* b_data, int n) {
     Eigen::Map<Eigen::Matrix<T, Eigen::Dynamic, 1>> a(a_data, n);
     Eigen::Map<Eigen::Matrix<T, Eigen::Dynamic, 1>> b(b_data, n);
-    return a.dot(b);
+    if constexpr (cn_is_complex_v<T>)
+        return a.conjugate().dot(b); // Eigen's dot conjugates a; NumPy's does not
+    else
+        return a.dot(b);
 }
 
 /// Eigen-based sub-matrix gemm: C += A_sub * B_sub (accumulate).
@@ -196,13 +201,9 @@ inline int array_tile(const std::unordered_map<int, ArrayDAGGroup::ArrayMetadata
     return ct_min_tile(ndims);
 }
 
-/// Name of the array whose coordinate system/decomposition the output region
-/// r_out of extract_regions_nd() refers to.  extract_regions_nd() takes r_out
-/// from the last SET_REGION root (in its target's coordinates) when there is
-/// one, so its target must also provide the output decomposition; otherwise
-/// the first non-temp output root does.  Using a fresh output's decomposition
-/// for a SET_REGION region (e.g. a kernel writing CALL[2:4] that also exports
-/// an intermediate) mis-sized the outputs and crashed / dropped them.
+/// Array whose decomposition defines r_out of extract_regions_nd(): the last
+/// SET_REGION root's target if any, else the first non-temp output root.
+/// Do not substitute a fresh output's decomposition for a SET_REGION region.
 inline int fused_output_decomp_name(DAGNode* node) {
     auto output_name = [](ASTNode* root) {
         if (static_cast<Opcode>(root->opcode) == Opcode::SET_REGION && !root->operands.empty() &&
@@ -223,14 +224,46 @@ inline int fused_output_decomp_name(DAGNode* node) {
 
 /// Walk the AST to extract input and output regions for communication.
 /// Returns true if region operations were found.
+/// `meta` resolves the global shape on chares that hold none of the node's arrays.
 template <int N>
 bool extract_regions_nd(DAGNode* node, std::unordered_map<int, CTArrayBase<N>*>& arrays,
                         ArrayRegion<N>& r_out, std::vector<ArrayRegion<N>>& input_regions,
-                        std::vector<int>& input_source_names, std::array<int, N>& global_shape_out);
+                        std::vector<int>& input_source_names, std::array<int, N>& global_shape_out,
+                        const std::unordered_map<int, ArrayDAGGroup::ArrayMetadata>* meta = nullptr);
 
 /// Determine the DType for a DAG node from its AST or the arrays map.
 template <int N>
 DType determine_dtype(DAGNode* node, std::unordered_map<int, CTArrayBase<N>*>& arrays);
+
+/// Scratch buffer for point-to-point messages: device memory under USE_KOKKOS, host otherwise.
+inline char* alloc_buffer(int64_t bytes) {
+    bytes = std::max<int64_t>(bytes, 1);
+#ifdef USE_KOKKOS
+    return static_cast<char*>(Kokkos::kokkos_malloc<DeviceSpace>(bytes));
+#else
+    return new char[bytes];
+#endif
+}
+
+inline void free_buffer(char* buf) {
+#ifdef USE_KOKKOS
+    Kokkos::kokkos_free<DeviceSpace>(buf);
+#else
+    delete[] buf;
+#endif
+}
+
+/// Wait for every kernel this chare queued on its compute stream.
+template <int N>
+void compute_fence(PartitionImpl<N>* partition) {
+#if defined(USE_NVIDIA)
+    partition->compute_exec.fence();
+#elif defined(USE_KOKKOS)
+    Kokkos::fence();
+#else
+    (void)partition;
+#endif
+}
 
 /// TRANSPOSE receive side (executor_transpose.cpp, N = 2, 3).
 template <int N, typename T>
@@ -309,45 +342,28 @@ inline void cross_matmul_send_result_2d_to_1d(PartitionImpl<2>* partition, DAGNo
 
 
 /// ---------------------------------------------------------------------------
-/// Custom Charm++ reduction for dot product (carries metadata + value)
+/// Partial dot product sent to chare 0 (carries metadata + value)
 /// ---------------------------------------------------------------------------
 
 /// Data contributed by each chare for a REDUCE (dot product) operation.
-/// Layout: [node_id, result_name, dtype, pad, value[8]] = 24 bytes.
+/// Layout: [node_id, result_name, dtype, pad, value[16]] = 32 bytes.
 struct ReduceContrib {
     int node_id;
     int result_name;
     int dtype_int;
     int pad;
-    char value[8]; // large enough for float, double, int32_t, int64_t
+    char value[16]; // one element of any BLAS dtype (complex128 included)
 };
-static_assert(sizeof(ReduceContrib) == 24, "ReduceContrib must be 24 bytes");
-
-/// Custom reducer: sums the value field based on dtype, preserving metadata.
-CkReductionMsg* reduce_dot_sum(int nMsg, CkReductionMsg** msgs);
-
-/// Global reducer type handle — registered once during init.
-extern CkReduction::reducerType reduce_dot_sum_type;
-
-/// Call once to register the custom reducer.
-void register_reduce_dot_sum();
+static_assert(sizeof(ReduceContrib) == 32, "ReduceContrib must be 32 bytes");
 
 /// ---------------------------------------------------------------------------
 /// Cross-partition SET_REGION send helpers
 /// ---------------------------------------------------------------------------
 
-/// Lattice mapping of a cross-ndims SET_REGION  target[tgt_region] = source[src_view].
-///
-/// Non-singleton dims of the source view and of the target region are paired
-/// in order: the k-th lattice point of source dim src_dim[td] lands on the
-/// k-th lattice point of target dim td.  Other dims are fixed (the singleton
-/// coordinate of the view / of the target region).  All coordinates are
-/// decomp-global (array-local + decomp offset).
-///
-/// Both the sending (source) and receiving (target) chares derive everything
-/// from this one map, so target offsets (e.g. Hin[t, :, ws:] = prev2d), source
-/// views (H[t, :, a:b]) and offset decompositions stay consistent with the
-/// receiver's expected message count.
+/// Lattice mapping of a cross-ndims SET_REGION target[tgt_region] = source[src_view].
+/// Non-singleton dims are paired in order (k-th lattice point to k-th); other dims
+/// are fixed. Coordinates are decomp-global. Sender and receiver both derive from
+/// this map, so their message counts agree.
 template <int N_src, int N_tgt>
 struct CrossSetRegionMap {
     int src_dim[N_tgt];
@@ -493,6 +509,7 @@ inline void cross_set_region_send(PartitionImpl<N_src>* partition, DAGNode* node
     auto& src_decomp = src->decomp;
     auto src_chare_global = src_decomp.chare_region_global(src_nd);
 
+    // Compute source local region in global coordinates
     std::array<int, N_src> src_cs;
     for (int d = 0; d < N_src; ++d)
         src_cs[d] = src_chare_global.start[d];
@@ -533,7 +550,6 @@ inline void cross_set_region_send(PartitionImpl<N_src>* partition, DAGNode* node
         T* send_buf = new T[total_size];
         T* src_data = static_cast<T*>(src->data_ptr());
 
-        // Pack data: iterate over the target fragment lattice, map back to source coords
         int idx[N_tgt];
         for (int d = 0; d < N_tgt; ++d)
             idx[d] = cr.start[d];
@@ -560,7 +576,6 @@ inline void cross_set_region_send(PartitionImpl<N_src>* partition, DAGNode* node
         T* send_buf = static_cast<T*>(Kokkos::kokkos_malloc<DeviceSpace>(byte_size));
         T* src_device = static_cast<T*>(src->device_data_ptr());
 
-        // Capture plain arrays for the device lambda
         int dm[N_tgt], cr_start[N_tgt], cr_sizes[N_tgt], cr_step[N_tgt], t_s[N_tgt], t_st[N_tgt];
         int sc[N_src], ss[N_src], v_s[N_src], v_st[N_src];
         for (int d = 0; d < N_tgt; ++d) {
@@ -611,22 +626,9 @@ inline void dispatch_cross_set_region_send(DType dt, PartitionImpl<N_src>* parti
                                            const CrossSetRegionMap<N_src, N_tgt>& xmap,
                                            typename PartitionTraits<N_tgt>::ProxyType& target_proxy,
                                            const ArrayDecomp<N_tgt>& tgt_decomp) {
-    switch (dt) {
-    case DType::FLOAT32:
-        cross_set_region_send<N_src, N_tgt, float>(partition, node, source_name, xmap,
+    cn_dispatch(dt, [&](auto tag) {
+        using T = decltype(tag);
+        cross_set_region_send<N_src, N_tgt, T>(partition, node, source_name, xmap,
                                                     target_proxy, tgt_decomp);
-        break;
-    case DType::FLOAT64:
-        cross_set_region_send<N_src, N_tgt, double>(partition, node, source_name, xmap,
-                                                     target_proxy, tgt_decomp);
-        break;
-    case DType::INT32:
-        cross_set_region_send<N_src, N_tgt, int32_t>(partition, node, source_name, xmap,
-                                                      target_proxy, tgt_decomp);
-        break;
-    case DType::INT64:
-        cross_set_region_send<N_src, N_tgt, int64_t>(partition, node, source_name, xmap,
-                                                      target_proxy, tgt_decomp);
-        break;
-    }
+    });
 }

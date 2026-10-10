@@ -93,36 +93,14 @@ static void dispatch_cross_matmatmul_send_panel_2d(
         return partition->arrays[arr_name]->data_ptr();
 #endif
     };
-    switch (dt) {
-    case DType::FLOAT32:
-        cross_matmatmul_send_panel_2d<float>(
+    cn_dispatch_blas(dt, [&](auto tag) {
+        using T = decltype(tag);
+        cross_matmatmul_send_panel_2d<T>(
             partition, node, arr_name, input_index, target_ci,
-            static_cast<float*>(arr_ptr((float*)nullptr)),
+            static_cast<T*>(arr_ptr((T*)nullptr)),
             local_cols, row_offset, col_offset, sub_rows, sub_cols,
             k_start, k_end, c_pos, proxy_2d);
-        break;
-    case DType::FLOAT64:
-        cross_matmatmul_send_panel_2d<double>(
-            partition, node, arr_name, input_index, target_ci,
-            static_cast<double*>(arr_ptr((double*)nullptr)),
-            local_cols, row_offset, col_offset, sub_rows, sub_cols,
-            k_start, k_end, c_pos, proxy_2d);
-        break;
-    case DType::INT32:
-        cross_matmatmul_send_panel_2d<int32_t>(
-            partition, node, arr_name, input_index, target_ci,
-            static_cast<int32_t*>(arr_ptr((int32_t*)nullptr)),
-            local_cols, row_offset, col_offset, sub_rows, sub_cols,
-            k_start, k_end, c_pos, proxy_2d);
-        break;
-    case DType::INT64:
-        cross_matmatmul_send_panel_2d<int64_t>(
-            partition, node, arr_name, input_index, target_ci,
-            static_cast<int64_t*>(arr_ptr((int64_t*)nullptr)),
-            local_cols, row_offset, col_offset, sub_rows, sub_cols,
-            k_start, k_end, c_pos, proxy_2d);
-        break;
-    }
+    });
 }
 
 template <int N>
@@ -141,11 +119,8 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
     auto* dag_group = static_cast<ArrayDAGGroup*>(group);
 
     if constexpr (N == 2) {
-        // A, B and C may use different tiles (A or B can even be a dim-dropped
-        // 3-D array with a 3-D tile), so every chare-index computation must use
-        // the tile of the array whose chares it enumerates.  Using A's tile for
-        // B and C made the receiver expect the wrong number of panels (hang
-        // for A3d[0, :, :] @ B).  a_tile/b_tile are set once metadata is known.
+        // A, B and C may use different tiles: each chare-index computation must use
+        // the tile of the array whose chares it enumerates.
         int c_tile = array_tile(dag_group->array_meta, result_name, 2);
         int a_tile = c_tile, b_tile = c_tile;
 
@@ -492,12 +467,7 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
                             }
                         }
                     };
-                    switch (dt) {
-                    case DType::FLOAT32: { float* d = nullptr; compute_pre(d); break; }
-                    case DType::FLOAT64: { double* d = nullptr; compute_pre(d); break; }
-                    case DType::INT32: { int32_t* d = nullptr; compute_pre(d); break; }
-                    case DType::INT64: { int64_t* d = nullptr; compute_pre(d); break; }
-                    }
+                    cn_dispatch_blas(dt, [&](auto tag) { decltype(tag)* d = nullptr; compute_pre(d); });
                 }
             }
         }
@@ -691,12 +661,7 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
                     delete[] send_buf;
 #endif
                 };
-                switch (dt) {
-                case DType::FLOAT32: { float* d = nullptr; send_3d_panel(d); break; }
-                case DType::FLOAT64: { double* d = nullptr; send_3d_panel(d); break; }
-                case DType::INT32: { int32_t* d = nullptr; send_3d_panel(d); break; }
-                case DType::INT64: { int64_t* d = nullptr; send_3d_panel(d); break; }
-                }
+                cn_dispatch_blas(dt, [&](auto tag) { decltype(tag)* d = nullptr; send_3d_panel(d); });
             } else {
                 // This 3D chare holds B. Send B panels to C chares.
                 int k_start = row_lo - rd_s;
@@ -806,12 +771,7 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
                     delete[] send_buf;
 #endif
                 };
-                switch (dt) {
-                case DType::FLOAT32: { float* d = nullptr; send_3d_panel(d); break; }
-                case DType::FLOAT64: { double* d = nullptr; send_3d_panel(d); break; }
-                case DType::INT32: { int32_t* d = nullptr; send_3d_panel(d); break; }
-                case DType::INT64: { int64_t* d = nullptr; send_3d_panel(d); break; }
-                }
+                cn_dispatch_blas(dt, [&](auto tag) { decltype(tag)* d = nullptr; send_3d_panel(d); });
             }
         }
 

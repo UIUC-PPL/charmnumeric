@@ -52,11 +52,81 @@ static void collect_leaves_and_outputs(DAGNode* node, std::vector<ASTNode*>& mem
     }
 }
 
+/// Byte-sized stand-in element types for pointer arithmetic.
+struct Bytes16 {
+    char b[16];
+};
+template <typename F>
+static void with_elem_size(int esz, F&& f) {
+    switch (esz) {
+    case 1: f(uint8_t{}); break;
+    case 2: f(uint16_t{}); break;
+    case 4: f(uint32_t{}); break;
+    case 8: f(uint64_t{}); break;
+    default: f(Bytes16{}); break;
+    }
+}
+
+/// Mixed element sizes: esz[k] bytes per input; fragments and results are byte pointers.
+template <int N>
+static std::vector<std::vector<AlignedMemRef<N, char>>>
+align_fragments_mixed(const std::vector<std::vector<FragmentData<N, char>>>& inputs,
+                      const std::vector<int>& esz, const std::vector<ArrayRegion<N>>& parents) {
+    int K = (int)inputs.size();
+    std::vector<std::vector<AlignedMemRef<N, char>>> result(K);
+    std::unordered_set<int> sizes(esz.begin(), esz.end());
+    for (int size : sizes) {
+        // Cells depend only on the regions, so every pass splits identically.
+        with_elem_size(size, [&](auto tag) {
+            using E = decltype(tag);
+            std::vector<std::vector<FragmentData<N, E>>> typed(K);
+            for (int k = 0; k < K; ++k)
+                for (auto const& fd : inputs[k]) {
+                    FragmentData<N, E> t{fd.region, reinterpret_cast<E*>(fd.data)};
+                    for (int d = 0; d < N; ++d)
+                        t.src_strides[d] = fd.src_strides[d];
+                    typed[k].push_back(t);
+                }
+            auto aligned = align_fragments<N, E>(typed, parents);
+            for (int k = 0; k < K; ++k) {
+                if (esz[k] != size)
+                    continue;
+                for (auto const& a : aligned[k]) {
+                    AlignedMemRef<N, char> c;
+                    c.region = a.region;
+                    c.memref.allocated = reinterpret_cast<char*>(a.memref.allocated);
+                    c.memref.aligned = reinterpret_cast<char*>(a.memref.aligned);
+                    c.memref.offset = a.memref.offset;
+                    for (int d = 0; d < N; ++d) {
+                        c.memref.sizes[d] = a.memref.sizes[d];
+                        c.memref.strides[d] = a.memref.strides[d];
+                    }
+                    result[k].push_back(c);
+                }
+            }
+        });
+    }
+    return result;
+}
+
+/// Copy dtype_size(dt) bytes of element 0 of a device buffer into dst.
+static void load_scalar_bytes(char* dst, const void* device_src, DType dt) {
+    int esz = dtype_size(dt);
+#ifdef USE_KOKKOS
+    using U = Kokkos::MemoryTraits<Kokkos::Unmanaged>;
+    Kokkos::deep_copy(Kokkos::View<char*, HostSpace, U>(dst, esz),
+                      Kokkos::View<const char*, DeviceSpace, U>(
+                          static_cast<const char*>(device_src), esz));
+#else
+    memcpy(dst, device_src, esz);
+#endif
+}
+
 // ---- Unified execute_node_nd ----
 
 /// Build a MemRef descriptor for an input array.
 template <int N, typename T = float>
-static MemRef<N, T> make_input_memref(Array<N, T>* arr) {
+static MemRef<N, T> make_input_memref(CTArrayBase<N>* arr) {
     MemRef<N, T> desc;
     T* ptr = static_cast<T*>(arr->device_data_ptr());
     desc.allocated = ptr;
@@ -75,7 +145,7 @@ static MemRef<N, T> make_input_memref(Array<N, T>* arr) {
 
 /// Build an output MemRef descriptor.
 template <int N, typename T = float>
-static MemRef<N, T> make_output_memref(Array<N, T>* arr) {
+static MemRef<N, T> make_output_memref(CTArrayBase<N>* arr) {
     MemRef<N, T> desc;
     T* ptr = static_cast<T*>(arr->device_data_ptr());
     desc.allocated = ptr;
@@ -100,6 +170,10 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
     auto& ameta = this->array_meta;
 
 
+    // DBG_PRINT("[Chare %d] execute_node_nd<%d>: node_id=%d identifier=%lld fusible=%d comm=%s\n",
+    //           chare_idx, N, node->id, (long long)node->identifier, (int)node->fusible,
+    //           comm ? "yes" : "no");
+
     auto it = compile_cache.find(node->identifier);
 
     std::vector<ASTNode*> memrefLeaves_check;
@@ -110,11 +184,14 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
 
     if (force_interpreter || it == compile_cache.end() || !it->second) {
         // Interpreter fallback
+        // DBG_PRINT("[Chare %d]   -> interpreter fallback\n", chare_idx);
         bool handled = false;
         if (comm) {
             for (auto ast_node : node->ast->roots) {
                 if (static_cast<Opcode>(ast_node->opcode) == Opcode::MATMUL) {
-                    if constexpr (N == 2) {
+                    if constexpr (!cn_is_blas_v<T>) {
+                        CkAbort("MATMUL: unsupported dtype %d", (int)dtype_of<T>());
+                    } else if constexpr (N == 2) {
                         // --- 2D MATMUL interpreter with communication data ---
                         int mat_name = ast_node->operands[0]->result_name;
                         int result_name = ast_node->result_name;
@@ -1204,50 +1281,30 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
     int n_broadcast = (int)broadcastLeaves.size();
     bool has_comm = comm && !comm->my_inputs.empty();
 
-    // Load broadcast scalar values from local arrays or received buffers.
-    // Each broadcast leaf is a size-1 array; we load its single element as a T scalar.
-    std::vector<T> broadcast_values(n_broadcast);
+    // Broadcast leaves (size-1 arrays) are passed by value in their own dtype;
+    // scalar leaves follow them as f64 (the kernel converts them).
+    std::vector<std::array<char, 16>> broadcast_values(n_broadcast);
     std::vector<void*> broadcast_ptrs(n_broadcast);
     for (int i = 0; i < n_broadcast; ++i) {
         int bname = broadcastLeaves[i]->result_name;
+        DType bdt = broadcastLeaves[i]->dtype;
         auto arr_it = partition->arrays.find(bname);
         if (arr_it != partition->arrays.end()) {
-#ifdef USE_KOKKOS
-            Kokkos::deep_copy(
-                Kokkos::View<T, HostSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>(
-                    &broadcast_values[i]),
-                Kokkos::View<T, DeviceSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>(
-                    static_cast<T*>(arr_it->second->device_data_ptr())));
-#else
-            arr_it->second->copyToHost();
-            broadcast_values[i] = *static_cast<T*>(arr_it->second->data_ptr());
-#endif
+            load_scalar_bytes(broadcast_values[i].data(), arr_it->second->device_data_ptr(), bdt);
         } else if (comm) {
             // Look for broadcast value in received remote buffers
             // Convention: broadcast operands use input_index = memref count + broadcast index
             int bcast_input_idx = n_inputs + i;
             auto rb_it = comm->remote_buffers.find(bcast_input_idx);
-            if (rb_it != comm->remote_buffers.end() && !rb_it->second.empty()) {
-#ifdef USE_KOKKOS
-                // rb.data is a device pointer under USE_KOKKOS
-                Kokkos::deep_copy(
-                    Kokkos::View<T, HostSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>(
-                        &broadcast_values[i]),
-                    Kokkos::View<T, DeviceSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>(
-                        reinterpret_cast<T*>(rb_it->second[0].data)));
-#else
-                broadcast_values[i] = *reinterpret_cast<T*>(rb_it->second[0].data);
-#endif
-            }
+            if (rb_it != comm->remote_buffers.end() && !rb_it->second.empty())
+                load_scalar_bytes(broadcast_values[i].data(), rb_it->second[0].data, bdt);
         }
-        broadcast_ptrs[i] = &broadcast_values[i];
-        DBG_PRINT("[Chare %d]   broadcast[%d] name=%d value=%f\n",
-                  chare_idx, i, bname, (double)broadcast_values[i]);
+        broadcast_ptrs[i] = broadcast_values[i].data();
+        DBG_PRINT("[Chare %d]   broadcast[%d] name=%d dtype=%d\n", chare_idx, i, bname, (int)bdt);
     }
-    // Scalar leaves follow the broadcast arguments.
-    std::vector<T> scalar_values(scalarLeaves.size());
+    std::vector<double> scalar_values(scalarLeaves.size());
     for (size_t i = 0; i < scalarLeaves.size(); ++i) {
-        scalar_values[i] = static_cast<T>(scalarLeaves[i]->scalar);
+        scalar_values[i] = scalarLeaves[i]->scalar;
         broadcast_ptrs.push_back(&scalar_values[i]);
     }
 
@@ -1261,7 +1318,8 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
     if (has_comm) {
         std::vector<int> tmp_names;
         std::array<int, N> tmp_gs;
-        has_regions = extract_regions_nd<N>(node, partition->arrays, r_out, tmp_inp, tmp_names, tmp_gs);
+        has_regions = extract_regions_nd<N>(node, partition->arrays, r_out, tmp_inp, tmp_names, tmp_gs,
+                                            &array_meta);
     }
 
     if (!has_comm) {
@@ -1281,7 +1339,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                 missing_input = true;
                 break;
             }
-            descs[i] = make_input_memref(static_cast<Array<N, T>*>(arr_it->second));
+            descs[i] = make_input_memref<N, T>(arr_it->second);
         }
         if (missing_input)
             return;
@@ -1325,9 +1383,9 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                 if (meta_it != array_meta.end())
                     out_decomp_alloc = meta_it->second.template decomp<N>();
             }
-            Array<N, T>* output = partition->template ensure_array_typed<T>(
-                out_region, out_gs, result_name, out_decomp_alloc);
-            descs[n_inputs + i] = make_output_memref(output);
+            CTArrayBase<N>* output = partition->ensure_array(
+                out_region, out_gs, result_name, outputRoots[i]->dtype, out_decomp_alloc);
+            descs[n_inputs + i] = make_output_memref<N, T>(output);
         }
 
         dispatch_kernel(func_ptr, n_memrefs, descs, n_inputs, broadcast_ptrs
@@ -1336,9 +1394,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                         partition->compute_stream_raw
 #endif
         );
-        // A SET_REGION whose right-hand side has only scalar/broadcast leaves
-        // (e.g. a[1:2] = b[0:1] + 1) produced a 1-element result buffer; write it
-        // into the target region like the fragment path does below.
+        // Scalar/broadcast-only RHS gives a 1-element result; write it to the target region.
         if (n_inputs == 0)
             for (ASTNode* root : node->ast->roots)
                 if (static_cast<Opcode>(root->opcode) == Opcode::SET_REGION)
@@ -1375,7 +1431,8 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
     // Global output sub-region this chare owns (same coordinate system as r_out).
     auto [r_myout_global, has_r_myout_global] = intersect(r_out, r_chare_out);
 
-    std::vector<std::vector<FragmentData<N, T>>> input_frag_data(n_inputs);
+    std::vector<std::vector<FragmentData<N, char>>> input_frag_data(n_inputs);
+    std::vector<int> input_esz(n_inputs);
     std::vector<ArrayRegion<N>> parents;
 
     for (int i = 0; i < n_inputs; ++i) {
@@ -1383,9 +1440,10 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
         auto src_it = partition->arrays.find(source_name);
 
         auto& my_inp = comm->my_inputs[i];
+        input_esz[i] = dtype_size(memrefLeaves[i]->dtype);
 
         if (src_it != partition->arrays.end()) {
-            Array<N, T>* arr = static_cast<Array<N, T>*>(src_it->second);
+            CTArrayBase<N>* arr = src_it->second;
 
             // Use this input array's decomp for its chare region
             ArrayRegion<N> r_chare_inp = arr->decomp.chare_region_global(nd_idx);
@@ -1405,8 +1463,9 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                     for (int d = 0; d < N; ++d)
                         flat_offset += (int64_t)(local_part.start[d] - cs_inp[d]) * arr_strides[d];
 
-                    T* local_ptr = static_cast<T*>(arr->device_data_ptr()) + flat_offset;
-                    FragmentData<N, T> fd;
+                    char* local_ptr =
+                        static_cast<char*>(arr->device_data_ptr()) + flat_offset * input_esz[i];
+                    FragmentData<N, char> fd;
                     fd.region = local_part;
                     fd.data = local_ptr;
                     for (int d = 0; d < N; ++d)
@@ -1419,12 +1478,12 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
         auto rb_it = comm->remote_buffers.find(i);
         if (rb_it != comm->remote_buffers.end())
             for (auto& rb : rb_it->second)
-                input_frag_data[i].push_back({rb.region, reinterpret_cast<T*>(rb.data)});
+                input_frag_data[i].push_back({rb.region, rb.data});
 
         parents.push_back(my_inp);
     }
 
-    auto aligned = align_fragments(input_frag_data, parents);
+    auto aligned = align_fragments_mixed<N>(input_frag_data, input_esz, parents);
     int M = aligned.empty() ? 0 : (int)aligned[0].size();
 
     {
@@ -1466,8 +1525,8 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                     else
                         result_decomp = out_decomp;
                 }
-                partition->template ensure_array_typed<T>(
-                    out_region, out_gs, result_name, result_decomp);
+                partition->ensure_array(out_region, out_gs, result_name, outputRoots[i]->dtype,
+                                        result_decomp);
             }
         }
 
@@ -1475,15 +1534,23 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
             int n_memrefs = n_inputs + n_outputs;
             std::vector<MemRef<N, T>> descs(n_memrefs);
 
-            for (int i = 0; i < n_inputs; ++i)
-                descs[i] = aligned[i][m].memref;
+            for (int i = 0; i < n_inputs; ++i) {
+                const MemRef<N, char>& a = aligned[i][m].memref;
+                descs[i].allocated = reinterpret_cast<T*>(a.allocated);
+                descs[i].aligned = reinterpret_cast<T*>(a.aligned);
+                descs[i].offset = a.offset;
+                for (int d = 0; d < N; ++d) {
+                    descs[i].sizes[d] = a.sizes[d];
+                    descs[i].strides[d] = a.strides[d];
+                }
+            }
 
             for (int i = 0; i < n_outputs; ++i) {
                 auto out_it = partition->arrays.find(outputRoots[i]->result_name);
                 if (out_it == partition->arrays.end() || out_it->second == nullptr)
                     CkAbort("[Chare %d] fragment path: missing output array name=%d node=%d",
                             chare_idx, outputRoots[i]->result_name, node->id);
-                Array<N, T>* out = static_cast<Array<N, T>*>(out_it->second);
+                CTArrayBase<N>* out = out_it->second;
                 int j = n_inputs + i;
 
                 std::array<int64_t, N> out_strides;
@@ -1514,7 +1581,8 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                             out_strides[d];
                 }
 
-                T* ptr = static_cast<T*>(out->device_data_ptr()) + flat_offset;
+                T* ptr = reinterpret_cast<T*>(static_cast<char*>(out->device_data_ptr()) +
+                                              flat_offset * out->elem_size());
                 MemRef<N, T> desc;
                 desc.allocated = ptr;
                 desc.aligned = ptr;
@@ -1542,16 +1610,8 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
             partition->executor->ast_visitor(root, dtype_of<T>());
 }
 
-// Explicit template instantiations for execute_node_nd
-template void ArrayDAGGroup::execute_node_nd<1, float>(DAGNode*, PartitionImpl<1>*, PendingComm<1>*);
-template void ArrayDAGGroup::execute_node_nd<1, double>(DAGNode*, PartitionImpl<1>*, PendingComm<1>*);
-template void ArrayDAGGroup::execute_node_nd<1, int32_t>(DAGNode*, PartitionImpl<1>*, PendingComm<1>*);
-template void ArrayDAGGroup::execute_node_nd<1, int64_t>(DAGNode*, PartitionImpl<1>*, PendingComm<1>*);
-template void ArrayDAGGroup::execute_node_nd<2, float>(DAGNode*, PartitionImpl<2>*, PendingComm<2>*);
-template void ArrayDAGGroup::execute_node_nd<2, double>(DAGNode*, PartitionImpl<2>*, PendingComm<2>*);
-template void ArrayDAGGroup::execute_node_nd<2, int32_t>(DAGNode*, PartitionImpl<2>*, PendingComm<2>*);
-template void ArrayDAGGroup::execute_node_nd<2, int64_t>(DAGNode*, PartitionImpl<2>*, PendingComm<2>*);
-template void ArrayDAGGroup::execute_node_nd<3, float>(DAGNode*, PartitionImpl<3>*, PendingComm<3>*);
-template void ArrayDAGGroup::execute_node_nd<3, double>(DAGNode*, PartitionImpl<3>*, PendingComm<3>*);
-template void ArrayDAGGroup::execute_node_nd<3, int32_t>(DAGNode*, PartitionImpl<3>*, PendingComm<3>*);
-template void ArrayDAGGroup::execute_node_nd<3, int64_t>(DAGNode*, PartitionImpl<3>*, PendingComm<3>*);
+#define CN_INST_EXECUTE_NODE(T)                                                                    \
+    template void ArrayDAGGroup::execute_node_nd<1, T>(DAGNode*, PartitionImpl<1>*, PendingComm<1>*); \
+    template void ArrayDAGGroup::execute_node_nd<2, T>(DAGNode*, PartitionImpl<2>*, PendingComm<2>*); \
+    template void ArrayDAGGroup::execute_node_nd<3, T>(DAGNode*, PartitionImpl<3>*, PendingComm<3>*);
+CN_FOR_EACH_TYPE(CN_INST_EXECUTE_NODE)

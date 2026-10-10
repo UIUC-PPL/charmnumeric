@@ -1,21 +1,9 @@
 #!/usr/bin/env python
-"""Tests for native reductions (REDUCTION / BINCOUNT executors).
+"""Tests for native reductions (REDUCTION / BINCOUNT executors) against NumPy.
 
-Covers full reductions (sum, prod, mean, var, std, max/amax, min/amin,
-argmax, argmin, count_nonzero, all, any), axis reductions (every axis of 1-D,
-2-D and 3-D operands, keepdims, axis tuples), the Array/ArrayView methods,
-linalg.norm, and bincount (with and without weights, minlength or
-interface-computed length). Operands include non-tile-aligned shapes that
-span several chares, offset and strided views, all four dtypes, ties
-(first-occurrence argmax/argmin) and NaN propagation. Results are also fed
-into later expressions. Everything is checked against NumPy on the fetched
-inputs.
-
-Environment: CNUM_HOST, CNUM_PORT, CNUM_ODF (default 4). Run with e.g.
-    harness/run_one.sh server.out 2 33001 examples/ops/test_reductions.py
-Prints PASS test_reductions / FAIL test_reductions: ... (exit status 0 / 1).
-On the CPU build the minimum tiles are 262144 (1-D), 512 (2-D) and 64 (3-D),
-so the larger shapes below span several chares.
+Covers full and axis reductions, argmax/argmin ties, NaN propagation, norm and bincount,
+on offset and strided views. Env: CNUM_HOST, CNUM_PORT, CNUM_ODF (default 4).
+Run as e.g. harness/run_one.sh server.out 2 33001 examples/ops/test_reductions.py
 """
 
 import os
@@ -35,15 +23,11 @@ IFACE = None
 
 
 def make(shape, dtype, seed):
-    """Native pseudo-random input. Floats in (-1, 1) clipped to [-0.97, 0.97]
-    (so max/min have many ties); ints in [-50, 50) (many ties).
+    """Native pseudo-random input: floats clipped to [-0.97, 0.97], ints in [-50, 50).
 
-    Intermediate results are materialized with execute() before they are
-    reused: a fused temporary read more than once currently comes back as
-    zeros (e.g. z = ones * 0.5; z + z * (0.97 - z)). 1-D inputs are row sums
-    of an (n, 2) input (matvec), because the 1-D index-grid generator in
-    _cnum_util relies on chains of size-1 slice updates that the backend
-    mishandles within one epoch."""
+    Each intermediate is execute()d before reuse, since a fused temporary read
+    twice currently comes back as zeros. 1-D inputs are row sums of (n, 2) inputs.
+    """
     dtype = np.dtype(dtype)
     if len(shape) == 1:
         return make((shape[0], 2), dtype, seed) @ cnp.ones((2,), dtype=dtype)
@@ -85,7 +69,7 @@ def main(chk):
 
     def eq(label, arr, ref, rtol=0.0, atol=0.0):
         ref = np.asarray(ref)
-        exp_shape = ref.shape if ref.ndim else (1,)
+        exp_shape = ref.shape
         if tuple(arr.shape) != exp_shape:
             chk.true(label + " shape", False, f"{arr.shape} != {exp_shape}")
             return
