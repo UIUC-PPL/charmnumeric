@@ -4,9 +4,10 @@ compress, repeat and choose.
 Each index expression is linearized into one array of flat offsets into the
 indexed array's root, then executed by one GATHER or SCATTER node
 (src/executor_indexing.cpp) over ``E = pre slice dims + broadcast(index shapes)
-+ post slice dims``. Masks become index arrays via EXPAND (nonzero); the output
-size is fetched first with a ``count_nonzero`` get, as are repeat with array
-counts and compress with a device condition.
++ post slice dims``. A mask over the leading dims of x (``x[m]``, ``x[m] = v``)
+is one COMPRESS / MASK_SCATTER node; other masks become index arrays via EXPAND
+(nonzero). The output size is fetched first with a ``count_nonzero`` get, as
+are repeat with array counts and compress with a device condition.
 
 Differences from NumPy:
 - Negative-step slices next to an index array are part of the gather; keys of
@@ -359,10 +360,90 @@ def _key_plan(x, key, mode="raise"):
     return _plan(x, items, mode, newaxes)
 
 
+# ---- masks over leading dims: COMPRESS / MASK_SCATTER ----
+
+
+def _lead_mask(x, key):
+    """The mask of ``x[mask]`` if it covers leading dims of x (a backend or host
+    bool array), else None."""
+    k = key[0] if isinstance(key, tuple) and len(key) == 1 else key
+    if isinstance(x, _NDBase) or not 1 <= x.ndims <= 3:
+        return None
+    if _is_array(k):
+        if not _is_mask(k) or isinstance(k, _NDBase):
+            return None
+    elif not (isinstance(k, np.ndarray) and k.dtype == _BOOL):
+        return None
+    nd = k.ndims if _is_array(k) else k.ndim
+    if not 1 <= nd <= x.ndims or tuple(k.shape) != tuple(x.shape[:nd]):
+        return None
+    return k
+
+
+def _mask_count(k):
+    """(count of k, k as a backend array)."""
+    if _is_array(k):
+        from .reductions import count_nonzero
+
+        return _fetch_int(count_nonzero(k)), k
+    return int(np.count_nonzero(k)), asarray(np.ascontiguousarray(k))
+
+
+def _full_mask(k, shape):
+    """Mask k over the leading dims of ``shape``, repeated over the others."""
+    if tuple(k.shape) == tuple(shape):
+        return k
+    return _broadcast_to(_reshape(k, tuple(k.shape) + (1,) * (len(shape) - k.ndims)), shape)
+
+
+def _mask_getitem(x, k):
+    cnt, k = _mask_count(k)
+    rest = tuple(x.shape[k.ndims:])
+    shape = (cnt,) + rest
+    n = int(np.prod(shape))
+    if n == 0:
+        return create_array(shape, dtype=x.dtype)
+    r = nonfusible_op(x, _full_mask(k, tuple(x.shape)), n, operation=ArrayOperation.compress,
+                      shape=(n,), dtype=x.dtype)
+    return _reshape(r, shape) if rest else r
+
+
+def _mask_setitem(x, k, value):
+    if _is_scalar_like(value):
+        if not _is_array(k):
+            k = asarray(np.ascontiguousarray(k))
+        x[...] = _where(_full_mask(k, tuple(x.shape)), _coerce_scalar(value), x)
+        return
+    cnt, k = _mask_count(k)
+    E = (cnt,) + tuple(x.shape[k.ndims:])
+    n = int(np.prod(E))
+    value = _scatter_value(x, value, E)
+    if n == 0:
+        return
+    if not _is_array(value):
+        x[...] = _where(_full_mask(k, tuple(x.shape)), value, x)
+        return
+    if len(E) > 1 or value.ndims != 1:
+        value = _reshape(value, (n,))
+    m = _full_mask(k, tuple(x.shape))
+    _fresh_operands((x, m, value))
+    root = x._root_parent if isinstance(x, ArrayView) else x
+    result = create_result(
+        Array, ArrayOperation.mask_scatter, [x, m, value, n],
+        fusible=False, region=_full_region((n,)), dtype=x.dtype, shape=(n,),
+    )
+    result.writes = ((root.name, root.region),)  # in place: the result name is unused
+    get_execution_state().add_node(NonFusibleNode(obj=result))
+    _wrote(root)
+
+
 # ---- __getitem__ / __setitem__ ----
 
 
 def getitem(x, key):
+    k = _lead_mask(x, key)
+    if k is not None:
+        return _mask_getitem(x, k)
     plan = _key_plan(x, key)
     if plan is None:  # e.g. a[[...]] parsed to plain slices
         raise IndexError(f"unsupported index {key!r}")
@@ -375,27 +456,28 @@ def _scatter_value(x, value, E):
     if _is_array(value):
         value = _cast_operand(value, x.dtype)
         return value if tuple(value.shape) == tuple(E) else _broadcast_to(value, E)
-    if _is_scalar_like(value):
-        return _coerce_scalar(value)
-    host = np.asarray(value, dtype=x.dtype)
-    if host.ndim == 0:
-        return _coerce_scalar(host.item())
-    try:
-        host = np.broadcast_to(host, E)
-    except ValueError as exc:
-        raise ValueError(
-            f"could not broadcast input from shape {host.shape} into shape {E}"
-        ) from exc
-    return asarray(np.ascontiguousarray(host))
+    if not _is_scalar_like(value):
+        host = np.asarray(value, dtype=x.dtype)
+        if host.ndim:
+            try:
+                host = np.broadcast_to(host, E)
+            except ValueError as exc:
+                raise ValueError(
+                    f"could not broadcast input from shape {host.shape} into shape {E}"
+                ) from exc
+            return asarray(np.ascontiguousarray(host))
+        value = host.item()
+    value = _coerce_scalar(value)
+    if isinstance(value, complex) or (isinstance(value, int) and abs(value) > 2**53
+                                      and x.dtype.kind in "iu"):
+        return full(E, value, dtype=x.dtype)  # not exact as a double
+    return value
 
 
 def setitem(x, key, value):
-    k = key[0] if isinstance(key, tuple) and len(key) == 1 else key
-    if (_is_array(k) and _is_mask(k) and tuple(k.shape) == tuple(x.shape)
-            and _is_scalar_like(value)):
-        # x[mask] = v without a sync: an elementwise select
-        x[...] = _where(k, _coerce_scalar(value), x)
-        return
+    k = _lead_mask(x, key)
+    if k is not None:
+        return _mask_setitem(x, k, value)
     plan = _key_plan(x, key)
     if plan is None:
         raise IndexError(f"unsupported index {key!r}")
@@ -435,7 +517,20 @@ def _folded_offsets(shape, key):
     return total
 
 
+def _folded_mask(x, key):
+    """Full-shape mask of a >3-D x, as a mask of its 3-D storage (or None)."""
+    k = key[0] if isinstance(key, tuple) and len(key) == 1 else key
+    if isinstance(k, _NDBase) and k.dtype == _BOOL and tuple(k.shape) == tuple(x.shape):
+        return k._base if tuple(k._base.shape) == tuple(x._base.shape) else None
+    if isinstance(k, np.ndarray) and k.dtype == _BOOL and k.shape == tuple(x.shape):
+        return k.reshape(tuple(x._base.shape))
+    return None
+
+
 def folded_getitem(x, key):
+    k = _folded_mask(x, key)
+    if k is not None:
+        return _mask_getitem(x._base, k)
     offs = _folded_offsets(tuple(x.shape), _host_key(key))
     if offs.size == 0:
         return empty(offs.shape, dtype=x.dtype)
@@ -445,11 +540,14 @@ def folded_getitem(x, key):
 
 
 def folded_setitem(x, key, value):
+    if getattr(x, "_copy_of_view", False):
+        raise NotImplementedError("index arrays on a copy of a view of a >3-D array are not supported")
+    k = _folded_mask(x, key)
+    if k is not None and not isinstance(value, _NDBase):
+        return _mask_setitem(x._base, k, value)
     offs = _folded_offsets(tuple(x.shape), _host_key(key))
     if offs.size == 0:
         return
-    if getattr(x, "_copy_of_view", False):
-        raise NotImplementedError("index arrays on a copy of a view of a >3-D array are not supported")
     root = x._base
     if isinstance(root, ArrayView) and tuple(root.shape) != tuple(root._root_parent.shape):
         raise NotImplementedError("index arrays on a view of a >3-D array are not supported")
@@ -584,7 +682,7 @@ def put(a, ind, v, mode="raise"):
         host = np.asarray(v, dtype=a.dtype).reshape(-1)
         v = asarray(np.ascontiguousarray(np.resize(host, size).reshape(E)))
     else:
-        v = _coerce_scalar(v)
+        v = _scatter_value(a, v, E)
     _scatter(a, L, v, E, 0, 0, [])
 
 

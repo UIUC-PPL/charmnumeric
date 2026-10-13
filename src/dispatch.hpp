@@ -3,6 +3,8 @@
 #include "backend.hpp"
 #include "jit_api.hpp"
 
+#include <limits>
+
 // ---- Stream policy helpers (USE_KOKKOS) ----
 // Under USE_NVIDIA: Kokkos::Cuda exec space instances bound to per-chare streams.
 // Under USE_KOKKOS without USE_NVIDIA: default execution space + Kokkos::fence().
@@ -13,9 +15,11 @@
     Kokkos::RangePolicy<Kokkos::Cuda>((partition)->compute_exec, 0, (n))
 #define CT_COMM_POLICY(partition, n)                                                               \
     Kokkos::RangePolicy<Kokkos::Cuda>((partition)->comm_exec, 0, (n))
+#define CT_COMPUTE_EXEC(partition) ((partition)->compute_exec)
 #else
 #define CT_COMPUTE_POLICY(partition, n) Kokkos::RangePolicy<>(0, (n))
 #define CT_COMM_POLICY(partition, n) Kokkos::RangePolicy<>(0, (n))
+#define CT_COMPUTE_EXEC(partition) Kokkos::DefaultExecutionSpace()
 #endif
 #endif
 
@@ -83,7 +87,6 @@ struct DeferredSendParam {
 template <int N_sender, int N_target = N_sender>
 static void deferred_send_cb(void* param, void* msg) {
     auto* p = static_cast<DeferredSendParam<N_sender, N_target>*>(param);
-    p->partition->pending_sends[p->send_id] = p->send_buf;
     ChareIndex<N_sender> self_ci;
     for (int d = 0; d < N_sender; ++d)
         self_ci.idx[d] = p->partition->index[d];
@@ -116,7 +119,14 @@ static void device_pack_send(PartitionImpl<N_sender>* partition,
     memcpy(ds->region_data, region_data, sizeof(int) * N_target * 3);
     ds->byte_size = byte_size;
     ds->send_buf = send_buf;
-    ds->send_id = static_cast<CMK_REFNUM_TYPE>(partition->next_send_id++);
+    // The id travels as a CMK_REFNUM_TYPE refnum: skip ids of sends still in flight.
+    auto& pending = partition->pending_sends;
+    if (pending.size() > std::numeric_limits<CMK_REFNUM_TYPE>::max())
+        CkAbort("device_pack_send: too many sends in flight");
+    do
+        ds->send_id = static_cast<CMK_REFNUM_TYPE>(partition->next_send_id++);
+    while (pending.count(ds->send_id));
+    pending[ds->send_id] = send_buf;
 #ifdef USE_NVIDIA
     CkCallback hapi_cb(deferred_send_cb<N_sender, N_target>, ds);
     hapiAddCallback(partition->comm_stream_raw, &hapi_cb);

@@ -265,7 +265,7 @@ static void diag_send(PartitionImpl<N_src>* partition, DAGNode* node, int source
             partition->comm_bytes_sent += byte_size;
 #endif
 #ifdef USE_KOKKOS
-            T* send_buf = static_cast<T*>(Kokkos::kokkos_malloc<DeviceSpace>(byte_size));
+            T* send_buf = static_cast<T*>(comm_alloc(byte_size));
             T* src_device = static_cast<T*>(src->device_data_ptr()) + r.first_local;
             Kokkos::parallel_for(
                 CT_COMM_POLICY(partition, r.count),
@@ -337,7 +337,7 @@ static void diag_send(PartitionImpl<N_src>* partition, DAGNode* node, int source
             partition->comm_bytes_sent += byte_size;
 #endif
 #ifdef USE_KOKKOS
-            T* send_buf = static_cast<T*>(Kokkos::kokkos_malloc<DeviceSpace>(byte_size));
+            T* send_buf = static_cast<T*>(comm_alloc(byte_size));
             T* src_device = static_cast<T*>(src->device_data_ptr());
             int rs_cap = row_start, cs_cap = col_start, lc_cap = local_cols;
             int ko_cap = k_offset;
@@ -682,7 +682,7 @@ static void tile_send(PartitionImpl<N_src>* partition, DAGNode* node, int source
                               byte_size, reinterpret_cast<char*>(send_buf));
             delete[] send_buf;
 #else
-            T* send_buf = static_cast<T*>(Kokkos::kokkos_malloc<DeviceSpace>(byte_size));
+            T* send_buf = static_cast<T*>(comm_alloc(byte_size));
             T* src_device = static_cast<T*>(src->device_data_ptr());
             Kokkos::parallel_for(
                 CT_COMM_POLICY(partition, local_size),

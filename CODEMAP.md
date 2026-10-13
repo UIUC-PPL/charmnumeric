@@ -8,7 +8,7 @@ Distributed N-dimensional array DSL built on charmtyles. The backend stores 1-3D
 | Symbol | Line | Description |
 |--------|------|-------------|
 | `DType` | 39 | Wire dtype codes — FLOAT32=0, FLOAT64=1, INT32=2, INT64=3, BOOL=4, INT8=5, INT16=6, UINT8..UINT64=7-10, FLOAT16=11, COMPLEX64=12, COMPLEX128=13; `from_numpy()`, `to_numpy()` |
-| `ArrayOperation` | 139 | Opcodes: add=0, sub=1, mul=2, div=3, matmul=4, tanh=5, exp=6, tile=7, reduce=8, matmatmul=9, diag=10; elementwise math/comparisons/where/clip 20-49; creation upload=50, random=51, iota=52; reduction=60, bincount=61; transpose=70; scan=81, sort=82, argsort=83; linalg=100; gather=120, scatter=121, expand=122; reshape=140, broadcast=141; convolve=150, flip=151; convert (fused astype)=160, real=161, imag=162, conj=163, bitwise_and/or/xor=164-166, invert=167, left_shift=168, right_shift=169 |
+| `ArrayOperation` | 139 | Opcodes: add=0, sub=1, mul=2, div=3, matmul=4, tanh=5, exp=6, tile=7, reduce=8, matmatmul=9, diag=10; elementwise math/comparisons/where/clip 20-49; creation upload=50, random=51, iota=52; reduction=60, bincount=61; transpose=70; scan=81, sort=82, argsort=83; linalg=100; gather=120, scatter=121, expand=122, compress=123, mask_scatter=124; reshape=140, broadcast=141; convolve=150, flip=151; convert (fused astype)=160, real=161, imag=162, conj=163, bitwise_and/or/xor=164-166, invert=167, left_shift=168, right_shift=169 |
 | `ArrayRegion` | 153 | N-D region with start/stop/step per dim — `serialize()`:194, `shape()`:209, `compose()`:212, `overlaps()`:232, `covers()`:239, `intersect()`:246 |
 | `Array(FrontendObject)` | 618 | Main array class — `wire_dtype()`:639, `get()`:683, `get_region()`/`__getitem__()`:690/697, `__setitem__()`:708, `dot()`:724, `matvec()`:727, `copy()`:730, `fill()`:735, `astype()`:738; operators: +,-,*,/,@ at 713-722 |
 | `ArrayView(FrontendObjectView)` | 747 | View with same ops as Array — `get()`:796, `__getitem__()`:801, `__setitem__()`:812, `dot()`:828 |
@@ -76,10 +76,11 @@ Distributed N-dimensional array DSL built on charmtyles. The backend stores 1-3D
 | `split_negative_steps()` | Negative-step key -> (positive key, flipped axes); used by `__getitem__`/`__setitem__` |
 | `reference()` | NumPy model of both nodes (CNUM_SIM simulator) |
 
-### `charmnumeric/indexing.py` — Advanced indexing (opcodes 120-122)
+### `charmnumeric/indexing.py` — Advanced indexing (opcodes 120-124)
 | Symbol | Description |
 |--------|-------------|
 | `getitem()` / `setitem()` | `Array.__getitem__/__setitem__` for keys with index arrays or masks (slices in them may have negative steps): the key is linearized into an array L of flat offsets into the root (`_items`, `_plan`), then one GATHER / SCATTER node |
+| `_lead_mask()` / `_mask_getitem()` / `_mask_setitem()` | `x[m]`, `x[m] = v` for a backend or host bool mask over leading dims of x: one COMPRESS / MASK_SCATTER node (a mask over fewer dims is broadcast first); `folded_getitem/setitem` use them for full-shape masks of >3-D arrays |
 | `nonzero/flatnonzero/argwhere` | EXPAND node; output size from a `count_nonzero` get on `default_interface()` |
 | `take/put/take_along_axis/put_along_axis/compress/repeat/choose` | NumPy API (also `Array` methods); bool arrays index as masks; elements up to 8 bytes (no complex128) |
 
@@ -190,6 +191,8 @@ Bit-exact NumPy mirror of `src/creation_kernels.hpp` (Philox4x32-10, software lo
 | `UnaryOpEntry` | 87 | Registry: same bodies as BinaryOpEntry |
 | `TernaryOpEntry` | 94 | Registry for 3-input ops (where, clip); `emitGenericNaryOp` builds the N-input linalg.generic |
 | `MLIRJitCompiler` | 101 | AST → MLIR → executable — `buildFromAST()`, `optimizeAndFuse()`, `generateCPU()`, `loadCPU()`, `generateNVIDIA/AMD/Intel()` |
+| kernel caches (jit.cpp) | — | In-process map keyed by the kernel IR, then a persistent object-file cache: `$CNUM_JIT_CACHE_DIR` (default `${XDG_CACHE_HOME:-~/.cache}/charmnumeric/jit`)/`<server build id>`/`<sha256(IR, target)>.o`, loaded with an LLJIT (`loadCachedKernel`); NVIDIA cubins in `cubin/`, keyed by PTX, arch and driver; `CNUM_JIT_CACHE=0` disables it, `CNUM_JIT_TIME=1` prints compile phases |
+| `cn_mgpu*` (jit.cpp, NVIDIA) | — | Overrides of the MLIR CUDA runtime wrappers: stream/alloc calls use the chare's stream, module load and launch use the current context |
 
 ### `dtypes.hpp` / `dtype_info.hpp` — Element types and dtype dispatch
 | Symbol | Description |
@@ -234,8 +237,8 @@ Bit-exact NumPy mirror of `src/creation_kernels.hpp` (Philox4x32-10, software lo
 | `executor_signal.cpp` | CONVOLVE/FLIP: each result chare receives the input window (halo of the filter size) and the filter, or its mirrored tile, point-to-point; direct sum or per-chare FFT (host mixed radix, cuFFT on NVIDIA) |
 | `executor_shape.cpp` | RESHAPE/BROADCAST (opcodes 140-141): source chares send row runs (reshape) or the projected block (broadcast) to each result chare (`receive_shape`, host-staged); broadcast blocks are expanded on the device |
 | `executor_linalg.cpp` | LINALG: operand blocks gathered to chare 0 of the result partition (`receive_linalg`), factored there (Eigen on CPU, cuSOLVER/cuBLAS on NVIDIA), result tiles scattered back |
-| `executor_indexing.cpp` | GATHER/SCATTER/EXPAND: index chares send request lists to the data chares, which send value lists to the target chares (`receive_index_msg`); EXPAND scans segment counts on one coordinator chare |
-| `executor_creation.cpp` | UPLOAD/RANDOM/IOTA: `stage_uploads()` (cut payload into this PE's chare tiles), `execute_creation_node()` (create + fill locally) |
+| `executor_indexing.cpp` | GATHER/SCATTER/EXPAND: index chares send request lists to the data chares, which send value lists to the target chares (`receive_index_msg`); EXPAND scans segment counts on one coordinator chare. COMPRESS/MASK_SCATTER: device scan of each x block's mask, row offsets from one coordinator, compacted runs sent in bulk to the result tiles (or pulled from v's chares) |
+| `executor_creation.cpp` | UPLOAD/RANDOM/IOTA: `stage_uploads()` (PE 0 cuts the payload into tiles and sends them to the chares' home PEs), `execute_creation_node()` (create + fill locally) |
 | `creation_kernels.hpp` | Host/device element functions: Philox RNG, Box-Muller with software log/cos, arange/linspace/indices/eye |
 | `jit.cpp` | MLIRJitCompiler implementation — buildFromAST (per-leaf element types), emitOp (per-op compute dtype, `convertValue`), registries |
 

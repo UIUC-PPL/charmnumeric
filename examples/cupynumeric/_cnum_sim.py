@@ -408,6 +408,16 @@ def _eval(obj):
             tgt.flat[offs.reshape(-1)] = np.broadcast_to(np.asarray(vals), E).reshape(-1)
         return
 
+    if op == AO.compress:
+        x, m, _n = ops
+        _store_result(obj, _fit(np.asarray(_value(x))[np.asarray(_value(m)) != 0], obj))
+        return
+
+    if op == AO.mask_scatter:
+        x, m, v, _n = ops
+        _value(x)[np.asarray(_value(m)) != 0] = np.array(_value(v))
+        return
+
     if op == AO.expand:
         x, mode, _total = ops
         xv = np.asarray(_value(x)).reshape(-1)
@@ -510,12 +520,12 @@ class SimInterface(CharmNumericInterface):
     def connect(self, *args, **kwargs):
         pass
 
-    def run_async(self, cmd):
+    def run_async(self, cmd, bulk=()):
         _stats["flushes"] += 1
-        _stats["bytes"] += len(cmd)
+        _stats["bytes"] += len(cmd) + sum(len(b) for b in bulk)
 
-    def run_sync(self, cmd, reply_type="i", reply_size=4):
-        self.run_async(cmd)
+    def run_sync(self, cmd, reply_type="i", reply_size=4, bulk=()):
+        self.run_async(cmd, bulk)
         return 0
 
     def get(self, ndims, name, size, dtype=None):

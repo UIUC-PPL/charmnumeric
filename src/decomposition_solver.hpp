@@ -104,8 +104,17 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
         return count;
     };
 
+    // Tiles are square, so a skinny matrix gets many tiny tiles; also cap the count by
+    // size so each 2-D tile holds at least a quarter of a minimum square tile.
     auto clamp_tile_for_max_count = [&](ArrayMetadata& m) {
-        int max_tiles = std::max(1, odf) * std::max(1, num_pes);
+        int64_t elems = 1, min_elems = 1;
+        for (int d = 0; d < m.ndims; d++) {
+            elems *= std::max(1, m.global_shape[d]);
+            min_elems *= detail::ct_min_tile(m.ndims);
+        }
+        int64_t by_size = m.ndims == 2 ? std::max<int64_t>(1, 4 * elems / min_elems)
+                                       : std::numeric_limits<int>::max();
+        int max_tiles = (int)std::min<int64_t>(std::max(1, odf) * std::max(1, num_pes), by_size);
         while (compute_tile_count(m) > max_tiles)
             m.tile *= 2;
     };
@@ -608,7 +617,8 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                 // These results are routed by a zero-offset decomposition; BINCOUNT
                 // also needs x and weights laid out identically.
                 if (is_reduction_op(op) || op == Opcode::LINALG || is_shape_op(op) ||
-                    is_signal_op(op) || op == Opcode::GATHER || op == Opcode::EXPAND) {
+                    is_signal_op(op) || op == Opcode::GATHER || op == Opcode::EXPAND ||
+                    op == Opcode::COMPRESS) {
                     matmul_arrays.insert(ast_node->result_name);
                     if (op == Opcode::BINCOUNT)
                         for (ASTNode* operand : ast_node->operands)

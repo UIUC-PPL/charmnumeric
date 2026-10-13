@@ -110,8 +110,8 @@ class ArrayRegion : public Region {
     int size(int d) const { return (stop[d] - start[d] + step[d] - 1) / step[d]; }
 
     /// Total number of elements across all dimensions
-    int size() const {
-        int total = 1;
+    int64_t size() const {
+        int64_t total = 1;
         for (int d = 0; d < N; ++d)
             total *= size(d);
         return total;

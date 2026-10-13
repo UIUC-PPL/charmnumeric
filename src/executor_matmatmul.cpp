@@ -62,7 +62,7 @@ static void cross_matmatmul_send_panel_2d(
                       reinterpret_cast<char*>(send_buf));
     delete[] send_buf;
 #else
-    T* send_buf = static_cast<T*>(Kokkos::kokkos_malloc<DeviceSpace>(byte_size));
+    T* send_buf = static_cast<T*>(comm_alloc(byte_size));
     T* src = local_data + row_offset * local_cols + col_offset;
     int lc = local_cols;
     int sc = sub_cols;
@@ -159,9 +159,7 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
 
             if (a_ndims == 3) {
                 auto* ar = static_cast<ArrayRegion<3>*>(mm_root->operand_regions[0]);
-                int dd = -1;
-                for (int d = 0; d < 3; d++)
-                    if (ar->stop[d] - ar->start[d] == 1) { dd = d; break; }
+                int dd = matmul_drop_dim(mm_root, 0);
                 int rd = (dd == 0) ? 1 : 0;
                 int cd = (dd <= 1) ? 2 : 1;
                 a_rs = ar->start[rd]; a_re = ar->stop[rd];
@@ -174,9 +172,7 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
 
             if (b_ndims == 3) {
                 auto* br = static_cast<ArrayRegion<3>*>(mm_root->operand_regions[1]);
-                int dd = -1;
-                for (int d = 0; d < 3; d++)
-                    if (br->stop[d] - br->start[d] == 1) { dd = d; break; }
+                int dd = matmul_drop_dim(mm_root, 1);
                 int rd = (dd == 0) ? 1 : 0;
                 int cd = (dd <= 1) ? 2 : 1;
                 b_rs = br->start[rd]; b_re = br->stop[rd];
@@ -194,9 +190,7 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
             if (a_ndims == 3) {
                 auto ad = a_meta_it->second.template decomp<3>();
                 auto* ar3 = static_cast<ArrayRegion<3>*>(mm_root->operand_regions[0]);
-                int dd = -1;
-                for (int d = 0; d < 3; d++)
-                    if (ar3->stop[d] - ar3->start[d] == 1) { dd = d; break; }
+                int dd = matmul_drop_dim(mm_root, 0);
                 int rd = (dd == 0) ? 1 : 0, cd = (dd <= 1) ? 2 : 1;
                 a_rs += ad.offset[rd]; a_re += ad.offset[rd];
                 a_cs += ad.offset[cd]; a_ce += ad.offset[cd];
@@ -209,9 +203,7 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
             if (b_ndims == 3) {
                 auto bd = b_meta_it->second.template decomp<3>();
                 auto* br3 = static_cast<ArrayRegion<3>*>(mm_root->operand_regions[1]);
-                int dd = -1;
-                for (int d = 0; d < 3; d++)
-                    if (br3->stop[d] - br3->start[d] == 1) { dd = d; break; }
+                int dd = matmul_drop_dim(mm_root, 1);
                 int rd = (dd == 0) ? 1 : 0, cd = (dd <= 1) ? 2 : 1;
                 b_rs += bd.offset[rd]; b_re += bd.offset[rd];
                 b_cs += bd.offset[cd]; b_ce += bd.offset[cd];
@@ -251,6 +243,65 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
         int last_c_row_chare = (c_re > 0) ? (c_re - 1) / c_tile : 0;
         int first_c_col_chare = c_cs / c_tile;
         int last_c_col_chare = (c_ce > 0) ? (c_ce - 1) / c_tile : 0;
+
+        // Fast path: this chare holds A's and B's slices and all of C, so one local
+        // GEMM replaces the panel exchange (no other chare has work).
+        {
+            auto ai = partition->arrays.find(a_name);
+            auto bi = partition->arrays.find(b_name);
+            auto covers = [](const ArrayRegion<2>& r, int r0, int r1, int c0, int c1) {
+                return r.start[0] <= r0 && r.stop[0] >= r1 && r.start[1] <= c0 && r.stop[1] >= c1;
+            };
+            int K = a_ce - a_cs;
+            if (ai != partition->arrays.end() && bi != partition->arrays.end() &&
+                a_meta_it->second.ndims == 2 && b_meta_it->second.ndims == 2 && M > 0 &&
+                N_cols > 0 && K > 0 && K == b_re - b_rs && ai->second->local_size() > 0 &&
+                bi->second->local_size() > 0) {
+                auto a_ch = ai->second->decomp.chare_region_global(nd_idx);
+                auto b_ch = bi->second->decomp.chare_region_global(nd_idx);
+                auto c_ch = c_decomp.chare_region_global(nd_idx);
+                if (covers(a_ch, a_rs, a_re, a_cs, a_ce) && covers(b_ch, b_rs, b_re, b_cs, b_ce) &&
+                    covers(c_ch, c_rs, c_re, c_cs, c_ce) && c_ch.start[0] == c_rs &&
+                    c_ch.start[1] == c_cs) {
+                    int c_rows = M, c_cols = N_cols;
+                    if (partition->arrays.find(result_name) == partition->arrays.end()) {
+                        ArrayRegion<2> out_region({0, 0}, {c_rows, c_cols}, {1, 1});
+                        ArrayDecomp<2> out_decomp =
+                            dag_group->array_meta[result_name].template decomp<2>();
+                        partition->arrays[result_name] = partition->allocate_or_reuse(
+                            out_region, {M, N_cols}, result_name, dt, out_decomp);
+                    }
+                    CTArrayBase<2>* A = ai->second;
+                    CTArrayBase<2>* B = bi->second;
+                    CTArrayBase<2>* C = partition->arrays[result_name];
+                    int lda = A->region.size(1), ldb = B->region.size(1), ldc = C->region.size(1);
+                    int64_t a_off = (int64_t)(a_rs - a_ch.start[0]) * lda + (a_cs - a_ch.start[1]);
+                    int64_t b_off = (int64_t)(b_rs - b_ch.start[0]) * ldb + (b_cs - b_ch.start[1]);
+                    cn_dispatch_blas(dt, [&](auto tag) {
+                        using T = decltype(tag);
+#ifdef USE_KOKKOS
+                        T* a = static_cast<T*>(A->device_data_ptr());
+                        T* b = static_cast<T*>(B->device_data_ptr());
+                        T* c = static_cast<T*>(C->device_data_ptr());
+#else
+                        T* a = static_cast<T*>(A->data_ptr());
+                        T* b = static_cast<T*>(B->data_ptr());
+                        T* c = static_cast<T*>(C->data_ptr());
+#endif
+                        local_gemm<T>(a + a_off, lda, b + b_off, ldb, c, ldc, M, N_cols,
+                                      K, T(0)
+#ifdef USE_NVIDIA
+                                      ,
+                                      partition->compute_stream_raw
+#endif
+                        );
+                    });
+                    pending[node->id] = {node, 0, {}, {}, /*incremental=*/true};
+                    on_comm_done(node->id);
+                    return;
+                }
+            }
+        }
 
         // --- Phase 1: Send A panels ---
         auto a_it = partition->arrays.find(a_name);
@@ -463,7 +514,12 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
                                 int b_ro = k_lo - b_k_s;
                                 panel_gemm_accumulate<T>(a_data, a_rows, a_k_size, a_co, b_data,
                                                          b_k_e - b_k_s, b_cols, b_ro, k_size,
-                                                         c_data, c_rows2, sub_cols2, c_lr, c_lc);
+                                                         c_data, c_rows2, sub_cols2, c_lr, c_lc
+#ifdef USE_NVIDIA
+                                                         ,
+                                                         partition->compute_stream_raw
+#endif
+                                );
                             }
                         }
                     };
@@ -493,10 +549,7 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
                 continue;
             auto* r3d = static_cast<ArrayRegion<3>*>(mm_root->operand_regions[op_idx]);
 
-            int dd = -1;
-            for (int d = 0; d < 3; d++) {
-                if (r3d->stop[d] - r3d->start[d] == 1) { dd = d; break; }
-            }
+            int dd = matmul_drop_dim(mm_root, op_idx);
             if (dd < 0)
                 continue;
             int rd = (dd == 0) ? 1 : 0;
@@ -588,7 +641,7 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
                             int64_t panel_count = (int64_t)send_rows * sub_cols;
                             int64_t panel_bytes = panel_count * sizeof(T);
                             T* panel_buf = static_cast<T*>(
-                                Kokkos::kokkos_malloc<DeviceSpace>(panel_bytes));
+                                comm_alloc(panel_bytes));
                             pack_3d_panel<T>(CT_COMM_POLICY(partition, panel_count), panel_buf,
                                              d_data, cap_sub_cols, cap_dd_dim, cap_dd,
                                              cap_rd_dim, cap_rd + send_row_off, cap_cd_dim,
@@ -697,7 +750,7 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
                             int64_t panel_count = (int64_t)sub_rows * send_cols;
                             int64_t panel_bytes = panel_count * sizeof(T);
                             T* panel_buf = static_cast<T*>(
-                                Kokkos::kokkos_malloc<DeviceSpace>(panel_bytes));
+                                comm_alloc(panel_bytes));
                             int cap_send_cols = send_cols;
                             pack_3d_panel<T>(CT_COMM_POLICY(partition, panel_count), panel_buf,
                                              d_data, cap_send_cols, cap_dd_dim, cap_dd,

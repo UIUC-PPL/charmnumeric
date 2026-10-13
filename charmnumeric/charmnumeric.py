@@ -4,7 +4,8 @@ import struct
 
 import numpy as np
 
-from charmtyles.ast import InlineData, NonFusibleNode, get_execution_state
+from charmtyles.ast import ASTNode, InlineData, NonFusibleNode, get_execution_state
+import charmtyles.ast as _ct_ast
 from charmtyles.core import (
     Region,
     FrontendObject,
@@ -12,6 +13,7 @@ from charmtyles.core import (
     create_object,
     create_result,
     execute,
+    _PENDING_AST,
     _shape_size,
 )
 from charmtyles.operation import Operation
@@ -220,6 +222,8 @@ class ArrayOperation(Operation):
     gather = 120
     scatter = 121
     expand = 122
+    compress = 123
+    mask_scatter = 124
     # 140-149: shape ops (src/executor_shape.cpp)
     reshape = 140
     broadcast = 141
@@ -730,7 +734,48 @@ def _ew(operation, *operands, name, ufunc=None, dtype=None):
     operands = tuple(
         v if isinstance(v, (Array, ArrayView)) else _scalar_wire(v, np.dtype(loop))
         for v, loop in zip(operands, loops))
+    drop = _drop_operands(operands, shape)
+    if drop is not None:
+        ops, key = drop
+        r = fusible_op(*ops, operation=operation, shape=ops[_first_array(ops)].shape, dtype=dtype)
+        return _lazy_copy(r, key, lambda: r, shape, r, key)
     return fusible_op(*operands, operation=operation, shape=shape, dtype=dtype)
+
+
+def _first_array(ops):
+    return next(i for i, v in enumerate(ops) if v.__class__ is ArrayView or v.__class__ is Array)
+
+
+def _drop_operands(operands, shape):
+    """Source views and key if every array operand is a lazy int-index copy of ``shape``
+    with the same storage layout, so the op runs at storage rank (no copies)."""
+    ops, key, sshape = [], None, None
+    for v in operands:
+        if v.__class__ is not Array and v.__class__ is not ArrayView:
+            ops.append(v)
+            continue
+        d = v.__dict__.get("_drop") if v.__class__ is Array else None
+        if d is None or v._shape != shape:
+            return None
+        view, k = d
+        if key is None:
+            key, sshape = k, view.shape
+        elif k != key or view.shape != sshape:
+            return None
+        ops.append(view)
+    return (tuple(ops), key) if key is not None else None
+
+
+def _lazy_copy(parent, key, source, shape, view, vkey):
+    """Linked copy (see _basic_getitem) of ``parent[key]`` that is emitted on first use;
+    until then elementwise ops and assignments read ``view`` (== ``view[vkey]`` at storage rank)."""
+    result = Array(region=_full_region(_storage_shape(shape)), ast=_PENDING_AST,
+                   dtype=view.dtype, shape=shape)
+    result._pending_create = True
+    result._view_of = (parent, key, source)
+    result._seen = None
+    result._drop = (view, vkey)
+    return result
 
 
 def _astype(x, dtype):
@@ -1992,21 +2037,44 @@ def _creation_op(operation, shape, dtype, words=(), payload=None):
     return result
 
 
+def _upload_pieces(shape, itemsize, limit):
+    """Slice keys cutting a C-order array of `shape` into pieces of at most `limit` bytes."""
+    inner = itemsize * _shape_size(shape[1:])
+    if inner <= limit or len(shape) == 1:
+        step = max(1, limit // inner)
+        for i in range(0, shape[0], step):
+            yield (slice(i, min(i + step, shape[0])),)
+    else:
+        for i in range(shape[0]):
+            for key in _upload_pieces(shape[1:], itemsize, limit):
+                yield (slice(i, i + 1),) + key
+
+
 def _upload(host):
-    """Create an array holding the host ndarray `host` (bulk, one DAG node)."""
+    """Create an array holding the host ndarray `host` (one UPLOAD node per message-sized piece)."""
     host = np.ascontiguousarray(host)
     if host.size == 0:
         return create_array(host.shape, dtype=host.dtype)
-    return _creation_op(ArrayOperation.upload, host.shape, host.dtype, payload=host.tobytes())
+    if host.ndim > 3:
+        from .folded import FoldedArray, fold_shape
+
+        return FoldedArray(_upload(host.reshape(fold_shape(host.shape))), host.shape)
+    limit = _ct_ast.max_inline_bytes
+    if host.nbytes <= limit:
+        return _creation_op(ArrayOperation.upload, host.shape, host.dtype, payload=host.tobytes())
+    result = create_array(host.shape, dtype=host.dtype)
+    for key in _upload_pieces(host.shape, host.itemsize, limit):
+        piece = host[key]
+        result[key] = _creation_op(ArrayOperation.upload, piece.shape, host.dtype,
+                                   payload=piece.tobytes())
+    return result
 
 
 def _array_from_host_data(values, dtype=None, copy=True, ndmin=0):
     requested_dtype = _normalize_dtype(dtype, allow_none=True)
 
-    if copy:
-        host = np.array(values, dtype=requested_dtype, copy=True)
-    else:
-        host = np.asarray(values, dtype=requested_dtype)
+    # No host copy needed for copy=True: uploads snapshot the bytes before returning.
+    host = np.asarray(values, dtype=requested_dtype)
 
     while host.ndim < ndmin:
         host = np.expand_dims(host, axis=0)
@@ -2174,6 +2242,9 @@ def _basic_getitem(x, key):
         else:
             next(dims)
     out = tuple(out)
+    if _shape_size(out) > 1 and len(items) == len(plain) and not _has_negative_step(plain):
+        vkey = tuple(_FULL_SLICE if k.__class__ is slice else 0 for k in plain)
+        return _lazy_copy(x, plain, source, out, view, vkey)
     result = _reshape_copy(view, out)
     if out:
         result._view_of = (x, plain, source)
@@ -2192,14 +2263,23 @@ def _fresh(x):
     link = root.__dict__.get("_view_of") if root.__class__ is Array else None
     if link is None:
         return
+    if root.__dict__.get("_pending_create"):
+        root._pending_create = False
+        root.set_active_ast(ASTNode(Operation.create, [root, root.region], root.name))
+        state = get_execution_state()
+        state.track_object(root)
+        state.add_node(NonFusibleNode(obj=root))
     parent, key, source = link
     _fresh(parent)
     version = _version(parent)
     if root._seen != version:
+        drop = root.__dict__.get("_drop")
         root._view_of = None  # neither refresh nor write back while copying
         root[...] = source()
         root._view_of = link
         root._seen = version
+        if drop is not None:
+            root._drop = drop
 
 
 def _fresh_operands(operands):
@@ -2213,6 +2293,9 @@ def _wrote(root):
     d = root.__dict__
     d.pop("_transpose_cache", None)
     d.pop("_rank_cache", None)
+    d.pop("_drop", None)
+    d.pop("_iota_recipe", None)
+    d.pop("_rng_recipe", None)
     d["_version"] = d.get("_version", 0) + 1
     link = d.get("_view_of")
     if link is not None:
@@ -2324,6 +2407,9 @@ def _setitem(self, key, rhs):
         rhs = _upload(np.array([rhs], dtype=self.dtype))  # not exact as a double
     if _shape_size(shape) == 0:
         return
+    drop = rhs.__dict__.get("_drop") if rhs.__class__ is Array else None
+    if drop is not None and _squeeze_shape(drop[0].shape) == _squeeze_shape(shape):
+        rhs = drop[0]  # lazy int-index copy: assign from its source view
     rhs = _cast_operand(rhs, self.dtype)  # NumPy casts on assignment
     if isinstance(rhs, (Array, ArrayView)) and _shape_size(
         (rhs._root_parent if isinstance(rhs, ArrayView) else rhs).shape

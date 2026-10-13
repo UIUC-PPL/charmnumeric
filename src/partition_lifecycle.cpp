@@ -45,10 +45,10 @@ PartitionImpl<N>::~PartitionImpl() {
             delete arr;
 #ifdef USE_KOKKOS
     for (auto& [id, ptr] : pending_sends)
-        Kokkos::kokkos_free<DeviceSpace>(ptr);
+        comm_free(ptr);
     for (auto& [key, bufs] : posted_recv_bufs)
         for (char* p : bufs)
-            Kokkos::kokkos_free<DeviceSpace>(p);
+            comm_free(p);
 #endif
 #ifdef USE_NVIDIA
     cudaStreamDestroy(compute_stream_raw);

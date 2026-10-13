@@ -4,9 +4,10 @@
 
 #include <cstring>
 
-// Array-creation ops (UPLOAD, RANDOM, IOTA) fill each array chare-locally, without communication.
-// RANDOM/IOTA derive elements from the global index. UPLOAD tiles are cut from the DAG
-// payload in stage_uploads and freed after use.
+// Array-creation ops (UPLOAD, RANDOM, IOTA) fill each array chare-locally.
+// RANDOM/IOTA derive elements from the global index. UPLOAD bytes reach only PE 0, which
+// cuts them into tiles and sends each to its chare's home PE; a chare living elsewhere
+// fetches its tile from there.
 
 namespace {
 
@@ -36,8 +37,32 @@ CkArrayIndex chare_array_index(const std::array<int, N>& idx) {
         return CkArrayIndex3D(idx[0], idx[1], idx[2]);
 }
 
+/// PE that stages chare idx's UPLOAD tiles: its home PE (CNUM_UPLOAD_STAGE_SHIFT moves
+/// staging off the chares to test the fetch path).
 template <int N>
-void stage_upload_nd(ArrayDAGGroup* group, ASTNode* root, CkLocMgr* loc_mgr) {
+int upload_stage_pe(CkLocMgr* loc_mgr, const std::array<int, N>& idx) {
+    static const int shift = [] {
+        const char* e = getenv("CNUM_UPLOAD_STAGE_SHIFT");
+        return e ? atoi(e) : 0;
+    }();
+    return (loc_mgr->homePe(chare_array_index<N>(idx)) + shift) % CkNumPes();
+}
+
+template <int N>
+CkLocMgr* partition_loc_mgr(ArrayDAGGroup* group) {
+    if constexpr (N == 1)
+        return group->partition_proxy_1.ckLocMgr();
+    else if constexpr (N == 2)
+        return group->partition_proxy_2.ckLocMgr();
+    else
+        return group->partition_proxy_3.ckLocMgr();
+}
+
+constexpr int kTileMetaInts = 8; // ndims, global_shape[3], offset[3], tile
+
+template <int N>
+void stage_upload_nd(ArrayDAGGroup* group, ASTNode* root, const char* payload) {
+    CkLocMgr* loc_mgr = partition_loc_mgr<N>(group);
     int name = root->result_name;
     auto meta_it = group->array_meta.find(name);
     if (meta_it == group->array_meta.end())
@@ -51,9 +76,13 @@ void stage_upload_nd(ArrayDAGGroup* group, ASTNode* root, CkLocMgr* loc_mgr) {
     for (int d = N - 2; d >= 0; --d)
         gstrides[d] = gstrides[d + 1] * (int64_t)decomp.global_shape[d + 1];
     int64_t total = gstrides[0] * (int64_t)decomp.global_shape[0];
-    if ((int64_t)root->payload.size() != total * esz)
+    if (root->payload_size != total * esz)
         CkAbort("UPLOAD: array %d payload has %lld bytes, expected %lld", name,
-                (long long)root->payload.size(), (long long)(total * esz));
+                (long long)root->payload_size, (long long)(total * esz));
+    int meta_ints[kTileMetaInts] = {meta.ndims, meta.global_shape[0], meta.global_shape[1],
+                                    meta.global_shape[2], meta.offset[0], meta.offset[1],
+                                    meta.offset[2], meta.tile};
+    std::vector<char> remote; // a tile on its way to another PE
 
     const int* grid = group->partition_grid[N].grid;
     int num_chares = 1;
@@ -72,27 +101,38 @@ void stage_upload_nd(ArrayDAGGroup* group, ASTNode* root, CkLocMgr* loc_mgr) {
         for (int d = 0; d < N; ++d)
             if (local.size(d) <= 0)
                 empty = true;
-        if (empty || loc_mgr->homePe(chare_array_index<N>(ci)) != CkMyPe())
+        if (empty)
             continue;
 
-        ArrayDAGGroup::UploadTile& tile = group->upload_tiles[upload_key<N>(name, ci)];
-        tile.meta = meta;
+        int pe = upload_stage_pe<N>(loc_mgr, ci);
+        auto key = upload_key<N>(name, ci);
+        std::vector<char>* dst = &remote;
+        if (pe == CkMyPe()) {
+            ArrayDAGGroup::UploadTile& tile = group->upload_tiles[key];
+            tile.meta = meta;
+            dst = &tile.data;
+        }
         int64_t row = local.size(N - 1);
         int64_t rows = local.size() / row;
-        tile.data.resize((size_t)(local.size() * esz));
+        dst->resize((size_t)(local.size() * esz));
         std::array<int, N> idx = {};
         for (int64_t r = 0; r < rows; ++r) {
             int64_t src = 0;
             for (int d = 0; d < N; ++d)
                 src += (int64_t)(local.start[d] + idx[d]) * gstrides[d];
-            memcpy(tile.data.data() + r * row * esz, root->payload.data() + src * esz,
-                   (size_t)(row * esz));
+            memcpy(dst->data() + r * row * esz, payload + src * esz, (size_t)(row * esz));
             for (int d = N - 2; d >= 0; --d) {
                 if (++idx[d] < local.size(d))
                     break;
                 idx[d] = 0;
             }
         }
+        if (pe == CkMyPe())
+            group->serve_upload_fetch(key, N);
+        else
+            group->thisProxy[pe].stage_upload_tile(name, N, key[1], key[2], key[3], kTileMetaInts,
+                                                   meta_ints, (int64_t)remote.size(),
+                                                   remote.data());
     }
 }
 
@@ -208,34 +248,127 @@ void fill_typed(Opcode opc, PartitionImpl<N>* partition, CTArrayBase<N>* base, A
 
 } // namespace
 
-void ArrayDAGGroup::stage_uploads(DAG* dag) {
+void ArrayDAGGroup::stage_uploads(DAG* dag, int epoch) {
     for (auto& [id, dag_node] : dag->nodes) {
         for (ASTNode* root : dag_node->ast->roots) {
             if (static_cast<Opcode>(root->opcode) != Opcode::UPLOAD)
                 continue;
+            const char* payload = inline_bytes(epoch, root);
+            if (payload == nullptr)
+                continue; // not PE 0: tiles arrive in stage_upload_tile
             switch (root->ndims) {
             case 1:
-                stage_upload_nd<1>(this, root, partition_proxy_1.ckLocMgr());
+                stage_upload_nd<1>(this, root, payload);
                 break;
             case 2:
-                stage_upload_nd<2>(this, root, partition_proxy_2.ckLocMgr());
+                stage_upload_nd<2>(this, root, payload);
                 break;
             case 3:
-                stage_upload_nd<3>(this, root, partition_proxy_3.ckLocMgr());
+                stage_upload_nd<3>(this, root, payload);
                 break;
             default:
                 CkAbort("UPLOAD: unsupported ndims=%d", root->ndims);
             }
-            // The DAG (and its ASTs) outlive the epoch; drop the full payload now.
-            std::vector<char>().swap(root->payload);
         }
     }
+    release_inline_bulk(epoch);
+}
+
+void ArrayDAGGroup::stage_upload_tile(int name, int nd, int i0, int i1, int i2, int nmeta,
+                                      int* meta, int64_t size, char* data) {
+    if (nmeta != kTileMetaInts)
+        CkAbort("UPLOAD: tile of array %d has %d metadata words", name, nmeta);
+    std::array<int, 4> key = {name, i0, i1, i2};
+    UploadTile& tile = upload_tiles[key];
+    tile.meta.ndims = meta[0];
+    for (int d = 0; d < 3; ++d) {
+        tile.meta.global_shape[d] = meta[1 + d];
+        tile.meta.offset[d] = meta[4 + d];
+    }
+    tile.meta.tile = meta[7];
+    tile.meta.decomp_final = true;
+    tile.data.assign(data, data + size);
+    serve_upload_fetch(key, nd);
+}
+
+void ArrayDAGGroup::serve_upload_fetch(const std::array<int, 4>& key, int nd) {
+    auto f = upload_fetches.find(key);
+    if (f == upload_fetches.end())
+        return;
+    auto it = upload_tiles.find(key);
+    send_upload_tile(key, nd, f->second.first, it->second.data);
+    upload_fetches.erase(f);
+    upload_tiles.erase(it);
+}
+
+void ArrayDAGGroup::fetch_upload_tile(int node_id, int name, int nd, int i0, int i1, int i2) {
+    std::array<int, 4> key = {name, i0, i1, i2};
+    auto it = upload_tiles.find(key);
+    if (it == upload_tiles.end()) {
+        upload_fetches[key] = {node_id, nd}; // not staged yet: served by stage_upload_nd
+        return;
+    }
+    send_upload_tile(key, nd, node_id, it->second.data);
+    upload_tiles.erase(it);
+}
+
+void ArrayDAGGroup::send_upload_tile(const std::array<int, 4>& key, int nd, int node_id,
+                                     std::vector<char>& data) {
+    int64_t size = static_cast<int64_t>(data.size());
+    if (nd == 1)
+        partition_proxy_1(key[1]).receive_upload_tile(node_id, key[0], size, data.data());
+    else if (nd == 2)
+        partition_proxy_2(key[1], key[2]).receive_upload_tile(node_id, key[0], size, data.data());
+    else
+        partition_proxy_3(key[1], key[2], key[3])
+            .receive_upload_tile(node_id, key[0], size, data.data());
+}
+
+template <int N>
+void ArrayDAGExecutorND<N>::on_upload_tile(int node_id, int name, char* data, int64_t size) {
+    auto w = upload_wait.find(node_id);
+    if (w == upload_wait.end())
+        CkAbort("UPLOAD: unexpected tile of array %d for node %d", name, node_id);
+    ASTNode* root = nullptr;
+    for (ASTNode* r : w->second.first->ast->roots)
+        if (r->result_name == name && static_cast<Opcode>(r->opcode) == Opcode::UPLOAD)
+            root = r;
+    auto arr_it = partition->arrays.find(name);
+    if (root == nullptr || arr_it == partition->arrays.end())
+        CkAbort("UPLOAD: tile for unknown array %d", name);
+    std::vector<char> tile(data, data + size);
+    cn_dispatch(root->dtype, [&](auto tag) {
+        using T = decltype(tag);
+        fill_upload<N, T>(static_cast<Array<N, T>*>(arr_it->second), tile);
+    });
+    if (--w->second.second == 0) {
+        upload_wait.erase(w);
+        finish_creation_node(node_id);
+    }
+}
+
+template <int N>
+void ArrayDAGExecutorND<N>::finish_creation_node(int node_id) {
+#ifdef USE_NVIDIA
+    auto* p = new ComputeDoneParam<N>{partition, node_id, false};
+    CkCallback hcb(compute_done_cb<N>, p);
+    hapiAddCallback(partition->compute_stream_raw, &hcb);
+#else
+    CT_KOKKOS_FENCE();
+    node_finished(node_id);
+#endif
+}
+
+template <int N>
+void PartitionImpl<N>::receive_upload_tile(int node_id, int name, int64_t size, char* data) {
+    executor->on_upload_tile(node_id, name, data, size);
 }
 
 template <int N>
 void ArrayDAGExecutorND<N>::execute_creation_node(DAGNode* node) {
     auto* dag_group = static_cast<ArrayDAGGroup*>(group);
     auto nd_idx = partition->nd_index();
+    int fetches = 0;
 
     for (ASTNode* root : node->ast->roots) {
         auto opc = static_cast<Opcode>(root->opcode);
@@ -266,8 +399,16 @@ void ArrayDAGExecutorND<N>::execute_creation_node(DAGNode* node) {
         auto arr_it = partition->arrays.find(name);
         if (arr_it == partition->arrays.end())
             continue; // this chare holds no part of the array
-        if (opc == Opcode::UPLOAD && !have_tile)
-            CkAbort("UPLOAD: no staged tile for array %d on PE %d", name, CkMyPe());
+        if (opc == Opcode::UPLOAD && !have_tile) {
+            // staged on another PE: fetch it (on_upload_tile fills the array)
+            int pe = upload_stage_pe<N>(partition_loc_mgr<N>(dag_group), nd_idx);
+            std::array<int, 3> ci = {0, 0, 0};
+            for (int d = 0; d < N; ++d)
+                ci[d] = nd_idx[d];
+            dag_group->thisProxy[pe].fetch_upload_tile(node->id, name, N, ci[0], ci[1], ci[2]);
+            ++fetches;
+            continue;
+        }
 
         TileGeometry<N> t;
         ArrayRegion<N> local = decomp.chare_region_local(nd_idx);
@@ -282,18 +423,16 @@ void ArrayDAGExecutorND<N>::execute_creation_node(DAGNode* node) {
         });
     }
 
-#ifdef USE_NVIDIA
-    {
-        auto* p = new ComputeDoneParam<N>{partition, node->id, false};
-        CkCallback hcb(compute_done_cb<N>, p);
-        hapiAddCallback(partition->compute_stream_raw, &hcb);
-    }
-#else
-    CT_KOKKOS_FENCE();
-    node_finished(node->id);
-#endif
+    if (fetches > 0)
+        upload_wait[node->id] = {node, fetches};
+    else
+        finish_creation_node(node->id);
 }
 
 template void ArrayDAGExecutorND<1>::execute_creation_node(DAGNode*);
 template void ArrayDAGExecutorND<2>::execute_creation_node(DAGNode*);
 template void ArrayDAGExecutorND<3>::execute_creation_node(DAGNode*);
+
+template void PartitionImpl<1>::receive_upload_tile(int, int, int64_t, char*);
+template void PartitionImpl<2>::receive_upload_tile(int, int, int64_t, char*);
+template void PartitionImpl<3>::receive_upload_tile(int, int, int64_t, char*);

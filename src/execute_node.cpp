@@ -243,28 +243,14 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                                     vec_data = reinterpret_cast<T*>(buffers[0].data);
                                     vec_len = buffers[0].byte_size / sizeof(T);
                                 } else {
-                                    std::sort(buffers.begin(), buffers.end(),
-                                        [](auto& a, auto& b) {
-                                            return a.region.start[0] < b.region.start[0];
-                                        });
-                                    for (auto& rb : buffers)
-                                        vec_len += rb.byte_size / sizeof(T);
-                                    assembled_vec = new T[vec_len];
-                                    int offset = 0;
-                                    for (auto& rb : buffers) {
-                                        int len = rb.byte_size / sizeof(T);
-                                        memcpy(assembled_vec + offset,
-                                               reinterpret_cast<T*>(rb.data),
-                                               rb.byte_size);
-                                        offset += len;
-                                    }
+                                    assembled_vec = concat_vector_pieces<T>(buffers, vec_len);
                                     vec_data = assembled_vec;
                                 }
                             }
                         }
 
                         if (!vec_data || sub_rows <= 0 || sub_cols <= 0) {
-                            delete[] assembled_vec;
+                            free_vector_pieces(assembled_vec);
                             handled = true;
                             continue;
                         }
@@ -280,23 +266,11 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
 
                         int actual_cols = std::min(sub_cols, vec_len);
 #ifdef USE_KOKKOS
-                        {
-                            Kokkos::View<T**, Kokkos::LayoutRight, DeviceSpace,
-                                         Kokkos::MemoryTraits<Kokkos::Unmanaged>>
-                                d_mat(static_cast<T*>(mat->device_data_ptr()),
-                                      local_rows, local_cols);
-                            auto d_sub_mat = Kokkos::subview(d_mat,
-                                Kokkos::make_pair(row_offset, row_offset + sub_rows),
-                                Kokkos::make_pair(col_offset, col_offset + actual_cols));
-                            Kokkos::View<T*, DeviceSpace,
-                                         Kokkos::MemoryTraits<Kokkos::Unmanaged>>
-                                d_vec(vec_data, actual_cols);
-                            Kokkos::View<T*, DeviceSpace,
-                                         Kokkos::MemoryTraits<Kokkos::Unmanaged>>
-                                d_res(static_cast<T*>(result->device_data_ptr()),
-                                      sub_rows);
-                            KokkosBlas::gemv("N", T(1), d_sub_mat, d_vec, T(0), d_res);
-                        }
+                        local_gemv<T>(CT_COMPUTE_EXEC(partition),
+                                      static_cast<T*>(mat->device_data_ptr()) +
+                                          (int64_t)row_offset * local_cols + col_offset,
+                                      local_cols, sub_rows, actual_cols, vec_data,
+                                      static_cast<T*>(result->device_data_ptr()));
                         CT_KOKKOS_FENCE();
 #else
                         eigen_gemv_sub(static_cast<T*>(mat->data_ptr()), local_cols,
@@ -304,7 +278,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                                        sub_rows, actual_cols,
                                        vec_data, static_cast<T*>(result->data_ptr()));
 #endif
-                        delete[] assembled_vec;
+                        free_vector_pieces(assembled_vec);
 
                         // Send partial result to 1D partition(s)
                         {
@@ -365,12 +339,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
 
                         // Extract 3D region: identify dropped/row/col dims
                         auto* mr = static_cast<ArrayRegion<3>*>(ast_node->operand_regions[0]);
-                        int dd = -1;
-                        for (int d = 0; d < 3; d++) {
-                            if (mr->stop[d] - mr->start[d] == 1) {
-                                dd = d; break;
-                            }
-                        }
+                        int dd = matmul_drop_dim(ast_node, 0);
                         int rd = (dd == 0) ? 1 : 0;
                         int cd = (dd <= 1) ? 2 : 1;
 
@@ -411,28 +380,14 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                                     vec_data = reinterpret_cast<T*>(buffers[0].data);
                                     vec_len = buffers[0].byte_size / sizeof(T);
                                 } else {
-                                    std::sort(buffers.begin(), buffers.end(),
-                                        [](auto& a, auto& b) {
-                                            return a.region.start[0] < b.region.start[0];
-                                        });
-                                    for (auto& rb : buffers)
-                                        vec_len += rb.byte_size / sizeof(T);
-                                    assembled_vec = new T[vec_len];
-                                    int offset = 0;
-                                    for (auto& rb : buffers) {
-                                        int len = rb.byte_size / sizeof(T);
-                                        memcpy(assembled_vec + offset,
-                                               reinterpret_cast<T*>(rb.data),
-                                               rb.byte_size);
-                                        offset += len;
-                                    }
+                                    assembled_vec = concat_vector_pieces<T>(buffers, vec_len);
                                     vec_data = assembled_vec;
                                 }
                             }
                         }
 
                         if (!vec_data || sub_rows <= 0 || sub_cols <= 0) {
-                            delete[] assembled_vec;
+                            free_vector_pieces(assembled_vec);
                             handled = true;
                             continue;
                         }
@@ -498,6 +453,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                             // Flatten the 3D subview to 2D for KokkosBlas
                             // For dd==0: subview is (1, sub_rows, actual_cols) -> reshape to (sub_rows, actual_cols)
                             // For other cases, strides may differ; use manual parallel_for
+                            Kokkos::fence("ct_gemv_3d inputs");
                             Kokkos::parallel_for(
                                 Kokkos::RangePolicy<>(0, sub_rows),
                                 KOKKOS_LAMBDA(int i) {
@@ -512,10 +468,10 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                                     }
                                     d_res(i) = sum;
                                 });
+                            Kokkos::fence("ct_gemv_3d");
                         }
-                        CT_KOKKOS_FENCE();
 #endif
-                        delete[] assembled_vec;
+                        free_vector_pieces(assembled_vec);
 
                         // Send partial result to 1D partition(s)
                         {
@@ -573,10 +529,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                             if (mat_ndims == 3) {
                                 auto* mr = static_cast<ArrayRegion<3>*>(ast_node->operand_regions[0]);
                                 // Find dropped dim and extract row dim size
-                                int dd = -1;
-                                for (int d = 0; d < 3; d++) {
-                                    if (mr->stop[d] - mr->start[d] == 1) { dd = d; break; }
-                                }
+                                int dd = matmul_drop_dim(ast_node, 0);
                                 int rd = (dd == 0) ? 1 : 0;
                                 slice_rows = mr->stop[rd] - mr->start[rd];
                             } else {

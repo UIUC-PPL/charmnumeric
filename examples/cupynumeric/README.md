@@ -18,7 +18,7 @@ cd example/charmnumeric/examples/cupynumeric
 
 # against a running backend (server.out ++server ++server-port $CNUM_PORT)
 CNUM_HOST=127.0.0.1 CNUM_PORT=1234 CNUM_ODF=4 python cg.py --check
-CNUM_AUTO_FLUSH=1000 python cfd.py          # optional: charmtyles set_auto_flush
+CNUM_AUTO_FLUSH=0 python cfd.py             # no automatic async flushes (default: every 256 ops)
 
 # without a backend: host-side reference simulator (static/semantic check)
 CNUM_SIM=1 python kmeans.py
@@ -392,3 +392,11 @@ This checks:
 - the absence of patterns the backend is known not to support.
 
 It does **not** run the C++ backend.
+
+## Reference mode: cuPyNumeric instead of NumPy
+
+`CNUM_REFERENCE=cupynumeric` makes the shim run the upstream program on real cuPyNumeric (a `legate` subprocess in a
+separate conda env) with the recorded draws and factors replayed, and compare the locals as above; the reported times
+of both sides are printed. `run_cupy_compare.sh <npes> <outdir>` runs all ports this way on a GPU node (charmnumeric
++p<npes> against cuPyNumeric on <npes> GPUs) and `_cupy_compare_table.py` formats results.jsonl. Setup and flags are
+in the docstring of `_cupy_reference.py`; the NumPy mode is the default and unchanged.

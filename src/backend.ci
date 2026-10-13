@@ -16,6 +16,9 @@ mainmodule charmnumeric
         entry void receive_get_request(int ndims, int epoch, int name, int size, int dtype);
         entry void gather(int epoch, int name, int64_t offset, int64_t size, char data[size]);
         entry void barrier_arrive(int epoch);
+        entry void fetch_upload_tile(int node_id, int name, int nd, int i0, int i1, int i2);
+        entry void stage_upload_tile(int name, int nd, int i0, int i1, int i2, int nmeta,
+                                     int meta[nmeta], int64_t size, char data[size]);
     };
 
     array [1D] Partition1D
@@ -38,6 +41,7 @@ mainmodule charmnumeric
         entry void receive_linalg(int node_id, int64_t size, char data[size]);
         entry void receive_index_msg(int node_id, int64_t size, char data[size]);
         entry void receive_shape(int node_id, int64_t size, char data[size]);
+        entry void receive_upload_tile(int node_id, int name, int64_t size, char data[size]);
     };
 
     array [2D] Partition2D
@@ -60,6 +64,7 @@ mainmodule charmnumeric
         entry void receive_linalg(int node_id, int64_t size, char data[size]);
         entry void receive_index_msg(int node_id, int64_t size, char data[size]);
         entry void receive_shape(int node_id, int64_t size, char data[size]);
+        entry void receive_upload_tile(int node_id, int name, int64_t size, char data[size]);
     };
 
     array [3D] Partition3D
@@ -82,5 +87,6 @@ mainmodule charmnumeric
         entry void receive_linalg(int node_id, int64_t size, char data[size]);
         entry void receive_index_msg(int node_id, int64_t size, char data[size]);
         entry void receive_shape(int node_id, int64_t size, char data[size]);
+        entry void receive_upload_tile(int node_id, int name, int64_t size, char data[size]);
     };
 }

@@ -4,7 +4,7 @@ Environment variables:
     CNUM_HOST        backend host            (default 127.0.0.1)
     CNUM_PORT        backend CCS port        (default 1234)
     CNUM_ODF         over-decomposition fac. (default 4)
-    CNUM_AUTO_FLUSH  if set, call charmtyles set_auto_flush(interface, N)
+    CNUM_AUTO_FLUSH  pending ops per automatic async flush (charmnumeric/interface.py)
     CNUM_SIM         if set to a non-empty value other than "0", do not
                      connect; return the host-side reference simulator from
                      _cnum_sim.py instead (static/semantic dry run).
@@ -31,10 +31,4 @@ def get_interface():
 
     interface = cnp.CharmNumericInterface()
     interface.connect(host, port, odf)
-
-    flush = os.environ.get("CNUM_AUTO_FLUSH")
-    if flush:
-        from charmtyles.core import set_auto_flush
-
-        set_auto_flush(interface, int(flush))
     return interface

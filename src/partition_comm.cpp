@@ -19,7 +19,7 @@ void PartitionImpl<N>::receive_data(int& node_id, int& input_index, int& name, i
                                     CkDeviceBufferPost* devicePost) {
     // Post entry method: allocate device buffer for incoming GPU data
     // receive_data later gets a null data pointer, so the buffer is keyed by message identity.
-    data = static_cast<char*>(Kokkos::kokkos_malloc<DeviceSpace>(size));
+    data = static_cast<char*>(comm_alloc(size));
     posted_recv_bufs[recv_key(node_id, input_index, name, ndims, region_data)].push_back(data);
 }
 
@@ -27,7 +27,7 @@ template <int N>
 void PartitionImpl<N>::send_complete(int send_id) {
     auto it = pending_sends.find(send_id);
     if (it != pending_sends.end()) {
-        Kokkos::kokkos_free<DeviceSpace>(it->second);
+        comm_free(it->second);
         pending_sends.erase(it);
     }
 }

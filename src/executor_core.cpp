@@ -56,7 +56,7 @@ static void send_remote_input(PartitionImpl<N>* partition, DAGNode* node, const 
 
 #ifdef USE_KOKKOS
     // Pack on device and send via direct GPU messaging
-    T* send_buf = static_cast<T*>(Kokkos::kokkos_malloc<DeviceSpace>(total_size * sizeof(T)));
+    T* send_buf = static_cast<T*>(comm_alloc(total_size * sizeof(T)));
     T* src_device = static_cast<T*>(arr->device_data_ptr());
 
     // Capture strides/offsets in plain arrays for KOKKOS_LAMBDA
@@ -595,7 +595,7 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
             // receive_data takes a nocopydevice buffer; send_complete frees it.
             auto send_device = [&](auto& proxy, const auto& ci, auto nt) {
                 constexpr int NT = decltype(nt)::value;
-                char* dbuf = static_cast<char*>(Kokkos::kokkos_malloc<DeviceSpace>(elem_sz));
+                char* dbuf = static_cast<char*>(comm_alloc(elem_sz));
                 Kokkos::deep_copy(
                     Kokkos::View<char*, DeviceSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>(
                         dbuf, elem_sz),

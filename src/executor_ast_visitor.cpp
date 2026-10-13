@@ -353,16 +353,11 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
             // Perform matmul on device using KokkosBlas::gemv
             auto kokkos_gemv = [&](auto dummy) {
                 using VT = decltype(dummy);
-                Kokkos::View<VT**, Kokkos::LayoutRight, DeviceSpace,
-                             Kokkos::MemoryTraits<Kokkos::Unmanaged>>
-                    d_mat(static_cast<VT*>(mat_base->device_data_ptr()), local_rows, local_cols);
-                auto d_sub =
-                    Kokkos::subview(d_mat, Kokkos::ALL, Kokkos::make_pair(0, actual_cols));
-                Kokkos::View<VT*, DeviceSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>
-                    d_vec(static_cast<VT*>(vec_base->device_data_ptr()), actual_cols);
-                Kokkos::View<VT*, DeviceSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>
-                    d_res(static_cast<VT*>(result_base->device_data_ptr()), local_rows);
-                KokkosBlas::gemv("N", VT(1), d_sub, d_vec, VT(0), d_res);
+                local_gemv<VT>(CT_COMPUTE_EXEC(partition),
+                               static_cast<VT*>(mat_base->device_data_ptr()), local_cols,
+                               local_rows, actual_cols,
+                               static_cast<VT*>(vec_base->device_data_ptr()),
+                               static_cast<VT*>(result_base->device_data_ptr()));
             };
             cn_dispatch_blas(dtype, kokkos_gemv);
 #else
@@ -493,7 +488,14 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
                              Kokkos::MemoryTraits<Kokkos::Unmanaged>>
                     d_c(static_cast<VT*>(partition->arrays[result_name]->device_data_ptr()), sub_rows,
                         sub_cols);
+#ifdef USE_NVIDIA
+                // default instance is not ordered with the chare's compute stream
+                cudaStreamSynchronize(partition->compute_stream_raw);
+#endif
                 KokkosBlas::gemm("N", "N", VT(1), d_a_sub, d_b_sub, VT(1), d_c);
+#ifdef USE_NVIDIA
+                Kokkos::DefaultExecutionSpace().fence("ct_gemm result");
+#endif
             };
             cn_dispatch_blas(dtype, kokkos_gemm);
 #else
@@ -536,6 +538,8 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
     case Opcode::GATHER:
     case Opcode::SCATTER:
     case Opcode::EXPAND:
+    case Opcode::COMPRESS:
+    case Opcode::MASK_SCATTER:
         // Always handled by execute_index_node.
         return node->result_name;
     default:

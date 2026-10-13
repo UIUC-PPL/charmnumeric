@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import subprocess
 import time
@@ -33,11 +34,22 @@ def synchronize(interface=None):
     execute(interface)
     interface.get(1, _BARRIER_NAME, 0, dtype=np.bool_)
 
+# Pending ops that trigger an async flush, so the backend runs while the program
+# records more and DAGs stay small (CNUM_AUTO_FLUSH; 0 disables).
+_AUTO_FLUSH = int(os.environ.get("CNUM_AUTO_FLUSH", "256"))
+
+
 class CharmNumericInterface(CCSInterface):
     def __init__(self, *args, **kwargs):
         global _default_interface
         super().__init__(*args, **kwargs)
         _default_interface = self
+
+    def connect(self, server_ip, server_port, odf):
+        super().connect(server_ip, server_port, odf)
+        from charmtyles.core import set_auto_flush
+
+        set_auto_flush(self, _AUTO_FLUSH if _AUTO_FLUSH > 0 else None)
 
     def from_bytes(self, payload, **kwargs):
         reply_type = kwargs.pop("reply_type", "array")

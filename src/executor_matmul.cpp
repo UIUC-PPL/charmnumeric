@@ -27,7 +27,7 @@ static void cross_matmul_send_vector_slice_1d_to_2d(
 #endif
 
 #ifdef USE_KOKKOS
-    T* send_buf = static_cast<T*>(Kokkos::kokkos_malloc<DeviceSpace>(byte_size));
+    T* send_buf = static_cast<T*>(comm_alloc(byte_size));
     T* src_device = static_cast<T*>(vec->device_data_ptr()) + local_offset;
     Kokkos::parallel_for(
         CT_COMM_POLICY(partition, send_len),
@@ -72,7 +72,7 @@ static void cross_matmul_send_vector_slice_1d_to_3d(
 #endif
 
 #ifdef USE_KOKKOS
-    T* send_buf = static_cast<T*>(Kokkos::kokkos_malloc<DeviceSpace>(byte_size));
+    T* send_buf = static_cast<T*>(comm_alloc(byte_size));
     T* src_device = static_cast<T*>(vec->device_data_ptr()) + local_offset;
     Kokkos::parallel_for(
         CT_COMM_POLICY(partition, send_len),
@@ -176,13 +176,7 @@ void ArrayDAGExecutorND<N>::execute_matmul_node(DAGNode* node) {
             vec_e = vec_region->stop[0];
 
             // Identify dropped dim (size-1 range), row dim, col dim
-            int dd = -1;
-            for (int d = 0; d < 3; d++) {
-                if (mat_region_3d->stop[d] - mat_region_3d->start[d] == 1) {
-                    dd = d;
-                    break;
-                }
-            }
+            int dd = matmul_drop_dim(matmul_root, 0);
             int rd = (dd == 0) ? 1 : 0;
             int cd = (dd <= 1) ? 2 : 1;
 
@@ -480,13 +474,7 @@ void ArrayDAGExecutorND<N>::execute_matmul_node(DAGNode* node) {
         auto* vec_region = static_cast<ArrayRegion<1>*>(matmul_root->operand_regions[1]);
 
         // Identify dropped dim (size-1 range), row dim, col dim
-        int dd = -1;
-        for (int d = 0; d < 3; d++) {
-            if (mat_region_3d->stop[d] - mat_region_3d->start[d] == 1) {
-                dd = d;
-                break;
-            }
-        }
+        int dd = matmul_drop_dim(matmul_root, 0);
         int rd = (dd == 0) ? 1 : 0;
         int cd = (dd <= 1) ? 2 : 1;
 

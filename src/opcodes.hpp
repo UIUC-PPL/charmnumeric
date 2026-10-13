@@ -69,6 +69,8 @@ enum class Opcode {
     GATHER = 120,  // out[e] = src.flat[L[b] + sum(slice coords * strides)]
     SCATTER = 121, // dst.flat[L[b] + ...] = v[e] (in place; result name unused)
     EXPAND = 122,  // flat positions i of a view, each repeated count(x[i]) times
+    COMPRESS = 123,     // x[mask], mask of x's view shape: operands (x, mask, count)
+    MASK_SCATTER = 124, // x[mask] = v (in place): operands (x, mask, v, count)
     // 140-149: executor_shape.cpp. Operands (x, target shape...).
     RESHAPE = 140,   // C-order reshape into a new array
     BROADCAST = 141, // numpy.broadcast_to, materialized
@@ -93,9 +95,12 @@ inline bool is_signal_op(Opcode op) {
     return op == Opcode::CONVOLVE || op == Opcode::FLIP;
 }
 
+/// Returns true for the boolean-mask ops (execute_mask_node).
+inline bool is_mask_op(Opcode op) { return op == Opcode::COMPRESS || op == Opcode::MASK_SCATTER; }
+
 /// Returns true for ops handled by execute_index_node.
 inline bool is_index_op(Opcode op) {
-    return op == Opcode::GATHER || op == Opcode::SCATTER || op == Opcode::EXPAND;
+    return op == Opcode::GATHER || op == Opcode::SCATTER || op == Opcode::EXPAND || is_mask_op(op);
 }
 
 /// Returns true for ops handled by execute_reduction_node.

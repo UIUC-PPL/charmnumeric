@@ -192,6 +192,8 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
     // charmtyles (cache_dag) prefixes every DAG with an int64 plan signature for
     // DAGGroup::replay_dag_template. The template cache is not used here yet, so
     // skip the signature and deserialize the full DAG that follows it.
+    if (size < (int)sizeof(int64_t))
+        CkAbort("receive_dag: %d-byte DAG message is too short", size);
     int64_t plan_signature;
     memcpy(&plan_signature, serialized_dag, sizeof(plan_signature));
     (void)plan_signature;
@@ -204,10 +206,17 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
         for (ASTNode* ast_node : dag_node->ast->roots) {
             if (ast_node->ndims >= 1 && ast_node->ndims <= 3)
                 active_ndims.insert(ast_node->ndims);
-            for (ASTNode* operand : ast_node->operands)
+            for (ASTNode* operand : ast_node->operands) {
                 if (!operand->is_scalar && !operand->is_broadcast && operand->ndims >= 1 &&
                     operand->ndims <= 3)
                     active_ndims.insert(operand->ndims);
+                // a materialized size-1 source of another rank must send its value
+                if (operand->is_broadcast) {
+                    auto live = live_array_meta.find(operand->result_name);
+                    if (live != live_array_meta.end())
+                        active_ndims.insert(live->second.ndims);
+                }
+            }
             if (static_cast<Opcode>(ast_node->opcode) == Opcode::DIAG) {
                 active_ndims.insert(1);
                 active_ndims.insert(2);
@@ -301,13 +310,7 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
                         if (mat_ndims == 3) {
                             auto* mr =
                                 static_cast<ArrayRegion<3>*>(ast_node->operand_regions[0]);
-                            int dropped = -1;
-                            for (int d = 0; d < 3; d++) {
-                                if (mr->stop[d] - mr->start[d] == 1) {
-                                    dropped = d;
-                                    break;
-                                }
-                            }
+                            int dropped = matmul_drop_dim(ast_node, 0);
                             int row_dim = (dropped == 0) ? 1 : 0;
                             mat_rows = mr->stop[row_dim] - mr->start[row_dim];
                         } else {
@@ -331,12 +334,7 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
                         if (lhs_ndims == 3) {
                             auto* lr =
                                 static_cast<ArrayRegion<3>*>(ast_node->operand_regions[0]);
-                            int dd = -1;
-                            for (int d = 0; d < 3; d++)
-                                if (lr->stop[d] - lr->start[d] == 1) {
-                                    dd = d;
-                                    break;
-                                }
+                            int dd = matmul_drop_dim(ast_node, 0);
                             int rd = (dd == 0) ? 1 : 0;
                             M = lr->stop[rd] - lr->start[rd];
                         } else {
@@ -347,12 +345,7 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
                         if (rhs_ndims == 3) {
                             auto* rr =
                                 static_cast<ArrayRegion<3>*>(ast_node->operand_regions[1]);
-                            int dd = -1;
-                            for (int d = 0; d < 3; d++)
-                                if (rr->stop[d] - rr->start[d] == 1) {
-                                    dd = d;
-                                    break;
-                                }
+                            int dd = matmul_drop_dim(ast_node, 1);
                             int cd = (dd <= 1) ? 2 : 1;
                             N_cols = rr->stop[cd] - rr->start[cd];
                         } else {
@@ -577,7 +570,7 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
                 }
             } else if (op == Opcode::TILE || is_reduction_op(op) || op == Opcode::LINALG ||
                        is_shape_op(op) || is_signal_op(op) || op == Opcode::GATHER ||
-                       op == Opcode::EXPAND) {
+                       op == Opcode::EXPAND || op == Opcode::COMPRESS) {
                 auto res_it = array_meta.find(ast_node->result_name);
                 if (res_it != array_meta.end()) {
                     int res_nd = res_it->second.ndims;
@@ -675,7 +668,7 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
               epoch);
 
     // Cut UPLOAD payloads into tiles once decompositions and chare grids are final.
-    stage_uploads(dag);
+    stage_uploads(dag, epoch);
 
     compile(dag);
 

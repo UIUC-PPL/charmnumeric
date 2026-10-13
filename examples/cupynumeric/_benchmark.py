@@ -10,6 +10,8 @@ Each run_timed* call runs the program with charmnumeric, then with NumPy, and co
 
 The last line is ``PASS <program>`` or ``FAIL <program>: <reasons>``.
 With --package numpy the program runs on NumPy only.
+CNUM_REFERENCE=cupynumeric swaps the NumPy rerun for the upstream program on
+cuPyNumeric in a subprocess (see _cupy_reference.py); the default is unchanged.
 """
 
 import contextlib
@@ -30,6 +32,7 @@ from charmnumeric.folded import FoldedArray
 _DEVICE = (cnp.Array, cnp.ArrayView, FoldedArray)
 _NAME = os.path.splitext(os.path.basename(sys.argv[0]))[0]
 _TOOL = 4  # sys.monitoring tool id
+_REF = "cuPyNumeric" if os.environ.get("CNUM_REFERENCE") == "cupynumeric" else "NumPy"
 _RTOL = {"e": 1e-2, "f": 2e-5, "d": 1e-6, "F": 2e-5, "D": 1e-6}  # by dtype char
 
 
@@ -391,7 +394,7 @@ def _magnitude(x):
     return 0.0
 
 
-def _compare_records(where, got_rec, want_rec, failures):
+def _compare_records(where, got_rec, want_rec, failures, stats=None):
     pairs = []
     for var, want in want_rec.items():
         if var not in got_rec:
@@ -414,11 +417,18 @@ def _compare_records(where, got_rec, want_rec, failures):
         label = f"{where}: {var}"
         w = numpy.asarray(w)
         if g.shape != w.shape:
-            failures.append(f"{label} has shape {g.shape}, NumPy {w.shape}")
+            failures.append(f"{label} has shape {g.shape}, {_REF} {w.shape}")
             continue
         if g.dtype != w.dtype:
-            failures.append(f"{label} has dtype {g.dtype}, NumPy {w.dtype}")
+            failures.append(f"{label} has dtype {g.dtype}, {_REF} {w.dtype}")
             continue
+        if stats is not None and w.dtype.kind in "fciub" and w.size:
+            with numpy.errstate(invalid="ignore"):
+                d = numpy.abs(g.astype(complex) - w)
+            d = d[numpy.isfinite(d)]
+            err = float(d.max()) if d.size else 0.0
+            stats["abs"] = max(stats["abs"], err)
+            stats["rel"] = max(stats["rel"], err / max(scale, 1e-300))
         if w.dtype.kind in "fc":
             rtol = _RTOL.get(w.dtype.char, 1e-9)
             ok = numpy.allclose(g, w, rtol=rtol, atol=rtol * scale, equal_nan=True)
@@ -430,7 +440,7 @@ def _compare_records(where, got_rec, want_rec, failures):
                 detail = f"max|err| {err:.3e} (scale {scale:.3e})"
             else:
                 detail = f"{int(numpy.sum(g != w))} of {w.size} differ"
-            failures.append(f"{label} differs from NumPy: {detail}")
+            failures.append(f"{label} differs from {_REF}: {detail}")
 
 
 # ---- harness ----
@@ -467,6 +477,7 @@ class BenchmarkHarness:
         self.np = numpy if self._numpy_only else _Module(cnp, self.session, False)
         self.timer = self.execution_timer = self.wall_timer = _Timer(self.interface)
         self.failures = []
+        self.cupy = os.environ.get("CNUM_REFERENCE", "numpy") == "cupynumeric"
 
     def run_timed_with_info(self, info, f, *args, **kwargs):
         self._run(info, f, args, kwargs)
@@ -485,6 +496,7 @@ class BenchmarkHarness:
         pass
 
     def _run(self, info, f, args, kwargs):
+        runs = []
         for combo in itertools.product(*[a if isinstance(a, list) else [a] for a in args]):
             label = "" if all(not isinstance(a, list) for a in args) else \
                 " [" + ", ".join(str(c) for c, a in zip(combo, args) if isinstance(a, list)) + "]"
@@ -492,25 +504,39 @@ class BenchmarkHarness:
                 f(*combo, **kwargs)
                 continue
             try:
-                self._compare(f, combo, kwargs, label)
+                self._compare(f, combo, kwargs, label, info, runs)
             except Exception as exc:  # noqa: BLE001
                 traceback.print_exc()
                 msg = str(exc).splitlines()[0] if str(exc) else ""
                 self.failures.append(f"{type(exc).__name__}{label}: {msg}")
+        if self.cupy and runs:
+            try:
+                import _cupy_reference
+
+                _cupy_reference.compare(self, info, f, runs, kwargs)
+            except Exception as exc:  # noqa: BLE001
+                traceback.print_exc()
+                self.failures.append(f"cuPyNumeric reference: {type(exc).__name__}: {exc}")
         if self.failures:
             print(f"FAIL {_NAME}: " + "; ".join(self.failures[:8]), flush=True)
             sys.exit(1)
         print(f"PASS {_NAME}", flush=True)
 
-    def _compare(self, f, combo, kwargs, label):
+    def _compare(self, f, combo, kwargs, label, info=None, runs=None):
         session = self.session = _Session()
         self.np._session = session
         got, want = {}, {}
         tee = _Tee(sys.stdout)
+        t0 = time.perf_counter()
         with _recording(got), contextlib.redirect_stdout(tee):
             f(*[self.np if a is self.np else a for a in combo], **kwargs)
+        wall_ms = (time.perf_counter() - t0) * 1e3
         if tee.failed:
             self.failures.append(f"program printed FAIL{label}")
+        if self.cupy:
+            runs.append(dict(label=label, combo=combo, got=got, session=session,
+                             wall_ms=wall_ms))
+            return
 
         ref = _Module(numpy, session, True)
         ref_args = [ref if a is self.np else a for a in combo]

@@ -42,11 +42,34 @@ ArrayDAGGroup::~ArrayDAGGroup() {
 }
 
 void ArrayDAGGroup::compute_decompositions(DAG* dag) {
-    decomposition_solver::compute_decompositions(array_meta, dag, odf, CkNumPes());
+    // Solve over the arrays this DAG references only: array_meta keeps every array
+    // ever created, and the others are all decomp_final (singleton classes).
+    std::unordered_map<int, ArrayMetadata> sub;
+    std::unordered_set<ASTNode*> seen;
+    std::vector<ASTNode*> stack;
+    for (auto& [id, node] : dag->nodes)
+        for (ASTNode* root : node->ast->roots)
+            stack.push_back(root);
+    while (!stack.empty()) {
+        ASTNode* n = stack.back();
+        stack.pop_back();
+        if (n == nullptr || !seen.insert(n).second)
+            continue;
+        if (!n->is_scalar) {
+            auto it = array_meta.find(n->result_name);
+            if (it != array_meta.end())
+                sub.emplace(it->first, it->second);
+        }
+        for (ASTNode* op : n->operands)
+            stack.push_back(op);
+    }
+    decomposition_solver::compute_decompositions(sub, dag, odf, CkNumPes());
+    for (auto& [name, meta] : sub)
+        array_meta[name] = meta;
 
     DBG_PRINT("[PE %d] compute_decompositions: assigned tiles and offsets for %d arrays\n",
-              CkMyPe(), (int)array_meta.size());
-    for (auto& [name, meta] : array_meta) {
+              CkMyPe(), (int)sub.size());
+    for (auto& [name, meta] : sub) {
         DBG_PRINT("  array %d: ndims=%d shape=(%d,%d,%d) tile=%d offset=(%d,%d,%d)\n", name,
                   meta.ndims, meta.global_shape[0], meta.global_shape[1],
                   meta.global_shape[2], meta.tile, meta.offset[0], meta.offset[1],

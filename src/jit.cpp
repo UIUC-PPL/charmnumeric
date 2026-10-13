@@ -7,7 +7,18 @@
 #include <chrono>
 #include <limits>
 
+#include <cerrno>
+#include <link.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include "llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h"
+#include "llvm/Object/ObjectFile.h"
+#include "llvm/Support/DynamicLibrary.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/SHA256.h"
+#include "llvm/TargetParser/Host.h"
 
 #ifdef JIT_ENABLE_GPU_BACKEND
 #include "llvm/IR/LegacyPassManager.h"
@@ -15,9 +26,13 @@
 #ifdef USE_NVIDIA
 #include "mlir/Dialect/GPU/Pipelines/Passes.h"
 #include "mlir/Dialect/GPU/Utils/GPUUtils.h"
+#include "llvm/ExecutionEngine/Orc/ExecutionUtils.h"
 #include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 #include "mlir/InitAllExtensions.h"
 #include "mlir/Dialect/SCF/Transforms/Passes.h"
+#include "mlir/Dialect/SCF/Utils/Utils.h"
+#include "llvm/MC/MCSubtargetInfo.h"
+#include <numeric>
 #include "mlir/Target/LLVM/NVVM/Target.h"
 #include "mlir/Target/LLVMIR/Dialect/GPU/GPUToLLVMIRTranslation.h"
 #endif
@@ -45,6 +60,41 @@ thread_local JitTimer* jitTimer = nullptr;
 void jitMark(const char* what) {
     if (jitTimer)
         jitTimer->mark(what);
+}
+} // namespace
+
+namespace {
+/// What a kernel's module handle points to: the engine that compiled it, or
+/// the JIT that loaded it from the kernel cache.
+struct JitModule {
+    std::unique_ptr<mlir::ExecutionEngine> engine;
+    std::unique_ptr<llvm::orc::LLJIT> jit;
+};
+
+bool jitCacheEnabled();
+const std::string& cacheDir();
+const std::string& cubinDir();
+
+/// Unique temporary name next to a cache entry (servers on several nodes share the cache).
+std::string cacheTmpName(const std::string& path) {
+    char host[256] = {0};
+    gethostname(host, sizeof(host) - 1);
+    return llvm::formatv("{0}.{1}.{2}.tmp", path, host, getpid()).str();
+}
+
+/// Publishes tmp as path unless path exists: an entry is never replaced, since
+/// other servers may be reading it.
+void publishCacheFile(const std::string& tmp, const std::string& path) {
+    if (link(tmp.c_str(), path.c_str()) != 0 && errno != EEXIST &&
+        !llvm::sys::fs::exists(path) && rename(tmp.c_str(), path.c_str()) == 0)
+        return; // no hard links on this file system
+    unlink(tmp.c_str());
+}
+
+/// Reads a cache entry into memory (no mmap: the file system is shared).
+llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> readCacheFile(const std::string& path) {
+    return llvm::MemoryBuffer::getFile(path, /*IsText=*/false, /*RequiresNullTerminator=*/false,
+                                       /*IsVolatile=*/true);
 }
 } // namespace
 
@@ -272,6 +322,7 @@ std::unique_ptr<mlir::ExecutionEngine> MLIRJitCompiler::generateCPU() {
     llvm::InitializeNativeTargetAsmPrinter();
 
     mlir::ExecutionEngineOptions engineOptions;
+    engineOptions.enableObjectDump = jitCacheEnabled();
     auto maybeEngine = mlir::ExecutionEngine::create(*module, engineOptions);
     if (!maybeEngine) {
         llvm::errs() << "Failed to create ExecutionEngine\n";
@@ -293,7 +344,7 @@ bool MLIRJitCompiler::loadCPU(std::unique_ptr<mlir::ExecutionEngine>& engine,
     if (!funcPtrOrErr)
         return false;
 
-    *moduleOut = (void*)engine.release();
+    *moduleOut = new JitModule{std::move(engine), nullptr};
     *functionOut = (void*)*funcPtrOrErr;
     return true;
 }
@@ -800,22 +851,69 @@ void fuseElementwiseLoops(mlir::func::FuncOp f) {
         alloc.erase();
     }
 }
+
+void cnEnsureContext();
+
+/// The current device's sm with PTX ISA max(8.0, the sm's minimum), if both
+/// LLVM and the driver support them; else sm_80 PTX, which the driver JITs forward.
+struct NvTarget {
+    std::string chip, features;
+};
+NvTarget nvTarget() {
+    thread_local CUdevice cachedDev = -1;
+    thread_local NvTarget t;
+    CUdevice dev = 0;
+    cnEnsureContext();
+    if (cuCtxGetDevice(&dev) != CUDA_SUCCESS)
+        dev = 0;
+    if (dev == cachedDev)
+        return t;
+    int major = 8, minor = 0, driver = 0;
+    cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev);
+    cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev);
+    cuDriverGetVersion(&driver);
+    int sm = major * 10 + minor;
+    static const std::pair<int, int> smPtx[] = {{86, 71},  {87, 74},  {88, 90},  {89, 78},
+                                                {90, 78},  {100, 86}, {101, 86}, {103, 88},
+                                                {110, 90}, {120, 87}, {121, 88}};
+    static const std::pair<int, int> driverPtx[] = {{12000, 80}, {12010, 81}, {12020, 82},
+                                                    {12030, 83}, {12040, 84}, {12050, 85},
+                                                    {12080, 87}, {12090, 88}, {13000, 90}};
+    int need = sm > 121 ? 1000 : 70, have = 0;
+    for (auto [s, v] : smPtx)
+        if (s == sm)
+            need = v;
+    for (auto [d, v] : driverPtx)
+        if (driver >= d)
+            have = v;
+    int ptx = std::max(need, std::min(80, have));
+    std::string chip = "sm_" + std::to_string(sm), feat = "ptx" + std::to_string(ptx);
+
+    LLVMInitializeNVPTXTargetInfo();
+    LLVMInitializeNVPTXTargetMC();
+    std::string err;
+    llvm::Triple triple("nvptx64-nvidia-cuda");
+    bool ok = ptx <= have;
+    if (ok) {
+        const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, err);
+        std::unique_ptr<llvm::MCSubtargetInfo> sti(
+            target ? target->createMCSubtargetInfo(triple, chip, "") : nullptr);
+        ok = sti && sti->isCPUStringValid(chip) &&
+             llvm::any_of(sti->getAllProcessorFeatures(),
+                          [&](const llvm::SubtargetFeatureKV& f) { return feat == f.Key; });
+    }
+    t = ok ? NvTarget{chip, "+" + feat} : NvTarget{"sm_80", "+ptx80"};
+    cachedDev = dev;
+    return t;
+}
 } // namespace
 
 bool MLIRJitCompiler::lowerToNVIDIAHost() {
     using namespace mlir;
 
     // 1. Every linalg op becomes one multi-dim scf.parallel; adjacent loops over
-    //    the same index space are fused. The rest is tiled so the innermost
-    //    tile maps to threads and the rest to blocks. Tile sizes keep blockDim
-    //    within limits (x,y <= 1024, z <= 64).
-    int64_t rank = 1;
-    module->walk([&](linalg::LinalgOp op) {
-        rank = std::max<int64_t>(rank, op.getNumLoops());
-    });
-    SmallVector<int64_t> tiles(rank, 1);
-    tiles.back() = (rank >= 3) ? 64 : 256;
-
+    //    the same index space are fused. Each loop is then linearized and tiled
+    //    by 256: blocks on grid x (up to 2^31-1), threads on block x.
     auto kernelFn = module->lookupSymbol<func::FuncOp>("fused_kernel");
     auto shapeArg = sameShapeArgs(kernelFn);
     PassManager pm0(&context);
@@ -834,9 +932,18 @@ bool MLIRJitCompiler::lowerToNVIDIAHost() {
     if (failed(pm1.run(*module)))
         return false;
     fuseElementwiseLoops(kernelFn);
+    IRRewriter rewriter(&context);
+    for (Operation& op : llvm::make_early_inc_range(kernelFn.getBody().front())) {
+        auto loop = dyn_cast<scf::ParallelOp>(op);
+        if (!loop || loop.getNumLoops() < 2 || loop.getNumReductions())
+            continue;
+        std::vector<unsigned> dims(loop.getNumLoops());
+        std::iota(dims.begin(), dims.end(), 0u);
+        collapseParallelLoops(rewriter, loop, {dims});
+    }
 
     PassManager pm(&context);
-    pm.nest<func::FuncOp>().addPass(createParallelLoopTilingPass(tiles, /*noMinMaxBounds=*/true));
+    pm.nest<func::FuncOp>().addPass(createParallelLoopTilingPass({256}, /*noMinMaxBounds=*/true));
     pm.nest<func::FuncOp>().addPass(createGpuMapParallelLoopsPass());
     pm.addPass(createConvertParallelLoopToGpuPass());
     if (failed(pm.run(*module)))
@@ -932,8 +1039,9 @@ bool MLIRJitCompiler::lowerToNVIDIAHost() {
     jitMark("gpu-map");
     PassManager pm2(&context);
     gpu::GPUToNVVMPipelineOptions opts;
-    opts.cubinChip = "sm_80";
-    opts.cubinFeatures = "+ptx80";
+    NvTarget target = nvTarget();
+    opts.cubinChip = target.chip;
+    opts.cubinFeatures = target.features;
     opts.cubinFormat = "isa";
     gpu::buildLowerToNVVMPassPipeline(pm2, opts);
     if (failed(pm2.run(*module))) {
@@ -980,6 +1088,100 @@ extern "C" void cn_mgpuMemFree(void* ptr, CUstream s) {
     }
 }
 
+// Modules load and kernels launch in the calling thread's current context (the
+// chare's device). The MLIR wrappers would use device 0's primary context, which
+// differs once Kokkos picks a device per local rank (e.g. SLURM_LOCALID under srun).
+void cnCheck(CUresult r, const char* what) {
+    if (r != CUDA_SUCCESS)
+        llvm::report_fatal_error(llvm::Twine(what) + " failed: " + llvm::Twine(r));
+}
+void cnEnsureContext() {
+    CUcontext ctx = nullptr;
+    if (cuCtxGetCurrent(&ctx) == CUDA_SUCCESS && ctx)
+        return;
+    CUdevice dev;
+    cnCheck(cuInit(0), "cuInit");
+    cnCheck(cuDeviceGet(&dev, 0), "cuDeviceGet");
+    cnCheck(cuDevicePrimaryCtxRetain(&ctx, dev), "cuDevicePrimaryCtxRetain");
+    cnCheck(cuCtxSetCurrent(ctx), "cuCtxSetCurrent");
+}
+extern "C" CUmodule cn_mgpuModuleLoad(void* data, size_t) {
+    cnEnsureContext();
+    CUmodule m = nullptr;
+    cnCheck(cuModuleLoadData(&m, data), "cuModuleLoadData");
+    return m;
+}
+/// PTX is assembled once per device architecture and driver; the cubin goes to
+/// the kernel cache (shared by all server builds).
+extern "C" CUmodule cn_mgpuModuleLoadJIT(void* data, int optLevel, size_t) {
+    cnEnsureContext();
+    CUdevice dev;
+    int cc[2] = {0, 0};
+    cnCheck(cuCtxGetDevice(&dev), "cuCtxGetDevice");
+    cuDeviceGetAttribute(&cc[0], CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev);
+    cuDeviceGetAttribute(&cc[1], CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev);
+    std::string path;
+    if (!cubinDir().empty()) {
+        int driver = 0;
+        cuDriverGetVersion(&driver);
+        llvm::SHA256 h;
+        h.update(llvm::StringRef(static_cast<const char*>(data)));
+        h.update(llvm::formatv("sm_{0}{1} O{2} driver {3}", cc[0], cc[1], optLevel, driver).str());
+        path = cubinDir() + "/" + llvm::toHex(h.final(), true) + ".cubin";
+        if (auto buf = readCacheFile(path)) {
+            CUmodule m = nullptr;
+            if (cuModuleLoadData(&m, (*buf)->getBufferStart()) == CUDA_SUCCESS)
+                return m;
+            unlink(path.c_str()); // corrupt entry: republished below
+        }
+    }
+    char log[4096] = {0};
+    CUjit_option opts[] = {CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+                           CU_JIT_OPTIMIZATION_LEVEL};
+    void* vals[] = {log, reinterpret_cast<void*>(sizeof(log)),
+                    reinterpret_cast<void*>(static_cast<intptr_t>(optLevel))};
+    CUlinkState link;
+    cnCheck(cuLinkCreate(3, opts, vals, &link), "cuLinkCreate");
+    void* cubin = nullptr;
+    size_t size = 0;
+    if (cuLinkAddData(link, CU_JIT_INPUT_PTX, data, strlen(static_cast<const char*>(data)) + 1,
+                      "fused_kernel", 0, nullptr, nullptr) != CUDA_SUCCESS ||
+        cuLinkComplete(link, &cubin, &size) != CUDA_SUCCESS)
+        llvm::report_fatal_error(llvm::Twine("PTX JIT failed: ") + log);
+    CUmodule m = nullptr;
+    cnCheck(cuModuleLoadData(&m, cubin), "cuModuleLoadData");
+    if (!path.empty()) {
+        std::string tmp = cacheTmpName(path);
+        std::error_code ec;
+        llvm::raw_fd_ostream os(tmp, ec);
+        if (!ec) {
+            os.write(static_cast<const char*>(cubin), size);
+            os.close();
+            if (os.has_error()) {
+                os.clear_error();
+                unlink(tmp.c_str());
+            } else {
+                publishCacheFile(tmp, path);
+            }
+        }
+    }
+    cuLinkDestroy(link);
+    return m;
+}
+extern "C" void cn_mgpuModuleUnload(CUmodule m) { cuModuleUnload(m); }
+extern "C" CUfunction cn_mgpuModuleGetFunction(CUmodule m, const char* name) {
+    CUfunction f = nullptr;
+    cnCheck(cuModuleGetFunction(&f, m, name), "cuModuleGetFunction");
+    return f;
+}
+extern "C" void cn_mgpuLaunchKernel(CUfunction f, intptr_t gx, intptr_t gy, intptr_t gz,
+                                    intptr_t bx, intptr_t by, intptr_t bz, int32_t smem,
+                                    CUstream s, void** params, void** extra, size_t) {
+    if (gx <= 0 || gy <= 0 || gz <= 0)
+        return; // empty iteration space
+    cnCheck(cuLaunchKernel(f, gx, gy, gz, bx, by, bz, smem, s, params, extra), "cuLaunchKernel");
+}
+
 llvm::orc::SymbolMap streamRuntimeSymbols(llvm::orc::MangleAndInterner interner) {
     llvm::orc::SymbolMap map = halfRuntimeSymbols(interner);
     auto add = [&](const char* name, void* fn) {
@@ -991,6 +1193,11 @@ llvm::orc::SymbolMap streamRuntimeSymbols(llvm::orc::MangleAndInterner interner)
     add("mgpuStreamDestroy", (void*)&cn_mgpuStreamDestroy);
     add("mgpuMemAlloc", (void*)&cn_mgpuMemAlloc);
     add("mgpuMemFree", (void*)&cn_mgpuMemFree);
+    add("mgpuModuleLoad", (void*)&cn_mgpuModuleLoad);
+    add("mgpuModuleLoadJIT", (void*)&cn_mgpuModuleLoadJIT);
+    add("mgpuModuleUnload", (void*)&cn_mgpuModuleUnload);
+    add("mgpuModuleGetFunction", (void*)&cn_mgpuModuleGetFunction);
+    add("mgpuLaunchKernel", (void*)&cn_mgpuLaunchKernel);
     return map;
 }
 } // namespace
@@ -1011,6 +1218,7 @@ std::unique_ptr<mlir::ExecutionEngine> MLIRJitCompiler::generateNVIDIAHost() {
     engineOptions.sharedLibPaths = runtimeLibs;
     // Host only launches: O0. jitCodeGenOptLevel alone is ignored; the target machine counts.
     engineOptions.jitCodeGenOptLevel = llvm::CodeGenOptLevel::None;
+    engineOptions.enableObjectDump = jitCacheEnabled();
     std::unique_ptr<llvm::TargetMachine> tm;
     if (auto jtmb = llvm::orc::JITTargetMachineBuilder::detectHost()) {
         jtmb->setCodeGenOptLevel(llvm::CodeGenOptLevel::None);
@@ -1345,6 +1553,31 @@ BinaryOpEntry::Fn cMinMax(bool max, bool fm) {
         return selC(b, loc, orI(b, loc, nan, cge(b, loc, x, y, max)), x, y);
     };
 }
+/// Float maximum/minimum (NaN of x first) and fmax/fmin (ignore NaN of y). Ties
+/// give y, so signed zeros match NumPy.
+BinaryOpEntry::Fn fMinMax(bool max, bool fm) {
+    return [max, fm](OpBuilder& b, Location loc, Value x, Value y) {
+        Value gt = fcmp(b, loc, max ? arith::CmpFPredicate::OGT : arith::CmpFPredicate::OLT, x, y);
+        return sel(b, loc, orI(b, loc, gt, fisnan(b, loc, fm ? y : x)), x, y);
+    };
+}
+Value fIsInf(OpBuilder& b, Location loc, Value v);
+/// NumPy's sign(z): z/|z|, +0 at 0, a unit along a single infinite part.
+Value cSign(OpBuilder& b, Location loc, Value z) {
+    Value r = re(b, loc, z), i = im(b, loc, z);
+    Value zero = constLike(b, loc, r, 0.0), one = constLike(b, loc, r, 1.0);
+    Value nan = constLike(b, loc, r, std::numeric_limits<double>::quiet_NaN());
+    Value a = mlir::complex::AbsOp::create(b, loc, z).getResult();
+    Value isZero = fcmp(b, loc, arith::CmpFPredicate::OEQ, a, zero);
+    Value nr = sel(b, loc, isZero, zero, arith::DivFOp::create(b, loc, r, a).getResult());
+    Value ni = sel(b, loc, isZero, zero, arith::DivFOp::create(b, loc, i, a).getResult());
+    Value rInf = fIsInf(b, loc, r), iInf = fIsInf(b, loc, i);
+    Value rUnit = math::CopySignOp::create(b, loc, one, r).getResult();
+    Value iUnit = math::CopySignOp::create(b, loc, one, i).getResult();
+    nr = sel(b, loc, rInf, sel(b, loc, iInf, nan, rUnit), sel(b, loc, iInf, zero, nr));
+    ni = sel(b, loc, iInf, sel(b, loc, rInf, nan, iUnit), sel(b, loc, rInf, zero, ni));
+    return mkComplex(b, loc, z.getType(), nr, ni);
+}
 /// Predicate on both parts of z combined with and/or.
 UnaryOpEntry::Fn cParts(UnaryOpEntry::Fn realPred, bool both) {
     return [realPred, both](OpBuilder& b, Location loc, Value z) {
@@ -1471,16 +1704,16 @@ const std::unordered_map<int, BinaryOpEntry>& MLIRJitCompiler::binaryOpRegistry(
           [](OpBuilder& b, Location loc, Value x, Value e) { return intPow(b, loc, x, e, true); },
           arithBinary<cx::PowOp>()}},
         {(int)Opcode::MAXIMUM,
-         {arithBinary<arith::MaximumFOp>(), arithBinary<arith::MaxSIOp>(),
+         {fMinMax(true, false), arithBinary<arith::MaxSIOp>(),
           arithBinary<arith::MaxUIOp>(), cMinMax(true, false)}},
         {(int)Opcode::MINIMUM,
-         {arithBinary<arith::MinimumFOp>(), arithBinary<arith::MinSIOp>(),
+         {fMinMax(false, false), arithBinary<arith::MinSIOp>(),
           arithBinary<arith::MinUIOp>(), cMinMax(false, false)}},
         {(int)Opcode::FMAX,
-         {arithBinary<arith::MaxNumFOp>(), arithBinary<arith::MaxSIOp>(),
+         {fMinMax(true, true), arithBinary<arith::MaxSIOp>(),
           arithBinary<arith::MaxUIOp>(), cMinMax(true, true)}},
         {(int)Opcode::FMIN,
-         {arithBinary<arith::MinNumFOp>(), arithBinary<arith::MinSIOp>(),
+         {fMinMax(false, true), arithBinary<arith::MinSIOp>(),
           arithBinary<arith::MinUIOp>(), cMinMax(false, true)}},
         {(int)Opcode::MOD,
          {floatMod,
@@ -1572,12 +1805,14 @@ const std::unordered_map<int, UnaryOpEntry>& MLIRJitCompiler::unaryOpRegistry() 
           }}},
         {(int)Opcode::SIGN,
          {[](OpBuilder& b, Location loc, Value v) {
-              // sign(+-0) = +-0 and sign(NaN) = NaN, as in NumPy
+              // sign(+-0) = +0 and sign(NaN) = NaN, as in NumPy
               Value zero = constLike(b, loc, v, 0.0);
               Value pos = fcmp(b, loc, arith::CmpFPredicate::OGT, v, zero);
               Value neg = fcmp(b, loc, arith::CmpFPredicate::OLT, v, zero);
+              Value isZero = fcmp(b, loc, arith::CmpFPredicate::OEQ, v, zero);
               return sel(b, loc, pos, constLike(b, loc, v, 1.0),
-                         sel(b, loc, neg, constLike(b, loc, v, -1.0), v));
+                         sel(b, loc, neg, constLike(b, loc, v, -1.0),
+                             sel(b, loc, isZero, zero, v)));
           },
           [](OpBuilder& b, Location loc, Value v) {
               Value zero = constLike(b, loc, v, 0.0);
@@ -1591,7 +1826,7 @@ const std::unordered_map<int, UnaryOpEntry>& MLIRJitCompiler::unaryOpRegistry() 
               return sel(b, loc, icmp(b, loc, arith::CmpIPredicate::ne, v, zero),
                          constLike(b, loc, v, 1.0), zero);
           },
-          complexUnary<cx::SignOp>()}},
+          cSign}},
         // Predicates (i1)
         {(int)Opcode::ISNAN,
          {fisnan, [](OpBuilder& b, Location loc, Value) { return constI1(b, loc, false); },
@@ -1634,11 +1869,12 @@ const std::unordered_map<int, TernaryOpEntry>& MLIRJitCompiler::ternaryOpRegistr
           [](OpBuilder& b, Location loc, Value c, Value x, Value y) {
               return selC(b, loc, c, x, y);
           }}},
-        // clip(x, lo, hi) = minimum(maximum(x, lo), hi), NaN-propagating like NumPy
+        // clip(x, lo, hi) = minimum(hi, maximum(lo, x)), NaN-propagating like
+        // NumPy; ties keep x (signed zeros)
         {(int)Opcode::CLIP,
          {[](OpBuilder& b, Location loc, Value x, Value lo, Value hi) {
-              Value m = arith::MaximumFOp::create(b, loc, x, lo).getResult();
-              return arith::MinimumFOp::create(b, loc, m, hi).getResult();
+              Value m = fMinMax(true, false)(b, loc, lo, x);
+              return fMinMax(false, false)(b, loc, hi, m);
           },
           [](OpBuilder& b, Location loc, Value x, Value lo, Value hi) {
               Value m = arith::MaxSIOp::create(b, loc, x, lo).getResult();
@@ -1855,6 +2091,216 @@ std::string MLIRJitCompiler::serializeToSPIRV() {
 #endif // JIT_ENABLE_GPU_BACKEND
 
 
+#if !defined(USE_AMD) && !defined(USE_INTEL)
+// ---- Persistent kernel cache ----
+// Compiled kernels are object files under $CNUM_JIT_CACHE_DIR (default
+// ${XDG_CACHE_HOME:-$HOME/.cache}/charmnumeric/jit, so it outlives node-local
+// /tmp), one directory per server build (GNU build id), named by a hash of the
+// kernel IR and the target. CNUM_JIT_CACHE=0 turns it off.
+namespace {
+
+int buildIdNote(struct dl_phdr_info* info, size_t, void* out) {
+    // the first entry is the executable
+    for (int i = 0; i < info->dlpi_phnum; ++i) {
+        const ElfW(Phdr)& ph = info->dlpi_phdr[i];
+        if (ph.p_type != PT_NOTE)
+            continue;
+        const char* p = reinterpret_cast<const char*>(info->dlpi_addr + ph.p_vaddr);
+        const char* end = p + ph.p_memsz;
+        while (p + sizeof(ElfW(Nhdr)) <= end) {
+            const auto* nh = reinterpret_cast<const ElfW(Nhdr)*>(p);
+            const char* name = p + sizeof(ElfW(Nhdr));
+            const char* desc = name + ((nh->n_namesz + 3) & ~3u);
+            if (nh->n_type == NT_GNU_BUILD_ID && nh->n_namesz == 4 && memcmp(name, "GNU", 4) == 0) {
+                *static_cast<std::string*>(out) = llvm::toHex(
+                    llvm::ArrayRef<uint8_t>(reinterpret_cast<const uint8_t*>(desc), nh->n_descsz),
+                    true);
+                return 1;
+            }
+            p = desc + ((nh->n_descsz + 3) & ~3u);
+        }
+    }
+    return 1;
+}
+
+std::string serverBuildId() {
+    std::string id;
+    dl_iterate_phdr(buildIdNote, &id);
+    struct stat st;
+    if (id.empty() && stat("/proc/self/exe", &st) == 0)
+        id = llvm::formatv("{0}-{1}", st.st_size, st.st_mtime).str();
+    return id;
+}
+
+/// base/sub, created; "" when the cache is off or the directory cannot be made.
+std::string cacheSubdir(const std::string& sub) {
+    const char* on = getenv("CNUM_JIT_CACHE");
+    if (on && std::string(on) == "0")
+        return {};
+    std::string d;
+    const char* dir = getenv("CNUM_JIT_CACHE_DIR");
+    const char* xdg = getenv("XDG_CACHE_HOME");
+    const char* home = getenv("HOME");
+    if (dir && *dir)
+        d = dir;
+    else if (xdg && *xdg)
+        d = std::string(xdg) + "/charmnumeric/jit";
+    else if (home && *home)
+        d = std::string(home) + "/.cache/charmnumeric/jit";
+    else
+        d = llvm::formatv("/tmp/cnum-jit-{0}", getuid()).str();
+    d += "/" + sub;
+    if (llvm::sys::fs::create_directories(d))
+        return {};
+    return d;
+}
+
+const std::string& cacheDir() {
+    static const std::string dir = cacheSubdir(serverBuildId());
+    return dir;
+}
+
+const std::string& cubinDir() {
+    static const std::string dir = cacheSubdir("cubin");
+    return dir;
+}
+
+std::string cachePath(const std::string& ir) {
+    if (cacheDir().empty())
+        return {};
+    llvm::SHA256 h;
+    h.update(ir);
+#ifdef USE_NVIDIA
+    NvTarget target = nvTarget();
+    h.update("nvidia " + target.chip + " " + target.features);
+#endif
+    h.update(llvm::sys::getHostCPUName());
+    return cacheDir() + "/" + llvm::toHex(h.final(), true) + ".o";
+}
+
+llvm::orc::SymbolMap runtimeSymbols(llvm::orc::MangleAndInterner interner) {
+#ifdef USE_NVIDIA
+    return streamRuntimeSymbols(interner);
+#else
+    return halfRuntimeSymbols(interner);
+#endif
+}
+
+/// Loads a cached kernel object (running its constructors, which load the GPU
+/// binary); nullptr if that fails.
+void* loadCachedKernel(const std::string& path, void** moduleOut) {
+    auto buf = readCacheFile(path);
+    if (!buf)
+        return nullptr;
+    // ctors were turned into __orc_init_func.* functions when the object was built
+    std::vector<std::string> inits;
+    {
+        auto obj = llvm::object::ObjectFile::createObjectFile((*buf)->getMemBufferRef());
+        if (!obj) {
+            llvm::consumeError(obj.takeError());
+            unlink(path.c_str()); // corrupt entry: let the next compile republish it
+            return nullptr;
+        }
+        for (const auto& sym : (*obj)->symbols()) {
+            auto name = sym.getName();
+            if (name && name->starts_with("__orc_init_func."))
+                inits.push_back(name->str());
+            else if (!name)
+                llvm::consumeError(name.takeError());
+        }
+    }
+    jitMark("c-obj");
+    llvm::InitializeNativeTarget();
+    llvm::InitializeNativeTargetAsmPrinter();
+#ifdef USE_NVIDIA
+    static const bool cudaRuntime =
+        !llvm::sys::DynamicLibrary::LoadLibraryPermanently(MLIR_CUDA_RUNTIME_LIB);
+    if (!cudaRuntime)
+        return nullptr;
+#endif
+    auto tmb = llvm::orc::JITTargetMachineBuilder::detectHost();
+    if (!tmb) {
+        llvm::consumeError(tmb.takeError());
+        return nullptr;
+    }
+    auto jit =
+        llvm::orc::LLJITBuilder()
+            .setJITTargetMachineBuilder(std::move(*tmb))
+            .setObjectLinkingLayerCreator(
+                [](llvm::orc::ExecutionSession& es)
+                    -> llvm::Expected<std::unique_ptr<llvm::orc::ObjectLayer>> {
+                    return std::make_unique<llvm::orc::RTDyldObjectLinkingLayer>(
+                        es, [](const llvm::MemoryBuffer&) {
+                            return std::make_unique<llvm::SectionMemoryManager>();
+                        });
+                })
+            .create();
+    if (!jit) {
+        llvm::consumeError(jit.takeError());
+        return nullptr;
+    }
+    jitMark("c-jit");
+    auto& jd = (*jit)->getMainJITDylib();
+    llvm::orc::MangleAndInterner mangle((*jit)->getExecutionSession(), (*jit)->getDataLayout());
+    llvm::Error err = jd.define(llvm::orc::absoluteSymbols(runtimeSymbols(mangle)));
+    // libc/libm and the runtime library, as ExecutionEngine resolves them
+    if (!err) {
+        auto gen = llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+            (*jit)->getDataLayout().getGlobalPrefix());
+        if (gen)
+            jd.addGenerator(std::move(*gen));
+        else
+            err = gen.takeError();
+    }
+    if (!err)
+        err = (*jit)->addObjectFile(std::move(*buf));
+    if (err) {
+        llvm::consumeError(std::move(err));
+        return nullptr;
+    }
+    auto fn = (*jit)->lookup("_mlir_fused_kernel");
+    if (!fn) {
+        llvm::consumeError(fn.takeError());
+        unlink(path.c_str());
+        return nullptr;
+    }
+    jitMark("c-link");
+    for (const std::string& name : inits) {
+        auto init = (*jit)->lookup(name);
+        if (!init) {
+            llvm::consumeError(init.takeError());
+            return nullptr;
+        }
+        init->toPtr<void (*)()>()();
+    }
+    *moduleOut = new JitModule{nullptr, std::move(*jit)};
+    return fn->toPtr<void*>();
+}
+
+/// Writes a compiled kernel's object into the cache.
+void storeCachedKernel(const std::string& path, void* moduleHandle) {
+    auto* jm = static_cast<JitModule*>(moduleHandle);
+    if (path.empty() || !jm->engine)
+        return;
+    std::string tmp = cacheTmpName(path);
+    jm->engine->dumpToObjectFile(tmp);
+    uint64_t size = 0;
+    if (llvm::sys::fs::file_size(tmp, size) || size == 0) {
+        unlink(tmp.c_str()); // failed or partial dump
+        return;
+    }
+    publishCacheFile(tmp, path);
+}
+
+bool jitCacheEnabled() { return !cacheDir().empty(); }
+
+} // namespace
+#else
+namespace {
+bool jitCacheEnabled() { return false; }
+} // namespace
+#endif
+
 namespace {
 std::unordered_map<std::string, std::pair<void*, void*>>& kernelCache() {
     static std::unordered_map<std::string, std::pair<void*, void*>> cache;
@@ -1890,6 +2336,17 @@ static void* jit_compile_ast_impl(void* ast, void** moduleHandleOut) {
         return hit->second.second;
     }
     jitMark("build");
+#if !defined(USE_AMD) && !defined(USE_INTEL)
+    std::string path = cachePath(key);
+    if (!path.empty()) {
+        void* fn = loadCachedKernel(path, moduleHandleOut);
+        if (fn) {
+            jitMark("cache");
+            kernelCache().emplace(std::move(key), std::make_pair(*moduleHandleOut, fn));
+            return fn;
+        }
+    }
+#endif
     if (!node_jit.verify())
         return nullptr;
     node_jit.optimizeAndFuse();
@@ -1924,6 +2381,9 @@ static void* jit_compile_ast_impl(void* ast, void** moduleHandleOut) {
 #endif
 
     jitMark("load");
+#if !defined(USE_AMD) && !defined(USE_INTEL)
+    storeCachedKernel(path, moduleHandle);
+#endif
     kernelCache().emplace(std::move(key), std::make_pair(moduleHandle, funcPtr));
     *moduleHandleOut = moduleHandle;
     return funcPtr;
@@ -1939,6 +2399,6 @@ void jit_free_module(void* moduleHandle) {
         else
             ++it;
     }
-    delete static_cast<mlir::ExecutionEngine*>(moduleHandle);
+    delete static_cast<JitModule*>(moduleHandle);
 #endif
 }

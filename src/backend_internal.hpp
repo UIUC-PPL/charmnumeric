@@ -4,12 +4,208 @@
 #include "dispatch.hpp"
 
 #include <algorithm>
+#include <type_traits>
 
 #ifdef USE_KOKKOS
 #include <KokkosBlas1_axpby.hpp>
+#include <KokkosBlas2_gemv.hpp>
 #include <KokkosBlas3_gemm.hpp>
 #else
 #include <Eigen/Dense>
+#endif
+
+#ifdef USE_NVIDIA
+#include <cublas_v2.h>
+
+/// cuBLAS handle of this PE (non-SMP: one PE per process).
+inline cublasHandle_t ct_cublas() {
+    static cublasHandle_t handle = [] {
+        cublasHandle_t h = nullptr;
+        if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS)
+            CkAbort("cublasCreate failed");
+        return h;
+    }();
+    return handle;
+}
+#endif
+
+/// Row-major C[m x n] = A[m x k] * B[k x n] + beta * C, leading dims lda/ldb/ldc.
+/// Under USE_KOKKOS all pointers are device pointers; float/double use cuBLAS on `stream`.
+template <typename T>
+inline void local_gemm(const T* a, int lda, const T* b, int ldb, T* c, int ldc, int m, int n,
+                       int k, T beta
+#ifdef USE_NVIDIA
+                       ,
+                       cudaStream_t stream
+#endif
+) {
+    if (m <= 0 || n <= 0)
+        return;
+#ifdef USE_KOKKOS
+#ifdef USE_NVIDIA
+    if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double>) {
+        // inputs may come from work on the default instance's stream
+        Kokkos::DefaultExecutionSpace().fence("ct_gemm inputs");
+        // column-major view of the row-major product: C^T = B^T * A^T
+        cublasHandle_t h = ct_cublas();
+        cublasSetStream(h, stream);
+        const T one = T(1);
+        cublasStatus_t st;
+        if constexpr (std::is_same_v<T, float>)
+            st = cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &one, b, ldb, a, lda, &beta, c,
+                             ldc);
+        else
+            st = cublasDgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &one, b, ldb, a, lda, &beta, c,
+                             ldc);
+        if (st != CUBLAS_STATUS_SUCCESS)
+            CkAbort("cuBLAS gemm failed (%d)", (int)st);
+        return;
+    }
+#endif
+    using SMat = Kokkos::View<T**, Kokkos::LayoutStride, DeviceSpace,
+                              Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+    SMat d_A(const_cast<T*>(a), Kokkos::LayoutStride(m, lda, k, 1));
+    SMat d_B(const_cast<T*>(b), Kokkos::LayoutStride(k, ldb, n, 1));
+    SMat d_C(c, Kokkos::LayoutStride(m, ldc, n, 1));
+#ifdef USE_NVIDIA
+    // KokkosBlas runs on the default instance, which is not ordered with `stream`
+    cudaStreamSynchronize(stream);
+#endif
+    KokkosBlas::gemm("N", "N", T(1), d_A, d_B, beta, d_C);
+#ifdef USE_NVIDIA
+    Kokkos::DefaultExecutionSpace().fence("ct_gemm result");
+#endif
+#else
+    using RMat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+    using CStride = Eigen::Stride<Eigen::Dynamic, 1>;
+    Eigen::Map<const RMat, 0, CStride> A_map(a, m, k, CStride(lda, 1));
+    Eigen::Map<const RMat, 0, CStride> B_map(b, k, n, CStride(ldb, 1));
+    Eigen::Map<RMat, 0, CStride> C_map(c, m, n, CStride(ldc, 1));
+    if (beta == T(0))
+        C_map.noalias() = A_map * B_map;
+    else
+        C_map.noalias() += A_map * B_map;
+#endif
+}
+
+/// Concatenate received vector pieces in index order into one buffer (device memory
+/// under Kokkos, like the pieces); free it with free_vector_pieces.
+template <typename T, typename Buffers>
+inline T* concat_vector_pieces(Buffers& buffers, int& vec_len) {
+    std::sort(buffers.begin(), buffers.end(),
+              [](auto& a, auto& b) { return a.region.start[0] < b.region.start[0]; });
+    vec_len = 0;
+    for (auto& rb : buffers)
+        vec_len += rb.byte_size / sizeof(T);
+#ifdef USE_KOKKOS
+    T* out = static_cast<T*>(comm_alloc((int64_t)vec_len * sizeof(T)));
+    using U = Kokkos::View<T*, DeviceSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+    int64_t off = 0;
+    for (auto& rb : buffers) {
+        int64_t len = rb.byte_size / sizeof(T);
+        Kokkos::deep_copy(U(out + off, len), U(reinterpret_cast<T*>(rb.data), len));
+        off += len;
+    }
+    Kokkos::fence("ct_concat_vector");
+#else
+    T* out = new T[vec_len];
+    int64_t off = 0;
+    for (auto& rb : buffers) {
+        memcpy(out + off, rb.data, rb.byte_size);
+        off += rb.byte_size / sizeof(T);
+    }
+#endif
+    return out;
+}
+
+template <typename T>
+inline void free_vector_pieces(T* p) {
+    if (p == nullptr)
+        return;
+#ifdef USE_KOKKOS
+    comm_free(p);
+#else
+    delete[] p;
+#endif
+}
+
+#ifdef USE_KOKKOS
+/// Item i: double-precision dot product of row i / chunks over column chunk i % chunks
+/// (float32 dot products accumulated in float drift from NumPy's BLAS on long rows).
+template <typename T>
+struct GemvChunkFunctor {
+    const T* mat;
+    int64_t ld;
+    int cols, chunks, chunk_len;
+    const T* vec;
+    double* tmp; // per (row, chunk); unused if chunks == 1
+    T* res;
+
+    KOKKOS_INLINE_FUNCTION void operator()(const int i) const {
+        int r = i / chunks, c0 = (i % chunks) * chunk_len;
+        int c1 = c0 + chunk_len < cols ? c0 + chunk_len : cols;
+        const T* row = mat + r * ld;
+        double s = 0.0;
+        for (int c = c0; c < c1; ++c)
+            s += static_cast<double>(row[c]) * static_cast<double>(vec[c]);
+        if (chunks == 1)
+            res[r] = static_cast<T>(s);
+        else
+            tmp[i] = s;
+    }
+};
+
+template <typename T>
+struct GemvJoinFunctor {
+    const double* tmp;
+    int chunks;
+    T* res;
+
+    KOKKOS_INLINE_FUNCTION void operator()(const int r) const {
+        double s = 0.0;
+        for (int k = 0; k < chunks; ++k)
+            s += tmp[(int64_t)r * chunks + k];
+        res[r] = static_cast<T>(s);
+    }
+};
+
+/// Row-major res[rows] = mat[rows x cols] * vec (device pointers, row stride ld), on `exec`.
+template <typename T, typename Exec>
+inline void local_gemv(const Exec& exec, const T* mat, int ld, int rows, int cols, const T* vec,
+                       T* res) {
+    if (rows <= 0)
+        return;
+    if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double>) {
+        // inputs may come from the default instance's stream; callers send the result
+        // from other streams right after, so finish before returning
+        Kokkos::DefaultExecutionSpace().fence("ct_gemv inputs");
+        int chunks = (int)std::min<int64_t>(
+            {std::max<int64_t>(1, 65536 / rows), (cols + 255) / 256, 1024});
+        chunks = std::max(chunks, 1);
+        int chunk_len = (cols + chunks - 1) / chunks;
+        Kokkos::View<double*, DeviceSpace> tmp;
+        if (chunks > 1)
+            tmp = Kokkos::View<double*, DeviceSpace>(
+                Kokkos::view_alloc(Kokkos::WithoutInitializing, "ct_gemv"), (int64_t)rows * chunks);
+        Kokkos::parallel_for("ct_gemv", Kokkos::RangePolicy<Exec>(exec, 0, rows * chunks),
+                             GemvChunkFunctor<T>{mat, ld, cols, chunks, chunk_len, vec,
+                                                 tmp.data(), res});
+        if (chunks > 1)
+            Kokkos::parallel_for("ct_gemv_join", Kokkos::RangePolicy<Exec>(exec, 0, rows),
+                                 GemvJoinFunctor<T>{tmp.data(), chunks, res});
+        exec.fence("ct_gemv");
+    } else {
+        Kokkos::View<T**, Kokkos::LayoutStride, DeviceSpace,
+                     Kokkos::MemoryTraits<Kokkos::Unmanaged>>
+            d_mat(const_cast<T*>(mat), Kokkos::LayoutStride(rows, ld, cols, 1));
+        Kokkos::View<T*, DeviceSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>> d_vec(
+            const_cast<T*>(vec), cols);
+        Kokkos::View<T*, DeviceSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>> d_res(res, rows);
+        Kokkos::DefaultExecutionSpace().fence("ct_gemv inputs");
+        KokkosBlas::gemv(exec, "N", T(1), d_mat, d_vec, T(0), d_res);
+        exec.fence("ct_gemv");
+    }
+}
 #endif
 
 /// SUMMA panel update: C[c_row:c_row+a_rows, c_col:c_col+b_cols] +=
@@ -20,32 +216,21 @@ template <typename T>
 inline void panel_gemm_accumulate(T* a_data, int a_rows, int a_k_size, int a_col_off,
                                   T* b_data, int b_k_size, int b_cols, int b_row_off,
                                   int k_size, T* c_data, int c_rows, int c_cols,
-                                  int c_row, int c_col) {
-#ifdef USE_KOKKOS
-    using UMat = Kokkos::View<T**, Kokkos::LayoutRight, DeviceSpace,
-                              Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
-    UMat d_A_full(a_data, a_rows, a_k_size);
-    auto d_A_sub = Kokkos::subview(d_A_full, Kokkos::ALL,
-                                   Kokkos::make_pair(a_col_off, a_col_off + k_size));
-    UMat d_B_full(b_data, b_k_size, b_cols);
-    auto d_B_sub = Kokkos::subview(d_B_full, Kokkos::make_pair(b_row_off, b_row_off + k_size),
-                                   Kokkos::ALL);
-    UMat d_C_full(c_data, c_rows, c_cols);
-    auto d_C_sub = Kokkos::subview(d_C_full, Kokkos::make_pair(c_row, c_row + a_rows),
-                                   Kokkos::make_pair(c_col, c_col + b_cols));
-    KokkosBlas::gemm("N", "N", T(1), d_A_sub, d_B_sub, T(1), d_C_sub);
-#else
+                                  int c_row, int c_col
+#ifdef USE_NVIDIA
+                                  ,
+                                  cudaStream_t stream
+#endif
+) {
     (void)c_rows;
     (void)b_k_size;
-    using RMat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-    using CStride = Eigen::Stride<Eigen::Dynamic, 1>;
-    Eigen::Map<RMat, 0, CStride> A_map(a_data + a_col_off, a_rows, k_size, CStride(a_k_size, 1));
-    Eigen::Map<RMat, 0, CStride> B_map(b_data + b_row_off * b_cols, k_size, b_cols,
-                                       CStride(b_cols, 1));
-    Eigen::Map<RMat, 0, CStride> C_map(c_data + c_row * c_cols + c_col, a_rows, b_cols,
-                                       CStride(c_cols, 1));
-    C_map.noalias() += A_map * B_map;
+    local_gemm<T>(a_data + a_col_off, a_k_size, b_data + (int64_t)b_row_off * b_cols, b_cols,
+                  c_data + (int64_t)c_row * c_cols + c_col, c_cols, a_rows, b_cols, k_size, T(1)
+#ifdef USE_NVIDIA
+                  ,
+                  stream
 #endif
+    );
 }
 
 /// Eigen-based gemv: res = mat[:, :actual_cols] * vec.
@@ -296,7 +481,7 @@ inline void cross_matmul_send_result_3d_to_1d(PartitionImpl<3>* partition, DAGNo
                       reinterpret_cast<char*>(send_buf));
     delete[] send_buf;
 #else
-    T* send_buf = static_cast<T*>(Kokkos::kokkos_malloc<DeviceSpace>(byte_size));
+    T* send_buf = static_cast<T*>(comm_alloc(byte_size));
     Kokkos::parallel_for(
         CT_COMM_POLICY(partition, result_rows),
         KOKKOS_LAMBDA(int i) { send_buf[i] = result_data[i]; });
@@ -331,7 +516,7 @@ inline void cross_matmul_send_result_2d_to_1d(PartitionImpl<2>* partition, DAGNo
                       reinterpret_cast<char*>(send_buf));
     delete[] send_buf;
 #else
-    T* send_buf = static_cast<T*>(Kokkos::kokkos_malloc<DeviceSpace>(byte_size));
+    T* send_buf = static_cast<T*>(comm_alloc(byte_size));
     Kokkos::parallel_for(
         CT_COMM_POLICY(partition, result_rows),
         KOKKOS_LAMBDA(int i) { send_buf[i] = result_data[i]; });
@@ -573,7 +758,7 @@ inline void cross_set_region_send(PartitionImpl<N_src>* partition, DAGNode* node
                           reinterpret_cast<char*>(send_buf));
         delete[] send_buf;
 #else
-        T* send_buf = static_cast<T*>(Kokkos::kokkos_malloc<DeviceSpace>(byte_size));
+        T* send_buf = static_cast<T*>(comm_alloc(byte_size));
         T* src_device = static_cast<T*>(src->device_data_ptr());
 
         int dm[N_tgt], cr_start[N_tgt], cr_sizes[N_tgt], cr_step[N_tgt], t_s[N_tgt], t_st[N_tgt];

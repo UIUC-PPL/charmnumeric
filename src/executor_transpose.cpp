@@ -88,7 +88,7 @@ static void transpose_pack_send(PartitionImpl<N>* partition, Array<N, T>* src, D
 #endif
 
 #ifdef USE_KOKKOS
-    T* send_buf = static_cast<T*>(Kokkos::kokkos_malloc<DeviceSpace>(byte_size));
+    T* send_buf = static_cast<T*>(comm_alloc(byte_size));
     T* src_device = static_cast<T*>(src->device_data_ptr());
     int64_t ss[N];
     for (int k = 0; k < N; ++k)

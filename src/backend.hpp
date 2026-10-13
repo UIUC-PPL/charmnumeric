@@ -59,6 +59,54 @@ inline auto proxy_at<3>(CProxy_Partition3D& proxy, const ChareIndex<3>& ci) {
     return proxy(ci.idx[0], ci.idx[1], ci.idx[2]);
 }
 
+/// Extent-1 dim of a dimension-dropped 3-D matrix region (rows/cols are the other two, in
+/// order) that gives `want_rows` x `want_cols` (-1: any); -1 if no dim has extent 1.
+inline int drop_dim_3d(const ArrayRegion<3>& r, int want_rows = -1, int want_cols = -1) {
+    int first = -1;
+    for (int dd = 0; dd < 3; ++dd) {
+        if (r.stop[dd] - r.start[dd] != 1)
+            continue;
+        int rd = dd == 0 ? 1 : 0, cd = dd <= 1 ? 2 : 1;
+        if (first < 0)
+            first = dd;
+        if ((want_rows < 0 || r.stop[rd] - r.start[rd] == want_rows) &&
+            (want_cols < 0 || r.stop[cd] - r.start[cd] == want_cols))
+            return dd;
+    }
+    return first;
+}
+
+/// (rows, cols) of a MATMUL/MATMATMUL operand region; a vector is one column.
+inline std::array<int, 2> matmul_region_extents(Region* rb) {
+    if (auto* r = dynamic_cast<ArrayRegion<1>*>(rb))
+        return {r->stop[0] - r->start[0], 1};
+    if (auto* r = dynamic_cast<ArrayRegion<2>*>(rb))
+        return {r->stop[0] - r->start[0], r->stop[1] - r->start[1]};
+    if (auto* r = dynamic_cast<ArrayRegion<3>*>(rb)) {
+        int dd = drop_dim_3d(*r);
+        if (dd >= 0) {
+            int rd = dd == 0 ? 1 : 0, cd = dd <= 1 ? 2 : 1;
+            return {r->stop[rd] - r->start[rd], r->stop[cd] - r->start[cd]};
+        }
+    }
+    return {-1, -1};
+}
+
+/// Dropped dim of 3-D operand `idx` of a MATMUL/MATMATMUL root. When several dims have
+/// extent 1, the one matching the other operand (A's cols == B's rows / vector length).
+inline int matmul_drop_dim(ASTNode* root, int idx) {
+    auto* r = static_cast<ArrayRegion<3>*>(root->operand_regions[idx]);
+    int want_rows = -1, want_cols = -1;
+    if (root->operand_regions.size() >= 2) {
+        auto other = matmul_region_extents(root->operand_regions[1 - idx]);
+        if (idx == 0)
+            want_cols = other[0];
+        else
+            want_rows = other[1];
+    }
+    return drop_dim_3d(*r, want_rows, want_cols);
+}
+
 #ifdef USE_KOKKOS
 #include <Kokkos_Core.hpp>
 using DeviceSpace = Kokkos::DefaultExecutionSpace::memory_space;
@@ -67,6 +115,58 @@ using HostSpace = Kokkos::HostSpace;
 #include "hapi.h"
 #include <cuda_runtime.h>
 #endif
+
+/// Device message buffers, cached by power-of-two size class: cudaMalloc/cudaFree per
+/// message cost tens of us, and cudaFree also synchronizes the device. Only for buffers
+/// freed after their last GPU use (send_complete, compute-done callbacks).
+struct CommPool {
+    static constexpr int kMinClass = 8, kMaxClass = 26; // 256 B .. 64 MB
+    static constexpr int64_t kMaxCached = int64_t(1) << 30;
+    std::unordered_map<void*, int> live; // pooled block -> size class
+    std::vector<void*> free_lists[kMaxClass + 1];
+    int64_t cached = 0;
+};
+
+inline CommPool& comm_pool() {
+    static CommPool pool;
+    return pool;
+}
+
+inline void* comm_alloc(int64_t bytes) {
+    int cls = CommPool::kMinClass;
+    while (cls <= CommPool::kMaxClass && (int64_t(1) << cls) < bytes)
+        ++cls;
+    if (cls > CommPool::kMaxClass)
+        return Kokkos::kokkos_malloc<DeviceSpace>(bytes);
+    auto& pool = comm_pool();
+    void* ptr;
+    if (!pool.free_lists[cls].empty()) {
+        ptr = pool.free_lists[cls].back();
+        pool.free_lists[cls].pop_back();
+        pool.cached -= int64_t(1) << cls;
+    } else {
+        ptr = Kokkos::kokkos_malloc<DeviceSpace>(size_t(1) << cls);
+    }
+    pool.live[ptr] = cls;
+    return ptr;
+}
+
+inline void comm_free(void* ptr) {
+    auto& pool = comm_pool();
+    auto it = pool.live.find(ptr);
+    if (it == pool.live.end()) {
+        Kokkos::kokkos_free<DeviceSpace>(ptr);
+        return;
+    }
+    int cls = it->second;
+    pool.live.erase(it);
+    if (pool.cached + (int64_t(1) << cls) > CommPool::kMaxCached) {
+        Kokkos::kokkos_free<DeviceSpace>(ptr);
+        return;
+    }
+    pool.free_lists[cls].push_back(ptr);
+    pool.cached += int64_t(1) << cls;
+}
 #endif
 
 #include "dtypes.hpp"
@@ -84,7 +184,7 @@ class CTArrayBase {
     DType dtype;
 
     virtual ~CTArrayBase() = default;
-    int local_size() const { return region.size(); }
+    int64_t local_size() const { return region.size(); }
     virtual void copyToHost() = 0;
     virtual void copyToDevice() = 0;
     virtual void* data_ptr() = 0;        // host pointer
@@ -207,10 +307,15 @@ struct PendingComm {
     bool incremental = false; // When true, compute as panels arrive
 
     void clear_remote_buffers() {
+#ifdef USE_KOKKOS
+        // pooled buffers are reused at once; kernels on the default instance may still read them
+        if (!remote_buffers.empty())
+            Kokkos::DefaultExecutionSpace().fence("ct_remote_buffers");
+#endif
         for (auto& [idx, bufs] : remote_buffers)
             for (auto& rb : bufs) {
 #ifdef USE_KOKKOS
-                Kokkos::kokkos_free<DeviceSpace>(rb.data);
+                comm_free(rb.data);
 #else
                 delete[] rb.data;
 #endif
@@ -224,18 +329,22 @@ struct PendingComm {
 template <int N>
 class PartitionImpl;
 
-/// Receive-side state of a REDUCTION/BINCOUNT node on one output chare
-/// (executor_reduction.cpp). Partials that arrive before the chare reaches the
-/// node wait in `stash`.
+/// State of a REDUCTION/BINCOUNT node on one chare (executor_reduction.cpp).
+/// Messages that arrive before the chare reaches the node wait in `stash`.
 template <int N>
 struct ReductionState {
     DAGNode* node = nullptr;
     bool started = false;
+    bool receiving = false; // owns part of the result
+    bool sending = false;   // BINCOUNT: waiting for weights moved onto x's layout
     std::vector<std::vector<char>> stash;
     ArrayRegion<N> mine;    // output elements owned by this chare (output array coords)
     std::vector<char> acc;  // one accumulator per element of `mine`
     int64_t covered = 0;    // input elements folded in, summed over `mine`
     int64_t expected = 0;   // mine.size() * reduced extent
+    std::vector<double> weights; // BINCOUNT weights for x's block, by view index - w_base
+    int64_t w_base = 0;
+    int64_t w_got = 0;
 };
 
 /// REDUCE (dot) state on chare 0; partials are summed as they arrive.
@@ -278,6 +387,15 @@ struct IndexState {
     std::vector<std::vector<char>> segs; // coordinator: received segment lists
     std::vector<int64_t> counts, seg_start; // EXPAND driver: element counts, row starts
     int64_t row = 1;
+    // COMPRESS / MASK_SCATTER
+    bool mx_pending = false; // this chare holds a block of x that is not done yet
+    bool mx_scanned = false;
+    int64_t m_covered = 0, m_expected = 0; // mask elements moved onto x's block
+    std::vector<uint8_t> mblock;           // that mask block (row-major)
+    std::vector<int64_t> rowpos;           // compacted offset of each block row, then the total
+    char* cbuf = nullptr;                  // compacted values (device memory in GPU builds)
+    int64_t out_covered = 0, out_expected = 0;
+    std::vector<std::vector<char>> reqs;   // v holder: requests, served once all arrived
 };
 
 /// RESHAPE/BROADCAST state per result chare; early messages wait in `stash`.
@@ -351,15 +469,22 @@ class ArrayDAGGroup : public CBase_ArrayDAGGroup {
     // using freshly recomputed metadata unless the array is recreated.
     std::unordered_map<int, ArrayMetadata> live_array_meta;
 
-    // UPLOAD payloads cut into per-chare tiles by stage_uploads(), keyed by
-    // (array name, chare index). A chare takes (and frees) its tile when it
-    // executes the UPLOAD node; meta is the decomposition the tile was cut for.
+    // UPLOAD payloads (held by PE 0 only) cut into per-chare tiles by stage_uploads() and
+    // sent to each chare's home PE, keyed by (array name, chare index). A chare takes (and
+    // frees) its tile when it executes the UPLOAD node, fetching it if it lives elsewhere.
     struct UploadTile {
         std::vector<char> data;
         ArrayMetadata meta;
     };
     std::map<std::array<int, 4>, UploadTile> upload_tiles;
-    void stage_uploads(DAG* dag);
+    std::map<std::array<int, 4>, std::pair<int, int>> upload_fetches; // key -> (node, ndims)
+    void stage_uploads(DAG* dag, int epoch);
+    void stage_upload_tile(int name, int nd, int i0, int i1, int i2, int nmeta, int* meta,
+                           int64_t size, char* data);
+    void serve_upload_fetch(const std::array<int, 4>& key, int nd);
+    void fetch_upload_tile(int node_id, int name, int nd, int i0, int i1, int i2);
+    void send_upload_tile(const std::array<int, 4>& key, int nd, int node_id,
+                          std::vector<char>& data);
 
     ArrayDAGGroup();
     ArrayDAGGroup(CkMigrateMessage* m) {}
@@ -420,6 +545,7 @@ class ArrayDAGExecutorND : public DAGExecutor {
     std::unordered_map<int, LinalgState<N>> la_state;
     std::unordered_map<int, IndexState<N>> ix_state;
     std::unordered_map<int, ShapeState<N>> shape_state;
+    std::unordered_map<int, std::pair<DAGNode*, int>> upload_wait; // node -> tiles still fetched
 
     ArrayDAGExecutorND(ArrayDAGGroup* group_, PartitionImpl<N>* partition_)
         : DAGExecutor(group_, N), partition(partition_) {}
@@ -440,6 +566,8 @@ class ArrayDAGExecutorND : public DAGExecutor {
     void execute_linalg_node(DAGNode* node);
     void on_linalg_msg(int node_id, char* data, int64_t size);
     void execute_creation_node(DAGNode* node);
+    void on_upload_tile(int node_id, int name, char* data, int64_t size);
+    void finish_creation_node(int node_id);
     void execute_transpose_node(DAGNode* node);
     void execute_shape_node(DAGNode* node);
     void on_shape_msg(int node_id, char* data, int64_t size);
@@ -450,6 +578,8 @@ class ArrayDAGExecutorND : public DAGExecutor {
     void execute_index_node(DAGNode* node);
     void on_index_msg(int node_id, char* data, int64_t size);
     void index_progress(int node_id);
+    void execute_mask_node(DAGNode* node);
+    void mask_progress(int node_id);
     void on_comm_done(int node_id);
     void on_matmatmul_receive(int node_id, int input_index);
     void on_matmul_partial(int node_id, RemoteBuffer<N>& partial_buf);
@@ -549,13 +679,13 @@ class PartitionImpl {
         if (static_cast<int>(bucket.size()) < FREE_LIST_MAX) {
             bucket.push_back(arr);
             DBG_PRINT("[PE %d] Partition<%d> retire_array name=%d: moved to freelist "
-                      "(dtype=%d local_size=%d bucket=%d/%d)\n",
-                      CkMyPe(), N, name, static_cast<int>(arr->dtype), arr->local_size(),
+                      "(dtype=%d local_size=%lld bucket=%d/%d)\n",
+                      CkMyPe(), N, name, static_cast<int>(arr->dtype), (long long)arr->local_size(),
                       static_cast<int>(bucket.size()), FREE_LIST_MAX);
         } else {
             DBG_PRINT("[PE %d] Partition<%d> retire_array name=%d: deleting local buffer "
-                      "(dtype=%d local_size=%d freelist_full=%d)\n",
-                      CkMyPe(), N, name, static_cast<int>(arr->dtype), arr->local_size(),
+                      "(dtype=%d local_size=%lld freelist_full=%d)\n",
+                      CkMyPe(), N, name, static_cast<int>(arr->dtype), (long long)arr->local_size(),
                       FREE_LIST_MAX);
             delete arr;
         }
@@ -603,7 +733,7 @@ class PartitionImpl {
         arr->h_view = {};
 #else
         T* data = static_cast<T*>(arr->data_ptr());
-        for (int i = 0; i < arr->local_size(); ++i)
+        for (int64_t i = 0; i < arr->local_size(); ++i)
             data[i] = T(0);
 #endif
         return arr;
@@ -652,7 +782,7 @@ class PartitionImpl {
     std::unordered_map<int, void*> pending_sends; // send_id → device ptr
     // Posted device recv buffers, keyed by message identity; nocopydevice passes a null data pointer.
     std::map<std::vector<int>, std::deque<char*>> posted_recv_bufs;
-    int next_send_id = 0;
+    unsigned next_send_id = 0;
 #ifdef USE_NVIDIA
     cudaStream_t compute_stream_raw;
     cudaStream_t comm_stream_raw;
@@ -689,6 +819,7 @@ class PartitionImpl {
     void receive_linalg(int node_id, int64_t size, char* data);
     void receive_index_msg(int node_id, int64_t size, char* data);
     void receive_shape(int node_id, int64_t size, char* data);
+    void receive_upload_tile(int node_id, int name, int64_t size, char* data);
     void process_get(int epoch);
 };
 
@@ -738,6 +869,9 @@ class Partition1D : public CBase_Partition1D {
     void receive_shape(int node_id, int64_t size, char* data) {
         impl.receive_shape(node_id, size, data);
     }
+    void receive_upload_tile(int node_id, int name, int64_t size, char* data) {
+        impl.receive_upload_tile(node_id, name, size, data);
+    }
 };
 
 class Partition2D : public CBase_Partition2D {
@@ -784,6 +918,9 @@ class Partition2D : public CBase_Partition2D {
     void receive_shape(int node_id, int64_t size, char* data) {
         impl.receive_shape(node_id, size, data);
     }
+    void receive_upload_tile(int node_id, int name, int64_t size, char* data) {
+        impl.receive_upload_tile(node_id, name, size, data);
+    }
 };
 
 class Partition3D : public CBase_Partition3D {
@@ -829,5 +966,8 @@ class Partition3D : public CBase_Partition3D {
     }
     void receive_shape(int node_id, int64_t size, char* data) {
         impl.receive_shape(node_id, size, data);
+    }
+    void receive_upload_tile(int node_id, int name, int64_t size, char* data) {
+        impl.receive_upload_tile(node_id, name, size, data);
     }
 };

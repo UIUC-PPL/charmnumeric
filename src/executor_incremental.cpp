@@ -95,7 +95,12 @@ void ArrayDAGExecutorND<N>::on_matmatmul_receive(int node_id, int input_index) {
 #endif
             panel_gemm_accumulate<T>(a_data, a_rows, a_k_size, a_col_off, b_data,
                                      b_k_end - b_k_start, b_cols, b_row_off, k_size, c_ptr,
-                                     sub_rows, sub_cols, c_local_row, c_local_col);
+                                     sub_rows, sub_cols, c_local_row, c_local_col
+#ifdef USE_NVIDIA
+                                     ,
+                                     partition->compute_stream_raw
+#endif
+            );
         }
     };
 
