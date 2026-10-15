@@ -1,5 +1,7 @@
 #pragma once
 
+#include <functional>
+#include <mutex>
 #include <deque>
 #include <map>
 
@@ -125,6 +127,7 @@ struct CommPool {
     std::unordered_map<void*, int> live; // pooled block -> size class
     std::vector<void*> free_lists[kMaxClass + 1];
     int64_t cached = 0;
+    std::mutex mu; // shared by the PEs of a process (SMP)
 };
 
 inline CommPool& comm_pool() {
@@ -139,6 +142,7 @@ inline void* comm_alloc(int64_t bytes) {
     if (cls > CommPool::kMaxClass)
         return Kokkos::kokkos_malloc<DeviceSpace>(bytes);
     auto& pool = comm_pool();
+    std::lock_guard<std::mutex> lock(pool.mu);
     void* ptr;
     if (!pool.free_lists[cls].empty()) {
         ptr = pool.free_lists[cls].back();
@@ -153,6 +157,7 @@ inline void* comm_alloc(int64_t bytes) {
 
 inline void comm_free(void* ptr) {
     auto& pool = comm_pool();
+    std::lock_guard<std::mutex> lock(pool.mu);
     auto it = pool.live.find(ptr);
     if (it == pool.live.end()) {
         Kokkos::kokkos_free<DeviceSpace>(ptr);
@@ -498,6 +503,13 @@ class ArrayDAGGroup : public CBase_ArrayDAGGroup {
     // Unified DAG handling — dispatches to all relevant partition types
     void receive_dag(int epoch, int size, char* serialized_dag);
     void receive_get_request(int ndims, int epoch, int name, int size, int dtype = 0);
+    void receive_dag_now(int epoch, int size, char* serialized_dag);
+    void receive_get_request_now(int ndims, int epoch, int name, int size, int dtype);
+    // Broadcasts from PE 0 may arrive out of order (e.g. a small GET overtaking a large
+    // DAG); epochs are processed in client order, later ones wait here.
+    int next_epoch = 0;
+    std::map<int, std::function<void()>> early_epochs;
+    void epoch_arrived(int epoch, std::function<void()> run);
     void gather(int epoch, int name, int64_t offset, int64_t size, char* data);
     void barrier_arrive(int epoch);
 

@@ -1,3 +1,5 @@
+#include <vector>
+#include <memory>
 #include "backend.hpp"
 #include "dag_group_internal.hpp"
 
@@ -188,7 +190,34 @@ void expand_partition_nd(CProxy_ArrayDAGGroup proxy, typename PartitionTraits<N>
 
 } // namespace
 
+void ArrayDAGGroup::epoch_arrived(int epoch, std::function<void()> run) {
+    if (epoch > next_epoch) {
+        early_epochs.emplace(epoch, std::move(run));
+        return;
+    }
+    run(); // epoch < next_epoch: the client reconnected and restarted its count
+    next_epoch = epoch + 1;
+    for (auto it = early_epochs.find(next_epoch); it != early_epochs.end();
+         it = early_epochs.find(next_epoch)) {
+        auto fn = std::move(it->second);
+        early_epochs.erase(it);
+        fn();
+        ++next_epoch;
+    }
+}
+
 void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
+    if (epoch == next_epoch) {
+        epoch_arrived(epoch, [&] { receive_dag_now(epoch, size, serialized_dag); });
+        return;
+    }
+    auto copy = std::make_shared<std::vector<char>>(serialized_dag, serialized_dag + size);
+    epoch_arrived(epoch, [this, epoch, copy] {
+        receive_dag_now(epoch, (int)copy->size(), copy->data());
+    });
+}
+
+void ArrayDAGGroup::receive_dag_now(int epoch, int size, char* serialized_dag) {
     // charmtyles (cache_dag) prefixes every DAG with an int64 plan signature for
     // DAGGroup::replay_dag_template. The template cache is not used here yet, so
     // skip the signature and deserialize the full DAG that follows it.
@@ -215,6 +244,10 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
                     auto live = live_array_meta.find(operand->result_name);
                     if (live != live_array_meta.end())
                         active_ndims.insert(live->second.ndims);
+                    // created by an earlier DAG that has not executed yet
+                    else if (auto m = array_meta.find(operand->result_name);
+                             m != array_meta.end())
+                        active_ndims.insert(m->second.ndims);
                 }
             }
             if (static_cast<Opcode>(ast_node->opcode) == Opcode::DIAG) {

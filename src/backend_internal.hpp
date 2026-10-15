@@ -17,9 +17,9 @@
 #ifdef USE_NVIDIA
 #include <cublas_v2.h>
 
-/// cuBLAS handle of this PE (non-SMP: one PE per process).
+/// cuBLAS handle of this PE (thread_local: SMP PEs are threads).
 inline cublasHandle_t ct_cublas() {
-    static cublasHandle_t handle = [] {
+    thread_local cublasHandle_t handle = [] {
         cublasHandle_t h = nullptr;
         if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS)
             CkAbort("cublasCreate failed");

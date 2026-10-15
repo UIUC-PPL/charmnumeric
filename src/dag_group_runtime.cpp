@@ -2,13 +2,25 @@
 #include "decomposition_solver.hpp"
 #include "jit_api.hpp"
 
+#include <atomic>
 #include <cstring>
+#include <mutex>
 #include <unordered_set>
+
+#ifdef USE_KOKKOS
+namespace {
+std::once_flag kokkos_once;   // SMP: the PEs of a process share one Kokkos instance
+std::atomic<int> kokkos_users{0};
+} // namespace
+#endif
 
 ArrayDAGGroup::ArrayDAGGroup() {
 #ifdef USE_KOKKOS
-    if (!Kokkos::is_initialized())
-        Kokkos::initialize();
+    std::call_once(kokkos_once, [] {
+        if (!Kokkos::is_initialized())
+            Kokkos::initialize();
+    });
+    ++kokkos_users;
 #endif
     if (CkMyPe() == 0) {
         partition_proxy_1 = CProxy_Partition1D::ckNew();
@@ -36,7 +48,7 @@ ArrayDAGGroup::~ArrayDAGGroup() {
         if (handle && freed.insert(handle).second)
             jit_free_module(handle);
 #ifdef USE_KOKKOS
-    if (Kokkos::is_initialized())
+    if (--kokkos_users == 0 && Kokkos::is_initialized())
         Kokkos::finalize();
 #endif
 }
@@ -78,6 +90,11 @@ void ArrayDAGGroup::compute_decompositions(DAG* dag) {
 }
 
 void ArrayDAGGroup::receive_get_request(int ndims, int epoch, int name, int size, int dtype) {
+    epoch_arrived(epoch, [=] { receive_get_request_now(ndims, epoch, name, size, dtype); });
+}
+
+void ArrayDAGGroup::receive_get_request_now(int ndims, int epoch, int name, int size,
+                                            int dtype) {
     if (name == kBarrierName) {
         int64_t chares = 0;
         for (auto& [nd, pg] : partition_grid) {

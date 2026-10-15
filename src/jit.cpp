@@ -1,3 +1,4 @@
+#include <mutex>
 #include "jit.hpp"
 #include "dtype_info.hpp"
 #include "jit_api.hpp"
@@ -2306,6 +2307,11 @@ std::unordered_map<std::string, std::pair<void*, void*>>& kernelCache() {
     static std::unordered_map<std::string, std::pair<void*, void*>> cache;
     return cache;
 }
+// The context and caches are per process; SMP PEs (threads) must not use them concurrently.
+std::mutex& jitMutex() {
+    static std::mutex m;
+    return m;
+}
 } // namespace
 
 static void* jit_compile_ast_impl(void* ast, void** moduleHandleOut);
@@ -2314,7 +2320,11 @@ void* jit_compile_ast(void* ast, void** moduleHandleOut) {
     static const bool timeIt = getenv("CNUM_JIT_TIME") != nullptr;
     JitTimer timer;
     jitTimer = timeIt ? &timer : nullptr;
-    void* fn = jit_compile_ast_impl(ast, moduleHandleOut);
+    void* fn;
+    {
+        std::lock_guard<std::mutex> lock(jitMutex());
+        fn = jit_compile_ast_impl(ast, moduleHandleOut);
+    }
     if (timeIt && !timer.line.empty())
         llvm::errs() << "jit:" << timer.line << "\n";
     jitTimer = nullptr;
@@ -2393,12 +2403,16 @@ void jit_free_module(void* moduleHandle) {
 #if !defined(USE_NVIDIA) && !defined(USE_AMD) && !defined(USE_INTEL)
     if (!moduleHandle)
         return;
+    std::lock_guard<std::mutex> lock(jitMutex());
+    bool cached = false; // modules are shared by the PEs of a process: free once
     for (auto it = kernelCache().begin(); it != kernelCache().end();) {
-        if (it->second.first == moduleHandle)
+        if (it->second.first == moduleHandle) {
             it = kernelCache().erase(it);
-        else
+            cached = true;
+        } else
             ++it;
     }
-    delete static_cast<JitModule*>(moduleHandle);
+    if (cached)
+        delete static_cast<JitModule*>(moduleHandle);
 #endif
 }

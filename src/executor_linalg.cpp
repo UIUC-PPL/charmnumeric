@@ -584,7 +584,7 @@ struct LaHandles {
 };
 
 static LaHandles& la_handles(cudaStream_t st) {
-    static LaHandles h;
+    thread_local LaHandles h; // per PE
     if (h.solver == nullptr) {
         CT_CUSOLVER_CHECK(cusolverDnCreate(&h.solver));
         CT_CUBLAS_CHECK(cublasCreate(&h.blas));
