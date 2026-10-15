@@ -43,6 +43,7 @@
 // Dialects
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Complex/IR/Complex.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
@@ -76,11 +77,19 @@
 #include <sycl/sycl.hpp>
 #endif
 
+// Registry entries for elementwise ops. Bodies receive operands already
+// converted to the op's compute type (float16 math runs in float32; bool is
+// i8 0/1) and may return i1 (predicates). Optional bodies: uint_body (default
+// int_body), complex_body (complex<f32|f64>), bool_body (default int_body).
+
 /// Registry entry for a binary elementwise op.
 struct BinaryOpEntry {
     using Fn = std::function<mlir::Value(mlir::OpBuilder&, mlir::Location, mlir::Value, mlir::Value)>;
     Fn float_body;
     Fn int_body; // nullptr if not supported for integers
+    Fn uint_body = nullptr;
+    Fn complex_body = nullptr;
+    Fn bool_body = nullptr;
 };
 
 /// Registry entry for a unary elementwise op.
@@ -88,6 +97,20 @@ struct UnaryOpEntry {
     using Fn = std::function<mlir::Value(mlir::OpBuilder&, mlir::Location, mlir::Value)>;
     Fn float_body;
     Fn int_body; // nullptr if not supported for integers
+    Fn uint_body = nullptr;
+    Fn complex_body = nullptr;
+    Fn bool_body = nullptr;
+};
+
+/// Ternary op: where, clip.
+struct TernaryOpEntry {
+    using Fn = std::function<mlir::Value(mlir::OpBuilder&, mlir::Location, mlir::Value,
+                                         mlir::Value, mlir::Value)>;
+    Fn float_body;
+    Fn int_body; // nullptr if not supported for integers
+    Fn uint_body = nullptr;
+    Fn complex_body = nullptr;
+    Fn bool_body = nullptr;
 };
 
 struct LeafUse {
@@ -107,14 +130,18 @@ class MLIRJitCompiler {
     std::unique_ptr<mlir::ExecutionEngine> generateCPU();
     bool loadCPU(std::unique_ptr<mlir::ExecutionEngine>& engine, const char* kernelName,
                  void** moduleOut, void** functionOut);
+    bool verify();
     void dumpMLIR();
+    void printModule(llvm::raw_ostream& os);
 
+#ifdef USE_NVIDIA
+    /// Host-side launcher (PTX embedded, device pointers in memref descriptors);
+    /// same packed args as the CPU path. Load with loadCPU().
+    std::unique_ptr<mlir::ExecutionEngine> generateNVIDIAHost();
+#endif
 #ifdef JIT_ENABLE_GPU_BACKEND
-    std::string generateNVIDIA();
     std::string generateAMD();
     std::string generateIntel();
-    bool loadNVIDIA(const std::string& ptx, const char* kernelName, void** moduleOut,
-                    void** functionOut);
     bool loadAMD(const std::string& gcn, const char* kernelName, void** moduleOut,
                  void** functionOut);
     bool loadIntel(const std::string& spirv, const char* kernelName, void** moduleOut,
@@ -124,9 +151,13 @@ class MLIRJitCompiler {
     /// Op registries: map opcode → body builder lambdas.
     static const std::unordered_map<int, BinaryOpEntry>& binaryOpRegistry();
     static const std::unordered_map<int, UnaryOpEntry>& unaryOpRegistry();
+    static const std::unordered_map<int, TernaryOpEntry>& ternaryOpRegistry();
 
   private:
-    mlir::MLIRContext context;
+#ifdef USE_NVIDIA
+    bool lowerToNVIDIAHost();
+#endif
+    mlir::MLIRContext& context;
     mlir::OwningOpRef<mlir::ModuleOp> module;
     std::unique_ptr<mlir::OpBuilder> builder;
 
@@ -142,6 +173,8 @@ class MLIRJitCompiler {
                        std::vector<ASTNode*>& broadcastLeaves);
     std::string leafUseKey(ASTNode* operand, Region* region) const;
     mlir::Value lookupOperand(ASTNode* operand, Region* region);
+    mlir::Value allocLike(mlir::Value arrayOperand, DType dt);
+    mlir::Value convertArray(mlir::Value v, DType from, DType to, bool is_temp);
     void emitOp(ASTNode* node, mlir::Location loc);
 
     // Lowering helpers
@@ -151,7 +184,6 @@ class MLIRJitCompiler {
     std::string
     translateToTarget(llvm::StringRef triple, llvm::StringRef cpu, llvm::StringRef features,
                       llvm::CodeGenFileType fileType = llvm::CodeGenFileType::AssemblyFile);
-    std::string serializeToPTX();
     std::string serializeToGCN();
     std::string serializeToSPIRV();
 #endif
@@ -167,39 +199,56 @@ class MLIRJitCompiler {
         auto outType = mlir::cast<MemRefType>(out.getType());
         int64_t rank = outType.getRank();
 
+        // Bare scalars are captured by the body instead of becoming operands.
+        auto identityMap = builder->getMultiDimIdentityMap(rank);
         bool aIsScalar = !mlir::isa<MemRefType>(a.getType());
         bool bIsScalar = !mlir::isa<MemRefType>(b.getType());
-
-        // Identity map for memref operands; empty-result map for 0-d scalar memrefs
-        auto identityMap = builder->getMultiDimIdentityMap(rank);
-        auto scalarMap0 = AffineMap::get(rank, /*symbolCount=*/0, /*results=*/{}, &context);
-
-        // linalg.generic requires shaped types (MemRef/Tensor) for all operands.
-        // Wrap bare scalar values in a 0-d memref so they broadcast correctly.
-        auto wrapScalar = [&](Value v) -> Value {
-            auto zeroD = MemRefType::get({}, v.getType());
-            auto mem = memref::AllocaOp::create(*builder, loc, zeroD);
-            memref::StoreOp::create(*builder, loc, v, mem, ValueRange{});
-            return mem;
-        };
-
-        SmallVector<AffineMap, 3> indexingMaps;
-        indexingMaps.push_back(aIsScalar ? scalarMap0 : identityMap);
-        indexingMaps.push_back(bIsScalar ? scalarMap0 : identityMap);
-        indexingMaps.push_back(identityMap); // output is always memref
-
-        SmallVector<utils::IteratorType> iterTypes(rank, utils::IteratorType::parallel);
-
         SmallVector<Value> inputs;
-        SmallVector<Value> outputs{out};
-        inputs.push_back(aIsScalar ? wrapScalar(a) : a);
-        inputs.push_back(bIsScalar ? wrapScalar(b) : b);
+        if (!aIsScalar)
+            inputs.push_back(a);
+        if (!bIsScalar)
+            inputs.push_back(b);
+        SmallVector<AffineMap, 3> indexingMaps(inputs.size() + 1, identityMap);
+        SmallVector<utils::IteratorType> iterTypes(rank, utils::IteratorType::parallel);
 
         linalg::GenericOp::create(
             *builder,
-            loc, TypeRange{}, ValueRange(inputs), ValueRange(outputs), indexingMaps, iterTypes,
+            loc, TypeRange{}, ValueRange(inputs), ValueRange{out}, indexingMaps, iterTypes,
             [&](OpBuilder& nestedBuilder, Location nestedLoc, ValueRange args) {
-                Value result = bodyBuilder(nestedBuilder, nestedLoc, args[0], args[1]);
+                Value x = aIsScalar ? a : args[0];
+                Value y = bIsScalar ? b : args[aIsScalar ? 0 : 1];
+                Value result = bodyBuilder(nestedBuilder, nestedLoc, x, y);
+                linalg::YieldOp::create(nestedBuilder, nestedLoc, result);
+            });
+    }
+
+    // N-ary element-wise op helper: bare scalar inputs are captured by the
+    // body; memref inputs use the identity map.
+    template <typename BodyBuilderFn>
+    void emitGenericNaryOp(mlir::ValueRange ins, mlir::Value out, BodyBuilderFn bodyBuilder) {
+        using namespace mlir;
+        auto loc = builder->getUnknownLoc();
+
+        auto outType = mlir::cast<MemRefType>(out.getType());
+        int64_t rank = outType.getRank();
+        auto identityMap = builder->getMultiDimIdentityMap(rank);
+
+        SmallVector<Value> inputs;
+        for (Value v : ins)
+            if (mlir::isa<MemRefType>(v.getType()))
+                inputs.push_back(v);
+        SmallVector<AffineMap> indexingMaps(inputs.size() + 1, identityMap);
+        SmallVector<utils::IteratorType> iterTypes(rank, utils::IteratorType::parallel);
+        SmallVector<Value> scalarsAndArrays(ins.begin(), ins.end());
+
+        linalg::GenericOp::create(
+            *builder, loc, TypeRange{}, ValueRange(inputs), ValueRange{out}, indexingMaps,
+            iterTypes, [&](OpBuilder& nestedBuilder, Location nestedLoc, ValueRange args) {
+                SmallVector<Value> vals;
+                unsigned k = 0;
+                for (Value v : scalarsAndArrays)
+                    vals.push_back(mlir::isa<MemRefType>(v.getType()) ? args[k++] : v);
+                Value result = bodyBuilder(nestedBuilder, nestedLoc, ValueRange(vals));
                 linalg::YieldOp::create(nestedBuilder, nestedLoc, result);
             });
     }

@@ -4,6 +4,17 @@
 #include <KokkosBlas1_dot.hpp>
 #endif
 
+#ifdef USE_KOKKOS
+/// sum(x * y); KokkosBlas::dot conjugates a complex x, NumPy's dot does not.
+template <typename T>
+static T device_dot_nc(const T* x, const T* y, int n) {
+    T sum = T(0);
+    Kokkos::parallel_reduce(
+        Kokkos::RangePolicy<>(0, n), KOKKOS_LAMBDA(int i, T& acc) { acc += x[i] * y[i]; }, sum);
+    return sum;
+}
+#endif
+
 template <int N>
 void ArrayDAGExecutorND<N>::execute_reduce_node(DAGNode* node) {
     if constexpr (N != 1) {
@@ -49,49 +60,24 @@ void ArrayDAGExecutorND<N>::execute_reduce_node(DAGNode* node) {
                     d_lhs(static_cast<VT*>(lhs_it->second->device_data_ptr()), local_size);
                 Kokkos::View<VT*, DeviceSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>
                     d_rhs(static_cast<VT*>(rhs_it->second->device_data_ptr()), local_size);
-                VT val = KokkosBlas::dot(d_lhs, d_rhs);
+                VT val;
+                if constexpr (cn_is_complex_v<VT>)
+                    val = device_dot_nc<VT>(d_lhs.data(), d_rhs.data(), local_size);
+                else
+                    val = KokkosBlas::dot(d_lhs, d_rhs);
                 memcpy(contrib.value, &val, sizeof(VT));
             };
-            switch (dt) {
-            case DType::FLOAT32: kokkos_dot(float{}); break;
-            case DType::FLOAT64: kokkos_dot(double{}); break;
-            case DType::INT32: kokkos_dot(int32_t{}); break;
-            case DType::INT64: kokkos_dot(int64_t{}); break;
-            }
+            cn_dispatch_blas(dt, kokkos_dot);
 #else
             lhs_it->second->copyToHost();
             rhs_it->second->copyToHost();
 
-            switch (dt) {
-            case DType::FLOAT32: {
-                float val = eigen_dot(static_cast<float*>(lhs_it->second->data_ptr()),
-                                      static_cast<float*>(rhs_it->second->data_ptr()),
-                                      local_size);
-                memcpy(contrib.value, &val, sizeof(float));
-                break;
-            }
-            case DType::FLOAT64: {
-                double val = eigen_dot(static_cast<double*>(lhs_it->second->data_ptr()),
-                                       static_cast<double*>(rhs_it->second->data_ptr()),
-                                       local_size);
-                memcpy(contrib.value, &val, sizeof(double));
-                break;
-            }
-            case DType::INT32: {
-                int32_t val = eigen_dot(static_cast<int32_t*>(lhs_it->second->data_ptr()),
-                                        static_cast<int32_t*>(rhs_it->second->data_ptr()),
-                                        local_size);
-                memcpy(contrib.value, &val, sizeof(int32_t));
-                break;
-            }
-            case DType::INT64: {
-                int64_t val = eigen_dot(static_cast<int64_t*>(lhs_it->second->data_ptr()),
-                                        static_cast<int64_t*>(rhs_it->second->data_ptr()),
-                                        local_size);
-                memcpy(contrib.value, &val, sizeof(int64_t));
-                break;
-            }
-            }
+            cn_dispatch_blas(dt, [&](auto tag) {
+                using T = decltype(tag);
+                T val = eigen_dot(static_cast<T*>(lhs_it->second->data_ptr()),
+                                  static_cast<T*>(rhs_it->second->data_ptr()), local_size);
+                memcpy(contrib.value, &val, sizeof(T));
+            });
 #endif
 
             DBG_PRINT("[1D Chare %d]   local dot computed (local_size=%d)\n",
@@ -99,25 +85,107 @@ void ArrayDAGExecutorND<N>::execute_reduce_node(DAGNode* node) {
         }
         // else: contrib.value is all zeros — contributes 0 to the reduction
 
-        // All chares contribute to the Charm++ reduction using the custom
-        // reducer that carries metadata (node_id, result_name, dtype).
-        ChareIndex<1> target_ci;
-        target_ci.idx[0] = 0;
-
+        // Partials go to chare 0 (not a Charm++ reduction: chares added by a later
+        // DAG restart their reduction numbering, which mismatches the older ones).
         auto* dag_group = static_cast<ArrayDAGGroup*>(group);
-        CkCallback cb(CkIndex_Partition1D::reduce_result(nullptr),
-                      proxy_at<1>(dag_group->partition_proxy_1, target_ci));
-        partition->contribute(sizeof(ReduceContrib), &contrib, reduce_dot_sum_type, cb);
-
-        // Non-zero chares are done — their partial is in flight via the reduction.
-        auto nd_idx = partition->nd_index();
-        if (nd_idx[0] != 0) {
-            node_finished(node->id);
+        ArrayDecomp<1> in_decomp = dag_group->array_meta[lhs_name].decomp<1>();
+        int first = in_decomp.offset[0] / in_decomp.tile;
+        int idx = partition->nd_index()[0];
+        bool holder = idx >= first && idx < first + in_decomp.num_chares(0);
+        if (idx == 0) {
+            DotState& st = dot_state[node->id];
+            st.started = true;
+            st.expected = in_decomp.num_chares(0);
+            if (holder)
+                on_dot_partial(node->id, reinterpret_cast<char*>(&contrib), sizeof(contrib));
+            else
+                finish_dot(node->id);
+            return; // finishes when every partial is in
         }
-        // Chare 0 waits for reduce_result callback before calling node_finished.
+        if (holder) {
+            ChareIndex<1> target_ci;
+            target_ci.idx[0] = 0;
+            proxy_at<1>(dag_group->partition_proxy_1, target_ci)
+                .reduce_result(node->id, sizeof(contrib), reinterpret_cast<char*>(&contrib));
+        }
+        node_finished(node->id);
+    }
+}
+
+template <int N>
+void ArrayDAGExecutorND<N>::on_dot_partial(int node_id, char* data, int64_t size) {
+    if constexpr (N == 1) {
+        DotState& st = dot_state[node_id];
+        ReduceContrib in;
+        memcpy(&in, data, sizeof(in));
+        if (st.got++ == 0) {
+            st.acc.assign(data, data + size);
+        } else {
+            ReduceContrib acc;
+            memcpy(&acc, st.acc.data(), sizeof(acc));
+            cn_dispatch_blas(static_cast<DType>(acc.dtype_int), [&](auto tag) {
+                using T = decltype(tag);
+                T a, b;
+                memcpy(&a, acc.value, sizeof(T));
+                memcpy(&b, in.value, sizeof(T));
+                a += b;
+                memcpy(acc.value, &a, sizeof(T));
+            });
+            memcpy(st.acc.data(), &acc, sizeof(acc));
+        }
+        if (st.started)
+            finish_dot(node_id);
+    }
+}
+
+/// Chare 0: store the sum once all partials arrived.
+template <int N>
+void ArrayDAGExecutorND<N>::finish_dot(int node_id) {
+    if constexpr (N == 1) {
+        DotState& st = dot_state[node_id];
+        if (st.got < st.expected)
+            return;
+        ReduceContrib result;
+        memcpy(&result, st.acc.data(), sizeof(result));
+        int result_name = result.result_name;
+        DType dt = static_cast<DType>(result.dtype_int);
+        auto& arrays = partition->arrays;
+
+        // Create the scalar result array (size 1) on chare 0
+        if (arrays.find(result_name) == arrays.end()) {
+            auto* dag_group = static_cast<ArrayDAGGroup*>(group);
+            ArrayDecomp<1> out_decomp = dag_group->array_meta[result_name].decomp<1>();
+            std::array<int, 1> out_start = {0};
+            std::array<int, 1> out_stop = {1};
+            std::array<int, 1> out_step = {1};
+            std::array<int, 1> out_gs = {1};
+            ArrayRegion<1> out_region(out_start, out_stop, out_step);
+            arrays[result_name] =
+                partition->allocate_or_reuse(out_region, out_gs, result_name, dt, out_decomp);
+        }
+
+        int elem_size = dtype_size(dt);
+#ifdef USE_KOKKOS
+        Kokkos::deep_copy(
+            Kokkos::View<char*, DeviceSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>(
+                static_cast<char*>(arrays[result_name]->device_data_ptr()), elem_size),
+            Kokkos::View<char*, HostSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>(
+                result.value, elem_size));
+#else
+        memcpy(arrays[result_name]->data_ptr(), result.value, elem_size);
+#endif
+        dot_state.erase(node_id);
+        node_finished(node_id);
     }
 }
 
 template void ArrayDAGExecutorND<1>::execute_reduce_node(DAGNode*);
 template void ArrayDAGExecutorND<2>::execute_reduce_node(DAGNode*);
 template void ArrayDAGExecutorND<3>::execute_reduce_node(DAGNode*);
+
+template void ArrayDAGExecutorND<1>::on_dot_partial(int, char*, int64_t);
+template void ArrayDAGExecutorND<2>::on_dot_partial(int, char*, int64_t);
+template void ArrayDAGExecutorND<3>::on_dot_partial(int, char*, int64_t);
+template void ArrayDAGExecutorND<1>::finish_dot(int);
+template void ArrayDAGExecutorND<2>::finish_dot(int);
+template void ArrayDAGExecutorND<3>::finish_dot(int);

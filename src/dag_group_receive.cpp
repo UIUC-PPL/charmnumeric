@@ -1,10 +1,12 @@
+#include <vector>
+#include <memory>
 #include "backend.hpp"
 #include "dag_group_internal.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <cstdlib>
 #include <set>
-#include <unordered_set>
 
 namespace {
 
@@ -188,8 +190,44 @@ void expand_partition_nd(CProxy_ArrayDAGGroup proxy, typename PartitionTraits<N>
 
 } // namespace
 
+void ArrayDAGGroup::epoch_arrived(int epoch, std::function<void()> run) {
+    if (epoch > next_epoch) {
+        early_epochs.emplace(epoch, std::move(run));
+        return;
+    }
+    run(); // epoch < next_epoch: the client reconnected and restarted its count
+    next_epoch = epoch + 1;
+    for (auto it = early_epochs.find(next_epoch); it != early_epochs.end();
+         it = early_epochs.find(next_epoch)) {
+        auto fn = std::move(it->second);
+        early_epochs.erase(it);
+        fn();
+        ++next_epoch;
+    }
+}
+
 void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
-    DAG* dag = DAG::deserialize(serialized_dag, deserialize_array_region);
+    if (epoch == next_epoch) {
+        epoch_arrived(epoch, [&] { receive_dag_now(epoch, size, serialized_dag); });
+        return;
+    }
+    auto copy = std::make_shared<std::vector<char>>(serialized_dag, serialized_dag + size);
+    epoch_arrived(epoch, [this, epoch, copy] {
+        receive_dag_now(epoch, (int)copy->size(), copy->data());
+    });
+}
+
+void ArrayDAGGroup::receive_dag_now(int epoch, int size, char* serialized_dag) {
+    // charmtyles (cache_dag) prefixes every DAG with an int64 plan signature for
+    // DAGGroup::replay_dag_template. The template cache is not used here yet, so
+    // skip the signature and deserialize the full DAG that follows it.
+    if (size < (int)sizeof(int64_t))
+        CkAbort("receive_dag: %d-byte DAG message is too short", size);
+    int64_t plan_signature;
+    memcpy(&plan_signature, serialized_dag, sizeof(plan_signature));
+    (void)plan_signature;
+    char* payload = serialized_dag + sizeof(plan_signature);
+    DAG* dag = DAG::deserialize(payload, deserialize_array_region);
 
     // Collect which ndims are used in this DAG
     std::set<int> active_ndims;
@@ -197,14 +235,43 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
         for (ASTNode* ast_node : dag_node->ast->roots) {
             if (ast_node->ndims >= 1 && ast_node->ndims <= 3)
                 active_ndims.insert(ast_node->ndims);
-            for (ASTNode* operand : ast_node->operands)
+            for (ASTNode* operand : ast_node->operands) {
                 if (!operand->is_scalar && !operand->is_broadcast && operand->ndims >= 1 &&
                     operand->ndims <= 3)
                     active_ndims.insert(operand->ndims);
+                // a materialized size-1 source of another rank must send its value
+                if (operand->is_broadcast) {
+                    auto live = live_array_meta.find(operand->result_name);
+                    if (live != live_array_meta.end())
+                        active_ndims.insert(live->second.ndims);
+                    // created by an earlier DAG that has not executed yet
+                    else if (auto m = array_meta.find(operand->result_name);
+                             m != array_meta.end())
+                        active_ndims.insert(m->second.ndims);
+                }
+            }
             if (static_cast<Opcode>(ast_node->opcode) == Opcode::DIAG) {
                 active_ndims.insert(1);
                 active_ndims.insert(2);
             }
+            if (static_cast<Opcode>(ast_node->opcode) == Opcode::LINALG) {
+                for (ASTNode* operand : ast_node->operands)
+                    if (!operand->is_scalar)
+                        active_ndims.insert(operand->ndims);
+                active_ndims.insert(ast_node->ndims);
+            }
+            if (is_shape_op(static_cast<Opcode>(ast_node->opcode))) {
+                active_ndims.insert(ast_node->operands[0]->ndims);
+                active_ndims.insert(ast_node->ndims);
+            }
+            if (is_reduction_op(static_cast<Opcode>(ast_node->opcode))) {
+                // The operand may be a size-1 broadcast view; both sides still run.
+                active_ndims.insert(ast_node->operands[0]->ndims);
+                active_ndims.insert(ast_node->ndims);
+            }
+            if (is_index_op(static_cast<Opcode>(ast_node->opcode)))
+                for (int nd : index_op_ndims(ast_node))
+                    active_ndims.insert(nd);
             if (static_cast<Opcode>(ast_node->opcode) == Opcode::TILE) {
                 int input_nd = ast_node->operands[0]->ndims;
                 int result_nd = ast_node->ndims;
@@ -223,7 +290,7 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
         for (ASTNode* ast_node : dag_node->ast->roots) {
             Opcode op = static_cast<Opcode>(ast_node->opcode);
 
-            if (op == Opcode::CREATE && ast_node->region) {
+            if (is_creation(op) && ast_node->region) {
                 int nd = ast_node->ndims;
                 switch (nd) {
                 case 1: {
@@ -247,6 +314,25 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
                 }
             } else if (op == Opcode::REDUCE) {
                 array_meta[ast_node->result_name] = {1, {1, 0, 0}, {}, 0};
+            } else if (is_reduction_op(op)) {
+                std::array<int, 3> out_shape;
+                int out_nd = reduction_result_meta(ast_node, array_meta, out_shape);
+                array_meta[ast_node->result_name] = {out_nd, out_shape, {}, 0};
+            } else if (op == Opcode::LINALG) {
+                std::array<int, 3> out_shape;
+                int out_nd = linalg_result_meta(ast_node, array_meta, out_shape);
+                array_meta[ast_node->result_name] = {out_nd, out_shape, {}, 0};
+            } else if (is_index_op(op)) {
+                std::array<int, 3> out_shape;
+                int out_nd = index_result_meta(ast_node, array_meta, out_shape);
+                if (out_nd > 0)
+                    array_meta[ast_node->result_name] = {out_nd, out_shape, {}, 0};
+            } else if (is_shape_op(op)) {
+                // operands: x, result shape...
+                std::array<int, 3> out_shape = {0, 0, 0};
+                for (int k = 0; k < ast_node->ndims; ++k)
+                    out_shape[k] = (int)ast_node->operands[k + 1]->scalar;
+                array_meta[ast_node->result_name] = {ast_node->ndims, out_shape, {}, 0};
             } else if (op == Opcode::MATMUL) {
                 int mat_op_name = ast_node->operands[0]->result_name;
                 auto mat_it = array_meta.find(mat_op_name);
@@ -257,13 +343,7 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
                         if (mat_ndims == 3) {
                             auto* mr =
                                 static_cast<ArrayRegion<3>*>(ast_node->operand_regions[0]);
-                            int dropped = -1;
-                            for (int d = 0; d < 3; d++) {
-                                if (mr->stop[d] - mr->start[d] == 1) {
-                                    dropped = d;
-                                    break;
-                                }
-                            }
+                            int dropped = matmul_drop_dim(ast_node, 0);
                             int row_dim = (dropped == 0) ? 1 : 0;
                             mat_rows = mr->stop[row_dim] - mr->start[row_dim];
                         } else {
@@ -287,12 +367,7 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
                         if (lhs_ndims == 3) {
                             auto* lr =
                                 static_cast<ArrayRegion<3>*>(ast_node->operand_regions[0]);
-                            int dd = -1;
-                            for (int d = 0; d < 3; d++)
-                                if (lr->stop[d] - lr->start[d] == 1) {
-                                    dd = d;
-                                    break;
-                                }
+                            int dd = matmul_drop_dim(ast_node, 0);
                             int rd = (dd == 0) ? 1 : 0;
                             M = lr->stop[rd] - lr->start[rd];
                         } else {
@@ -303,12 +378,7 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
                         if (rhs_ndims == 3) {
                             auto* rr =
                                 static_cast<ArrayRegion<3>*>(ast_node->operand_regions[1]);
-                            int dd = -1;
-                            for (int d = 0; d < 3; d++)
-                                if (rr->stop[d] - rr->start[d] == 1) {
-                                    dd = d;
-                                    break;
-                                }
+                            int dd = matmul_drop_dim(ast_node, 1);
                             int cd = (dd <= 1) ? 2 : 1;
                             N_cols = rr->stop[cd] - rr->start[cd];
                         } else {
@@ -366,6 +436,37 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
                     }
                     array_meta[ast_node->result_name] = {out_ndims, out_shape, {}, 0};
                 }
+            } else if (op == Opcode::TRANSPOSE) {
+                // permuted shape of the source view
+                int nd = ast_node->ndims;
+                std::array<int, 3> in_shape = {0, 0, 0};
+                if (!region_to_shape(ast_node->get_operand_region(0), nd, in_shape)) {
+                    auto input_it = array_meta.find(ast_node->operands[0]->result_name);
+                    if (input_it != array_meta.end())
+                        in_shape = input_it->second.global_shape;
+                }
+                std::array<int, 3> out_shape = {0, 0, 0};
+                for (int k = 0; k < nd && k + 1 < (int)ast_node->operands.size(); ++k)
+                    out_shape[k] = in_shape[(int)ast_node->operands[k + 1]->scalar];
+                array_meta[ast_node->result_name] = {nd, out_shape, {}, 0};
+            } else if (is_signal_op(op)) {
+                // CONVOLVE: shape operands (after the shifts); FLIP: the view's shape
+                int nd = ast_node->ndims;
+                std::array<int, 3> shape = {0, 0, 0};
+                if (op == Opcode::CONVOLVE) {
+                    for (int d = 0; d < nd; ++d)
+                        shape[d] = (int)ast_node->operands[3 + nd + d]->scalar;
+                } else if (!region_to_shape(ast_node->get_operand_region(0), nd, shape)) {
+                    auto input_it = array_meta.find(ast_node->operands[0]->result_name);
+                    if (input_it != array_meta.end())
+                        shape = input_it->second.global_shape;
+                }
+                array_meta[ast_node->result_name] = {nd, shape, {}, 0};
+            } else if (is_castscansort(op)) {
+                // Same shape as the input (pinned again after the solver).
+                auto input_it = array_meta.find(ast_node->operands[0]->result_name);
+                if (input_it != array_meta.end())
+                    array_meta[ast_node->result_name] = input_it->second;
             } else if (op == Opcode::SET_REGION) {
                 // SET_REGION writes into the target array's partition.
             } else if (is_elementwise(op) || op == Opcode::COPY) {
@@ -409,12 +510,26 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
         meta_it->second.offset = live_meta.offset;
     }
 
+    // SCAN/SORT/ARGSORT take the input's final decomposition (topo order, chains propagate).
+    dag_group_for_each_node_topo(dag, [&](DAGNode* dag_node) {
+        for (ASTNode* ast_node : dag_node->ast->roots) {
+            if (!is_castscansort(static_cast<Opcode>(ast_node->opcode)))
+                continue;
+            auto input_it = array_meta.find(ast_node->operands[0]->result_name);
+            if (input_it == array_meta.end())
+                continue;
+            ArrayMetadata meta = input_it->second;
+            meta.decomp_final = true;
+            array_meta[ast_node->result_name] = meta;
+        }
+    });
+
     // Pass 2: expand partitions now that tile sizes have been assigned.
     dag_group_for_each_node_topo(dag, [&](DAGNode* dag_node) {
         for (ASTNode* ast_node : dag_node->ast->roots) {
             Opcode op = static_cast<Opcode>(ast_node->opcode);
 
-            if (op == Opcode::CREATE && ast_node->region) {
+            if (is_creation(op) && ast_node->region) {
                 int nd = ast_node->ndims;
                 int tile = array_meta[ast_node->result_name].tile;
                 if (partition_grid[nd].start_epoch < 0)
@@ -442,6 +557,10 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
                     int tile_1d = res_it->second.tile;
                     std::array<int, 1> s = {0}, e = {mat_rows}, st = {1};
                     ArrayRegion<1> result_region(s, e, st);
+                    // New chares must start at this epoch; set it before inserting,
+                    // since a local insert constructs the chare immediately.
+                    if (partition_grid[1].start_epoch < 0)
+                        partition_grid[1].start_epoch = epoch;
                     expand_partition_nd<1>(thisProxy, partition_proxy_1, partition_grid[1].grid,
                                            &result_region, tile_1d);
                 }
@@ -453,6 +572,9 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
                     int tile_2d = res_it->second.tile;
                     std::array<int, 2> s = {0, 0}, e = {M, N_cols}, st = {1, 1};
                     ArrayRegion<2> result_region(s, e, st);
+                    // Without a start epoch, new chares start at -1 and never run this DAG.
+                    if (partition_grid[2].start_epoch < 0)
+                        partition_grid[2].start_epoch = epoch;
                     expand_partition_nd<2>(thisProxy, partition_proxy_2, partition_grid[2].grid,
                                            &result_region, tile_2d);
                 }
@@ -479,7 +601,9 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
                                                &result_region, tile);
                     }
                 }
-            } else if (op == Opcode::TILE) {
+            } else if (op == Opcode::TILE || is_reduction_op(op) || op == Opcode::LINALG ||
+                       is_shape_op(op) || is_signal_op(op) || op == Opcode::GATHER ||
+                       op == Opcode::EXPAND || op == Opcode::COMPRESS) {
                 auto res_it = array_meta.find(ast_node->result_name);
                 if (res_it != array_meta.end()) {
                     int res_nd = res_it->second.ndims;
@@ -511,12 +635,39 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
                     }
                     }
                 }
-            } else if (is_elementwise(op) || op == Opcode::COPY) {
+            } else if (op == Opcode::TRANSPOSE) {
+                // result may have a nonzero offset: cover [0, offset + shape)
+                auto res_it = array_meta.find(ast_node->result_name);
+                if (res_it != array_meta.end()) {
+                    int nd = res_it->second.ndims;
+                    int tile = res_it->second.tile;
+                    std::array<int, 3> ext = {0, 0, 0};
+                    for (int d = 0; d < nd; ++d)
+                        ext[d] = res_it->second.offset[d] + res_it->second.global_shape[d];
+                    if (partition_grid[nd].start_epoch < 0)
+                        partition_grid[nd].start_epoch = epoch;
+                    if (nd == 2) {
+                        std::array<int, 2> s = {0, 0}, e = {ext[0], ext[1]}, st = {1, 1};
+                        ArrayRegion<2> region(s, e, st);
+                        expand_partition_nd<2>(thisProxy, partition_proxy_2,
+                                               partition_grid[nd].grid, &region, tile);
+                    } else if (nd == 3) {
+                        std::array<int, 3> s = {0, 0, 0}, e = {ext[0], ext[1], ext[2]},
+                                           st = {1, 1, 1};
+                        ArrayRegion<3> region(s, e, st);
+                        expand_partition_nd<3>(thisProxy, partition_proxy_3,
+                                               partition_grid[nd].grid, &region, tile);
+                    }
+                }
+            } else if (is_elementwise(op) || op == Opcode::COPY || is_castscansort(op)) {
                 auto res_it = array_meta.find(ast_node->result_name);
                 if (res_it != array_meta.end() && res_it->second.global_shape[0] > 0) {
                     int nd = res_it->second.ndims;
                     int tile = res_it->second.tile;
-                    auto& sh = res_it->second.global_shape;
+                    // a nonzero decomposition offset shifts the tiles: cover [0, offset + shape)
+                    std::array<int, 3> sh = res_it->second.global_shape;
+                    for (int d = 0; d < nd; ++d)
+                        sh[d] += res_it->second.offset[d];
                     if (partition_grid[nd].start_epoch < 0)
                         partition_grid[nd].start_epoch = epoch;
                     switch (nd) {
@@ -549,6 +700,9 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
     DBG_PRINT("[PE %d] receive_dag epoch=%d: partition expansion pass complete\n", CkMyPe(),
               epoch);
 
+    // Cut UPLOAD payloads into tiles once decompositions and chare grids are final.
+    stage_uploads(dag, epoch);
+
     compile(dag);
 
     bool first = true;
@@ -560,6 +714,9 @@ void ArrayDAGGroup::receive_dag(int epoch, int size, char* serialized_dag) {
             add_dag(nd, epoch, dag->copy());
         }
     }
+
+    if (first)
+        delete dag;
 
     for (auto& [nd, pg] : partition_grid) {
         if (pg.grid[0] > 0 && active_ndims.find(nd) == active_ndims.end()) {

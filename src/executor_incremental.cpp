@@ -3,9 +3,6 @@
 #include <algorithm>
 #include <type_traits>
 
-#ifdef USE_KOKKOS
-#include <KokkosBlas3_gemm.hpp>
-#endif
 
 template <int N>
 void ArrayDAGExecutorND<N>::on_matmatmul_receive(int node_id, int input_index) {
@@ -91,71 +88,26 @@ void ArrayDAGExecutorND<N>::on_matmatmul_receive(int node_id, int input_index) {
             int b_row_off = k_lo - b_k_start;
 
 #ifdef USE_KOKKOS
-            // Device-side GEMM: rb.data is a device pointer under USE_KOKKOS
-            T* c_device = static_cast<T*>(arr_it->second->device_data_ptr());
-
-            Kokkos::View<T**, Kokkos::LayoutRight, DeviceSpace,
-                         Kokkos::MemoryTraits<Kokkos::Unmanaged>>
-                d_A_full(a_data, a_rows, a_k_size);
-            auto d_A_sub = Kokkos::subview(d_A_full, Kokkos::ALL,
-                                           Kokkos::make_pair(a_col_off, a_col_off + k_size));
-
-            int b_k_size = b_k_end - b_k_start;
-            Kokkos::View<T**, Kokkos::LayoutRight, DeviceSpace,
-                         Kokkos::MemoryTraits<Kokkos::Unmanaged>>
-                d_B_full(b_data, b_k_size, b_cols);
-            auto d_B_sub = Kokkos::subview(d_B_full,
-                                           Kokkos::make_pair(b_row_off, b_row_off + k_size),
-                                           Kokkos::ALL);
-
-            Kokkos::View<T**, Kokkos::LayoutRight, DeviceSpace,
-                         Kokkos::MemoryTraits<Kokkos::Unmanaged>>
-                d_C_full(c_device, sub_rows, sub_cols);
-            auto d_C_sub = Kokkos::subview(d_C_full,
-                                           Kokkos::make_pair(c_local_row, c_local_row + a_rows),
-                                           Kokkos::make_pair(c_local_col, c_local_col + b_cols));
-
-            KokkosBlas::gemm("N", "N", T(1), d_A_sub, d_B_sub, T(1), d_C_sub);
+            // rb.data and C are device pointers under USE_KOKKOS
+            T* c_ptr = static_cast<T*>(arr_it->second->device_data_ptr());
 #else
-            T* c_data = static_cast<T*>(arr_it->second->data_ptr());
-            T* c_sub = c_data + c_local_row * sub_cols + c_local_col;
-
-            using RMat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-            using CStride = Eigen::Stride<Eigen::Dynamic, 1>;
-
-            Eigen::Map<RMat, 0, CStride>
-                A_map(a_data + a_col_off, a_rows, k_size, CStride(a_k_size, 1));
-            Eigen::Map<RMat, 0, CStride>
-                B_map(b_data + b_row_off * b_cols, k_size, b_cols, CStride(b_cols, 1));
-            Eigen::Map<RMat, 0, CStride>
-                C_map(c_sub, a_rows, b_cols, CStride(sub_cols, 1));
-            C_map.noalias() += A_map * B_map;
+            T* c_ptr = static_cast<T*>(arr_it->second->data_ptr());
 #endif
+            panel_gemm_accumulate<T>(a_data, a_rows, a_k_size, a_col_off, b_data,
+                                     b_k_end - b_k_start, b_cols, b_row_off, k_size, c_ptr,
+                                     sub_rows, sub_cols, c_local_row, c_local_col
+#ifdef USE_NVIDIA
+                                     ,
+                                     partition->compute_stream_raw
+#endif
+            );
         }
     };
 
-    switch (dt) {
-    case DType::FLOAT32: {
-        float* d = nullptr;
+    cn_dispatch_blas(dt, [&](auto tag) {
+        decltype(tag)* d = nullptr;
         compute_pair(d);
-        break;
-    }
-    case DType::FLOAT64: {
-        double* d = nullptr;
-        compute_pair(d);
-        break;
-    }
-    case DType::INT32: {
-        int32_t* d = nullptr;
-        compute_pair(d);
-        break;
-    }
-    case DType::INT64: {
-        int64_t* d = nullptr;
-        compute_pair(d);
-        break;
-    }
-    }
+    });
 }
 
 template <int N>

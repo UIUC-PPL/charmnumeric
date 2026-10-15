@@ -1,6 +1,9 @@
 #pragma once
 
 #include "backend.hpp"
+#include "jit_api.hpp"
+
+#include <limits>
 
 // ---- Stream policy helpers (USE_KOKKOS) ----
 // Under USE_NVIDIA: Kokkos::Cuda exec space instances bound to per-chare streams.
@@ -12,9 +15,11 @@
     Kokkos::RangePolicy<Kokkos::Cuda>((partition)->compute_exec, 0, (n))
 #define CT_COMM_POLICY(partition, n)                                                               \
     Kokkos::RangePolicy<Kokkos::Cuda>((partition)->comm_exec, 0, (n))
+#define CT_COMPUTE_EXEC(partition) ((partition)->compute_exec)
 #else
 #define CT_COMPUTE_POLICY(partition, n) Kokkos::RangePolicy<>(0, (n))
 #define CT_COMM_POLICY(partition, n) Kokkos::RangePolicy<>(0, (n))
+#define CT_COMPUTE_EXEC(partition) Kokkos::DefaultExecutionSpace()
 #endif
 #endif
 
@@ -82,12 +87,13 @@ struct DeferredSendParam {
 template <int N_sender, int N_target = N_sender>
 static void deferred_send_cb(void* param, void* msg) {
     auto* p = static_cast<DeferredSendParam<N_sender, N_target>*>(param);
-    p->partition->pending_sends[p->send_id] = p->send_buf;
     ChareIndex<N_sender> self_ci;
     for (int d = 0; d < N_sender; ++d)
         self_ci.idx[d] = p->partition->index[d];
+    // send_id is the refnum: the source callback fires on the receiver, empty.
     CkCallback cb(PartitionTraits<N_sender>::CkIndexType::send_complete(nullptr),
                   proxy_at<N_sender>(p->partition->thisProxy, self_ci));
+    cb.setRefnum(static_cast<CMK_REFNUM_TYPE>(p->send_id));
     proxy_at<N_target>(p->target_proxy, p->target_ci).receive_data(
         p->node_id, p->input_index, p->inp_name, N_target, p->region_data, p->byte_size,
         CkDeviceBuffer(reinterpret_cast<char*>(p->send_buf), cb));
@@ -113,7 +119,14 @@ static void device_pack_send(PartitionImpl<N_sender>* partition,
     memcpy(ds->region_data, region_data, sizeof(int) * N_target * 3);
     ds->byte_size = byte_size;
     ds->send_buf = send_buf;
-    ds->send_id = partition->next_send_id++;
+    // The id travels as a CMK_REFNUM_TYPE refnum: skip ids of sends still in flight.
+    auto& pending = partition->pending_sends;
+    if (pending.size() > std::numeric_limits<CMK_REFNUM_TYPE>::max())
+        CkAbort("device_pack_send: too many sends in flight");
+    do
+        ds->send_id = static_cast<CMK_REFNUM_TYPE>(partition->next_send_id++);
+    while (pending.count(ds->send_id));
+    pending[ds->send_id] = send_buf;
 #ifdef USE_NVIDIA
     CkCallback hapi_cb(deferred_send_cb<N_sender, N_target>, ds);
     hapiAddCallback(partition->comm_stream_raw, &hapi_cb);
@@ -186,11 +199,41 @@ static void dispatch_kernel(void* func_ptr, int n_memrefs, std::vector<MemRef<N,
 
 #if defined(USE_NVIDIA)
     {
-        CUfunction cuFunc = reinterpret_cast<CUfunction>(func_ptr);
-        int64_t n_elements = total_elements();
-        int blockSize = 256;
-        int gridSize = ((int)n_elements + blockSize - 1) / blockSize;
-        cuLaunchKernel(cuFunc, gridSize, 1, 1, blockSize, 1, 1, 0, stream, args.data(), nullptr);
+        // func_ptr is the JIT'd host launcher (MLIRJitCompiler::generateNVIDIAHost);
+        // it queues kernels on this chare's compute stream without waiting.
+        jit_set_stream(stream);
+        static const bool check_memrefs = getenv("CNUM_CHECK_MEMREFS") != nullptr;
+        if (check_memrefs) {
+            // Debug aid: each descriptor's range must lie in its device allocation.
+            for (int i = 0; i < n_memrefs; ++i) {
+                const auto& m = descs[i];
+                int64_t lo = m.offset, hi = m.offset;
+                for (int d = 0; d < N; ++d) {
+                    int64_t ext = (m.sizes[d] > 0 ? m.sizes[d] - 1 : 0) * m.strides[d];
+                    (ext < 0 ? lo : hi) += ext;
+                }
+                CUdeviceptr base = 0;
+                size_t bytes = 0;
+                CUresult r = cuMemGetAddressRange(
+                    &base, &bytes, reinterpret_cast<CUdeviceptr>(m.aligned + lo));
+                bool ok = (r == CUDA_SUCCESS) &&
+                          reinterpret_cast<CUdeviceptr>(m.aligned + hi + 1) <= base + bytes;
+                if (!ok) {
+                    CkPrintf("[PE %d] memref %d/%d (%s) BAD: res=%d ptr=%p off=%lld sizes=", CkMyPe(),
+                             i, n_memrefs, i < n_input_memrefs ? "in" : "out", (int)r,
+                             (void*)m.aligned, (long long)m.offset);
+                    for (int d = 0; d < N; ++d)
+                        CkPrintf("%lld,", (long long)m.sizes[d]);
+                    CkPrintf(" strides=");
+                    for (int d = 0; d < N; ++d)
+                        CkPrintf("%lld,", (long long)m.strides[d]);
+                    CkPrintf(" alloc=[%p,+%zu) need=[%lld,%lld] elems\n", (void*)base, bytes,
+                             (long long)lo, (long long)hi);
+                }
+            }
+        }
+        using PackedFunc = void (*)(void**);
+        reinterpret_cast<PackedFunc>(func_ptr)(args.data());
     }
 #elif defined(USE_AMD)
     {

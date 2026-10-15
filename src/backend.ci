@@ -15,6 +15,10 @@ mainmodule charmnumeric
         entry void receive_dag(int epoch, int size, char msg[size]);
         entry void receive_get_request(int ndims, int epoch, int name, int size, int dtype);
         entry void gather(int epoch, int name, int64_t offset, int64_t size, char data[size]);
+        entry void barrier_arrive(int epoch);
+        entry void fetch_upload_tile(int node_id, int name, int nd, int i0, int i1, int i2);
+        entry void stage_upload_tile(int name, int nd, int i0, int i1, int i2, int nmeta,
+                                     int meta[nmeta], int64_t size, char data[size]);
     };
 
     array [1D] Partition1D
@@ -29,14 +33,15 @@ mainmodule charmnumeric
 #endif
                                 char data[size]);
 #ifdef USE_KOKKOS
-        entry void receive_data(int node_id, int input_index, int name,
-                                int ndims, int region_data[ndims*3],
-                                int64_t size, char data[size],
-                                CkDeviceBufferPost* devicePost);
-        entry void send_complete(int send_id);
+        entry void send_complete(CkDataMsg* msg);
 #endif
         entry void comm_done(int node_id);
-        entry void reduce_result(CkReductionMsg* msg);
+        entry void reduce_result(int node_id, int64_t size, char data[size]);
+        entry void receive_reduce_partial(int node_id, int64_t size, char data[size]);
+        entry void receive_linalg(int node_id, int64_t size, char data[size]);
+        entry void receive_index_msg(int node_id, int64_t size, char data[size]);
+        entry void receive_shape(int node_id, int64_t size, char data[size]);
+        entry void receive_upload_tile(int node_id, int name, int64_t size, char data[size]);
     };
 
     array [2D] Partition2D
@@ -51,14 +56,15 @@ mainmodule charmnumeric
 #endif
                                 char data[size]);
 #ifdef USE_KOKKOS
-        entry void receive_data(int node_id, int input_index, int name,
-                                int ndims, int region_data[ndims*3],
-                                int64_t size, char data[size],
-                                CkDeviceBufferPost* devicePost);
-        entry void send_complete(int send_id);
+        entry void send_complete(CkDataMsg* msg);
 #endif
         entry void comm_done(int node_id);
-        entry void reduce_result(CkReductionMsg* msg);
+        entry void reduce_result(int node_id, int64_t size, char data[size]);
+        entry void receive_reduce_partial(int node_id, int64_t size, char data[size]);
+        entry void receive_linalg(int node_id, int64_t size, char data[size]);
+        entry void receive_index_msg(int node_id, int64_t size, char data[size]);
+        entry void receive_shape(int node_id, int64_t size, char data[size]);
+        entry void receive_upload_tile(int node_id, int name, int64_t size, char data[size]);
     };
 
     array [3D] Partition3D
@@ -73,13 +79,14 @@ mainmodule charmnumeric
 #endif
                                 char data[size]);
 #ifdef USE_KOKKOS
-        entry void receive_data(int node_id, int input_index, int name,
-                                int ndims, int region_data[ndims*3],
-                                int64_t size, char data[size],
-                                CkDeviceBufferPost* devicePost);
-        entry void send_complete(int send_id);
+        entry void send_complete(CkDataMsg* msg);
 #endif
         entry void comm_done(int node_id);
-        entry void reduce_result(CkReductionMsg* msg);
+        entry void reduce_result(int node_id, int64_t size, char data[size]);
+        entry void receive_reduce_partial(int node_id, int64_t size, char data[size]);
+        entry void receive_linalg(int node_id, int64_t size, char data[size]);
+        entry void receive_index_msg(int node_id, int64_t size, char data[size]);
+        entry void receive_shape(int node_id, int64_t size, char data[size]);
+        entry void receive_upload_tile(int node_id, int name, int64_t size, char data[size]);
     };
 }

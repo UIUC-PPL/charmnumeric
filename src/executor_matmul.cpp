@@ -27,7 +27,7 @@ static void cross_matmul_send_vector_slice_1d_to_2d(
 #endif
 
 #ifdef USE_KOKKOS
-    T* send_buf = static_cast<T*>(Kokkos::kokkos_malloc<DeviceSpace>(byte_size));
+    T* send_buf = static_cast<T*>(comm_alloc(byte_size));
     T* src_device = static_cast<T*>(vec->device_data_ptr()) + local_offset;
     Kokkos::parallel_for(
         CT_COMM_POLICY(partition, send_len),
@@ -72,7 +72,7 @@ static void cross_matmul_send_vector_slice_1d_to_3d(
 #endif
 
 #ifdef USE_KOKKOS
-    T* send_buf = static_cast<T*>(Kokkos::kokkos_malloc<DeviceSpace>(byte_size));
+    T* send_buf = static_cast<T*>(comm_alloc(byte_size));
     T* src_device = static_cast<T*>(vec->device_data_ptr()) + local_offset;
     Kokkos::parallel_for(
         CT_COMM_POLICY(partition, send_len),
@@ -94,56 +94,24 @@ static void dispatch_cross_matmul_send_vector_slice_3d(
     DType dt, PartitionImpl<1>* partition, DAGNode* node, int vec_name,
     const ChareIndex<3>& target_ci, int local_offset, int send_len, int col_start, int col_end,
     CProxy_Partition3D& proxy_3d) {
-    switch (dt) {
-    case DType::FLOAT32:
-        cross_matmul_send_vector_slice_1d_to_3d<float>(partition, node, vec_name, target_ci,
+    cn_dispatch_blas(dt, [&](auto tag) {
+        using T = decltype(tag);
+        cross_matmul_send_vector_slice_1d_to_3d<T>(partition, node, vec_name, target_ci,
                                                         local_offset, send_len, col_start, col_end,
                                                         proxy_3d);
-        break;
-    case DType::FLOAT64:
-        cross_matmul_send_vector_slice_1d_to_3d<double>(partition, node, vec_name, target_ci,
-                                                         local_offset, send_len, col_start,
-                                                         col_end, proxy_3d);
-        break;
-    case DType::INT32:
-        cross_matmul_send_vector_slice_1d_to_3d<int32_t>(partition, node, vec_name, target_ci,
-                                                          local_offset, send_len, col_start,
-                                                          col_end, proxy_3d);
-        break;
-    case DType::INT64:
-        cross_matmul_send_vector_slice_1d_to_3d<int64_t>(partition, node, vec_name, target_ci,
-                                                          local_offset, send_len, col_start,
-                                                          col_end, proxy_3d);
-        break;
-    }
+    });
 }
 
 static void dispatch_cross_matmul_send_vector_slice(
     DType dt, PartitionImpl<1>* partition, DAGNode* node, int vec_name,
     const ChareIndex<2>& target_ci, int local_offset, int send_len, int col_start, int col_end,
     CProxy_Partition2D& proxy_2d) {
-    switch (dt) {
-    case DType::FLOAT32:
-        cross_matmul_send_vector_slice_1d_to_2d<float>(partition, node, vec_name, target_ci,
+    cn_dispatch_blas(dt, [&](auto tag) {
+        using T = decltype(tag);
+        cross_matmul_send_vector_slice_1d_to_2d<T>(partition, node, vec_name, target_ci,
                                                         local_offset, send_len, col_start, col_end,
                                                         proxy_2d);
-        break;
-    case DType::FLOAT64:
-        cross_matmul_send_vector_slice_1d_to_2d<double>(partition, node, vec_name, target_ci,
-                                                         local_offset, send_len, col_start,
-                                                         col_end, proxy_2d);
-        break;
-    case DType::INT32:
-        cross_matmul_send_vector_slice_1d_to_2d<int32_t>(partition, node, vec_name, target_ci,
-                                                          local_offset, send_len, col_start,
-                                                          col_end, proxy_2d);
-        break;
-    case DType::INT64:
-        cross_matmul_send_vector_slice_1d_to_2d<int64_t>(partition, node, vec_name, target_ci,
-                                                          local_offset, send_len, col_start,
-                                                          col_end, proxy_2d);
-        break;
-    }
+    });
 }
 
 template <int N>
@@ -164,7 +132,6 @@ void ArrayDAGExecutorND<N>::execute_matmul_node(DAGNode* node) {
 
     if constexpr (N == 1) {
         // --- 1D partition role in cross-partition matmul ---
-        int tile_1d = array_tile(dag_group->array_meta, vec_name, 1);
 
         auto nd_idx = partition->nd_index();
         int k = nd_idx[0];
@@ -209,13 +176,7 @@ void ArrayDAGExecutorND<N>::execute_matmul_node(DAGNode* node) {
             vec_e = vec_region->stop[0];
 
             // Identify dropped dim (size-1 range), row dim, col dim
-            int dd = -1;
-            for (int d = 0; d < 3; d++) {
-                if (mat_region_3d->stop[d] - mat_region_3d->start[d] == 1) {
-                    dd = d;
-                    break;
-                }
-            }
+            int dd = matmul_drop_dim(matmul_root, 0);
             int rd = (dd == 0) ? 1 : 0;
             int cd = (dd <= 1) ? 2 : 1;
 
@@ -426,14 +387,12 @@ void ArrayDAGExecutorND<N>::execute_matmul_node(DAGNode* node) {
 
         auto nd_idx = partition->nd_index();
 
-        DType dt = determine_dtype<N>(node, partition->arrays);
 
         auto mat_it = partition->arrays.find(mat_name);
         if (mat_it == partition->arrays.end()) {
             node_finished(node->id);
             return;
         }
-        int tile_2d = mat_it->second->decomp.tile;
         int mat_global_rows = mat_it->second->global_shape[0];
         int mat_global_cols = mat_it->second->global_shape[1];
 
@@ -503,27 +462,19 @@ void ArrayDAGExecutorND<N>::execute_matmul_node(DAGNode* node) {
 
         auto nd_idx = partition->nd_index();
 
-        DType dt = determine_dtype<N>(node, partition->arrays);
 
         auto mat_it = partition->arrays.find(mat_name);
         if (mat_it == partition->arrays.end()) {
             node_finished(node->id);
             return;
         }
-        int tile_3d = mat_it->second->decomp.tile;
 
         // operand_regions[0] is a 3D region
         auto* mat_region_3d = static_cast<ArrayRegion<3>*>(matmul_root->operand_regions[0]);
         auto* vec_region = static_cast<ArrayRegion<1>*>(matmul_root->operand_regions[1]);
 
         // Identify dropped dim (size-1 range), row dim, col dim
-        int dd = -1;
-        for (int d = 0; d < 3; d++) {
-            if (mat_region_3d->stop[d] - mat_region_3d->start[d] == 1) {
-                dd = d;
-                break;
-            }
-        }
+        int dd = matmul_drop_dim(matmul_root, 0);
         int rd = (dd == 0) ? 1 : 0;
         int cd = (dd <= 1) ? 2 : 1;
 
