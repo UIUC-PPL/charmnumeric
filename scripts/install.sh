@@ -8,7 +8,7 @@ CHARM_CLASSIC_REF=v8.1.0           CHARM_CLASSIC_SHA=69c48ad848a26455a33ee736f45
 CHARM_RECONVERSE_REF=v9.0.0-alpha2 CHARM_RECONVERSE_SHA=247c38f985a6c754ba2662edd15a117188669aac
 PYCCS_REPO=https://github.com/charmplusplus/PyCCS
 PYCCS_REF=8b8a54a5cb5c254d50181dfd23420b0f39078923
-CORE_REPO=https://github.com/UIUC-PPL/charmtyles
+CORE_REPO=${CNUM_CORE_REPO:-https://github.com/UIUC-PPL/charmtyles}
 MICROMAMBA_URL=https://github.com/mamba-org/micromamba-releases/releases/download/2.9.0-0/micromamba-linux-64
 MICROMAMBA_SHA256=366cd9cd8be14df1ab8ed50352a82111082a36686b2d389fdb79a92c3fafb3e3
 LLVM_VER=22.1.8
@@ -35,8 +35,9 @@ Usage: scripts/install.sh [options]   (inside an activated venv or conda env)
                      LLVM/MLIR $LLVM_VER from conda-forge (default), built from source, or an
                      existing prefix; a valid \$MLIR_DIR is used as is
   --cuda-arch NN     GPU compute capability, e.g. 80 (default: from nvidia-smi)
-  --core-ref REF     charmtyles branch to clone if this checkout is not inside one
-                     (default: this checkout's branch, else the default branch)
+  --core-ref REF     charmtyles branch, tag or commit to clone if this checkout is not inside
+                     one (default: this checkout's branch, else the default branch);
+                     \$CHARMTYLES_HOME selects an existing checkout, \$CNUM_CORE_REPO the URL
   --jobs N           build jobs (default $JOBS)
   -e, --editable     editable install
   --notebook         add the [notebook] extra (Jupyter)
@@ -50,7 +51,7 @@ while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     case "$1" in
         --prefix|--charm|--mlir|--cuda-arch|--core-ref|--jobs|-j)
-            [ $# -ge 2 ] && [ -n "$2" ] || die "$1 needs a value" ;;
+            [ $# -ge 2 ] && [ -n "$2" ] && [ "${2#--}" = "$2" ] || die "$1 needs a value" ;;
     esac
     case "$1" in
         --gpu) GPU=1 ;;
@@ -60,7 +61,7 @@ while [ $# -gt 0 ]; do
         --mlir) MLIR=$2; shift ;;
         --cuda-arch) CUDA_ARCH=$2; shift ;;
         --core-ref) CORE_REF=$2; shift ;;
-        --jobs|-j) JOBS=$2; shift ;;
+        --jobs|-j) [[ $2 =~ ^[1-9][0-9]*$ ]] || die "--jobs needs a number"; JOBS=$2; shift ;;
         --editable|-e) EDITABLE=1 ;;
         --notebook) NOTEBOOK=1 ;;
         --deps-only) DEPS_ONLY=1 ;;
@@ -75,9 +76,14 @@ step() { echo; echo "==> $*"; }
 mkdir -p "$PREFIX"; PREFIX=$(cd "$PREFIX" && pwd); LOG=$PREFIX/logs; mkdir -p "$LOG"
 case "$PREFIX$CN" in *" "*) die "paths with spaces are not supported: $PREFIX" ;; esac
 run_logged() { local log=$1; shift; "$@" > "$log" 2>&1 || { tail -30 "$log" >&2; die "failed, see $log"; }; }
-fetch() {  # url sha256 dest
-    [ -f "$3" ] || { curl -fsSL --retry 3 -o "$3.part" "$1" && mv "$3.part" "$3"; } || die "download failed: $1"
-    echo "$2  $3" | sha256sum -c --quiet - || { rm -f "$3"; die "checksum mismatch for $1"; }
+fetch() {  # url sha256 dest; a stale or corrupt file is downloaded again once
+    local try
+    for try in 1 2; do
+        [ -f "$3" ] || { curl -fsSL --retry 3 -o "$3.part" "$1" && mv "$3.part" "$3"; } || die "download failed: $1"
+        echo "$2  $3" | sha256sum -c --quiet - >/dev/null 2>&1 && return 0
+        rm -f "$3"
+    done
+    die "checksum mismatch for $1"
 }
 ver_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
 
@@ -111,14 +117,15 @@ cmake_ok || die "cmake >= 3.20 needed"
 if [ $GPU = 1 ]; then
     NVCC=$(command -v nvcc || echo "${CUDA_HOME:-/nonexistent}/bin/nvcc")
     [ -x "$NVCC" ] || die "--gpu needs the CUDA toolkit: put nvcc on PATH or set CUDA_HOME"
-    CUDA_HOME=${CUDA_HOME:-$(cd "$(dirname "$NVCC")/.." && pwd)}
+    CUDA_HOME=${CUDA_HOME:-$(dirname "$(dirname "$(readlink -f "$NVCC")")")}
     CUDA_DIR=${CUDA_DIR:-$CUDA_HOME}
     export CUDA_HOME CUDA_DIR PATH=$CUDA_HOME/bin:$PATH
     CUDA_VER=$(nvcc --version | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p')
     echo "CUDA $CUDA_VER ($CUDA_HOME)"
     case "$CUDA_VER" in 12.*) ;; *) warn "tested with CUDA 12.x only" ;; esac
     if [ -z "$CUDA_ARCH" ] && command -v nvidia-smi >/dev/null; then
-        CUDA_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.') || true
+        CUDA_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.') || CUDA_ARCH=""
+        [[ $CUDA_ARCH =~ ^[0-9]+$ ]] || CUDA_ARCH=""
     fi
 fi
 
@@ -127,11 +134,17 @@ CORE=${CHARMTYLES_HOME:-$(cd "$CN/../.." && pwd)}
 if [ ! -f "$CORE/include/charmtyles/core/charmtyles.ci" ]; then
     CORE=$PREFIX/src/charmtyles
     if [ ! -d "$CORE/.git" ]; then
-        CORE_REF=${CORE_REF:-$(git -C "$CN" symbolic-ref --short -q HEAD || true)}
-        if [ -n "$CORE_REF" ] && git ls-remote --exit-code --heads "$CORE_REPO" "$CORE_REF" >/dev/null 2>&1; then
-            step "Cloning charmtyles ($CORE_REF) into $CORE"; git clone -q -b "$CORE_REF" "$CORE_REPO" "$CORE"
+        if [ -n "$CORE_REF" ]; then
+            step "Cloning charmtyles ($CORE_REF) into $CORE"
+            git clone -q "$CORE_REPO" "$CORE" && git -C "$CORE" -c advice.detachedHead=false checkout -q "$CORE_REF" ||
+                { rm -rf "$CORE"; die "could not check out $CORE_REF (branch, tag or commit) from $CORE_REPO; \$CNUM_CORE_REPO changes the URL"; }
         else
-            step "Cloning charmtyles (default branch) into $CORE"; git clone -q "$CORE_REPO" "$CORE"
+            ref=$(git -C "$CN" symbolic-ref --short -q HEAD || true)
+            if [ -n "$ref" ] && git ls-remote --exit-code --heads "$CORE_REPO" "$ref" >/dev/null 2>&1; then
+                step "Cloning charmtyles ($ref) into $CORE"; git clone -q -b "$ref" "$CORE_REPO" "$CORE"
+            else
+                step "Cloning charmtyles (default branch) into $CORE"; git clone -q "$CORE_REPO" "$CORE"
+            fi
         fi
     fi
 fi
@@ -221,7 +234,7 @@ echo "MLIR: $MLIR_PREFIX ($("$MLIR_PREFIX/bin/llvm-config" --version))"
 # --- Kokkos + Kokkos Kernels (GPU) ---------------------------------------
 KOKKOS=""
 if [ $GPU = 1 ]; then
-    kk_ok() { [ -d "$1/lib64/cmake/KokkosKernels" ] || [ -d "$1/lib/cmake/KokkosKernels" ]; }
+    has_cfg() { [ -d "$1/lib64/cmake/$2" ] || [ -d "$1/lib/cmake/$2" ]; }
     karch() {
         case "$1" in
             70) echo VOLTA70 ;; 75) echo TURING75 ;; 80) echo AMPERE80 ;; 86) echo AMPERE86 ;;
@@ -232,8 +245,8 @@ if [ $GPU = 1 ]; then
     KARCH=""
     if [ -n "$CUDA_ARCH" ]; then KARCH=$(karch "$CUDA_ARCH"); fi
     if [ -n "${Kokkos_ROOT:-}" ]; then
-        if ! kk_ok "${KokkosKernels_ROOT:-$Kokkos_ROOT}"; then
-            warn "ignoring Kokkos_ROOT=$Kokkos_ROOT: no Kokkos Kernels next to it (set KokkosKernels_ROOT); using $PREFIX/kokkos"
+        if ! has_cfg "$Kokkos_ROOT" Kokkos || ! has_cfg "${KokkosKernels_ROOT:-$Kokkos_ROOT}" KokkosKernels; then
+            warn "ignoring Kokkos_ROOT=$Kokkos_ROOT: no Kokkos and Kokkos Kernels there (KokkosKernels_ROOT may point elsewhere); using $PREFIX/kokkos"
         else
             KOKKOS=$Kokkos_ROOT
             [ -z "$KARCH" ] || grep -q "KOKKOS_ARCH_$KARCH\b" "$KOKKOS/include/KokkosCore_config.h" 2>/dev/null ||
@@ -241,7 +254,7 @@ if [ $GPU = 1 ]; then
         fi
     fi
     if [ -z "$KOKKOS" ]; then
-        KOKKOS=$PREFIX/kokkos
+        KOKKOS=$PREFIX/kokkos; unset KokkosKernels_ROOT
         built=$(cat "$KOKKOS/.cnum-arch" 2>/dev/null || true)
         if [ -n "$built" ] && [ -n "$KARCH" ] && [ "$built" != "$KARCH" ]; then
             echo "Kokkos in $KOKKOS was built for $built; rebuilding for $KARCH"; rm -rf "$KOKKOS"; built=""

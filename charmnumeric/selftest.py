@@ -42,9 +42,13 @@ def _check_loads(path):
         _report(False, "server loads", str(exc))
         return
     text = out.stdout + out.stderr
-    bad = [line.strip() for line in text.splitlines() if "not found" in line or "error" in line.lower()]
+    bad = sorted({line.strip() for line in text.splitlines() if "not found" in line or "error" in line.lower()})
+    if bad and all(line.startswith("libcuda.so") for line in bad):
+        # no NVIDIA driver here (e.g. a login node); the GPU nodes provide libcuda
+        print(f"[warn] server loads: {'; '.join(bad)} (fine without a GPU driver; run on a GPU node)")
+        return
     _report(out.returncode == 0 and not bad, "server loads (libraries and symbol versions)",
-            "; ".join(sorted(set(bad))) if bad else ("" if out.returncode == 0 else f"exit {out.returncode}"))
+            "; ".join(bad) if bad else ("" if out.returncode == 0 else f"exit {out.returncode}"))
 
 
 def main():
