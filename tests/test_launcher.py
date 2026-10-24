@@ -131,12 +131,13 @@ def test_connect_to_cli_server(tmp_path):
                            env=_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
         host, port = cli.stdout.readline().strip().split(":")
+        keyfile = cli.stdout.readline().strip()
         code = """
             import charmnumeric as cnp
             print(cnp.arange(4).sum())
             print(cnp.launcher.server())
         """
-        out = subprocess.run(_py(code), env=_env(CNUM_HOST=host, CNUM_PORT=port),
+        out = subprocess.run(_py(code), env=_env(CNUM_HOST=host, CNUM_PORT=port, CNUM_CCS_KEY=keyfile),
                              capture_output=True, text=True, timeout=120)
         assert out.returncode == 0, out.stderr
         assert out.stdout.split() == ["6", "None"]
@@ -152,7 +153,8 @@ def test_explicit_connect():
                            env=_env(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     try:
         host, port = cli.stdout.readline().strip().split(":")
-        iface = cnp.connect(host, int(port))
+        keyfile = cli.stdout.readline().strip()
+        iface = cnp.connect(host, int(port), key=keyfile)
         assert cnp.connect(host, int(port)) is iface
         assert cnp.start() is iface
         assert float(cnp.ones(7).sum()) == 7.0
@@ -239,3 +241,37 @@ def test_build_inference(tmp_path, monkeypatch):
     monkeypatch.setenv("CNUM_SERVER", str(d / "server.out"))
     b = launcher.find_build()
     assert (b.arch, b.gpu, b.charmrun, b.reconverse) == ("reconverse-linux-x86_64-cuda", "NVIDIA", None, True)
+
+
+@needs_build
+def test_auth_required():
+    from charmtyles.interface import CCSInterface
+
+    cnp.start(npes=1)
+    srv = launcher.server()
+    assert oct(srv.run_dir.stat().st_mode & 0o777) == "0o700"
+    assert oct(srv.keyfile.stat().st_mode & 0o777) == "0o600"
+    with pytest.raises(ConnectionError):
+        CCSInterface().connect(srv.host, srv.port, 4)
+    with pytest.raises(ConnectionError):
+        CCSInterface().connect(srv.host, srv.port, 4, key=bytes(16))
+    assert float(cnp.ones(5).sum()) == 5.0
+    with pytest.raises(RuntimeError, match="stop"):
+        cnp.connect("127.0.0.1", srv.port + 1)
+
+
+def test_bad_env_values(monkeypatch):
+    monkeypatch.setenv("CNUM_PORT", "")
+    with pytest.raises(ValueError, match="CNUM_PORT"):
+        cnp.start()
+    monkeypatch.delenv("CNUM_PORT")
+    monkeypatch.setenv("CNUM_NPES", "four")
+    monkeypatch.setenv("CNUM_SERVER", sys.executable)
+    with pytest.raises(ValueError, match="CNUM_NPES"):
+        cnp.start()
+
+
+def test_sim_never_autostarts(monkeypatch):
+    monkeypatch.setenv("CNUM_SIM", "1")
+    with pytest.raises(RuntimeError, match="CNUM_SIM"):
+        float(cnp.ones(3).sum())

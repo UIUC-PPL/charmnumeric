@@ -44,8 +44,12 @@ class CharmNumericInterface(CCSInterface):
         super().__init__(*args, **kwargs)
         _default_interface = self
 
-    def connect(self, server_ip, server_port, odf):
-        super().connect(server_ip, server_port, odf)
+    def connect(self, server_ip, server_port, odf, key=None):
+        # key only when given: test harnesses patch CCSInterface.connect with 3 arguments.
+        if key is None:
+            super().connect(server_ip, server_port, odf)
+        else:
+            super().connect(server_ip, server_port, odf, key=key)
         from charmtyles.core import set_auto_flush
 
         set_auto_flush(self, _AUTO_FLUSH if _AUTO_FLUSH > 0 else None)

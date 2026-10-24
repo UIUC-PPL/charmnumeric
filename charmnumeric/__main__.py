@@ -21,7 +21,7 @@ def _launch_options(p):
     p.add_argument("--odf", type=int, help="over-decomposition factor (default $CNUM_ODF or 4)")
     p.add_argument("--timeout", type=float, help="startup timeout in seconds")
     p.add_argument("--server-arg", action="append", default=[], metavar="ARG",
-                   help="extra server argument (repeatable), e.g. --server-arg=+isomalloc_sync")
+                   help="extra server argument (repeatable)")
 
 
 def _kwargs(a):
@@ -51,11 +51,11 @@ def _server(a):
     kw.pop("odf")
     srv = launcher._launch(**kw)
     try:
-        print(f"{srv.host}:{srv.port}", flush=True)
+        print(f"{srv.host}:{srv.port}\n{srv.keyfile}", flush=True)
         print(f"charmnumeric: server with {srv.describe()}; log: {srv.log_path}\n"
-              f"  connect with CNUM_HOST={srv.host} CNUM_PORT={srv.port} "
-              f"or charmnumeric.connect({srv.host!r}, {srv.port}); Ctrl-C stops it",
-              file=sys.stderr, flush=True)
+              f"  connect (one client process) with CNUM_HOST={srv.host} CNUM_PORT={srv.port} "
+              f"CNUM_CCS_KEY={srv.keyfile},\n  or charmnumeric.connect({srv.host!r}, {srv.port}, "
+              f"key={str(srv.keyfile)!r}); Ctrl-C stops it", file=sys.stderr, flush=True)
         rc = srv.proc.wait()
         print(f"charmnumeric: server exited with code {rc}", file=sys.stderr)
         return rc
@@ -76,7 +76,7 @@ def _info(a):
     print(f"server:   {build.server}\ncharmrun: {build.charmrun}\narch:     {build.arch}\n"
           f"gpu:      {build.gpu}\nfrom:     {build.source}")
     if build.gpu:
-        print(f"visible GPUs: {launcher._visible_devices(build.gpu)}")
+        print(f"visible GPUs: {launcher.visible_devices(build.gpu)}")
     print(f"logs:     {launcher._log_root()}")
     return 0
 
