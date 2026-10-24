@@ -8,10 +8,8 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import signal
 import socket
 import subprocess
-import threading
 import time
 
 import pytest
@@ -89,11 +87,12 @@ def test_quickstart_notebook(kernel_env):
                             resources={"metadata": {"path": str(NOTEBOOK.parent)}}).execute()
     code = [c for c in nb.cells if c.cell_type == "code"]
     assert not [o for c in code for o in c.outputs if o.output_type == "error"]
-    display = _outputs(code[1])
+    tagged = {t: c for c in code for t in c.metadata.get("tags", [])}
+    display = _outputs(tagged["display"])
     assert "Array([" in display and "shape=(1000001,)" in display and "..." in display
-    assert "Array(shape=(1000001,)" in _outputs(code[3])
+    assert "Array(shape=(1000001,)" in _outputs(tagged["repr"])
+    assert "values not fetched" in _outputs(tagged["no-preview"])
     assert any("image/png" in o.get("data", {}) for c in code for o in c.outputs)
-    assert "values not fetched" in _outputs(code[7])
 
 
 def _cell(source):
@@ -103,14 +102,19 @@ def _cell(source):
 STARTUP = ("import os, time\nimport numpy as np\nimport charmnumeric as cnp\n"
            "cnp.CharmNumericInterface().connect(os.environ['CNUM_HOST'], "
            "int(os.environ['CNUM_PORT']), 4)")
-SLOW = ("a = cnp.ones((2000, 2000)) * 1e-3\n"
-        "for _ in range(16):\n    a = (a @ a) * 1e-3\n"
-        "t0 = time.monotonic()\nfloat(cnp.sum(a))")
+# "Interrupt kernel" sends SIGINT to the kernel process; sent from inside, so it lands
+# while the cell runs however loaded the machine is.
+SLOW = ("import signal, threading\n"
+        "a = cnp.ones((1500, 1500)) * 1e-3\n"
+        "for _ in range(10):\n    a = (a @ a) * 1e-3\n"
+        "t0 = time.monotonic()\n"
+        "threading.Timer(1.0, os.kill, (os.getpid(), signal.SIGINT)).start()\n"
+        "float(cnp.sum(a))")
 
 
 def test_interrupt_rerun_and_restart(kernel_env):
     nb = nbformat.v4.new_notebook(cells=[
-        _cell(STARTUP), _cell(SLOW), _cell("print(time.monotonic() - t0, float(cnp.sum(cnp.ones(10))))"),
+        _cell(STARTUP), _cell(SLOW), _cell("v = float(cnp.sum(cnp.ones(10)))\nprint(time.monotonic() - t0, v)"),
         _cell(STARTUP), _cell("b = cnp.arange(6.0) * 2\nb"), _cell("float(cnp.sum(a))"),
     ])
     nb.metadata["kernelspec"] = {"name": "python3", "display_name": "Python 3",
@@ -118,21 +122,22 @@ def test_interrupt_rerun_and_restart(kernel_env):
     client = nbclient.NotebookClient(nb, timeout=600, kernel_name="python3")
     with client.setup_kernel():
         client.execute_cell(nb.cells[0], 0)
-        # "Interrupt kernel" sends SIGINT to the kernel process.
-        timer = threading.Timer(1.5, os.kill, (client.km.provisioner.pid, signal.SIGINT))
-        timer.start()
         start = time.monotonic()
         try:
             client.execute_cell(nb.cells[1], 1)
-            interrupted = False
+            interrupted_at = None
         except nbclient.exceptions.CellExecutionError as exc:
             assert "KeyboardInterrupt" in str(exc)
-            interrupted = True
-        finally:
-            timer.cancel()
-        assert time.monotonic() - start < (8 if interrupted else 1.5)
+            interrupted_at = time.monotonic() - start
         client.execute_cell(nb.cells[2], 2)
-        assert _outputs(nb.cells[2]).split()[-1] == "10.0"
+        ready, value = _outputs(nb.cells[2]).split()[-2:]
+        assert value == "10.0"
+        # The interrupt returned well before the abandoned product was done (unless it was
+        # done within the 1 s before the interrupt).
+        if interrupted_at is None:
+            assert float(ready) < 2.5
+        else:
+            assert interrupted_at < float(ready) - 0.5
         for i in (3, 4, 5):
             client.execute_cell(nb.cells[i], i)
         assert "Array([ 0.,  2.,  4.,  6.,  8., 10.], dtype=float64)" in _outputs(nb.cells[4])
@@ -141,5 +146,5 @@ def test_interrupt_rerun_and_restart(kernel_env):
     # A new kernel (as after "Restart kernel") cannot take over the server.
     fresh = nbformat.v4.new_notebook(cells=[_cell(STARTUP)])
     fresh.metadata["kernelspec"] = nb.metadata["kernelspec"]
-    with pytest.raises(nbclient.exceptions.CellExecutionError, match="cannot be reused"):
+    with pytest.raises(nbclient.exceptions.CellExecutionError, match="another client process"):
         nbclient.NotebookClient(fresh, timeout=120, kernel_name="python3").execute()

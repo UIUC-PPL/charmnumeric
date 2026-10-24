@@ -1,8 +1,7 @@
-"""Display of arrays in notebooks and by print(), and the IPython cell hook.
+"""Array display for notebooks and print(), and the IPython after-cell flush.
 
-Showing values fetches at most the corners NumPy would print: arrays up to the
-print threshold come back whole, larger ones as ``edgeitems`` per side of each axis.
-``repr()`` never contacts the server.
+Shown values come from one fetch of the corners NumPy prints; ``__repr__`` stays
+metadata only and never contacts the server.
 """
 
 import html
@@ -35,26 +34,33 @@ def _print_limits():
     numpy_options = np.get_printoptions()
     threshold = _options["threshold"]
     edgeitems = _options["edgeitems"]
-    return (numpy_options["threshold"] if threshold is None else int(threshold),
-            numpy_options["edgeitems"] if edgeitems is None else int(edgeitems))
+    threshold = numpy_options["threshold"] if threshold is None else threshold
+    edgeitems = numpy_options["edgeitems"] if edgeitems is None else int(edgeitems)
+    return threshold, max(1, edgeitems)  # NumPy's edgeitems=0 output shows no real values
 
 
 def _fetch(x, interface):
-    """x, or for large x a stand-in that holds only the corners NumPy prints."""
+    """(host values, summarized): x itself, or the corners NumPy prints with one filler
+    element in the middle of each elided axis (NumPy never prints it)."""
+    from .charmnumeric import empty
+
     threshold, edge = _print_limits()
     shape = tuple(x.shape)
-    if int(x.size) <= threshold:
-        return np.asarray(x.get(interface)).reshape(shape), False
-    # Axes longer than 2*edge get a filler element in the middle, which NumPy elides.
-    spans = [((0, n, slice(0, n)),) if n <= 2 * edge else
-             ((0, edge, slice(0, edge)), (n - edge, n, slice(edge + 1, 2 * edge + 1)))
-             for n in shape]
-    out = np.zeros([n if n <= 2 * edge else 2 * edge + 1 for n in shape], dtype=x.dtype)
+    summarized = int(x.size) > threshold
+    elided = [summarized and n > 2 * edge for n in shape]
+    if not any(elided):
+        return np.asarray(x.get(interface)).reshape(shape), summarized
+    spans = [((slice(0, edge), slice(0, edge)), (slice(n - edge, n), slice(edge, 2 * edge)))
+             if cut else ((slice(0, n), slice(0, n)),) for n, cut in zip(shape, elided)]
+    corners = empty(tuple(2 * edge if cut else n for n, cut in zip(shape, elided)),
+                    dtype=x.dtype)
     for corner in itertools.product(*spans):
-        block = x[tuple(slice(lo, hi) for lo, hi, _ in corner)]
-        out[tuple(dst for _, _, dst in corner)] = np.asarray(block.get(interface)).reshape(
-            [hi - lo for lo, hi, _ in corner])
-    return out, True
+        corners[tuple(dst for _, dst in corner)] = x[tuple(src for src, _ in corner)]
+    host = np.asarray(corners.get(interface)).reshape(corners.shape)
+    for axis, cut in enumerate(elided):
+        if cut:
+            host = np.insert(host, edge, host.take(0, axis=axis), axis=axis)
+    return host, True
 
 
 def _host_values(x):
@@ -69,8 +75,19 @@ def _text(values, summarized, **kwargs):
         return np.array2string(values, **kwargs) if kwargs else str(values)
 
 
+def _repr_text(kind, values, summarized, shape, dtype):
+    """NumPy's array_repr layout (shape shown when summarized), always naming the dtype."""
+    prefix = f"{kind}("
+    body = prefix + _text(values, summarized, separator=", ", prefix=prefix, suffix=")") + ","
+    extras = ", ".join(([f"shape={tuple(shape)}"] if summarized else [])
+                       + [f"dtype={np.dtype(dtype).name}"]) + ")"
+    last_line = len(body) - (body.rfind("\n") + 1)
+    wraps = last_line + len(extras) + 1 > np.get_printoptions()["linewidth"]
+    return body + ("\n" + " " * len(prefix) if wraps else " ") + extras
+
+
 def values_str(x):
-    """str(x): NumPy's str of x, fetching only what it prints."""
+    """str(x): NumPy's str of x, fetching only what it prints (raises if the server is gone)."""
     return _text(*_host_values(x))
 
 
@@ -109,9 +126,7 @@ def mimebundle(x):
     else:
         note = "values not fetched; pending" if _pending(x) else "values not fetched"
     if host is not None:
-        body = _text(*host, separator=", ", prefix=f"{kind}(")
-        tail = f", shape={tuple(x.shape)}" if host[1] else ""
-        text = f"{kind}({body}{tail}, dtype={np.dtype(x.dtype).name})"
+        text = _repr_text(kind, *host, x.shape, x.dtype)
         shown = f"<pre style='margin:0.3em 0 0 0'>{html.escape(_text(*host))}</pre>"
     else:
         text = f"{header}\n<{note}>"
@@ -127,14 +142,14 @@ def mimebundle(x):
 _FLUSH_AFTER_CELL = os.environ.get("CNUM_FLUSH_AFTER_CELL", "1") not in ("", "0")
 
 
-def _flush_after_cell(result=None):
+def _flush_after_cell(_result=None):
     from charmtyles.ast import get_execution_state
     from charmtyles.core import execute
 
     from . import interface
 
     iface = interface._default_interface
-    if iface is None or getattr(iface, "server", None) is None:
+    if iface is None or not iface.connected:
         return
     if not get_execution_state()._has_pending_tasks():
         return

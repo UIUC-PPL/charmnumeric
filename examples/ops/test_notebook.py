@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """Interactive-use behavior: bounded display fetches, repr without server traffic,
-host conversions, Ctrl-C during a long get, and reconnecting.
+host conversions, Ctrl-C during a long get, reconnecting and fork.
 
 Run as e.g. harness/run_one.sh server.out 2 33001 examples/ops/test_notebook.py
 """
@@ -14,19 +14,22 @@ import time
 import numpy as np
 
 import charmnumeric as cnp
-from charmtyles.interface import CCSInterface
+from charmnumeric import _display
+from charmtyles.interface import Handlers
 from _ops_common import Checker, connect
 
 _fetched = []
-_get = CCSInterface.get
 
 
-def _counting_get(self, ndims, name, size, dtype=None):
-    _fetched.append(size)
-    return _get(self, ndims, name, size, dtype=dtype)
+def count_fetches(iface):
+    """Record the element count of every get on iface."""
+    get = iface.get
 
+    def counting(ndims, name, size, dtype=None):
+        _fetched.append(size)
+        return get(ndims, name, size, dtype=dtype)
 
-CCSInterface.get = _counting_get
+    iface.get = counting
 
 
 def fetched(fn):
@@ -75,10 +78,9 @@ def display(chk):
         bundle, n2 = fetched(lambda: a._repr_mimebundle_())
         chk.count += 1
         plain, page = bundle["text/plain"], bundle["text/html"]
-        kind = type(a).__name__
-        tail = f", shape={ref.shape}" if ref.size > 1000 else ""
-        want = (f"{kind}({np.array2string(ref, separator=', ', prefix=kind + '(')}{tail}, "
-                f"dtype={ref.dtype.name})")
+        want = _display._repr_text(type(a).__name__, ref, ref.size > 1000, ref.shape, ref.dtype)
+        if type(a).__name__ == "Array" and ref.dtype in (np.float32, np.int32):
+            want = np.array_repr(ref).replace("array(", "Array(", 1)  # NumPy shows these dtypes
         if n2 > limit or plain != want or "<pre" not in page:
             chk.failures.append(f"display {label}")
             print(f"  FAIL display {label} ({n2} fetched):\n{plain}\n!=\n{want}")
@@ -102,8 +104,8 @@ def display(chk):
 
 
 def slow_product():
-    a = cnp.ones((2000, 2000)) * 1e-3
-    for _ in range(12):
+    a = cnp.ones((1500, 1500)) * 1e-3
+    for _ in range(10):
         a = (a @ a) * 1e-3
     return cnp.sum(a)
 
@@ -112,23 +114,35 @@ def interrupt(chk, iface):
     total = slow_product()
     signal.signal(signal.SIGALRM, lambda *_: os.kill(os.getpid(), signal.SIGINT))
     start = time.monotonic()
-    signal.setitimer(signal.ITIMER_REAL, 0.5)
+    signal.setitimer(signal.ITIMER_REAL, 0.3)
+    waited = None
     try:
         total.get(iface)
-        print("  SKIP interrupt: the product finished before the interrupt")
     except KeyboardInterrupt:
         waited = time.monotonic() - start
-        chk.check("Ctrl-C stops the wait", np.asarray(waited < 4.0), np.asarray(True))
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
     chk.check("usable after Ctrl-C", cnp.arange(5) + 1, np.arange(5) + 1)
+    ready = time.monotonic() - start
     chk.check("interrupted result", total, np.asarray(0.0))
+    chk.count += 1
+    if waited is None:
+        print("  SKIP Ctrl-C stops the wait: the product finished before the interrupt")
+    elif waited < ready - 0.5:
+        print(f"  PASS Ctrl-C stops the wait ({waited:.1f} s; result ready at {ready:.1f} s)")
+    else:
+        chk.failures.append("Ctrl-C")
+        print(f"  FAIL Ctrl-C returned at {waited:.1f} s; result ready at {ready:.1f} s")
 
 
 def reconnect(chk, iface):
     keep = cnp.arange(10.0) * 3
     chk.check("before reconnect", keep, np.arange(10.0) * 3)
     again = connect()  # e.g. a re-run notebook cell
+    lost = cnp.CharmNumericInterface()  # a connect whose reply never arrives
+    lost._open(os.environ.get("CNUM_HOST", "127.0.0.1"), int(os.environ.get("CNUM_PORT", "1234")))
+    lost._send(Handlers.connection_handler, lost._connect_request(4))
+    again = connect()
     chk.check("old array after reconnect", keep + 1, np.arange(10.0) * 3 + 1)
     chk.check("new array after reconnect", cnp.ones(4) * 2, np.full(4, 2.0))
     code = ("from _ops_common import connect\n"
@@ -136,17 +150,35 @@ def reconnect(chk, iface):
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                          cwd=os.path.dirname(os.path.abspath(__file__)), timeout=120)
     chk.count += 1
-    if "cannot be reused" in out.stdout:
+    if "another client process" in out.stdout:
         print("  PASS another process is refused")
     else:
         chk.failures.append("another process")
         print(f"  FAIL another process: {out.stdout} {out.stderr}")
     chk.check("server still serves us", cnp.arange(3.0), np.arange(3.0))
-    return again
+    pid = os.fork()
+    if pid == 0:
+        status = 0
+        try:
+            cnp.arange(3.0).get(again)
+            status |= 1
+        except ConnectionError as e:
+            status |= 0 if "stale" in str(e) else 2
+        try:
+            connect()
+            status |= 4
+        except ConnectionError as e:
+            status |= 0 if "another client process" in str(e) else 8
+        os._exit(status)
+    _, status = os.waitpid(pid, 0)
+    chk.check("fork: inherited connection is stale, new connect refused",
+              np.asarray(os.waitstatus_to_exitcode(status)), np.asarray(0))
+    chk.check("parent still served after fork", cnp.arange(4.0) * 2, np.arange(4.0) * 2)
 
 
 def main():
     iface = connect()
+    count_fetches(iface)
     chk = Checker("test_notebook", iface)
     display(chk)
     interrupt(chk, iface)

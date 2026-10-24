@@ -584,7 +584,7 @@ class _HostConversions(object):
         return mimebundle(self)
 
     def to_numpy(self):
-        """A host copy (one fetch); matplotlib and pandas convert through this."""
+        """A host copy; matplotlib converts through this (one fetch, not one per element)."""
         return self.__array__()
 
     def block_until_ready(self):

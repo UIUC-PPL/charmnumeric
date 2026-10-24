@@ -32,6 +32,7 @@ from charmtyles.core import _shape_size
 from .charmnumeric import (
     Array,
     ArrayView,
+    _HostConversions,
     _NDBase,
     _broadcast_to,
     _broadcasts_to,
@@ -412,8 +413,7 @@ class FoldedArray(_NDBase):
         host = self.get(default_interface())
         return host if dtype is None else host.astype(dtype, copy=False)
 
-    def to_numpy(self):
-        return self.__array__()
+    to_numpy = _HostConversions.to_numpy
 
     def __repr__(self):
         return f"FoldedArray(shape={self._shape}, dtype={self.dtype.name})"

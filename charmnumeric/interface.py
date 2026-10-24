@@ -17,8 +17,7 @@ def default_interface():
     """The most recently created interface (ops with data-dependent sizes sync on it)."""
     if _default_interface is None:
         raise RuntimeError(
-            "this operation has a data-dependent result size and needs a "
-            "CharmNumericInterface; create (and connect) one first"
+            "no charmnumeric server is connected; connect a CharmNumericInterface first"
         )
     return _default_interface
 

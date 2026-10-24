@@ -40,9 +40,12 @@ your arrays. Notebook behavior:
   usable. Work already sent keeps running on the server; the next fetch waits for it.
 - ``np.asarray(a)``, ``a.to_numpy()`` and matplotlib fetch an array once. Slice large
   arrays before plotting.
-- A server serves one client process. After restarting the kernel, start a new
-  server; connecting a new process to a used server raises ``ConnectionError``.
+- A server serves one client process; any other process (a restarted kernel, a
+  forked child) gets ``ConnectionError`` when it connects. With a server you started
+  yourself, restart the server after restarting the kernel. ``cnp.start()`` gives
+  each kernel its own server, which avoids this.
 - If the server exits, the next fetch raises ``ConnectionError`` instead of hanging.
+  ``print(a)`` raises too; notebook display shows "values unavailable" instead.
 
 ``tests/test_notebook.py`` runs the notebook and an interrupt/reconnect scenario in
 real kernels (needs ``nbclient``, ``ipykernel``, ``matplotlib``)::
