@@ -76,7 +76,7 @@ mkdir -p "$PREFIX"; PREFIX=$(cd "$PREFIX" && pwd); LOG=$PREFIX/logs; mkdir -p "$
 case "$PREFIX$CN" in *" "*) die "paths with spaces are not supported: $PREFIX" ;; esac
 run_logged() { local log=$1; shift; "$@" > "$log" 2>&1 || { tail -30 "$log" >&2; die "failed, see $log"; }; }
 fetch() {  # url sha256 dest
-    [ -f "$3" ] || { curl -fL --retry 3 -o "$3.part" "$1" && mv "$3.part" "$3"; } || die "download failed: $1"
+    [ -f "$3" ] || { curl -fsSL --retry 3 -o "$3.part" "$1" && mv "$3.part" "$3"; } || die "download failed: $1"
     echo "$2  $3" | sha256sum -c --quiet - || { rm -f "$3"; die "checksum mismatch for $1"; }
 }
 ver_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
