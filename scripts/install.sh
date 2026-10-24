@@ -146,7 +146,7 @@ charm_fits() {
     local c=0 r=0; charm_cuda "$1" && c=1; charm_rcv "$1" && r=1
     [ $c = $GPU ] && [ $r = $RCV ]
 }
-want="$([ $RCV = 1 ] && echo Reconverse || echo classic)$([ $GPU = 1 ] && echo ' CUDA')"
+want=classic; [ $RCV = 0 ] || want=Reconverse; [ $GPU = 0 ] || want="$want CUDA"
 if [ -n "$CHARM" ]; then
     charm_ok "$CHARM" || die "--charm $CHARM is not a complete Charm++ build (needs bin/charmc and lib/libck.a)"
     charm_fits "$CHARM" || die "--charm $CHARM does not match the requested $want configuration"
@@ -163,7 +163,7 @@ if [ -z "$CHARM" ]; then
         step "Building Charm++ $ref $arch $opts (log: $LOG/charm-$arch$opts.log)"
         [ -d "$src/.git" ] || git -c advice.detachedHead=false clone -q --depth 1 -b "$ref" "$CHARM_REPO" "$src"
         [ "$(git -C "$src" rev-parse HEAD)" = "$sha" ] || die "Charm++ $ref in $src is not commit $sha"
-        (cd "$src" && run_logged "$LOG/charm-$arch$opts.log" ./build charm++ $arch $opts --with-production -j"$JOBS")
+        (cd "$src" && run_logged "$LOG/charm-$arch$opts.log" ./build charm++ $arch $opts --with-production --force -j"$JOBS")
         charm_ok "$CHARM" || die "Charm++ build incomplete, see $LOG/charm-$arch$opts.log"
         touch "$CHARM/.cnum-build-ok"
     fi
