@@ -2,14 +2,18 @@
 import os as _os
 
 _here = _os.path.dirname(_os.path.abspath(__file__))
+_charmrun = @CNUM_BI_CHARMRUN@
 
 SERVER = @CNUM_BI_SERVER@
-CHARMRUN = @CNUM_BI_CHARMRUN@
+CHARMRUN = _charmrun if _charmrun and _os.path.exists(_charmrun) else None
 CHARM_ARCH = "@CHARM_ARCH@"
 CHARM_HOME = "@CHARM_HOME@"
 GPU_BACKEND = @CNUM_BI_GPU@
 RECONVERSE = @CNUM_BI_RECONVERSE@
 SMP = @CNUM_BI_SMP@
 LLVM_VERSION = "@LLVM_PACKAGE_VERSION@"
+DEPS_DIR = "@CNUM_DEPS_DIR@"
+# Shared-library directories the server links from (Kokkos, CUDA toolkit).
+LIB_DIRS = [@CNUM_BI_LIB_DIRS@]
 GIT_REVISION = "@CNUM_GIT_REV@"
 CORE_GIT_REVISION = "@CNUM_CORE_GIT_REV@"

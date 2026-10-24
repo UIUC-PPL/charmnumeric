@@ -33,13 +33,18 @@ def _check_binary(label, path):
     return ok
 
 
-def _check_libs(path):
-    if not shutil.which("ldd"):
+def _check_loads(path):
+    # loader trace mode: resolves all libraries and symbol versions, runs no Charm++ code
+    env = dict(os.environ, LD_TRACE_LOADED_OBJECTS="1")
+    try:
+        out = subprocess.run([path], env=env, capture_output=True, text=True, timeout=60)
+    except OSError as exc:
+        _report(False, "server loads", str(exc))
         return
-    out = subprocess.run(["ldd", path], capture_output=True, text=True).stdout
-    missing = [line.split()[0] for line in out.splitlines() if "not found" in line]
-    _report(not missing, "server shared libraries resolve",
-            "missing " + ", ".join(sorted(set(missing))) if missing else "")
+    text = out.stdout + out.stderr
+    bad = [line.strip() for line in text.splitlines() if "not found" in line or "error" in line.lower()]
+    _report(out.returncode == 0 and not bad, "server loads (libraries and symbol versions)",
+            "; ".join(sorted(set(bad))) if bad else ("" if out.returncode == 0 else f"exit {out.returncode}"))
 
 
 def main():
@@ -70,7 +75,7 @@ def main():
               f"Reconverse {bi.RECONVERSE}, LLVM {bi.LLVM_VERSION}, "
               f"charmnumeric {bi.GIT_REVISION}, charmtyles {bi.CORE_GIT_REVISION}")
         if _check_binary("server", bi.SERVER):
-            _check_libs(bi.SERVER)
+            _check_loads(bi.SERVER)
         if bi.CHARMRUN is not None:
             _check_binary("charmrun", bi.CHARMRUN)
         if bi.GPU_BACKEND == "NVIDIA":

@@ -680,8 +680,11 @@ bool MLIRJitCompiler::lowerToCPU() {
 // $CNUM_MLIR_CUDA_RUNTIME, else a copy next to server.out (pip installs), else the build path.
 static const char* cudaRuntimeLib() {
     static const std::string path = [] {
-        if (const char* env = getenv("CNUM_MLIR_CUDA_RUNTIME"))
-            return std::string(env);
+        if (const char* env = getenv("CNUM_MLIR_CUDA_RUNTIME")) {
+            if (llvm::sys::fs::exists(env))
+                return std::string(env);
+            llvm::errs() << "CNUM_MLIR_CUDA_RUNTIME=" << env << " does not exist; ignoring it\n";
+        }
         llvm::SmallString<256> p(llvm::sys::fs::getMainExecutable(nullptr, nullptr));
         llvm::sys::path::remove_filename(p);
         llvm::sys::path::append(p, llvm::sys::path::filename(MLIR_CUDA_RUNTIME_LIB));

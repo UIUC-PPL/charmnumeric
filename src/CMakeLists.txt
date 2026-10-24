@@ -12,7 +12,7 @@ endif()
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/CnumCharm.cmake)
 
 # GPU backend: -DGPU_BACKEND=NVIDIA|AMD|INTEL; defaults to NVIDIA with a CUDA Charm++ build.
-if(NOT DEFINED GPU_BACKEND AND CHARM_CUDA)
+if("${GPU_BACKEND}" STREQUAL "" AND CHARM_CUDA)
     set(GPU_BACKEND NVIDIA)
 endif()
 string(TOUPPER "${GPU_BACKEND}" GPU_BACKEND_UPPER)
@@ -275,10 +275,16 @@ if(GPU_BACKEND_UPPER)
             set(_crw "${LLVM_BUILD_MAIN_SRC_DIR}/../mlir/lib/ExecutionEngine/CudaRuntimeWrappers.cpp")
             if(NOT EXISTS "${_crw}")
                 set(_crw "${CMAKE_CURRENT_BINARY_DIR}/CudaRuntimeWrappers.cpp")
+                set(_crw_sha_22.1.8 7a1aae0ec0041904838ff20ef75f3a216dc2bb5768659a1bc242cf603d62b989)
+                if(NOT DEFINED _crw_sha_${LLVM_PACKAGE_VERSION})
+                    message(FATAL_ERROR "LLVM ${LLVM_PACKAGE_VERSION} has no libmlir_cuda_runtime: build LLVM with "
+                        "-DMLIR_ENABLE_CUDA_RUNNER=ON, set MLIR_CUDA_RUNTIME_LIB, or use LLVM 22.1.8.")
+                endif()
                 if(NOT EXISTS "${_crw}")
                     message(STATUS "Downloading MLIR CudaRuntimeWrappers.cpp for LLVM ${LLVM_PACKAGE_VERSION}")
                     file(DOWNLOAD "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-${LLVM_PACKAGE_VERSION}/mlir/lib/ExecutionEngine/CudaRuntimeWrappers.cpp"
-                        "${_crw}.tmp" STATUS _st TLS_VERIFY ON)
+                        "${_crw}.tmp" STATUS _st TLS_VERIFY ON
+                        EXPECTED_HASH SHA256=${_crw_sha_${LLVM_PACKAGE_VERSION}})
                     list(GET _st 0 _rc)
                     if(NOT _rc EQUAL 0)
                         message(FATAL_ERROR "Could not download CudaRuntimeWrappers.cpp (${_st}). Build LLVM "
@@ -420,23 +426,32 @@ execute_process(COMMAND ${LLVM_CONFIG_EXE} --link-static --system-libs
                 OUTPUT_VARIABLE LLVM_SYSTEM_LIBS
                 OUTPUT_STRIP_TRAILING_WHITESPACE)
 separate_arguments(LLVM_SYSTEM_LIBS)
-# Resolve -lfoo to files, system copies first: a -L to a conda LLVM prefix would also
-# make ld pick that prefix's newer libstdc++, which the system one cannot satisfy at run time.
-set(_sys_libs)
-foreach(_f ${LLVM_SYSTEM_LIBS})
-    string(REGEX REPLACE "^-l" "" _n "${_f}")
-    if(NOT _n STREQUAL _f AND NOT _n MATCHES "^(rt|dl|m|pthread)$")
-        find_library(_cnum_sys_${_n} ${_n} NO_CACHE PATHS /usr/lib64 /usr/lib /usr/lib/x86_64-linux-gnu NO_DEFAULT_PATH)
-        if(NOT _cnum_sys_${_n})
-            find_library(_cnum_sys_${_n} ${_n} NO_CACHE HINTS ${LLVM_LIBRARY_DIR})
+# An LLVM prefix with its own libstdc++ (conda): link -lfoo from the system, so ld does
+# not pick up that newer libstdc++.
+if(EXISTS "${LLVM_LIBRARY_DIR}/libstdc++.so")
+    set(_sys_libs)
+    foreach(_f ${LLVM_SYSTEM_LIBS})
+        string(REGEX REPLACE "^-l" "" _n "${_f}")
+        if(NOT _n STREQUAL _f AND NOT _n MATCHES "^(rt|dl|m|pthread)$")
+            find_library(_cnum_sys_${_n} ${_n} NO_CACHE PATHS /usr/lib64 /usr/lib /usr/lib/x86_64-linux-gnu NO_DEFAULT_PATH)
+            if(_cnum_sys_${_n})
+                set(_f ${_cnum_sys_${_n}})
+            endif()
         endif()
-        if(_cnum_sys_${_n})
-            set(_f ${_cnum_sys_${_n}})
-        endif()
-    endif()
-    list(APPEND _sys_libs ${_f})
-endforeach()
-set(LLVM_SYSTEM_LIBS ${_sys_libs})
+        list(APPEND _sys_libs ${_f})
+    endforeach()
+    set(LLVM_SYSTEM_LIBS ${_sys_libs})
+else()
+    list(PREPEND LLVM_SYSTEM_LIBS "-L${LLVM_LIBRARY_DIR}")
+endif()
+
+# GNU ld < 2.43 turns the GOTPCRELX "push" that newer assemblers emit into a call
+# (crash in MLIRContext with conda-forge LLVM); --no-relax avoids it.
+set(CNUM_LD_FLAGS)
+execute_process(COMMAND ${CMAKE_CXX_COMPILER} -Wl,--version OUTPUT_VARIABLE _ldv ERROR_QUIET)
+if(_ldv MATCHES "GNU ld[^\n]* ([0-9]+\\.[0-9]+)" AND CMAKE_MATCH_1 VERSION_LESS 2.43)
+    set(CNUM_LD_FLAGS -Wl,--no-relax)
+endif()
 
 # -- Glob all MLIR static libraries --
 file(GLOB MLIR_ALL_LIB_FILES "${LLVM_LIBRARY_DIR}/libMLIR*.a")
@@ -446,8 +461,6 @@ file(GLOB MLIR_ALL_LIB_FILES "${LLVM_LIBRARY_DIR}/libMLIR*.a")
 # then --no-whole-archive for LLVM libs.
 set(ALL_STATIC_LIBS ${MLIR_ALL_LIB_FILES} ${LLVM_ALL_LIB_FILES})
 
-# --no-relax (below): GNU ld < 2.43 rewrites the GOTPCRELX "push" that newer assemblers
-# emit (e.g. in conda-forge's LLVM) into a call, and server.out crashes in MLIRContext.
 # charmc does not forward absolute .a paths to the underlying linker.
 # Write them to a response file and pass via -Wl,@file so they reach ld.
 # (file(GENERATE) because the core library path may be a generator expression.)
@@ -474,7 +487,7 @@ add_custom_command(
             "$<TARGET_OBJECTS:backend_obj>"
             "$<TARGET_OBJECTS:server_obj>"
             -Wl,@${LINK_RESPONSE_FILE}
-            -Wl,--no-relax
+            ${CNUM_LD_FLAGS}
             ${GPU_LINK_ARGS}
             -ldl
     DEPENDS jit_obj backend_obj server_obj ci_headers
@@ -495,7 +508,7 @@ add_custom_target(server ALL
 # =====================================================================
 # charmnumeric/_build_info.py tells Python where server.out and charmrun are: the
 # package's _bin/ for pip installs, this build directory otherwise.
-option(CNUM_WRITE_BUILD_INFO "Write charmnumeric/_build_info.py into the source tree (non-pip builds)" ON)
+option(CNUM_WRITE_BUILD_INFO "Also write charmnumeric/_build_info.py into the source tree (non-pip builds)" OFF)
 function(_cnum_py_bool var value)
     if(${value})
         set(${var} True PARENT_SCOPE)
@@ -520,6 +533,13 @@ endif()
 if(CHARM_RECONVERSE)
     set(CNUM_BI_CHARMRUN None)
 endif()
+set(CNUM_BI_LIB_DIRS)
+if(GPU_BACKEND_UPPER)
+    foreach(_d "$<TARGET_FILE_DIR:Kokkos::kokkoscore>" "$<TARGET_FILE_DIR:Kokkos::kokkoskernels>"
+               "${CUDAToolkit_LIBRARY_DIR}" "${CUSOLVER_LIB_DIR}")
+        string(APPEND CNUM_BI_LIB_DIRS "\"${_d}\", ")
+    endforeach()
+endif()
 foreach(_r CNUM_GIT_REV:${CMAKE_CURRENT_SOURCE_DIR} CNUM_CORE_GIT_REV:${CHARMTYLES_HOME})
     string(REPLACE ":" ";" _r "${_r}")
     list(GET _r 0 _var)
@@ -527,19 +547,21 @@ foreach(_r CNUM_GIT_REV:${CMAKE_CURRENT_SOURCE_DIR} CNUM_CORE_GIT_REV:${CHARMTYL
     execute_process(COMMAND git -C ${_dir} describe --always --dirty
         OUTPUT_VARIABLE ${_var} OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
 endforeach()
-configure_file(cmake/_build_info.py.in ${CMAKE_CURRENT_BINARY_DIR}/_build_info.py @ONLY)
+configure_file(cmake/_build_info.py.in ${CMAKE_CURRENT_BINARY_DIR}/_build_info.py.gen @ONLY)
+file(GENERATE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/_build_info.py INPUT ${CMAKE_CURRENT_BINARY_DIR}/_build_info.py.gen)
 
 if(SKBUILD)
     install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/server.out DESTINATION charmnumeric/_bin)
-    if(NOT CHARM_RECONVERSE)
-        install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/charmrun DESTINATION charmnumeric/_bin)
-    endif()
+    install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/charmrun DESTINATION charmnumeric/_bin OPTIONAL)
     if(CNUM_OWN_CUDA_RUNTIME)
         install(TARGETS mlir_cuda_runtime LIBRARY DESTINATION charmnumeric/_bin)
+    elseif(MLIR_CUDA_RUNTIME_LIB)
+        install(FILES ${MLIR_CUDA_RUNTIME_LIB} DESTINATION charmnumeric/_bin)
     endif()
     install(FILES ${CMAKE_CURRENT_BINARY_DIR}/_build_info.py DESTINATION charmnumeric)
 elseif(CNUM_WRITE_BUILD_INFO)
-    file(COPY ${CMAKE_CURRENT_BINARY_DIR}/_build_info.py DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/../charmnumeric)
+    file(GENERATE OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/../charmnumeric/_build_info.py
+        INPUT ${CMAKE_CURRENT_BINARY_DIR}/_build_info.py.gen)
 endif()
 
 # =====================================================================
