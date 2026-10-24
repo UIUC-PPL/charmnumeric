@@ -109,6 +109,17 @@ Distributed N-dimensional array DSL built on charmtyles. The backend stores 1-3D
 |--------|------|-------------|
 | `CharmNumericInterface(CCSInterface)` | 12 | Subclass with `from_bytes()` deserializer |
 | `LocalCluster` | 26 | Local server launcher — `_run_server()`:74, `_connect_with_retry()`:94, `close()`:111 |
+| `default_interface()` | 16 | Interface in use; without one, `launcher.auto_interface()` connects or starts a server |
+
+### `charmnumeric/launcher.py` — Server start/stop/connect (`cnp.start/stop/connect`)
+| Symbol | Description |
+|--------|-------------|
+| `find_build()` | `server.out` from `$CNUM_SERVER`, `_build_info`, or `src/build-*`; infers arch/GPU from `build.ninja`, `CMakeCache.txt`, ELF `DT_NEEDED` |
+| `_plan()` | Command line: charmrun `++local` / `++mpiexec` (local per-GPU ranks, srun + `+eth`), or Reconverse `server.out +pe N` (local, srun, mpiexec) |
+| `_launch()` | Runs the server under `_supervisor.py`, waits for `CCS server ready`, raises `ServerStartError` with the log tail |
+| `start()` / `stop()` / `connect()` / `auto_interface()` | Idempotent process-wide state, atexit shutdown (CCS `disconnect`, then signals) |
+
+`_supervisor.py`: owns the server's process group; stops it on stdin EOF (client exit or crash). `__main__.py`: `python -m charmnumeric run|server|info`.
 
 ### `charmnumeric/random.py` — Native RNG (numpy.random subset)
 | Symbol | Description |

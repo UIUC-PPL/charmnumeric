@@ -14,12 +14,11 @@ _default_interface = None
 
 
 def default_interface():
-    """The most recently created interface (ops with data-dependent sizes sync on it)."""
+    """The most recently created interface; without one, connects to or starts a server."""
     if _default_interface is None:
-        raise RuntimeError(
-            "this operation has a data-dependent result size and needs a "
-            "CharmNumericInterface; create (and connect) one first"
-        )
+        from .launcher import auto_interface
+
+        return auto_interface()
     return _default_interface
 
 
