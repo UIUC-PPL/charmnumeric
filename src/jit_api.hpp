@@ -14,8 +14,9 @@ void jit_free_module(void* moduleHandle);
 int jit_prewarm(double budget_ms);
 
 /// Bounds the disk cache in a background thread, one pass an hour per cache: removes
-/// build/target directories unused for CNUM_JIT_CACHE_DAYS (7), stale temporaries and
-/// pre-target-directory entries, then the oldest entries over CNUM_JIT_CACHE_MAX_FILES (5000).
+/// entries of build/target directories unused for CNUM_JIT_CACHE_DAYS (7), stale temporaries
+/// and pre-target-directory entries, then the oldest entries over CNUM_JIT_CACHE_MAX_FILES
+/// (5000). Only roots marked as dedicated caches are touched; CNUM_JIT_CACHE_EVICT=0 skips it.
 void jit_cache_maintain();
 
 /// GPU builds: the stream the next JIT kernel calls on this thread enqueue on.

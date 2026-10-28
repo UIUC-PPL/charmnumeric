@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <climits>
 #include <csignal>
 #include <ctime>
 #include <fcntl.h>
@@ -21,6 +22,7 @@
 
 #include "llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h"
 #include "llvm/Object/ObjectFile.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/DynamicLibrary.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -2184,9 +2186,67 @@ std::string cacheBase() {
         d = std::string(xdg) + "/charmnumeric/jit";
     else if (home && *home)
         d = std::string(home) + "/.cache/charmnumeric/jit";
-    else
+    else {
         d = llvm::formatv("/tmp/cnum-jit-{0}", getuid()).str();
+        struct stat st;
+        if ((mkdir(d.c_str(), 0700) != 0 && errno != EEXIST) || lstat(d.c_str(), &st) != 0 ||
+            !S_ISDIR(st.st_mode) || st.st_uid != getuid() || (st.st_mode & 077))
+            return {};
+    }
     return d;
+}
+
+// Marks a dedicated cache root; evictCache only runs on marked roots.
+constexpr const char* kCacheMarker = ".cnum-jit-cache";
+
+/// A serverBuildId(): GNU build id, or "<size>-<mtime>".
+bool isBuildIdName(llvm::StringRef n) {
+    if (n.size() >= 8 && n.size() <= 128 && llvm::all_of(n, llvm::isHexDigit))
+        return true;
+    auto [a, b] = n.split('-');
+    return !a.empty() && !b.empty() && llvm::all_of(a, llvm::isDigit) &&
+           llvm::all_of(b, llvm::isDigit);
+}
+
+/// A targetCacheDir() tag: [sm_<n>+ptx<n>-]<host CPU>.
+bool isTargetName(llvm::StringRef n) {
+    if (n.consume_front("sm_")) {
+        auto [sm, rest] = n.split('+');
+        if (sm.empty() || !llvm::all_of(sm, llvm::isAlnum) || !rest.consume_front("ptx"))
+            return false;
+        auto [ptx, cpu] = rest.split('-');
+        if (ptx.empty() || !llvm::all_of(ptx, llvm::isDigit))
+            return false;
+        n = cpu;
+    }
+    return !n.empty() && n.size() <= 64 && n != "." && n != ".." &&
+           llvm::all_of(n, [](char c) {
+               return llvm::isAlnum(c) || c == '-' || c == '_' || c == '.';
+           });
+}
+
+/// Marks base when it is new or empty, or holds only cache entries (a cache made before
+/// the marker existed); any other directory is used but never evicted.
+void markCacheBase(const std::string& base) {
+    static std::once_flag once;
+    std::call_once(once, [&] {
+        std::string marker = base + "/" + kCacheMarker;
+        if (llvm::sys::fs::exists(marker))
+            return;
+        std::error_code ec;
+        for (llvm::sys::fs::directory_iterator it(base, ec), end; it != end && !ec;
+             it.increment(ec)) {
+            llvm::StringRef n = llvm::sys::path::filename(it->path());
+            if (n != "cubin" && n != ".last-evict" && n != ".evict-lock" && !isBuildIdName(n))
+                return;
+        }
+        if ((ec && ec != std::errc::no_such_file_or_directory) ||
+            llvm::sys::fs::create_directories(base))
+            return;
+        int fd = open(marker.c_str(), O_CREAT | O_WRONLY, 0644);
+        if (fd >= 0)
+            close(fd);
+    });
 }
 
 /// base/sub, created; "" when the cache is off or the directory cannot be made.
@@ -2194,6 +2254,7 @@ std::string cacheSubdir(const std::string& sub) {
     std::string d = cacheBase();
     if (d.empty())
         return {};
+    markCacheBase(d);
     d += "/" + sub;
     if (llvm::sys::fs::create_directories(d))
         return {};
@@ -2563,6 +2624,12 @@ void evictCache(std::string base, std::string current) {
     // exited first; then it is taken over after 10 minutes and the next pass resumes).
     std::string stamp = base + "/.last-evict", lock = base + "/.evict-lock";
     fs::file_status st;
+    char real[PATH_MAX], home[PATH_MAX];
+    const char* h = getenv("HOME");
+    if (!llvm::sys::path::is_absolute(base) || !realpath(base.c_str(), real) ||
+        std::string(real) == "/" || (h && realpath(h, home) && std::string(real) == home) ||
+        !fs::exists(base + "/" + kCacheMarker))
+        return;
     if (!fs::status(stamp, st) && age(st.getLastModificationTime()) < 3600)
         return;
     int fd = open(lock.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
@@ -2623,26 +2690,32 @@ void evictCache(std::string base, std::string current) {
     std::vector<std::string> dirs;
     decltype(entries) none;
     scan(base, false, none, &dirs);
+    // Only build and target directories are entered, only entries and temporaries are
+    // deleted, and directories go only once empty.
     for (const std::string& d : dirs) {
-        if (llvm::sys::path::filename(d) == "cubin") {
+        llvm::StringRef name = llvm::sys::path::filename(d);
+        if (name == "cubin") {
             scan(d, false, entries, nullptr);
             continue;
         }
+        if (!isBuildIdName(name))
+            continue;
         std::vector<std::string> targets;
         scan(d, /*legacy=*/true, none, &targets);
-        bool keep = d == current;
         for (const std::string& t : targets) {
+            if (!isTargetName(llvm::sys::path::filename(t)))
+                continue;
             decltype(entries) files;
             if (age(scan(t, false, files, nullptr)) > maxAge) {
-                fs::remove_directories(t, /*IgnoreErrors=*/true);
-                removed += files.size();
+                for (const auto& f : files)
+                    remove(f.second);
+                rmdir(t.c_str());
                 continue;
             }
-            keep = true;
             entries.insert(entries.end(), files.begin(), files.end());
         }
-        if (!keep)
-            fs::remove_directories(d, /*IgnoreErrors=*/true);
+        if (d != current)
+            rmdir(d.c_str());
     }
     if (entries.size() > maxFiles) {
         std::sort(entries.begin(), entries.end());
@@ -2664,14 +2737,23 @@ void evictCache(std::string base, std::string current) {
 
 void jit_cache_maintain() {
 #if !defined(USE_AMD) && !defined(USE_INTEL)
+    const char* on = getenv("CNUM_JIT_CACHE_EVICT");
     std::string base = cacheBase();
-    if (base.empty() || cacheDir().empty())
+    if ((on && std::string(on) == "0") || base.empty() || cacheDir().empty())
         return;
     // the thread takes no signals (they belong to the Charm++ scheduler thread)
     sigset_t all, old;
     sigfillset(&all);
     pthread_sigmask(SIG_BLOCK, &all, &old);
-    std::thread(evictCache, base, cacheDir()).detach();
+    try {
+        std::thread([base, current = cacheDir()] {
+            try {
+                evictCache(base, current);
+            } catch (...) {
+            }
+        }).detach();
+    } catch (...) {
+    }
     pthread_sigmask(SIG_SETMASK, &old, nullptr);
 #endif
 }
