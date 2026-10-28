@@ -9,6 +9,11 @@
 #include <limits>
 
 #include <algorithm>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <sched.h>
+#include <set>
 #include <cerrno>
 #include <climits>
 #include <csignal>
@@ -126,9 +131,10 @@ void touchCacheEntry(const std::string& path, std::time_t mtime = 0) {
 } // namespace
 
 namespace {
-// One context per process: per-kernel creation dominated compile time.
+// One context per thread (compiles run on CompilePool threads), kept: per-kernel creation
+// dominated compile time.
 mlir::MLIRContext& sharedContext() {
-    static mlir::MLIRContext* ctx = [] {
+    thread_local mlir::MLIRContext* ctx = [] {
         mlir::DialectRegistry registry;
         mlir::registerAllToLLVMIRTranslations(registry);
 #ifdef USE_NVIDIA
@@ -2549,61 +2555,20 @@ std::mutex& jitMutex() {
 }
 } // namespace
 
-static void* jit_compile_ast_impl(void* ast, void** moduleHandleOut);
+namespace {
+const bool jitTimeIt = getenv("CNUM_JIT_TIME") != nullptr;
 
-void* jit_compile_ast(void* ast, void** moduleHandleOut) {
-    static const bool timeIt = getenv("CNUM_JIT_TIME") != nullptr;
-    JitTimer timer;
-    jitTimer = timeIt ? &timer : nullptr;
-    void* fn;
-    {
-        std::lock_guard<std::mutex> lock(jitMutex());
-        fn = jit_compile_ast_impl(ast, moduleHandleOut);
-    }
-    if (timeIt && !timer.line.empty())
-        llvm::errs() << "jit:" << timer.line << "\n";
-    jitTimer = nullptr;
-    return fn;
-}
+/// What a waiter saw of another server's claim.
+struct LockWatch {
+    struct timespec mtime = {0, 0};
+    std::chrono::steady_clock::time_point since;
+    bool seen = false;
+};
 
-static void* jit_compile_ast_impl(void* ast, void** moduleHandleOut) {
+/// Compiles ast; the kernel goes to the disk cache at path unless that is "".
+void* compileKernel(void* ast, const std::string& path, void** moduleHandleOut) {
     MLIRJitCompiler node_jit;
     node_jit.buildFromAST(ast);
-    // Kernels take every array as a dynamic memref, so equal IR means an equal kernel.
-    std::string key;
-    {
-        llvm::raw_string_ostream os(key);
-        node_jit.printModule(os);
-    }
-    auto hit = kernelCache().find(key);
-    if (hit != kernelCache().end()) {
-        *moduleHandleOut = hit->second.first;
-        return hit->second.second;
-    }
-    jitMark("build");
-#if !defined(USE_AMD) && !defined(USE_INTEL)
-    std::string path = cachePath(key);
-    if (!path.empty()) {
-        void* fn = nullptr;
-        std::time_t mtime = 0;
-        auto pre = preloadedKernels().find(path);
-        if (pre != preloadedKernels().end()) {
-            *moduleHandleOut = pre->second.module;
-            fn = pre->second.fn;
-            mtime = pre->second.mtime;
-            preloadedKernels().erase(pre);
-        } else if ((fn = loadCachedKernel(path, moduleHandleOut))) {
-            struct stat st;
-            mtime = stat(path.c_str(), &st) == 0 ? st.st_mtime : std::time(nullptr);
-        }
-        if (fn) {
-            touchCacheEntry(path, mtime);
-            jitMark("cache");
-            kernelCache().emplace(std::move(key), std::make_pair(*moduleHandleOut, fn));
-            return fn;
-        }
-    }
-#endif
     if (!node_jit.verify())
         return nullptr;
     node_jit.optimizeAndFuse();
@@ -2640,10 +2605,391 @@ static void* jit_compile_ast_impl(void* ast, void** moduleHandleOut) {
     jitMark("load");
 #if !defined(USE_AMD) && !defined(USE_INTEL)
     storeCachedKernel(path, moduleHandle);
+    jitMark("store");
 #endif
-    kernelCache().emplace(std::move(key), std::make_pair(moduleHandle, funcPtr));
     *moduleHandleOut = moduleHandle;
     return funcPtr;
+}
+
+#if !defined(USE_AMD) && !defined(USE_INTEL)
+/// A pre-warmed or disk-cached kernel; nullptr if there is none.
+void* loadCached(const std::string& path, void** moduleHandleOut) {
+    if (path.empty())
+        return nullptr;
+    void* fn = nullptr;
+    std::time_t mtime = 0;
+    auto pre = preloadedKernels().find(path);
+    if (pre != preloadedKernels().end()) {
+        *moduleHandleOut = pre->second.module;
+        fn = pre->second.fn;
+        mtime = pre->second.mtime;
+        preloadedKernels().erase(pre);
+    } else if (!(fn = loadCachedKernel(path, moduleHandleOut))) {
+        return nullptr;
+    }
+    touchCacheEntry(path, mtime);
+    jitMark("cache");
+    return fn;
+}
+
+/// Threads that compile kernels, made on demand and kept (each has its own MLIR context);
+/// big stacks, since LLVM codegen recursion grows with loop count. CNUM_JIT_THREADS sets
+/// their number (default: this process's CPUs, at most 8).
+class CompilePool {
+  public:
+    static CompilePool& get() {
+        static CompilePool* pool = new CompilePool;
+        return *pool;
+    }
+    int size() const { return max_; }
+    /// Runs the jobs, on the calling thread if no thread can be made.
+    void run(std::vector<std::function<void()>>& jobs) {
+        std::unique_lock<std::mutex> lk(m_);
+        while (threads_ < max_ && threads_ < static_cast<int>(jobs.size()) && spawn())
+            ++threads_;
+        if (threads_ == 0) {
+            lk.unlock();
+            for (auto& job : jobs)
+                job();
+            return;
+        }
+        for (auto& job : jobs)
+            queue_.push_back(&job);
+        pending_ += jobs.size();
+        work_.notify_all();
+        done_.wait(lk, [&] { return pending_ == 0; });
+    }
+
+  private:
+    CompilePool() {
+        int n = 8;
+        cpu_set_t set;
+        if (sched_getaffinity(0, sizeof(set), &set) == 0)
+            n = std::min(n, CPU_COUNT(&set));
+        if (const char* e = getenv("CNUM_JIT_THREADS"))
+            if (atoi(e) > 0)
+                n = atoi(e);
+        max_ = std::max(n, 1);
+    }
+    bool spawn() {
+        pthread_attr_t attr;
+        pthread_t t;
+        if (pthread_attr_init(&attr) != 0)
+            return false;
+        // the threads take no signals (they belong to the Charm++ scheduler thread)
+        sigset_t all, old;
+        sigfillset(&all);
+        pthread_sigmask(SIG_BLOCK, &all, &old);
+        auto body = [](void* pool) -> void* {
+            static_cast<CompilePool*>(pool)->work();
+            return nullptr;
+        };
+        bool ok = pthread_attr_setstacksize(&attr, size_t(1) << 30) == 0 &&
+                  pthread_create(&t, &attr, body, this) == 0;
+        pthread_sigmask(SIG_SETMASK, &old, nullptr);
+        pthread_attr_destroy(&attr);
+        if (ok)
+            pthread_detach(t);
+        return ok;
+    }
+    void work() {
+        std::unique_lock<std::mutex> lk(m_);
+        for (;;) {
+            work_.wait(lk, [&] { return !queue_.empty(); });
+            std::function<void()>* job = queue_.front();
+            queue_.pop_front();
+            lk.unlock();
+            (*job)();
+            lk.lock();
+            if (--pending_ == 0)
+                done_.notify_all();
+        }
+    }
+    std::mutex m_;
+    std::condition_variable work_, done_;
+    std::deque<std::function<void()>*> queue_;
+    size_t pending_ = 0;
+    int threads_ = 0, max_ = 1;
+};
+
+const std::string& hostName() {
+    static const std::string name = [] {
+        char host[256] = {0};
+        gethostname(host, sizeof(host) - 1);
+        return std::string(host);
+    }();
+    return name;
+}
+
+/// Compile claims: <entry>.lock, created exclusively and held while a server compiles the
+/// entry, so the servers sharing a cache compile each kernel once. Holders refresh the
+/// lock's mtime every 2 s.
+class Claims {
+  public:
+    static Claims& get() {
+        static Claims* claims = new Claims;
+        return *claims;
+    }
+    /// The claim's fd; -1 if another server holds it, -2 if it cannot be made here.
+    int take(const std::string& lock) {
+        int fd = open(lock.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
+        if (fd < 0)
+            return errno == EEXIST ? -1 : -2;
+        std::string id = hostName() + " " + std::to_string(getpid()) + "\n";
+        ssize_t written = write(fd, id.data(), id.size());
+        (void)written;
+        std::lock_guard<std::mutex> g(m_);
+        held_.insert(lock);
+        if (!beating_)
+            beating_ = startHeartbeat();
+        return fd;
+    }
+    /// Removes the lock unless it was broken and taken by someone else meanwhile.
+    void release(int fd, const std::string& lock) {
+        if (fd < 0)
+            return;
+        struct stat a, b;
+        if (fstat(fd, &a) == 0 && stat(lock.c_str(), &b) == 0 && a.st_ino == b.st_ino &&
+            a.st_dev == b.st_dev)
+            unlink(lock.c_str());
+        close(fd);
+        std::lock_guard<std::mutex> g(m_);
+        held_.erase(lock);
+    }
+
+  private:
+    bool startHeartbeat() {
+        sigset_t all, old;
+        sigfillset(&all);
+        pthread_sigmask(SIG_BLOCK, &all, &old);
+        bool ok = true;
+        try {
+            std::thread([this] {
+                for (;;) {
+                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                    std::lock_guard<std::mutex> g(m_);
+                    for (const std::string& lock : held_)
+                        utimes(lock.c_str(), nullptr);
+                }
+            }).detach();
+        } catch (...) {
+            ok = false;
+        }
+        pthread_sigmask(SIG_SETMASK, &old, nullptr);
+        return ok;
+    }
+    std::mutex m_;
+    std::set<std::string> held_;
+    bool beating_ = false;
+};
+
+/// False once the process is gone or a zombie (not reaped yet, e.g. under a launcher).
+bool processAlive(int pid) {
+    if (kill(pid, 0) != 0)
+        return errno != ESRCH;
+    auto stat = llvm::MemoryBuffer::getFileAsStream("/proc/" + std::to_string(pid) + "/stat");
+    if (!stat)
+        return true;
+    llvm::StringRef rest = (*stat)->getBuffer().rsplit(')').second.ltrim();
+    return !rest.starts_with("Z") && !rest.starts_with("X");
+}
+
+/// True if the claim lock is gone, or stale and then removed: its holder died on this host,
+/// or its mtime stood still for 30 s (no heartbeat) or is 2 min old.
+bool lockFree(const std::string& lock, LockWatch& w) {
+    int fd = open(lock.c_str(), O_RDONLY); // not stat: opening revalidates NFS attributes
+    if (fd < 0)
+        return errno == ENOENT;
+    struct stat st;
+    char buf[300] = {0};
+    bool ok = fstat(fd, &st) == 0;
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (!ok)
+        return false;
+    auto now = std::chrono::steady_clock::now();
+    bool stale = std::time(nullptr) - st.st_mtime > 120;
+    llvm::StringRef id(buf, n > 0 ? n : 0);
+    auto [host, pid] = id.trim().split(' ');
+    int p = 0;
+    if (host == hostName() && !pid.getAsInteger(10, p) && p > 0 && !processAlive(p))
+        stale = true;
+    if (!w.seen || st.st_mtim.tv_sec != w.mtime.tv_sec || st.st_mtim.tv_nsec != w.mtime.tv_nsec) {
+        w = {st.st_mtim, now, true};
+    } else if (now - w.since > std::chrono::seconds(30)) {
+        stale = true;
+    }
+    if (stale)
+        unlink(lock.c_str());
+    return stale;
+}
+#endif
+} // namespace
+
+void* jit_compile_ast(void* ast, void** moduleHandleOut) {
+    void* fn = nullptr;
+    jit_compile_batch(&ast, 1, &fn, moduleHandleOut);
+    return fn;
+}
+
+void jit_compile_batch(void* const* asts, int n, void** fns, void** moduleHandles) {
+    std::lock_guard<std::mutex> lock(jitMutex());
+    struct Item {
+        std::string key, path;
+        int same = -1; // index of the item with the same kernel
+        int fd = -1;
+        LockWatch watch;
+        std::chrono::steady_clock::time_point waitStart;
+    };
+    std::vector<Item> items(n);
+    std::unordered_map<std::string, int> first;
+    std::vector<int> todo;
+    for (int i = 0; i < n; ++i) {
+        Item& it = items[i];
+        fns[i] = moduleHandles[i] = nullptr;
+        JitTimer timer;
+        jitTimer = jitTimeIt ? &timer : nullptr;
+        {
+            MLIRJitCompiler node_jit;
+            node_jit.buildFromAST(asts[i]);
+            // Kernels take every array as a dynamic memref, so equal IR means an equal kernel.
+            llvm::raw_string_ostream os(it.key);
+            node_jit.printModule(os);
+        }
+        auto hit = kernelCache().find(it.key);
+        auto dup = first.find(it.key);
+        if (hit != kernelCache().end()) {
+            moduleHandles[i] = hit->second.first;
+            fns[i] = hit->second.second;
+        } else if (dup != first.end()) {
+            it.same = dup->second;
+        } else {
+            first.emplace(it.key, i);
+            jitMark("build");
+#if !defined(USE_AMD) && !defined(USE_INTEL)
+            it.path = cachePath(it.key);
+            fns[i] = loadCached(it.path, &moduleHandles[i]);
+#endif
+            if (fns[i])
+                kernelCache().emplace(it.key, std::make_pair(moduleHandles[i], fns[i]));
+            else
+                todo.push_back(i);
+        }
+        jitTimer = nullptr;
+        if (jitTimeIt && !timer.line.empty() && !std::count(todo.begin(), todo.end(), i))
+            llvm::errs() << "jit:" + timer.line + "\n";
+    }
+
+    if (!todo.empty()) {
+        auto t0 = std::chrono::steady_clock::now();
+        int compiled = 0, rounds = 0;
+#if !defined(USE_AMD) && !defined(USE_INTEL)
+        // Servers sharing the cache split the kernels: each claims up to a pool's worth,
+        // compiles them in parallel and loads the others' once published. A waiter breaks
+        // stale claims and, after CNUM_JIT_WAIT_S (60) s, compiles without one.
+        int width = CompilePool::get().size();
+        static const double maxWait = [] {
+            const char* e = getenv("CNUM_JIT_WAIT_S");
+            return e && atof(e) > 0 ? atof(e) : 60.0;
+        }();
+        // target registration is not thread-safe (a race can corrupt the registry's list)
+        llvm::InitializeNativeTarget();
+        llvm::InitializeNativeTargetAsmPrinter();
+#ifdef USE_NVIDIA
+        LLVMInitializeNVPTXTargetInfo();
+        LLVMInitializeNVPTXTarget();
+        LLVMInitializeNVPTXTargetMC();
+        LLVMInitializeNVPTXAsmPrinter();
+        cnEnsureContext();
+        CUcontext ctx = nullptr;
+        cuCtxGetCurrent(&ctx);
+#endif
+        std::rotate(todo.begin(), todo.begin() + getpid() % todo.size(), todo.end());
+        auto lastCheck = t0;
+        for (int i : todo)
+            items[i].waitStart = t0;
+        while (!todo.empty()) {
+            auto now = std::chrono::steady_clock::now();
+            bool check = now - lastCheck > std::chrono::milliseconds(200);
+            if (check)
+                lastCheck = now;
+            std::vector<int> mine, waiting;
+            for (int i : todo) {
+                Item& it = items[i];
+                std::string lockPath = it.path + ".lock";
+                if (rounds > 0 && !it.path.empty() && llvm::sys::fs::exists(it.path) &&
+                    (fns[i] = loadCached(it.path, &moduleHandles[i])))
+                    continue;
+                if (static_cast<int>(mine.size()) >= width) {
+                    waiting.push_back(i);
+                    continue;
+                }
+                int fd = -2;
+                if (!it.path.empty()) {
+                    fd = -1;
+                    if (rounds == 0 || !llvm::sys::fs::exists(lockPath) ||
+                        (check && lockFree(lockPath, it.watch)))
+                        fd = Claims::get().take(lockPath);
+                    if (fd == -1 &&
+                        std::chrono::duration<double>(now - it.waitStart).count() > maxWait)
+                        fd = -2;
+                }
+                if (fd == -1) {
+                    waiting.push_back(i);
+                    continue;
+                }
+                // claimed: the entry may have been published since it was looked up
+                if (fd >= 0 && (fns[i] = loadCached(it.path, &moduleHandles[i]))) {
+                    Claims::get().release(fd, lockPath);
+                    continue;
+                }
+                it.fd = fd;
+                mine.push_back(i);
+            }
+            if (!mine.empty()) {
+                std::vector<std::function<void()>> jobs;
+                for (int i : mine)
+                    jobs.push_back([&, i] {
+#ifdef USE_NVIDIA
+                        cuCtxSetCurrent(ctx);
+#endif
+                        JitTimer timer;
+                        jitTimer = jitTimeIt ? &timer : nullptr;
+                        fns[i] = compileKernel(asts[i], items[i].path, &moduleHandles[i]);
+                        Claims::get().release(items[i].fd, items[i].path + ".lock");
+                        jitTimer = nullptr;
+                        if (jitTimeIt)
+                            llvm::errs() << "jit:" + timer.line + "\n";
+                    });
+                CompilePool::get().run(jobs);
+                compiled += mine.size();
+            } else if (!waiting.empty()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            todo.swap(waiting);
+            ++rounds;
+        }
+#else
+        for (int i : todo)
+            fns[i] = compileKernel(asts[i], "", &moduleHandles[i]);
+        compiled = todo.size();
+#endif
+        for (int i = 0; i < n; ++i)
+            if (items[i].same < 0 && fns[i])
+                kernelCache().emplace(items[i].key, std::make_pair(moduleHandles[i], fns[i]));
+        if (jitTimeIt)
+            llvm::errs() << llvm::formatv("jit batch: {0} kernels, {1} compiled here, {2} rounds, "
+                                          "{3:F1} ms\n",
+                                          n, compiled, rounds,
+                                          std::chrono::duration<double, std::milli>(
+                                              std::chrono::steady_clock::now() - t0)
+                                              .count());
+    }
+    for (int i = 0; i < n; ++i)
+        if (items[i].same >= 0) {
+            fns[i] = fns[items[i].same];
+            moduleHandles[i] = moduleHandles[items[i].same];
+        }
 }
 
 int jit_prewarm(double budget_ms) {
@@ -2730,8 +3076,8 @@ void evictCache(std::string base, std::string current) {
     size_t removed = 0;
     auto remove = [&](const std::string& p) { removed += !fs::remove(p); };
 
-    // Entries (.o, .cubin) of dir go to out; stale .tmp files go, and with legacy the .o
-    // files too (the layout before per-target directories). Returns the newest mtime.
+    // Entries (.o, .cubin) of dir go to out; stale .tmp and .lock files go, and with legacy
+    // the .o files too (the layout before per-target directories). Returns the newest mtime.
     std::vector<std::pair<TimePoint, std::string>> entries;
     auto scan = [&](const std::string& dir, bool legacy, decltype(entries)& out,
                     std::vector<std::string>* subdirs) {
@@ -2750,7 +3096,7 @@ void evictCache(std::string base, std::string current) {
             }
             auto ext = llvm::sys::path::extension(p);
             TimePoint mt = st.getLastModificationTime();
-            if (ext == ".tmp") {
+            if (ext == ".tmp" || ext == ".lock") {
                 if (age(mt) > 3600)
                     remove(p);
             } else if (ext == ".o" || ext == ".cubin") {
