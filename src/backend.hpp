@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <mutex>
 #include <deque>
@@ -728,6 +730,29 @@ class PartitionImpl {
         return arr;
     }
 
+    /// CNUM_POISON_UNINIT=1 (debug): fill buffers allocated without zero-fill with 0xFF
+    /// bytes (NaN for floats), so elements the op fails to write show up in tests.
+    template <typename T>
+    void poison_uninit(Array<N, T>* arr) {
+        static const bool on = [] {
+            const char* e = getenv("CNUM_POISON_UNINIT");
+            return e != nullptr && *e != '\0' && *e != '0';
+        }();
+        int64_t bytes = arr->local_size() * (int64_t)sizeof(T);
+        if (!on || bytes == 0)
+            return;
+#if defined(USE_NVIDIA)
+        cudaMemsetAsync(arr->d_view.data(), 0xFF, bytes, compute_stream_raw);
+#elif defined(USE_KOKKOS)
+        Kokkos::deep_copy(Kokkos::View<unsigned char*, DeviceSpace, Kokkos::MemoryTraits<
+                              Kokkos::Unmanaged>>(
+                              reinterpret_cast<unsigned char*>(arr->d_view.data()), bytes),
+                          (unsigned char)0xFF);
+#else
+        memset(arr->data, 0xFF, bytes);
+#endif
+    }
+
     /// `zero` false: the caller overwrites every element, so the buffer is not zero-filled.
     template <typename T>
     Array<N, T>* allocate_or_reuse_typed(const ArrayRegion<N>& region,
@@ -736,8 +761,12 @@ class PartitionImpl {
                                          const ArrayDecomp<N>& decomp,
                                          bool zero = true) {
         CTArrayBase<N>* reused = try_reuse(dtype_of<T>(), region, global_shape, decomp);
-        if (reused == nullptr)
-            return new Array<N, T>(region, global_shape, name, decomp, zero);
+        if (reused == nullptr) {
+            auto* arr = new Array<N, T>(region, global_shape, name, decomp, zero);
+            if (!zero)
+                poison_uninit(arr);
+            return arr;
+        }
 
         auto* arr = static_cast<Array<N, T>*>(reused);
         arr->name = name;
@@ -765,6 +794,8 @@ class PartitionImpl {
                 data[i] = T(0);
         }
 #endif
+        if (!zero)
+            poison_uninit(arr);
         return arr;
     }
 
