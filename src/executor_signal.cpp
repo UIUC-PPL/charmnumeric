@@ -209,15 +209,22 @@ void copy_box(PartitionImpl<N>* partition, T* dst, int64_t dbase, const int64_t*
         });
 #else
     (void)partition;
-    for (int64_t k = 0; k < total; ++k) {
-        int64_t rem = k, di = dbase, si = sbase;
-        for (int d = N - 1; d >= 0; --d) {
+    int64_t len = ext[N - 1], dl = ds[N - 1], sl = ss[N - 1];
+    for (int64_t r = 0; r < total / len; ++r) {
+        int64_t rem = r, di = dbase, si = sbase;
+        for (int d = N - 2; d >= 0; --d) {
             int64_t c = rem % ext[d];
             rem /= ext[d];
             di += c * ds[d];
             si += c * ss[d];
         }
-        dst[di] = src[si];
+        T* dp = dst + di;
+        const T* sp = src + si;
+        if (dl == 1 && sl == 1)
+            std::copy(sp, sp + len, dp);
+        else
+            for (int64_t j = 0; j < len; ++j)
+                dp[j * dl] = sp[j * sl];
     }
 #endif
 }
