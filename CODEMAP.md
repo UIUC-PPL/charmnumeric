@@ -191,7 +191,8 @@ Bit-exact NumPy mirror of `src/creation_kernels.hpp` (Philox4x32-10, software lo
 | `UnaryOpEntry` | 87 | Registry: same bodies as BinaryOpEntry |
 | `TernaryOpEntry` | 94 | Registry for 3-input ops (where, clip); `emitGenericNaryOp` builds the N-input linalg.generic |
 | `MLIRJitCompiler` | 101 | AST → MLIR → executable — `buildFromAST()`, `optimizeAndFuse()`, `generateCPU()`, `loadCPU()`, `generateNVIDIA/AMD/Intel()` |
-| kernel caches (jit.cpp) | — | In-process map keyed by the kernel IR, then a persistent object-file cache: `$CNUM_JIT_CACHE_DIR` (default `${XDG_CACHE_HOME:-~/.cache}/charmnumeric/jit`)/`<server build id>`/`<sha256(IR, target)>.o`, loaded with an LLJIT (`loadCachedKernel`); NVIDIA cubins in `cubin/`, keyed by PTX, arch and driver; `CNUM_JIT_CACHE=0` disables it, `CNUM_JIT_TIME=1` prints compile phases |
+| kernel caches (jit.cpp) | — | In-process map keyed by the kernel IR, then a persistent object-file cache: `$CNUM_JIT_CACHE_DIR` (default `${XDG_CACHE_HOME:-~/.cache}/charmnumeric/jit`)/`<server build id>`/`<GPU target>-<host CPU>`/`<sha256(IR, target)>.o`, loaded with an LLJIT (`loadCachedKernel`); NVIDIA cubins in `cubin/`, keyed by PTX, arch and driver; `CNUM_JIT_CACHE=0` disables it, `CNUM_JIT_TIME=1` prints compile phases |
+| `jit_prewarm()` (jit.cpp), `ArrayDAGGroup::prewarm()` | — | After "CCS server ready", every PE creates its cuBLAS/cuSOLVER handles (GPU) and loads the most recently used kernels of the cache for its target for up to `CNUM_PREWARM_MS` (default 250); `CNUM_PREWARM=0` skips both |
 | `cn_mgpu*` (jit.cpp, NVIDIA) | — | Overrides of the MLIR CUDA runtime wrappers: stream/alloc calls use the chare's stream, module load and launch use the current context |
 
 ### `dtypes.hpp` / `dtype_info.hpp` — Element types and dtype dispatch

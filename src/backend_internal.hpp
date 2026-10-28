@@ -27,6 +27,10 @@ inline cublasHandle_t ct_cublas() {
     }();
     return handle;
 }
+
+/// Creates this PE's cuBLAS/cuSOLVER handles and runs a first GEMM (all lazy otherwise);
+/// returns the ms spent creating the handles.
+double ct_prewarm_blas();
 #endif
 
 /// Row-major C[m x n] = A[m x k] * B[k x n] + beta * C, leading dims lda/ldb/ldc.

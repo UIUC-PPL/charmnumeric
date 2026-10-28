@@ -40,6 +40,24 @@ void ArrayDAGGroup::set_proxies(CkArrayID p1, CkArrayID p2, CkArrayID p3) {
 
 void ArrayDAGGroup::proxies_ready() {
     Server<CProxy_ArrayDAGGroup>::initialize(thisProxy);
+    thisProxy.prewarm();
+}
+
+// CCS requests that arrive meanwhile wait in the scheduler queue.
+void ArrayDAGGroup::prewarm() {
+    const char* on = getenv("CNUM_PREWARM");
+    if (on && std::string(on) == "0")
+        return;
+    double t0 = CkWallTimer(), handles = 0;
+#ifdef USE_NVIDIA
+    handles = ct_prewarm_blas();
+#endif
+    double t1 = CkWallTimer();
+    const char* budget = getenv("CNUM_PREWARM_MS");
+    int kernels = jit_prewarm(budget ? atof(budget) : 250.0);
+    if (getenv("CNUM_JIT_TIME"))
+        CkPrintf("[%d] prewarm: blas %.1f ms (handles %.1f), %d cached kernels %.1f ms\n",
+                 CkMyPe(), 1e3 * (t1 - t0), handles, kernels, 1e3 * (CkWallTimer() - t1));
 }
 
 ArrayDAGGroup::~ArrayDAGGroup() {

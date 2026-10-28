@@ -1215,3 +1215,27 @@ template void ArrayDAGExecutorND<3>::on_linalg_msg(int, char*, int64_t);
 template void PartitionImpl<1>::receive_linalg(int, int64_t, char*);
 template void PartitionImpl<2>::receive_linalg(int, int64_t, char*);
 template void PartitionImpl<3>::receive_linalg(int, int64_t, char*);
+
+#ifdef USE_NVIDIA
+double ct_prewarm_blas() {
+    double t0 = CkWallTimer();
+    la_handles(nullptr);
+    cublasHandle_t h = ct_cublas();
+    cublasSetStream(h, nullptr);
+    double t1 = CkWallTimer();
+    // a first GEMM initializes cuBLAS internals and loads its kernels
+    void* p = nullptr;
+    if (cudaMalloc(&p, 12 * sizeof(double)) == cudaSuccess) {
+        cudaMemset(p, 0, 12 * sizeof(double));
+        auto* f = static_cast<float*>(p);
+        auto* d = static_cast<double*>(p);
+        const float f1 = 1, f0 = 0;
+        const double d1 = 1, d0 = 0;
+        cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, 2, 2, 2, &f1, f, 2, f + 4, 2, &f0, f + 8, 2);
+        cublasDgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, 2, 2, 2, &d1, d, 2, d + 4, 2, &d0, d + 8, 2);
+        cudaStreamSynchronize(nullptr);
+        cudaFree(p);
+    }
+    return 1e3 * (t1 - t0);
+}
+#endif

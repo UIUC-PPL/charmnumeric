@@ -8,9 +8,11 @@
 #include <chrono>
 #include <limits>
 
+#include <algorithm>
 #include <cerrno>
 #include <link.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h"
@@ -18,6 +20,7 @@
 #include "llvm/Support/DynamicLibrary.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/SHA256.h"
 #include "llvm/TargetParser/Host.h"
 
@@ -2096,8 +2099,8 @@ std::string MLIRJitCompiler::serializeToSPIRV() {
 // ---- Persistent kernel cache ----
 // Compiled kernels are object files under $CNUM_JIT_CACHE_DIR (default
 // ${XDG_CACHE_HOME:-$HOME/.cache}/charmnumeric/jit, so it outlives node-local
-// /tmp), one directory per server build (GNU build id), named by a hash of the
-// kernel IR and the target. CNUM_JIT_CACHE=0 turns it off.
+// /tmp), one directory per server build (GNU build id) and target, named by a
+// hash of the kernel IR and the target. CNUM_JIT_CACHE=0 turns it off.
 namespace {
 
 int buildIdNote(struct dl_phdr_info* info, size_t, void* out) {
@@ -2166,8 +2169,28 @@ const std::string& cubinDir() {
     return dir;
 }
 
+/// cacheDir()/<GPU target>-<host CPU>, created; "" if that fails.
+std::string targetCacheDir() {
+    std::string tag = llvm::sys::getHostCPUName().str();
+#ifdef USE_NVIDIA
+    NvTarget target = nvTarget();
+    tag = target.chip + target.features + "-" + tag;
+#endif
+    std::string dir = cacheDir() + "/" + tag;
+    thread_local std::string made;
+    if (dir != made) {
+        if (llvm::sys::fs::create_directories(dir))
+            return {};
+        made = dir;
+    }
+    return dir;
+}
+
 std::string cachePath(const std::string& ir) {
     if (cacheDir().empty())
+        return {};
+    std::string dir = targetCacheDir();
+    if (dir.empty())
         return {};
     llvm::SHA256 h;
     h.update(ir);
@@ -2176,7 +2199,7 @@ std::string cachePath(const std::string& ir) {
     h.update("nvidia " + target.chip + " " + target.features);
 #endif
     h.update(llvm::sys::getHostCPUName());
-    return cacheDir() + "/" + llvm::toHex(h.final(), true) + ".o";
+    return dir + "/" + llvm::toHex(h.final(), true) + ".o";
 }
 
 llvm::orc::SymbolMap runtimeSymbols(llvm::orc::MangleAndInterner interner) {
@@ -2307,6 +2330,11 @@ std::unordered_map<std::string, std::pair<void*, void*>>& kernelCache() {
     static std::unordered_map<std::string, std::pair<void*, void*>> cache;
     return cache;
 }
+/// Kernels loaded by jit_prewarm, by cache path, until their first compile.
+std::unordered_map<std::string, std::pair<void*, void*>>& preloadedKernels() {
+    static std::unordered_map<std::string, std::pair<void*, void*>> cache;
+    return cache;
+}
 // The context and caches are per process; SMP PEs (threads) must not use them concurrently.
 std::mutex& jitMutex() {
     static std::mutex m;
@@ -2349,8 +2377,17 @@ static void* jit_compile_ast_impl(void* ast, void** moduleHandleOut) {
 #if !defined(USE_AMD) && !defined(USE_INTEL)
     std::string path = cachePath(key);
     if (!path.empty()) {
-        void* fn = loadCachedKernel(path, moduleHandleOut);
+        void* fn = nullptr;
+        auto pre = preloadedKernels().find(path);
+        if (pre != preloadedKernels().end()) {
+            *moduleHandleOut = pre->second.first;
+            fn = pre->second.second;
+            preloadedKernels().erase(pre);
+        } else {
+            fn = loadCachedKernel(path, moduleHandleOut);
+        }
         if (fn) {
+            utimes(path.c_str(), nullptr); // jit_prewarm loads recently used kernels first
             jitMark("cache");
             kernelCache().emplace(std::move(key), std::make_pair(*moduleHandleOut, fn));
             return fn;
@@ -2397,6 +2434,40 @@ static void* jit_compile_ast_impl(void* ast, void** moduleHandleOut) {
     kernelCache().emplace(std::move(key), std::make_pair(moduleHandle, funcPtr));
     *moduleHandleOut = moduleHandle;
     return funcPtr;
+}
+
+int jit_prewarm(double budget_ms) {
+#if !defined(USE_AMD) && !defined(USE_INTEL)
+    static std::once_flag once; // SMP: the PEs of a process share the kernel cache
+    std::call_once(once, [budget_ms] {
+        std::string dir = cacheDir().empty() ? std::string() : targetCacheDir();
+        if (dir.empty() || budget_ms <= 0)
+            return;
+        auto t0 = std::chrono::steady_clock::now();
+        std::vector<std::pair<llvm::sys::TimePoint<>, std::string>> files;
+        std::error_code ec;
+        for (llvm::sys::fs::directory_iterator it(dir, ec), end; it != end && !ec;
+             it.increment(ec)) {
+            llvm::sys::fs::file_status st;
+            if (llvm::sys::path::extension(it->path()) == ".o" && !llvm::sys::fs::status(it->path(), st))
+                files.emplace_back(st.getLastModificationTime(), it->path());
+        }
+        std::sort(files.rbegin(), files.rend());
+        std::lock_guard<std::mutex> lock(jitMutex());
+        for (const auto& file : files) {
+            std::chrono::duration<double, std::milli> spent = std::chrono::steady_clock::now() - t0;
+            if (spent.count() >= budget_ms)
+                break;
+            void* module = nullptr;
+            if (void* fn = loadCachedKernel(file.second, &module))
+                preloadedKernels().emplace(file.second, std::make_pair(module, fn));
+        }
+    });
+    std::lock_guard<std::mutex> lock(jitMutex());
+    return static_cast<int>(preloadedKernels().size());
+#else
+    return 0;
+#endif
 }
 
 void jit_free_module(void* moduleHandle) {
