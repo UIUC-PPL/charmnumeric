@@ -1,8 +1,29 @@
 [build-system]
-requires = [
-    "setuptools>=64",
-    "wheel",
-    "Cython",
-    "numpy",
-]
-build-backend = "setuptools.build_meta"
+requires = ["scikit-build-core>=0.10,<2", "cython>=3.0,<4", "numpy>=2.0,<3"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "charmnumeric"
+version = "0.1.dev0"
+description = "Distributed NumPy-like arrays on charmtyles and Charm++"
+readme = "README.rst"
+license = { text = "BSD" }
+authors = [{ name = "Aditya Bhosale", email = "adityapb1546@gmail.com" }]
+requires-python = ">=3.9"
+# Also needs charmtyles and PyCCS, which are not on PyPI; scripts/install.sh installs both.
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+tests = ["pytest"]
+notebook = ["jupyterlab", "ipykernel", "matplotlib", "nbclient", "nbformat"]
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+cmake.version = ">=3.20"
+build-dir = "build/{wheel_tag}"
+wheel.packages = ["charmnumeric"]
+# Local build products in the source package; CMake installs the real ones.
+sdist.exclude = [".deps/", "build/", "src/build*/", "charmnumeric/_bin/", "charmnumeric/*.so", "charmnumeric/_native_region.cpp"]
+
+[tool.scikit-build.cmake.define]
+GPU_BACKEND = { env = "CNUM_GPU_BACKEND", default = "" }

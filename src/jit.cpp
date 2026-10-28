@@ -17,6 +17,7 @@
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Support/DynamicLibrary.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/SHA256.h"
 #include "llvm/TargetParser/Host.h"
@@ -676,6 +677,22 @@ bool MLIRJitCompiler::lowerToCPU() {
 #error "MLIR_CUDA_RUNTIME_LIB must point to libmlir_cuda_runtime.so"
 #endif
 
+// $CNUM_MLIR_CUDA_RUNTIME, else a copy next to server.out (pip installs), else the build path.
+static const char* cudaRuntimeLib() {
+    static const std::string path = [] {
+        if (const char* env = getenv("CNUM_MLIR_CUDA_RUNTIME")) {
+            if (llvm::sys::fs::exists(env))
+                return std::string(env);
+            llvm::errs() << "CNUM_MLIR_CUDA_RUNTIME=" << env << " does not exist; ignoring it\n";
+        }
+        llvm::SmallString<256> p(llvm::sys::fs::getMainExecutable(nullptr, nullptr));
+        llvm::sys::path::remove_filename(p);
+        llvm::sys::path::append(p, llvm::sys::path::filename(MLIR_CUDA_RUNTIME_LIB));
+        return std::string(llvm::sys::fs::exists(p) ? p.str() : llvm::StringRef(MLIR_CUDA_RUNTIME_LIB));
+    }();
+    return path.c_str();
+}
+
 namespace {
 using mlir::Operation;
 
@@ -1215,7 +1232,7 @@ std::unique_ptr<mlir::ExecutionEngine> MLIRJitCompiler::generateNVIDIAHost() {
     llvm::InitializeNativeTargetAsmPrinter();
 
     mlir::ExecutionEngineOptions engineOptions;
-    static const llvm::StringRef runtimeLibs[] = {MLIR_CUDA_RUNTIME_LIB};
+    static const llvm::StringRef runtimeLibs[] = {cudaRuntimeLib()};
     engineOptions.sharedLibPaths = runtimeLibs;
     // Host only launches: O0. jitCodeGenOptLevel alone is ignored; the target machine counts.
     engineOptions.jitCodeGenOptLevel = llvm::CodeGenOptLevel::None;
@@ -2215,7 +2232,7 @@ void* loadCachedKernel(const std::string& path, void** moduleOut) {
     llvm::InitializeNativeTargetAsmPrinter();
 #ifdef USE_NVIDIA
     static const bool cudaRuntime =
-        !llvm::sys::DynamicLibrary::LoadLibraryPermanently(MLIR_CUDA_RUNTIME_LIB);
+        !llvm::sys::DynamicLibrary::LoadLibraryPermanently(cudaRuntimeLib());
     if (!cudaRuntime)
         return nullptr;
 #endif
