@@ -883,8 +883,9 @@ bool cnEnsureContext();
 
 /// The current device's sm with PTX ISA max(8.0, the sm's minimum), if both
 /// LLVM and the driver support them; else sm_80 PTX, which the driver JITs forward.
+/// Kernels embed a cubin for the device: sm and driver.
 struct NvTarget {
-    std::string chip, features;
+    std::string chip, features, device;
 };
 NvTarget nvTarget() {
     thread_local CUdevice cachedDev = -1;
@@ -929,7 +930,8 @@ NvTarget nvTarget() {
              llvm::any_of(sti->getAllProcessorFeatures(),
                           [&](const llvm::SubtargetFeatureKV& f) { return feat == f.Key; });
     }
-    t = ok ? NvTarget{chip, "+" + feat} : NvTarget{"sm_80", "+ptx80"};
+    std::string device = llvm::formatv("{0} driver {1}", chip, driver).str();
+    t = ok ? NvTarget{chip, "+" + feat, device} : NvTarget{"sm_80", "+ptx80", device};
     cachedDev = dev;
     return t;
 }
@@ -1062,7 +1064,8 @@ bool MLIRJitCompiler::lowerToNVIDIAHost() {
         op.erase();
     }
 
-    // 4. NVVM pipeline: kernels embed PTX (driver JITs it); host uses mgpu* calls.
+    // 4. NVVM pipeline: kernels embed PTX (generateNVIDIAHost assembles it); the host
+    //    uses mgpu* calls.
     jitMark("gpu-map");
     PassManager pm2(&context);
     gpu::GPUToNVVMPipelineOptions opts;
@@ -1165,8 +1168,32 @@ extern "C" CUmodule cn_mgpuModuleLoad(void* data, size_t) {
         return nullptr;
     return cnLoaded(m);
 }
-/// PTX is assembled once per device architecture and driver; the cubin goes to
-/// the kernel cache (shared by all server builds).
+/// Assembles PTX for the current context's device with the driver's JIT; log gets its errors.
+CUresult cnPtxToCubin(llvm::StringRef ptx, int optLevel, std::string& cubin, std::string& log) {
+    char buf[4096] = {0};
+    CUjit_option opts[] = {CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+                           CU_JIT_OPTIMIZATION_LEVEL};
+    void* vals[] = {buf, reinterpret_cast<void*>(sizeof(buf)),
+                    reinterpret_cast<void*>(static_cast<intptr_t>(optLevel))};
+    CUlinkState link;
+    CUresult r = cuLinkCreate(3, opts, vals, &link);
+    if (r != CUDA_SUCCESS)
+        return r;
+    std::string text = ptx.str(); // NUL-terminated
+    void* out = nullptr;
+    size_t size = 0;
+    r = cuLinkAddData(link, CU_JIT_INPUT_PTX, text.data(), text.size() + 1, "fused_kernel", 0,
+                      nullptr, nullptr);
+    if (r == CUDA_SUCCESS)
+        r = cuLinkComplete(link, &out, &size);
+    if (r == CUDA_SUCCESS)
+        cubin.assign(static_cast<const char*>(out), size);
+    log = buf;
+    cuLinkDestroy(link);
+    return r;
+}
+/// Loads PTX (kernels whose cubin could not be embedded). It is assembled once per device
+/// architecture and driver; the cubin goes to the kernel cache (shared by all server builds).
 extern "C" CUmodule cn_mgpuModuleLoadJIT(void* data, int optLevel, size_t) {
     CUdevice dev;
     int cc[2] = {0, 0};
@@ -1195,40 +1222,25 @@ extern "C" CUmodule cn_mgpuModuleLoadJIT(void* data, int optLevel, size_t) {
                 return nullptr;
         }
     }
-    char log[4096] = {0};
-    CUjit_option opts[] = {CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
-                           CU_JIT_OPTIMIZATION_LEVEL};
-    void* vals[] = {log, reinterpret_cast<void*>(sizeof(log)),
-                    reinterpret_cast<void*>(static_cast<intptr_t>(optLevel))};
-    CUlinkState link;
-    if (!cnOk(cuLinkCreate(3, opts, vals, &link), "cuLinkCreate"))
-        return nullptr;
-    void* cubin = nullptr;
-    size_t size = 0;
-    CUresult r = cuLinkAddData(link, CU_JIT_INPUT_PTX, data,
-                               strlen(static_cast<const char*>(data)) + 1, "fused_kernel", 0,
-                               nullptr, nullptr);
-    if (r == CUDA_SUCCESS)
-        r = cuLinkComplete(link, &cubin, &size);
+    std::string cubin, log;
+    CUresult r =
+        cnPtxToCubin(llvm::StringRef(static_cast<const char*>(data)), optLevel, cubin, log);
     if (r != CUDA_SUCCESS) {
         if (jitSoftLoad) {
             cnOk(r, "");
-            cuLinkDestroy(link);
             return nullptr;
         }
         llvm::report_fatal_error(llvm::Twine("PTX JIT failed: ") + log);
     }
     CUmodule m = nullptr;
-    if (!cnOk(cuModuleLoadData(&m, cubin), "cuModuleLoadData")) {
-        cuLinkDestroy(link);
+    if (!cnOk(cuModuleLoadData(&m, cubin.data()), "cuModuleLoadData"))
         return nullptr;
-    }
     if (!path.empty()) {
         std::string tmp = cacheTmpName(path);
         std::error_code ec;
         llvm::raw_fd_ostream os(tmp, ec);
         if (!ec) {
-            os.write(static_cast<const char*>(cubin), size);
+            os << cubin;
             os.close();
             if (os.has_error()) {
                 os.clear_error();
@@ -1238,7 +1250,6 @@ extern "C" CUmodule cn_mgpuModuleLoadJIT(void* data, int optLevel, size_t) {
             }
         }
     }
-    cuLinkDestroy(link);
     return cnLoaded(m);
 }
 extern "C" void cn_mgpuModuleUnload(CUmodule m) {
@@ -1287,6 +1298,28 @@ std::unique_ptr<mlir::ExecutionEngine> MLIRJitCompiler::generateNVIDIAHost() {
         llvm::errs() << "generateNVIDIAHost: GPU lowering failed\n";
         return nullptr;
     }
+    // Embed cubins instead of PTX, so loading does not run the driver's JIT. A failure
+    // keeps the PTX (mgpuModuleLoadJIT then reports it).
+    module->walk([&](mlir::gpu::BinaryOp bin) {
+        llvm::SmallVector<mlir::Attribute> objects;
+        for (mlir::Attribute a : bin.getObjectsAttr()) {
+            auto obj = mlir::dyn_cast<mlir::gpu::ObjectAttr>(a);
+            std::string cubin, log;
+            int opt = 2; // as mgpuModuleLoadJIT gets it
+            if (auto props = obj ? obj.getProperties() : nullptr)
+                if (auto o = mlir::dyn_cast_or_null<mlir::IntegerAttr>(props.get("O")))
+                    opt = o.getInt();
+            if (obj && obj.getFormat() == mlir::gpu::CompilationTarget::Assembly &&
+                cnPtxToCubin(obj.getObject().getValue(), opt, cubin, log) == CUDA_SUCCESS)
+                a = mlir::gpu::ObjectAttr::get(&context, obj.getTarget(),
+                                               mlir::gpu::CompilationTarget::Binary,
+                                               mlir::StringAttr::get(&context, cubin),
+                                               obj.getProperties(), obj.getKernels());
+            objects.push_back(a);
+        }
+        bin.setObjectsAttr(mlir::ArrayAttr::get(&context, objects));
+    });
+    jitMark("cubin");
 
     llvm::InitializeNativeTarget();
     llvm::InitializeNativeTargetAsmPrinter();
@@ -2315,7 +2348,8 @@ std::string targetCacheDir() {
     std::string tag = llvm::sys::getHostCPUName().str();
 #ifdef USE_NVIDIA
     NvTarget target = nvTarget();
-    tag = target.chip + target.features + "-" + tag;
+    llvm::StringRef sm = llvm::StringRef(target.device).split(' ').first;
+    tag = target.chip + target.features + (sm == target.chip ? "" : "-" + sm.str()) + "-" + tag;
 #endif
     std::string dir = cacheDir() + "/" + tag;
     thread_local std::string made;
@@ -2337,7 +2371,7 @@ std::string cachePath(const std::string& ir) {
     h.update(ir);
 #ifdef USE_NVIDIA
     NvTarget target = nvTarget();
-    h.update("nvidia " + target.chip + " " + target.features);
+    h.update("nvidia " + target.chip + " " + target.features + " cubin " + target.device);
 #endif
     h.update(llvm::sys::getHostCPUName());
     return dir + "/" + llvm::toHex(h.final(), true) + ".o";
