@@ -14,6 +14,10 @@ fetches LLVM/MLIR 22 and Eigen as conda-forge binaries, then ``pip install``\ s
 charmtyles and charmnumeric. ``server.out`` and ``charmrun`` go inside the package
 (``charmnumeric/_bin``); ``charmnumeric._build_info`` records their paths.
 
+charmtyles is a private repository: cloning it needs access to UIUC-PPL/charmtyles
+and GitHub credentials (``gh auth login``, or an SSH URL; ``CNUM_CORE_REPO`` sets the
+URL ``install.sh`` clones from).
+
 .. code-block:: bash
 
     # -b gpu-backend until the gpu-backend PRs are merged; then use the default branches
