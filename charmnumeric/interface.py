@@ -36,7 +36,7 @@ def synchronize(interface=None):
 
 # Pending ops that trigger an async flush, so the backend runs while the program
 # records more and DAGs stay small (CNUM_AUTO_FLUSH; 0 disables).
-_AUTO_FLUSH = int(os.environ.get("CNUM_AUTO_FLUSH", "256"))
+_AUTO_FLUSH = int(os.environ.get("CNUM_AUTO_FLUSH", "64"))
 
 
 class CharmNumericInterface(CCSInterface):
