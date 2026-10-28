@@ -72,15 +72,16 @@ void ArrayDAGGroup::prewarm() {
     double t0 = CkWallTimer(), handles = -1;
     bool gpu = true;
 #ifdef USE_NVIDIA
-    gpu = prewarm_device();
     size_t free = 0, total = 0;
-    if (gpu && budget > 0 && cudaMemGetInfo(&free, &total) == cudaSuccess &&
-        free >= (size_t(1) << 30))
+    gpu = budget > 0 && prewarm_device() && cudaMemGetInfo(&free, &total) == cudaSuccess &&
+          free >= (size_t(1) << 30);
+    if (gpu)
         handles = ct_prewarm_blas();
     cudaGetLastError();
 #endif
     double t1 = CkWallTimer();
-    int kernels = gpu ? jit_prewarm(budget - 1e3 * (t1 - t0)) : 0;
+    // kernels keep a fifth of the budget even when the BLAS part overran
+    int kernels = gpu ? jit_prewarm(std::max(budget - 1e3 * (t1 - t0), 0.2 * budget)) : 0;
     if (getenv("CNUM_JIT_TIME"))
         CkPrintf("[%d] prewarm: blas %.1f ms (handles %.1f), %d cached kernels %.1f ms\n",
                  CkMyPe(), 1e3 * (t1 - t0), handles, kernels, 1e3 * (CkWallTimer() - t1));

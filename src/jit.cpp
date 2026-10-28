@@ -67,9 +67,13 @@ struct JitTimer {
     }
 };
 thread_local JitTimer* jitTimer = nullptr;
-// Set while jit_prewarm runs a cached kernel's constructors: CUDA failures there are
-// recorded here instead of aborting.
-thread_local bool* jitLoadFailed = nullptr;
+// Set while jit_prewarm runs a cached kernel's constructors: the first CUDA failure there
+// is recorded here instead of aborting (-1: not a CUDA error), with the modules loaded so far.
+struct SoftLoad {
+    int error = 0;
+    std::vector<void*> modules;
+};
+thread_local SoftLoad* jitSoftLoad = nullptr;
 void jitMark(const char* what) {
     if (jitTimer)
         jitTimer->mark(what);
@@ -108,6 +112,16 @@ void publishCacheFile(const std::string& tmp, const std::string& path) {
 llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> readCacheFile(const std::string& path) {
     return llvm::MemoryBuffer::getFile(path, /*IsText=*/false, /*RequiresNullTerminator=*/false,
                                        /*IsVolatile=*/true);
+}
+
+/// Refreshes an entry's mtime (recency for jit_prewarm and eviction) at most hourly, since
+/// the file system is shared.
+void touchCacheEntry(const std::string& path, std::time_t mtime = 0) {
+    struct stat st;
+    if (!mtime && stat(path.c_str(), &st) == 0)
+        mtime = st.st_mtime;
+    if (mtime && std::time(nullptr) - mtime > 3600)
+        utimes(path.c_str(), nullptr);
 }
 } // namespace
 
@@ -1112,19 +1126,25 @@ void cnCheck(CUresult r, const char* what) {
 bool cnOk(CUresult r, const char* what) {
     if (r == CUDA_SUCCESS)
         return true;
-    if (jitLoadFailed) {
-        *jitLoadFailed = true;
+    if (jitSoftLoad) {
+        if (!jitSoftLoad->error)
+            jitSoftLoad->error = r;
         return false;
     }
     cnCheck(r, what);
     return false;
 }
+/// The entry itself is bad (not e.g. out of memory): remove it.
+bool cnBadImage(int r) {
+    return r == CUDA_ERROR_INVALID_IMAGE || r == CUDA_ERROR_NO_BINARY_FOR_GPU ||
+           r == CUDA_ERROR_INVALID_PTX;
+}
 bool cnEnsureContext() {
     CUcontext ctx = nullptr;
     if (cuCtxGetCurrent(&ctx) == CUDA_SUCCESS && ctx)
         return true;
-    if (jitLoadFailed) { // jit_prewarm only loads into an existing context
-        *jitLoadFailed = true;
+    if (jitSoftLoad) { // jit_prewarm only loads into an existing context
+        cnOk(CUDA_ERROR_INVALID_CONTEXT, "");
         return false;
     }
     CUdevice dev;
@@ -1134,11 +1154,16 @@ bool cnEnsureContext() {
     cnCheck(cuCtxSetCurrent(ctx), "cuCtxSetCurrent");
     return true;
 }
+CUmodule cnLoaded(CUmodule m) {
+    if (jitSoftLoad)
+        jitSoftLoad->modules.push_back(m);
+    return m;
+}
 extern "C" CUmodule cn_mgpuModuleLoad(void* data, size_t) {
     CUmodule m = nullptr;
     if (!cnEnsureContext() || !cnOk(cuModuleLoadData(&m, data), "cuModuleLoadData"))
         return nullptr;
-    return m;
+    return cnLoaded(m);
 }
 /// PTX is assembled once per device architecture and driver; the cubin goes to
 /// the kernel cache (shared by all server builds).
@@ -1159,9 +1184,15 @@ extern "C" CUmodule cn_mgpuModuleLoadJIT(void* data, int optLevel, size_t) {
         path = cubinDir() + "/" + llvm::toHex(h.final(), true) + ".cubin";
         if (auto buf = readCacheFile(path)) {
             CUmodule m = nullptr;
-            if (cuModuleLoadData(&m, (*buf)->getBufferStart()) == CUDA_SUCCESS)
-                return m;
-            unlink(path.c_str()); // corrupt entry: republished below
+            CUresult r = cuModuleLoadData(&m, (*buf)->getBufferStart());
+            if (r == CUDA_SUCCESS) {
+                touchCacheEntry(path);
+                return cnLoaded(m);
+            }
+            if (cnBadImage(r))
+                unlink(path.c_str()); // corrupt entry: republished below
+            else if (!cnOk(r, "cuModuleLoadData"))
+                return nullptr;
         }
     }
     char log[4096] = {0};
@@ -1174,11 +1205,14 @@ extern "C" CUmodule cn_mgpuModuleLoadJIT(void* data, int optLevel, size_t) {
         return nullptr;
     void* cubin = nullptr;
     size_t size = 0;
-    if (cuLinkAddData(link, CU_JIT_INPUT_PTX, data, strlen(static_cast<const char*>(data)) + 1,
-                      "fused_kernel", 0, nullptr, nullptr) != CUDA_SUCCESS ||
-        cuLinkComplete(link, &cubin, &size) != CUDA_SUCCESS) {
-        if (jitLoadFailed) {
-            *jitLoadFailed = true;
+    CUresult r = cuLinkAddData(link, CU_JIT_INPUT_PTX, data,
+                               strlen(static_cast<const char*>(data)) + 1, "fused_kernel", 0,
+                               nullptr, nullptr);
+    if (r == CUDA_SUCCESS)
+        r = cuLinkComplete(link, &cubin, &size);
+    if (r != CUDA_SUCCESS) {
+        if (jitSoftLoad) {
+            cnOk(r, "");
             cuLinkDestroy(link);
             return nullptr;
         }
@@ -1205,11 +1239,16 @@ extern "C" CUmodule cn_mgpuModuleLoadJIT(void* data, int optLevel, size_t) {
         }
     }
     cuLinkDestroy(link);
-    return m;
+    return cnLoaded(m);
 }
-extern "C" void cn_mgpuModuleUnload(CUmodule m) { cuModuleUnload(m); }
+extern "C" void cn_mgpuModuleUnload(CUmodule m) {
+    if (m)
+        cuModuleUnload(m);
+}
 extern "C" CUfunction cn_mgpuModuleGetFunction(CUmodule m, const char* name) {
     CUfunction f = nullptr;
+    if (!m && jitSoftLoad)
+        return nullptr;
     cnCheck(cuModuleGetFunction(&f, m, name), "cuModuleGetFunction");
     return f;
 }
@@ -2395,22 +2434,29 @@ void* loadCachedKernel(const std::string& path, void** moduleOut, bool soft = fa
         return nullptr;
     }
     jitMark("c-link");
-    bool failed = false;
-    jitLoadFailed = soft ? &failed : nullptr;
+    SoftLoad sl;
+    jitSoftLoad = soft ? &sl : nullptr;
     for (const std::string& name : inits) {
         auto init = (*jit)->lookup(name);
         if (!init) {
             llvm::consumeError(init.takeError());
-            failed = true;
+            sl.error = -1;
             break;
         }
         init->toPtr<void (*)()>()();
-        if (failed)
+        if (sl.error)
             break;
     }
-    jitLoadFailed = nullptr;
-    if (failed) {
-        unlink(path.c_str());
+    jitSoftLoad = nullptr;
+    if (sl.error) {
+        bool bad = sl.error < 0;
+#ifdef USE_NVIDIA
+        bad = bad || cnBadImage(sl.error);
+        for (void* m : sl.modules)
+            cuModuleUnload(static_cast<CUmodule>(m));
+#endif
+        if (bad) // else transient (e.g. out of memory): keep the entry
+            unlink(path.c_str());
         return nullptr;
     }
     *moduleOut = new JitModule{nullptr, std::move(*jit)};
@@ -2517,9 +2563,7 @@ static void* jit_compile_ast_impl(void* ast, void** moduleHandleOut) {
             mtime = stat(path.c_str(), &st) == 0 ? st.st_mtime : std::time(nullptr);
         }
         if (fn) {
-            // recency orders jit_prewarm and eviction; touched at most hourly (shared file system)
-            if (std::time(nullptr) - mtime > 3600)
-                utimes(path.c_str(), nullptr);
+            touchCacheEntry(path, mtime);
             jitMark("cache");
             kernelCache().emplace(std::move(key), std::make_pair(*moduleHandleOut, fn));
             return fn;

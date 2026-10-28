@@ -8,9 +8,11 @@ void* jit_compile_ast(void* ast, void** moduleHandle);
 /// Identical kernels share one module: free each once. No-op on GPU builds.
 void jit_free_module(void* moduleHandle);
 
-/// Loads the most recently used kernels of this target's disk cache (of the first 1024
-/// entries listed) until budget_ms has passed, listing included; returns how many this
-/// process holds. Later compiles of them skip the disk. Load failures are not fatal.
+/// Loads the most recently used kernels of this target's disk cache until budget_ms has
+/// passed, listing included; returns how many this process holds. Only the first 1024
+/// entries in directory order are considered, so with more entries the choice is not
+/// strictly most recent first. Later compiles of them skip the disk. Load failures are not
+/// fatal; only invalid entries are removed.
 int jit_prewarm(double budget_ms);
 
 /// Bounds the disk cache in a background thread, one pass an hour per cache: removes
