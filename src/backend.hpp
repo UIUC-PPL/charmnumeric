@@ -506,6 +506,12 @@ class ArrayDAGGroup : public CBase_ArrayDAGGroup {
     void proxies_ready();
     // After the server is ready: BLAS handles and cached JIT kernels (see CODEMAP)
     void prewarm();
+#ifdef USE_KOKKOS
+    // Which process pairs of a host can use CUDA IPC (gpu_comm.cpp)
+    void ipc_probe_start();
+    void ipc_probe_exports(int n, char* data);
+    void ipc_probe_results(int n, char* data);
+#endif
 
     // Unified DAG handling — dispatches to all relevant partition types
     void receive_dag(int epoch, int size, char* serialized_dag);

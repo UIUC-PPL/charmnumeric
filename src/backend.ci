@@ -12,6 +12,10 @@ mainmodule charmnumeric
         entry ArrayDAGGroup();
         entry void set_proxies(CkArrayID p1, CkArrayID p2, CkArrayID p3);
         entry [reductiontarget] void proxies_ready();
+#ifdef USE_KOKKOS
+        entry [reductiontarget] void ipc_probe_exports(int n, char data[n]);
+        entry [reductiontarget] void ipc_probe_results(int n, char data[n]);
+#endif
         entry void prewarm();
         entry void receive_dag(int epoch, int size, char msg[size]);
         entry void receive_get_request(int ndims, int epoch, int name, int size, int dtype);

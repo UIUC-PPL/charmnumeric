@@ -161,6 +161,7 @@ set(BACKEND_EXECUTOR_SOURCES
 set(BACKEND_PARTITION_SOURCES
     partition_lifecycle.cpp
     partition_comm.cpp
+    gpu_comm.cpp
     partition_get.cpp
 )
 
