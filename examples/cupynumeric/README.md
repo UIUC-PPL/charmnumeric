@@ -18,7 +18,7 @@ cd example/charmnumeric/examples/cupynumeric
 
 # against a running backend (server.out ++server ++server-port $CNUM_PORT)
 CNUM_HOST=127.0.0.1 CNUM_PORT=1234 CNUM_ODF=4 python cg.py --check
-CNUM_AUTO_FLUSH=0 python cfd.py             # no automatic async flushes (default: every 256 ops)
+CNUM_AUTO_FLUSH=0 python cfd.py             # no automatic async flushes (default: every 64 ops)
 
 # without a backend: host-side reference simulator (static/semantic check)
 CNUM_SIM=1 python kmeans.py

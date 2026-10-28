@@ -39,22 +39,27 @@ template <int N>
 struct ComputeDoneParam {
     PartitionImpl<N>* partition;
     int node_id;
-    bool has_comm;
 };
 
 /// C callback invoked by HAPI when all prior compute_stream work completes.
 template <int N>
 static void compute_done_cb(void* param, void* msg) {
     auto* p = static_cast<ComputeDoneParam<N>*>(param);
-    if (p->has_comm) {
-        auto it = p->partition->executor->pending.find(p->node_id);
-        if (it != p->partition->executor->pending.end()) {
-            it->second.clear_remote_buffers();
-            p->partition->executor->pending.erase(it);
-        }
-    }
     p->partition->executor->node_finished(p->node_id);
     delete p;
+}
+
+template <int N>
+using RemoteBuffers = std::unordered_map<int, std::vector<RemoteBuffer<N>>>;
+
+/// HAPI callback freeing a finished node's received buffers once its kernels have run.
+template <int N>
+static void free_remote_buffers_cb(void* param, void* msg) {
+    auto* bufs = static_cast<RemoteBuffers<N>*>(param);
+    for (auto& [idx, list] : *bufs)
+        for (auto& rb : list)
+            comm_free(rb.data);
+    delete bufs;
 }
 
 /// Param struct for deferred-send callbacks (hapiAddCallback).

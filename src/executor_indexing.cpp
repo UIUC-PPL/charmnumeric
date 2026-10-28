@@ -980,7 +980,7 @@ void ArrayDAGExecutorND<N>::index_progress(int node_id) {
     if (st.req_left == 0 && st.val_left == 0 && st.seg_left == 0 && !st.wait_offsets) {
         ix_state.erase(node_id);
 #ifdef USE_NVIDIA
-        auto* p = new ComputeDoneParam<N>{partition, node_id, false};
+        auto* p = new ComputeDoneParam<N>{partition, node_id};
         CkCallback hcb(compute_done_cb<N>, p);
         hapiAddCallback(partition->compute_stream_raw, &hcb);
 #else
@@ -1811,7 +1811,7 @@ void ArrayDAGExecutorND<N>::mask_progress(int node_id) {
         st.out_covered == st.out_expected) {
         ix_state.erase(node_id);
 #ifdef USE_NVIDIA
-        auto* p = new ComputeDoneParam<N>{partition, node_id, false};
+        auto* p = new ComputeDoneParam<N>{partition, node_id};
         CkCallback hcb(compute_done_cb<N>, p);
         hapiAddCallback(partition->compute_stream_raw, &hcb);
 #else
