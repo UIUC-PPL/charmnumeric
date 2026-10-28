@@ -2296,6 +2296,7 @@ def _wrote(root):
     d.pop("_drop", None)
     d.pop("_iota_recipe", None)
     d.pop("_rng_recipe", None)
+    d.pop("_nnz_cache", None)
     d["_version"] = d.get("_version", 0) + 1
     link = d.get("_view_of")
     if link is not None:

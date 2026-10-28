@@ -151,6 +151,115 @@ for shape in [(3, 4, 5, 6), (2, 3, 4, 5, 6)]:
     xh[mh] = 3.0
     C.check("folded x[mask] = scalar" + s, x, xh)
 
+# reused masks: the cached nonzero count must follow every write to the mask
+import charmnumeric.indexing as _ix  # noqa: E402
+
+fetches = [0]
+_fetch = _ix._fetch_int
+
+
+def counting_fetch(x):
+    fetches[0] += 1
+    return _fetch(x)
+
+
+_ix._fetch_int = counting_fetch
+
+
+def reuse(label, mutate, mh, m):
+    """x[m], x[m] = v and y[m, m] = v before and after ``mutate`` changes mh/m."""
+    for step in ("", " after " + label):
+        if step:
+            mutate()
+        xh = host((600,), np.float64)
+        x = dev(xh)
+        C.check("reuse x[m]" + step, x[m], xh[mh])
+        vh = host((int(mh.sum()),), np.float64)
+        x[m] = dev(vh)
+        xh[mh] = vh
+        C.check("reuse x[m] = array" + step, x, xh)
+        yh = host((600, 600), np.int64)
+        y = dev(yh)
+        y[m, m] = 7
+        yh[mh, mh] = 7
+        C.check("reuse y[m, m] = 7" + step, y, yh)
+        C.check("reuse nonzero(m)" + step, cnp.nonzero(m)[0], np.nonzero(mh)[0])
+
+
+mh = hmask((600,))
+m = dev(mh)
+reuse("no write", lambda: None, mh, m)
+before = fetches[0]
+xh = host((600,), np.float64)
+x = dev(xh)
+for _ in range(3):
+    C.check("unchanged mask x[m]", x[m], xh[mh])
+C.check("unchanged mask: count is not fetched again", np.array(fetches[0]), np.array(before))
+
+
+def write(fn_dev, fn_host):
+    def go():
+        fn_dev()
+        fn_host()
+    return go
+
+
+nh = hmask((600,))
+reuse("m[...] = other", write(lambda: m.__setitem__(Ellipsis, dev(nh)),
+                              lambda: mh.__setitem__(Ellipsis, nh)), mh, m)
+reuse("m[10:300] = True", write(lambda: m.__setitem__(slice(10, 300), True),
+                                lambda: mh.__setitem__(slice(10, 300), True)), mh, m)
+nh = hmask((600,))
+reuse("m ^= other", write(lambda: m.__ixor__(dev(nh)), lambda: mh.__ixor__(nh)), mh, m)
+idx = rng.integers(0, 600, 50)
+reuse("m[idx] = False", write(lambda: m.__setitem__(dev(idx), False),
+                              lambda: mh.__setitem__(idx, False)), mh, m)
+sel = hmask((600,))
+reuse("m[sel] = array", write(lambda: m.__setitem__(dev(sel), dev(~mh[sel])),
+                              lambda: mh.__setitem__(sel, ~mh[sel])), mh, m)
+reuse("m.fill(True)", write(lambda: m.fill(True), lambda: mh.fill(True)), mh, m)
+nh = hmask((600,))
+reuse("copyto(m, other)", write(lambda: cnp.copyto(m, dev(nh)),
+                                lambda: np.copyto(mh, nh)), mh, m)
+nh = hmask((600,))
+reuse("logical_not(other, out=m)", write(lambda: cnp.logical_not(dev(nh), out=m),
+                                         lambda: np.logical_not(nh, out=mh)), mh, m)
+# a view of the mask, written through its root
+mv = m[100:]
+reuse("root m[...] = other (view mask)", write(lambda: m.__setitem__(Ellipsis, dev(~mh)),
+                                                lambda: mh.__setitem__(Ellipsis, ~mh)),
+      mh, m)
+xh = host((500,), np.float64)
+x = dev(xh)
+C.check("view mask x[m[100:]]", x[mv], xh[mh[100:]])
+m[150:250] = False
+mh[150:250] = False
+C.check("view mask after root write", x[mv], xh[mh[100:]])
+# linked copies (integer index, transpose) refresh from their array
+Mh = hmask((4, 600))
+M = dev(Mh)
+row = M[2]
+C.check("linked row mask", x[row[:500]], xh[Mh[2, :500]])
+M[2] = dev(~Mh[2])
+Mh[2] = ~Mh[2]
+C.check("linked row mask after array write", x[row[:500]], xh[Mh[2, :500]])
+Th = hmask((600, 4))
+T = dev(Th)
+col = T.T
+C.check("transposed mask", cnp.nonzero(col[1])[0], np.nonzero(Th.T[1])[0])
+T[:, 1] = dev(~Th[:, 1])
+Th[:, 1] = ~Th[:, 1]
+C.check("transposed mask after array write", cnp.nonzero(col[1])[0], np.nonzero(Th.T[1])[0])
+# a mask computed from an array keeps its value when that array changes
+bh = host((600,), np.float64)
+b = dev(bh)
+cm = b > 0
+cmh = bh > 0
+C.check("computed mask", x[cm[:500]], xh[cmh[:500]])
+b[...] = -b
+C.check("computed mask after its input changes", x[cm[:500]], xh[cmh[:500]])
+_ix._fetch_int = _fetch
+
 C.raises("mask shape mismatch", IndexError, lambda: dev(np.ones(5))[dev(np.ones(4, bool))])
 C.raises("value count mismatch", ValueError,
          lambda: dev(np.ones(5)).__setitem__(dev(np.ones(5, bool)), np.ones(3)))
