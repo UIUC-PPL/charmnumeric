@@ -9,6 +9,7 @@
 #include <limits>
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -101,7 +102,8 @@ const std::string& cubinDir();
 std::string cacheTmpName(const std::string& path) {
     char host[256] = {0};
     gethostname(host, sizeof(host) - 1);
-    return llvm::formatv("{0}.{1}.{2}.tmp", path, host, getpid()).str();
+    static std::atomic<unsigned> n{0}; // compile threads of a process
+    return llvm::formatv("{0}.{1}.{2}.{3}.tmp", path, host, getpid(), n++).str();
 }
 
 /// Publishes tmp as path unless path exists: an entry is never replaced, since
@@ -892,6 +894,7 @@ bool cnEnsureContext();
 /// Kernels embed a cubin for the device: sm and driver.
 struct NvTarget {
     std::string chip, features, device;
+    int driver;
 };
 NvTarget nvTarget() {
     thread_local CUdevice cachedDev = -1;
@@ -937,7 +940,8 @@ NvTarget nvTarget() {
                           [&](const llvm::SubtargetFeatureKV& f) { return feat == f.Key; });
     }
     std::string device = llvm::formatv("{0} driver {1}", chip, driver).str();
-    t = ok ? NvTarget{chip, "+" + feat, device} : NvTarget{"sm_80", "+ptx80", device};
+    t = ok ? NvTarget{chip, "+" + feat, device, driver}
+           : NvTarget{"sm_80", "+ptx80", device, driver};
     cachedDev = dev;
     return t;
 }
@@ -2438,7 +2442,8 @@ std::string targetCacheDir() {
 #ifdef USE_NVIDIA
     NvTarget target = nvTarget();
     llvm::StringRef sm = llvm::StringRef(target.device).split(' ').first;
-    tag = target.chip + target.features + (sm == target.chip ? "" : "-" + sm.str()) + "-" + tag;
+    tag = target.chip + target.features + (sm == target.chip ? "" : "-" + sm.str()) + "-d" +
+          std::to_string(target.driver) + "-" + tag;
 #endif
     std::string dir = cacheDir() + "/" + tag;
     thread_local std::string made;
@@ -2477,10 +2482,13 @@ llvm::orc::SymbolMap runtimeSymbols(llvm::orc::MangleAndInterner interner) {
 /// Loads a cached kernel object (running its constructors, which load the GPU
 /// binary); nullptr if that fails. With soft, CUDA failures in the constructors fail the
 /// load instead of aborting. Entries that fail to load are removed.
-void* loadCachedKernel(const std::string& path, void** moduleOut, bool soft = false) {
+void* loadCachedKernel(const std::string& path, void** moduleOut, bool soft = false,
+                       bool* found = nullptr) {
     auto buf = readCacheFile(path);
     if (!buf)
         return nullptr;
+    if (found)
+        *found = true;
     // ctors were turned into __orc_init_func.* functions when the object was built
     std::vector<std::string> inits;
     {
@@ -2695,8 +2703,10 @@ void* compileKernel(void* ast, const std::string& path, void** moduleHandleOut) 
 }
 
 #if !defined(USE_AMD) && !defined(USE_INTEL)
-/// A pre-warmed or disk-cached kernel; nullptr if there is none.
-void* loadCached(const std::string& path, void** moduleHandleOut) {
+/// A pre-warmed or disk-cached kernel; nullptr if there is none or it does not load. CUDA
+/// failures do not abort: invalid entries are removed, and *kept is set when an entry
+/// stays that could not be loaded (e.g. out of memory).
+void* loadCached(const std::string& path, void** moduleHandleOut, bool* kept = nullptr) {
     if (path.empty())
         return nullptr;
     void* fn = nullptr;
@@ -2707,13 +2717,27 @@ void* loadCached(const std::string& path, void** moduleHandleOut) {
         fn = pre->second.fn;
         mtime = pre->second.mtime;
         preloadedKernels().erase(pre);
-    } else if (!(fn = loadCachedKernel(path, moduleHandleOut))) {
-        return nullptr;
+    } else {
+        bool found = false;
+        fn = loadCachedKernel(path, moduleHandleOut, /*soft=*/true, &found);
+        if (!fn) {
+            if (kept && found)
+                *kept = llvm::sys::fs::exists(path);
+            return nullptr;
+        }
     }
     touchCacheEntry(path, mtime);
     jitMark("cache");
     return fn;
 }
+
+/// The process's CPUs at startup, before Charm++ may pin the PE thread (+setcpuaffinity):
+/// compile threads run on all of them.
+struct StartupCpus {
+    cpu_set_t set;
+    bool ok;
+    StartupCpus() { ok = sched_getaffinity(0, sizeof(set), &set) == 0; }
+} startupCpus;
 
 /// Threads that compile kernels, made on demand and kept (each has its own MLIR context);
 /// big stacks, since LLVM codegen recursion grows with loop count. CNUM_JIT_THREADS sets
@@ -2746,9 +2770,8 @@ class CompilePool {
   private:
     CompilePool() {
         int n = 8;
-        cpu_set_t set;
-        if (sched_getaffinity(0, sizeof(set), &set) == 0)
-            n = std::min(n, CPU_COUNT(&set));
+        if (startupCpus.ok)
+            n = std::min(n, CPU_COUNT(&startupCpus.set));
         if (const char* e = getenv("CNUM_JIT_THREADS"))
             if (atoi(e) > 0)
                 n = atoi(e);
@@ -2768,6 +2791,8 @@ class CompilePool {
             return nullptr;
         };
         bool ok = pthread_attr_setstacksize(&attr, size_t(1) << 30) == 0 &&
+                  (!startupCpus.ok || pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t),
+                                                                  &startupCpus.set) == 0) &&
                   pthread_create(&t, &attr, body, this) == 0;
         pthread_sigmask(SIG_SETMASK, &old, nullptr);
         pthread_attr_destroy(&attr);
@@ -2782,7 +2807,10 @@ class CompilePool {
             std::function<void()>* job = queue_.front();
             queue_.pop_front();
             lk.unlock();
-            (*job)();
+            try {
+                (*job)();
+            } catch (...) { // the job's kernel stays missing
+            }
             lk.lock();
             if (--pending_ == 0)
                 done_.notify_all();
@@ -2850,8 +2878,12 @@ class Claims {
             std::thread([this] {
                 for (;;) {
                     std::this_thread::sleep_for(std::chrono::seconds(2));
-                    std::lock_guard<std::mutex> g(m_);
-                    for (const std::string& lock : held_)
+                    std::set<std::string> held;
+                    {
+                        std::lock_guard<std::mutex> g(m_);
+                        held = held_;
+                    }
+                    for (const std::string& lock : held)
                         utimes(lock.c_str(), nullptr);
                 }
             }).detach();
@@ -2878,7 +2910,8 @@ bool processAlive(int pid) {
 }
 
 /// True if the claim lock is gone, or stale and then removed: its holder died on this host,
-/// or its mtime stood still for 30 s (no heartbeat) or is 2 min old.
+/// or its mtime stood still for 30 s (no heartbeat; 6 s for a holder on this host), or for
+/// 5 s and it is 2 min old (by the local clock, so only with an observed standstill).
 bool lockFree(const std::string& lock, LockWatch& w) {
     int fd = open(lock.c_str(), O_RDONLY); // not stat: opening revalidates NFS attributes
     if (fd < 0)
@@ -2891,15 +2924,18 @@ bool lockFree(const std::string& lock, LockWatch& w) {
     if (!ok)
         return false;
     auto now = std::chrono::steady_clock::now();
-    bool stale = std::time(nullptr) - st.st_mtime > 120;
+    bool stale = false;
     llvm::StringRef id(buf, n > 0 ? n : 0);
     auto [host, pid] = id.trim().split(' ');
     int p = 0;
-    if (host == hostName() && !pid.getAsInteger(10, p) && p > 0 && !processAlive(p))
+    bool here = host == hostName();
+    if (here && !pid.getAsInteger(10, p) && p > 0 && !processAlive(p))
         stale = true;
     if (!w.seen || st.st_mtim.tv_sec != w.mtime.tv_sec || st.st_mtim.tv_nsec != w.mtime.tv_nsec) {
         w = {st.st_mtim, now, true};
-    } else if (now - w.since > std::chrono::seconds(30)) {
+    } else if (now - w.since > std::chrono::seconds(here ? 6 : 30) ||
+               (now - w.since > std::chrono::seconds(5) &&
+                std::time(nullptr) - st.st_mtime > 120)) {
         stale = true;
     }
     if (stale)
@@ -2920,6 +2956,7 @@ void jit_compile_batch(void* const* asts, int n, void** fns, void** moduleHandle
     struct Item {
         std::string key, path;
         int same = -1; // index of the item with the same kernel
+        bool local = false; // compile without a claim
         int fd = -1;
         LockWatch watch;
         std::chrono::steady_clock::time_point waitStart;
@@ -2951,7 +2988,7 @@ void jit_compile_batch(void* const* asts, int n, void** fns, void** moduleHandle
             jitMark("build");
 #if !defined(USE_AMD) && !defined(USE_INTEL)
             it.path = cachePath(it.key);
-            fns[i] = loadCached(it.path, &moduleHandles[i]);
+            fns[i] = loadCached(it.path, &moduleHandles[i], &it.local);
 #endif
             if (fns[i])
                 kernelCache().emplace(it.key, std::make_pair(moduleHandles[i], fns[i]));
@@ -2965,15 +3002,16 @@ void jit_compile_batch(void* const* asts, int n, void** fns, void** moduleHandle
 
     if (!todo.empty()) {
         auto t0 = std::chrono::steady_clock::now();
-        int compiled = 0, rounds = 0;
+        int compiled = 0, rounds = 0, width = 1;
 #if !defined(USE_AMD) && !defined(USE_INTEL)
         // Servers sharing the cache split the kernels: each claims up to a pool's worth,
         // compiles them in parallel and loads the others' once published. A waiter breaks
-        // stale claims and, after CNUM_JIT_WAIT_S (60) s, compiles without one.
-        int width = CompilePool::get().size();
+        // stale claims (lockFree), and compiles without a claim after CNUM_JIT_WAIT_S (600) s
+        // or when a published entry does not load here.
+        width = CompilePool::get().size();
         static const double maxWait = [] {
             const char* e = getenv("CNUM_JIT_WAIT_S");
-            return e && atof(e) > 0 ? atof(e) : 60.0;
+            return e && atof(e) > 0 ? atof(e) : 600.0;
         }();
         // target registration is not thread-safe (a race can corrupt the registry's list)
         llvm::InitializeNativeTarget();
@@ -2988,31 +3026,28 @@ void jit_compile_batch(void* const* asts, int n, void** fns, void** moduleHandle
         cuCtxGetCurrent(&ctx);
 #endif
         std::rotate(todo.begin(), todo.begin() + getpid() % todo.size(), todo.end());
-        auto lastCheck = t0;
         for (int i : todo)
             items[i].waitStart = t0;
+        auto pause = std::chrono::milliseconds(10); // between polls; doubles up to 200 ms
         while (!todo.empty()) {
             auto now = std::chrono::steady_clock::now();
-            bool check = now - lastCheck > std::chrono::milliseconds(200);
-            if (check)
-                lastCheck = now;
             std::vector<int> mine, waiting;
             for (int i : todo) {
                 Item& it = items[i];
                 std::string lockPath = it.path + ".lock";
-                if (rounds > 0 && !it.path.empty() && llvm::sys::fs::exists(it.path) &&
-                    (fns[i] = loadCached(it.path, &moduleHandles[i])))
+                // opened, not stat'ed: no stale negative NFS lookups
+                if (rounds > 0 && !it.local &&
+                    (fns[i] = loadCached(it.path, &moduleHandles[i], &it.local)))
                     continue;
                 if (static_cast<int>(mine.size()) >= width) {
                     waiting.push_back(i);
                     continue;
                 }
                 int fd = -2;
-                if (!it.path.empty()) {
-                    fd = -1;
-                    if (rounds == 0 || !llvm::sys::fs::exists(lockPath) ||
-                        (check && lockFree(lockPath, it.watch)))
-                        fd = Claims::get().take(lockPath);
+                if (!it.path.empty() && !it.local) {
+                    fd = rounds == 0 || lockFree(lockPath, it.watch)
+                             ? Claims::get().take(lockPath)
+                             : -1;
                     if (fd == -1 &&
                         std::chrono::duration<double>(now - it.waitStart).count() > maxWait)
                         fd = -2;
@@ -3022,7 +3057,7 @@ void jit_compile_batch(void* const* asts, int n, void** fns, void** moduleHandle
                     continue;
                 }
                 // claimed: the entry may have been published since it was looked up
-                if (fd >= 0 && (fns[i] = loadCached(it.path, &moduleHandles[i]))) {
+                if (fd >= 0 && (fns[i] = loadCached(it.path, &moduleHandles[i], &it.local))) {
                     Claims::get().release(fd, lockPath);
                     continue;
                 }
@@ -3033,21 +3068,29 @@ void jit_compile_batch(void* const* asts, int n, void** fns, void** moduleHandle
                 std::vector<std::function<void()>> jobs;
                 for (int i : mine)
                     jobs.push_back([&, i] {
+                        struct Release { // the claim, also if the compile throws
+                            int fd;
+                            std::string lock;
+                            ~Release() { Claims::get().release(fd, lock); }
+                        } release{items[i].fd, items[i].path + ".lock"};
 #ifdef USE_NVIDIA
                         cuCtxSetCurrent(ctx);
 #endif
                         JitTimer timer;
                         jitTimer = jitTimeIt ? &timer : nullptr;
                         fns[i] = compileKernel(asts[i], items[i].path, &moduleHandles[i]);
-                        Claims::get().release(items[i].fd, items[i].path + ".lock");
                         jitTimer = nullptr;
                         if (jitTimeIt)
                             llvm::errs() << "jit:" + timer.line + "\n";
                     });
                 CompilePool::get().run(jobs);
                 compiled += mine.size();
-            } else if (!waiting.empty()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            if (!waiting.empty() && mine.empty() && waiting.size() == todo.size()) {
+                std::this_thread::sleep_for(pause);
+                pause = std::min(pause * 2, std::chrono::milliseconds(200));
+            } else {
+                pause = std::chrono::milliseconds(10);
             }
             todo.swap(waiting);
             ++rounds;
@@ -3062,11 +3105,12 @@ void jit_compile_batch(void* const* asts, int n, void** fns, void** moduleHandle
                 kernelCache().emplace(items[i].key, std::make_pair(moduleHandles[i], fns[i]));
         if (jitTimeIt)
             llvm::errs() << llvm::formatv("jit batch: {0} kernels, {1} compiled here, {2} rounds, "
-                                          "{3:F1} ms\n",
+                                          "{3:F1} ms, {4} threads\n",
                                           n, compiled, rounds,
                                           std::chrono::duration<double, std::milli>(
                                               std::chrono::steady_clock::now() - t0)
-                                              .count());
+                                              .count(),
+                                          width);
     }
     for (int i = 0; i < n; ++i)
         if (items[i].same >= 0) {
@@ -3097,7 +3141,8 @@ int jit_prewarm(double budget_ms) {
         for (llvm::sys::fs::directory_iterator it(dir, ec), end;
              it != end && !ec && ++seen <= kScan && spent() < budget_ms; it.increment(ec)) {
             llvm::sys::fs::file_status st;
-            if (llvm::sys::path::extension(it->path()) == ".o" &&
+            llvm::StringRef name = llvm::sys::path::filename(it->path());
+            if (cacheFileKind(name) == CacheFile::Entry && name.ends_with(".o") &&
                 !llvm::sys::fs::status(it->path(), st))
                 files.emplace_back(st.getLastModificationTime(), it->path());
         }
