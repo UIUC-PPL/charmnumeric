@@ -207,9 +207,10 @@ class Array : public CTArrayBase<N> {
     T* data; // host pointer (always allocated, used for gather/get)
 #endif
 
-    /// Construct from a local region + global shape + decomposition.
+    /// Construct from a local region + global shape + decomposition; zero-filled unless
+    /// `zero` is false (the caller overwrites every element).
     Array(ArrayRegion<N> region_, std::array<int, N> global_shape_, int name_,
-          ArrayDecomp<N> decomp_) {
+          ArrayDecomp<N> decomp_, bool zero = true) {
         this->name = name_;
         this->region = region_;
         this->global_shape = global_shape_;
@@ -221,11 +222,16 @@ class Array : public CTArrayBase<N> {
             this->global_size *= global_shape_[d];
         int n = this->region.size();
 #ifdef USE_KOKKOS
-        d_view = Kokkos::View<T*, DeviceSpace>("array_device", n);
+        if (zero)
+            d_view = Kokkos::View<T*, DeviceSpace>("array_device", n);
+        else
+            d_view = Kokkos::View<T*, DeviceSpace>(
+                Kokkos::view_alloc(Kokkos::WithoutInitializing, "array_device"), n);
 #else
         data = new T[n];
-        for (int i = 0; i < n; i++)
-            data[i] = T(0);
+        if (zero)
+            for (int i = 0; i < n; i++)
+                data[i] = T(0);
 #endif
     }
 
@@ -722,14 +728,16 @@ class PartitionImpl {
         return arr;
     }
 
+    /// `zero` false: the caller overwrites every element, so the buffer is not zero-filled.
     template <typename T>
     Array<N, T>* allocate_or_reuse_typed(const ArrayRegion<N>& region,
                                          const std::array<int, N>& global_shape,
                                          int name,
-                                         const ArrayDecomp<N>& decomp) {
+                                         const ArrayDecomp<N>& decomp,
+                                         bool zero = true) {
         CTArrayBase<N>* reused = try_reuse(dtype_of<T>(), region, global_shape, decomp);
         if (reused == nullptr)
-            return new Array<N, T>(region, global_shape, name, decomp);
+            return new Array<N, T>(region, global_shape, name, decomp, zero);
 
         auto* arr = static_cast<Array<N, T>*>(reused);
         arr->name = name;
@@ -743,12 +751,15 @@ class PartitionImpl {
         arr->dtype = dtype_of<T>();
 
 #ifdef USE_KOKKOS
-        Kokkos::deep_copy(arr->d_view, T(0));
+        if (zero)
+            Kokkos::deep_copy(arr->d_view, T(0));
         arr->h_view = {};
 #else
-        T* data = static_cast<T*>(arr->data_ptr());
-        for (int64_t i = 0; i < arr->local_size(); ++i)
-            data[i] = T(0);
+        if (zero) {
+            T* data = static_cast<T*>(arr->data_ptr());
+            for (int64_t i = 0; i < arr->local_size(); ++i)
+                data[i] = T(0);
+        }
 #endif
         return arr;
     }
@@ -757,10 +768,11 @@ class PartitionImpl {
                                       const std::array<int, N>& global_shape,
                                       int name,
                                       DType dtype,
-                                      const ArrayDecomp<N>& decomp) {
+                                      const ArrayDecomp<N>& decomp,
+                                      bool zero = true) {
         CTArrayBase<N>* arr = nullptr;
         cn_dispatch(dtype, [&](auto tag) {
-            arr = allocate_or_reuse_typed<decltype(tag)>(region, global_shape, name, decomp);
+            arr = allocate_or_reuse_typed<decltype(tag)>(region, global_shape, name, decomp, zero);
         });
         return arr;
     }
@@ -783,10 +795,11 @@ class PartitionImpl {
                                  const std::array<int, N>& global_shape,
                                  int name,
                                  DType dtype,
-                                 const ArrayDecomp<N>& decomp) {
+                                 const ArrayDecomp<N>& decomp,
+                                 bool zero = true) {
         auto it = arrays.find(name);
         if (it == arrays.end()) {
-            auto* arr = allocate_or_reuse(region, global_shape, name, dtype, decomp);
+            auto* arr = allocate_or_reuse(region, global_shape, name, dtype, decomp, zero);
             arrays[name] = arr;
             return arr;
         }

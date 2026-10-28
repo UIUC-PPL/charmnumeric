@@ -763,8 +763,9 @@ void ArrayDAGExecutorND<N>::execute_signal_node(DAGNode* node) {
         sizes[d] = ohi[d] - olo[d];
         ones[d] = 1;
     }
+    // finish_conv / finish_flip write the whole tile
     partition->ensure_array(ArrayRegion<N>(zeros, sizes, ones), s.out.global_shape,
-                            root->result_name, dt, s.out);
+                            root->result_name, dt, s.out, false);
     int expected = 0;
     for (int i = 0; i < s.nin; ++i)
         expected += expected_msgs<N>(s, i, olo, ohi);

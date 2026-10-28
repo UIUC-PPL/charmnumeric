@@ -1336,8 +1336,10 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                 if (meta_it != array_meta.end())
                     out_decomp_alloc = meta_it->second.template decomp<N>();
             }
-            CTArrayBase<N>* output = partition->ensure_array(
-                out_region, out_gs, result_name, outputRoots[i]->dtype, out_decomp_alloc);
+            // the kernel writes every element of a new output
+            CTArrayBase<N>* output = partition->ensure_array(out_region, out_gs, result_name,
+                                                             outputRoots[i]->dtype,
+                                                             out_decomp_alloc, false);
             descs[n_inputs + i] = make_output_memref<N, T>(output);
         }
 
@@ -1438,6 +1440,10 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
 
     auto aligned = align_fragments_mixed<N>(input_frag_data, input_esz, parents);
     int M = aligned.empty() ? 0 : (int)aligned[0].size();
+    // elements the kernels write per output (the cells of input 0 are disjoint)
+    int64_t covered = 0;
+    for (int m = 0; m < M; ++m)
+        covered += aligned[0][m].region.size();
 
     {
         std::array<int, N> first_input_start = {};
@@ -1449,6 +1455,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
             if (partition->arrays.find(result_name) == partition->arrays.end()) {
                 std::array<int, N> out_gs, local_out, zeros = {}, ones;
                 bool valid = true;
+                int64_t volume = 1;
                 for (int d = 0; d < N; ++d) {
                     out_gs[d] = r_out.size(d);
                     // Size this chare's output tile by intersect(r_out, chare tile), not
@@ -1461,6 +1468,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                         local_out[d] = 0;
                     if (local_out[d] <= 0)
                         valid = false;
+                    volume *= local_out[d];
                     ones[d] = 1;
                 }
                 if (!valid)
@@ -1479,7 +1487,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                         result_decomp = out_decomp;
                 }
                 partition->ensure_array(out_region, out_gs, result_name, outputRoots[i]->dtype,
-                                        result_decomp);
+                                        result_decomp, covered != volume);
             }
         }
 
