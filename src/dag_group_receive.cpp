@@ -456,6 +456,9 @@ void ArrayDAGGroup::receive_dag_now(int epoch, int size, char* serialized_dag) {
                 if (op == Opcode::CONVOLVE) {
                     for (int d = 0; d < nd; ++d)
                         shape[d] = (int)ast_node->operands[3 + nd + d]->scalar;
+                } else if (op == Opcode::BATCHED_MATMUL) {
+                    for (int d = 0; d < nd; ++d)
+                        shape[d] = (int)ast_node->operands[8 + d]->scalar;
                 } else if (!region_to_shape(ast_node->get_operand_region(0), nd, shape)) {
                     auto input_it = array_meta.find(ast_node->operands[0]->result_name);
                     if (input_it != array_meta.end())

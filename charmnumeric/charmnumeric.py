@@ -240,6 +240,7 @@ class ArrayOperation(Operation):
     invert = 167
     left_shift = 168
     right_shift = 169
+    batched_matmul = 170  # charmnumeric/einsum.py
 
 
 class _NDBase(object):
