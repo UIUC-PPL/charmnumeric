@@ -211,7 +211,15 @@ Bit-exact NumPy mirror of `src/creation_kernels.hpp` (Philox4x32-10, software lo
 | `CT_COMPUTE_POLICY/CT_COMM_POLICY` | 11-19 | Kokkos execution policies |
 | `dispatch_kernel<N,T>()` | 138 | Dispatch JIT kernel with memref descriptors |
 | `compute_done_cb<N>()` | 42 | (GPU) HAPI callback for compute completion |
-| `deferred_send_cb<N_sender,N_target>()` | 83 | (GPU) HAPI callback for deferred send |
+| `deferred_send_cb<N_sender,N_target>()` | 92 | (GPU) HAPI callback for deferred send: `receive_ipc` (same host), `receive_staged` (other host) or `receive_data` with a `CkDeviceBuffer` (same process, or fallback) |
+| `device_pack_send<N_sender,N_target>()` | 129 | (GPU) Picks the transport by the target's process and host, queues the IPC / pinned copy on the comm stream |
+
+### `gpu_comm.hpp` — GPU messages between processes (NVIDIA)
+| Symbol | Description |
+|--------|-------------|
+| `gpu_ipc_alloc()` / `gpu_ipc_free()` | Send blocks in lazily created 256 MB `cudaMalloc` slabs with CUDA IPC handles (`CNUM_GPU_IPC=0` disables, `CNUM_GPU_IPC_MB` bounds them, default 1024); `comm_free()` returns arena blocks here |
+| `gpu_ipc_peer_slab()` | Receiver: maps a peer slab once (`cudaIpcOpenMemHandle`) and caches it |
+| `pinned_alloc()` / `pinned_free()` | Pinned host pool by size class for cross-host messages (`CNUM_GPU_STAGE=0` disables, `CNUM_GPU_STAGE_MB` bounds the cache, default 512); released from the stream callback after the copy |
 
 ### Key C++ source files
 | File | Description |
@@ -234,7 +242,7 @@ Bit-exact NumPy mirror of `src/creation_kernels.hpp` (Philox4x32-10, software lo
 | `executor_incremental.cpp` | Incremental computation |
 | `executor_ast_visitor.cpp` | AST visitor for elementwise node execution |
 | `partition_lifecycle.cpp` | `init()`, `create()`, `run()`, destructor |
-| `partition_comm.cpp` | `receive_data()` inter-chare communication |
+| `partition_comm.cpp` | `receive_data()` inter-chare communication; `receive_ipc()`/`receive_staged()` copy into a device buffer on the comm stream, then deliver as `receive_data()` |
 | `partition_get.cpp` | `process_get()` — gather results to PE 0 |
 | `executor_signal.cpp` | CONVOLVE/FLIP: each result chare receives the input window (halo of the filter size) and the filter, or its mirrored tile, point-to-point; direct sum or per-chare FFT (host mixed radix, cuFFT on NVIDIA) |
 | `executor_shape.cpp` | RESHAPE/BROADCAST (opcodes 140-141): source chares send row runs (reshape) or the projected block (broadcast) to each result chare (`receive_shape`, host-staged); broadcast blocks are expanded on the device |
@@ -257,4 +265,4 @@ Bit-exact NumPy mirror of `src/creation_kernels.hpp` (Philox4x32-10, software lo
 | `test_strided_copy_reduces_tile_and_sets_offset()` | 374 | Stride-2 access regression: tile reduction and absolute offset lifting |
 
 ### `backend.ci` — Charm++ interface (86 lines)
-Module `charmnumeric` (depends on `charmtyles`). Mainchare `Main`. Group `ArrayDAGGroup : DAGGroup` with entries: `set_proxies()`, `proxies_ready()` [reduction], `receive_dag()`, `receive_get_request()`, `gather()`. Arrays `Partition1D/2D/3D` with entries: `run()`, `receive_data()` [nocopy/nocopydevice], `send_complete()`, `comm_done()`, `reduce_result()`, `receive_reduce_partial()`, `receive_linalg()`, `receive_shape()`.
+Module `charmnumeric` (depends on `charmtyles`). Mainchare `Main`. Group `ArrayDAGGroup : DAGGroup` with entries: `set_proxies()`, `proxies_ready()` [reduction], `receive_dag()`, `receive_get_request()`, `gather()`. Arrays `Partition1D/2D/3D` with entries: `run()`, `receive_data()` [nocopy/nocopydevice], `send_complete()`, `receive_ipc()`, `receive_staged()` (GPU), `comm_done()`, `reduce_result()`, `receive_reduce_partial()`, `receive_linalg()`, `receive_shape()`.
