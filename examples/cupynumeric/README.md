@@ -83,9 +83,10 @@ the harness object (`np`, `timer`, `package`, `repeat`, `run`, `run_timed`,
   (`_cnum_connect.get_interface`: `CNUM_HOST`/`CNUM_PORT`/`CNUM_ODF`, or the
   simulator with `CNUM_SIM=1`). `harness.package` is `"charmnumeric"`, so
   the `package == "legate"` branches (`stencil_hint`) are skipped.
-- **Timing.** `timer.stop()` calls `charmnumeric.synchronize()`, a backend
-  barrier that returns once every chare of every partition has finished all
-  earlier work, so the times include backend completion.
+- **Timing.** `timer.start()` and `timer.stop()` call `charmnumeric.synchronize()`,
+  a backend barrier that returns once every chare of every partition has finished
+  all earlier work. As with cuPyNumeric's timer, work recorded before `start()`
+  is not timed, and the times include backend completion.
 - **NumPy comparison.** `run_timed*` runs the benchmark function with
   `np` = charmnumeric, then once more with `np` = NumPy, and compares:
   - *Inputs.* `np.random.*` draws (and `default_rng()` generator draws) of

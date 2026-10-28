@@ -92,6 +92,9 @@ class _Timer:
         self._t0 = None
 
     def start(self):
+        # like legate.timing.time(): work recorded before start() is not timed
+        if self._interface is not None:
+            cnp.synchronize(self._interface)
         self._t0 = time.perf_counter()
 
     def stop(self):
