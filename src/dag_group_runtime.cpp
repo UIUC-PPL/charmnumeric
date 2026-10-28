@@ -95,8 +95,12 @@ ArrayDAGGroup::~ArrayDAGGroup() {
         if (handle && freed.insert(handle).second)
             jit_free_module(handle);
 #ifdef USE_KOKKOS
-    if (--kokkos_users == 0 && Kokkos::is_initialized())
+    if (--kokkos_users == 0 && Kokkos::is_initialized()) {
+#ifdef USE_NVIDIA
+        gpu_comm_shutdown();
+#endif
         Kokkos::finalize();
+    }
 #endif
 }
 

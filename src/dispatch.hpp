@@ -148,6 +148,7 @@ static void device_pack_send(PartitionImpl<N_sender>* partition,
     pending[ds->send_id] = send_buf;
 #ifdef USE_NVIDIA
     auto target = proxy_at<N_target>(target_proxy, target_ci);
+    // partitions do not migrate: lastKnown is the target's PE
     int target_pe = target.ckLocalBranch()->lastKnown(target.ckGetIndex());
     if (CmiNodeOf(target_pe) != CkMyNode()) {
         if (gpu_ipc_peer(target_pe))
