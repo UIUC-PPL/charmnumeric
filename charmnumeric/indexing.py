@@ -76,6 +76,9 @@ def _fetch_int(x):
     return int(x.get(default_interface()).reshape(-1)[0])
 
 
+_COUNT_CACHE_MAX = 8
+
+
 def _count(x, kind="nonzero"):
     """count_nonzero(x) or (kind "sum") sum(x) as an int, a blocking get; cached on x's
     root until the root is written."""
@@ -93,6 +96,8 @@ def _count(x, kind="nonzero"):
     if hit is not None and hit[0] == version:
         return hit[1]
     cnt = _fetch_int(fn(x))
+    if key not in cache and len(cache) >= _COUNT_CACHE_MAX:
+        cache.pop(next(iter(cache)))
     cache[key] = (version, cnt)
     return cnt
 

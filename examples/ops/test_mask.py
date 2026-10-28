@@ -235,6 +235,11 @@ C.check("view mask x[m[100:]]", x[mv], xh[mh[100:]])
 m[150:250] = False
 mh[150:250] = False
 C.check("view mask after root write", x[mv], xh[mh[100:]])
+mv[400:][5:10] = True  # through a view of a view of the mask
+mh[100:][400:][5:10] = True
+C.check("view mask after write through a view of it", x[mv], xh[mh[100:]])
+reuse("m[100:][5:10] = True", write(lambda: m[100:].__setitem__(slice(5, 10), True),
+                                    lambda: mh[100:].__setitem__(slice(5, 10), True)), mh, m)
 # linked copies (integer index, transpose) refresh from their array
 Mh = hmask((4, 600))
 M = dev(Mh)
@@ -243,6 +248,12 @@ C.check("linked row mask", x[row[:500]], xh[Mh[2, :500]])
 M[2] = dev(~Mh[2])
 Mh[2] = ~Mh[2]
 C.check("linked row mask after array write", x[row[:500]], xh[Mh[2, :500]])
+rv = row[:500]
+C.check("view of a linked row", x[rv], xh[Mh[2, :500]])
+row[100:200][...] = True  # through a view of the linked copy, back into M
+Mh[2, 100:200] = True
+C.check("view of a linked row after a write through a view", x[rv], xh[Mh[2, :500]])
+C.check("array row after a write through the linked copy", x[M[2][:500]], xh[Mh[2, :500]])
 Th = hmask((600, 4))
 T = dev(Th)
 col = T.T
@@ -258,6 +269,20 @@ cmh = bh > 0
 C.check("computed mask", x[cm[:500]], xh[cmh[:500]])
 b[...] = -b
 C.check("computed mask after its input changes", x[cm[:500]], xh[cmh[:500]])
+# a folded (>3-D) mask: its count is cached on the 3-D storage
+fh = hmask((3, 4, 5, 6))
+f = dev(fh)
+gh = host((3, 4, 5, 6), np.float64)
+g = dev(gh)
+C.check("folded mask reused", g[f], gh[fh])
+C.check("folded mask reused again", g[f], gh[fh])
+f[1] = dev(~fh[1])
+fh[1] = ~fh[1]
+C.check("folded mask after f[1] = ~f[1]", g[f], gh[fh])
+vh = host((int(fh.sum()),), np.float64)
+g[f] = dev(vh)
+gh[fh] = vh
+C.check("folded x[mask] = array after the write", g, gh)
 # repeat with device counts caches their sum the same way
 Rh = rng.integers(0, 4, 300)
 R = dev(Rh)
