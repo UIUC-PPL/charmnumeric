@@ -583,8 +583,31 @@ struct LaHandles {
     cublasHandle_t blas = nullptr;
 };
 
-static LaHandles& la_handles(cudaStream_t st) {
+static LaHandles& la_slot() {
     thread_local LaHandles h; // per PE
+    return h;
+}
+
+/// Creates the handles unless they exist; false (nothing kept) on failure.
+static bool la_try_create() {
+    LaHandles& h = la_slot();
+    if (h.solver != nullptr)
+        return true;
+    cusolverDnHandle_t solver = nullptr;
+    cublasHandle_t blas = nullptr;
+    if (cusolverDnCreate(&solver) != CUSOLVER_STATUS_SUCCESS)
+        return false;
+    if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS) {
+        cusolverDnDestroy(solver);
+        return false;
+    }
+    h.solver = solver;
+    h.blas = blas;
+    return true;
+}
+
+static LaHandles& la_handles(cudaStream_t st) {
+    LaHandles& h = la_slot();
     if (h.solver == nullptr) {
         CT_CUSOLVER_CHECK(cusolverDnCreate(&h.solver));
         CT_CUBLAS_CHECK(cublasCreate(&h.blas));
@@ -1219,13 +1242,13 @@ template void PartitionImpl<3>::receive_linalg(int, int64_t, char*);
 #ifdef USE_NVIDIA
 double ct_prewarm_blas() {
     double t0 = CkWallTimer();
-    la_handles(nullptr);
-    cublasHandle_t h = ct_cublas();
-    cublasSetStream(h, nullptr);
+    bool la = la_try_create();
+    cublasHandle_t h = ct_try_cublas();
     double t1 = CkWallTimer();
     // a first GEMM initializes cuBLAS internals and loads its kernels
     void* p = nullptr;
-    if (cudaMalloc(&p, 12 * sizeof(double)) == cudaSuccess) {
+    if (la && h && cublasSetStream(h, nullptr) == CUBLAS_STATUS_SUCCESS &&
+        cudaMalloc(&p, 12 * sizeof(double)) == cudaSuccess) {
         cudaMemset(p, 0, 12 * sizeof(double));
         auto* f = static_cast<float*>(p);
         auto* d = static_cast<double*>(p);
@@ -1236,6 +1259,7 @@ double ct_prewarm_blas() {
         cudaStreamSynchronize(nullptr);
         cudaFree(p);
     }
+    cudaGetLastError(); // a failure above must not show up in later error checks
     return 1e3 * (t1 - t0);
 }
 #endif

@@ -41,20 +41,46 @@ void ArrayDAGGroup::set_proxies(CkArrayID p1, CkArrayID p2, CkArrayID p3) {
 void ArrayDAGGroup::proxies_ready() {
     Server<CProxy_ArrayDAGGroup>::initialize(thisProxy);
     thisProxy.prewarm();
+    jit_cache_maintain();
 }
+
+#ifdef USE_NVIDIA
+/// Pre-warm uses the GPU only if this thread's current device is the one Kokkos uses (no
+/// context is made on another GPU, e.g. GPU 0 from an SMP PE thread).
+static bool prewarm_device() {
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev != Kokkos::Cuda().cuda_device()) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+#endif
 
 // CCS requests that arrive meanwhile wait in the scheduler queue.
 void ArrayDAGGroup::prewarm() {
     const char* on = getenv("CNUM_PREWARM");
     if (on && std::string(on) == "0")
         return;
-    double t0 = CkWallTimer(), handles = 0;
+    double budget = 250.0;
+    if (const char* ms = getenv("CNUM_PREWARM_MS")) {
+        char* end = nullptr;
+        double v = strtod(ms, &end);
+        if (end != ms && *end == '\0' && v >= 0)
+            budget = v;
+    }
+    double t0 = CkWallTimer(), handles = -1;
+    bool gpu = true;
 #ifdef USE_NVIDIA
-    handles = ct_prewarm_blas();
+    gpu = prewarm_device();
+    size_t free = 0, total = 0;
+    if (gpu && budget > 0 && cudaMemGetInfo(&free, &total) == cudaSuccess &&
+        free >= (size_t(1) << 30))
+        handles = ct_prewarm_blas();
+    cudaGetLastError();
 #endif
     double t1 = CkWallTimer();
-    const char* budget = getenv("CNUM_PREWARM_MS");
-    int kernels = jit_prewarm(budget ? atof(budget) : 250.0);
+    int kernels = gpu ? jit_prewarm(budget - 1e3 * (t1 - t0)) : 0;
     if (getenv("CNUM_JIT_TIME"))
         CkPrintf("[%d] prewarm: blas %.1f ms (handles %.1f), %d cached kernels %.1f ms\n",
                  CkMyPe(), 1e3 * (t1 - t0), handles, kernels, 1e3 * (CkWallTimer() - t1));

@@ -17,19 +17,24 @@
 #ifdef USE_NVIDIA
 #include <cublas_v2.h>
 
-/// cuBLAS handle of this PE (thread_local: SMP PEs are threads).
-inline cublasHandle_t ct_cublas() {
-    thread_local cublasHandle_t handle = [] {
-        cublasHandle_t h = nullptr;
-        if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS)
-            CkAbort("cublasCreate failed");
-        return h;
-    }();
+/// This PE's cuBLAS handle, created on first use; nullptr if that fails (thread_local: SMP
+/// PEs are threads).
+inline cublasHandle_t ct_try_cublas() {
+    thread_local cublasHandle_t handle = nullptr;
+    if (handle == nullptr && cublasCreate(&handle) != CUBLAS_STATUS_SUCCESS)
+        handle = nullptr;
     return handle;
 }
 
+inline cublasHandle_t ct_cublas() {
+    cublasHandle_t h = ct_try_cublas();
+    if (h == nullptr)
+        CkAbort("cublasCreate failed");
+    return h;
+}
+
 /// Creates this PE's cuBLAS/cuSOLVER handles and runs a first GEMM (all lazy otherwise);
-/// returns the ms spent creating the handles.
+/// failures are skipped. Returns the ms spent creating the handles.
 double ct_prewarm_blas();
 #endif
 
