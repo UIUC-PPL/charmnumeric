@@ -50,6 +50,8 @@ from .indexing import (
 from .einsum import einsum, einsum_path, inner, outer, tensordot
 from .folded import FoldedArray
 from .interface import CharmNumericInterface, LocalCluster, synchronize
+from . import launcher
+from .launcher import connect, start, stop
 from .operations import add, diag, divide, dot, exp, matmul, multiply, norm2, subtract, tanh, tile
 from .reductions import (
     all,
@@ -196,6 +198,7 @@ __all__ = [
     "right_shift",
     "conj",
     "conjugate",
+    "connect",
     "imag",
     "invert",
     "iscomplexobj",
@@ -344,10 +347,12 @@ __all__ = [
     "sin",
     "sort",
     "sqrt",
+    "start",
     "square",
     "squeeze",
     "stack",
     "std",
+    "stop",
     "subtract",
     "sum",
     "swapaxes",

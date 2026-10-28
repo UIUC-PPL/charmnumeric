@@ -1,6 +1,7 @@
 """Shared helpers for the elementwise-op tests.
 
-Env: CNUM_HOST, CNUM_PORT, CNUM_ODF select the backend; CNUM_SIM=1 uses the
+Env: CNUM_HOST, CNUM_PORT, CNUM_ODF select the backend (neither host nor port:
+a local server is started); CNUM_SIM=1 uses the
 NumPy simulator in ../cupynumeric/_cnum_sim.py instead.
 
 Inputs are generated on the backend from index grids and fetched with .get();
@@ -27,6 +28,8 @@ def connect():
         from _cnum_sim import SimInterface
 
         return SimInterface()
+    if "CNUM_HOST" not in os.environ and "CNUM_PORT" not in os.environ:
+        return cnp.start()
     iface = cnp.CharmNumericInterface()
     iface.connect(
         os.environ.get("CNUM_HOST", "127.0.0.1"),

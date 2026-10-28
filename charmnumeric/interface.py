@@ -14,12 +14,11 @@ _default_interface = None
 
 
 def default_interface():
-    """The most recently created interface (ops with data-dependent sizes sync on it)."""
+    """The most recently created interface; without one, connects to or starts a server."""
     if _default_interface is None:
-        raise RuntimeError(
-            "this operation has a data-dependent result size and needs a "
-            "CharmNumericInterface; create (and connect) one first"
-        )
+        from .launcher import auto_interface
+
+        return auto_interface()
     return _default_interface
 
 
@@ -45,8 +44,12 @@ class CharmNumericInterface(CCSInterface):
         super().__init__(*args, **kwargs)
         _default_interface = self
 
-    def connect(self, server_ip, server_port, odf):
-        super().connect(server_ip, server_port, odf)
+    def connect(self, server_ip, server_port, odf, key=None):
+        # key only when given: test harnesses patch CCSInterface.connect with 3 arguments.
+        if key is None:
+            super().connect(server_ip, server_port, odf)
+        else:
+            super().connect(server_ip, server_port, odf, key=key)
         from charmtyles.core import set_auto_flush
 
         set_auto_flush(self, _AUTO_FLUSH if _AUTO_FLUSH > 0 else None)
