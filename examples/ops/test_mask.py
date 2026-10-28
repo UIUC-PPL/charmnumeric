@@ -258,6 +258,21 @@ cmh = bh > 0
 C.check("computed mask", x[cm[:500]], xh[cmh[:500]])
 b[...] = -b
 C.check("computed mask after its input changes", x[cm[:500]], xh[cmh[:500]])
+# repeat with device counts caches their sum the same way
+Rh = rng.integers(0, 4, 300)
+R = dev(Rh)
+xh = host((300,), np.float64)
+x = dev(xh)
+C.check("repeat(x, R)", cnp.repeat(x, R), np.repeat(xh, Rh))
+before = fetches[0]
+C.check("repeat(x, R) again", cnp.repeat(x, R), np.repeat(xh, Rh))
+C.check("repeat: sum is not fetched again", np.array(fetches[0]), np.array(before))
+R[5:50] = 3
+Rh[5:50] = 3
+C.check("repeat(x, R) after R[5:50] = 3", cnp.repeat(x, R), np.repeat(xh, Rh))
+R += 1
+Rh += 1
+C.check("repeat(x, R) after R += 1", cnp.repeat(x, R), np.repeat(xh, Rh))
 _ix._fetch_int = _fetch
 
 C.raises("mask shape mismatch", IndexError, lambda: dev(np.ones(5))[dev(np.ones(4, bool))])
