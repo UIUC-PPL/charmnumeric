@@ -116,6 +116,7 @@ using HostSpace = Kokkos::HostSpace;
 #ifdef USE_NVIDIA
 #include "hapi.h"
 #include <cuda_runtime.h>
+#include "gpu_comm.hpp"
 #endif
 
 /// Device message buffers, cached by power-of-two size class: cudaMalloc/cudaFree per
@@ -160,6 +161,10 @@ inline void comm_free(void* ptr) {
     std::lock_guard<std::mutex> lock(pool.mu);
     auto it = pool.live.find(ptr);
     if (it == pool.live.end()) {
+#ifdef USE_NVIDIA
+        if (gpu_ipc_free(ptr))
+            return;
+#endif
         Kokkos::kokkos_free<DeviceSpace>(ptr);
         return;
     }
@@ -501,6 +506,12 @@ class ArrayDAGGroup : public CBase_ArrayDAGGroup {
     void proxies_ready();
     // After the server is ready: BLAS handles and cached JIT kernels (see CODEMAP)
     void prewarm();
+#ifdef USE_KOKKOS
+    // Which process pairs of a host can use CUDA IPC (gpu_comm.cpp)
+    void ipc_probe_start();
+    void ipc_probe_exports(int n, char* data);
+    void ipc_probe_results(int n, char* data);
+#endif
 
     // Unified DAG handling — dispatches to all relevant partition types
     void receive_dag(int epoch, int size, char* serialized_dag);
@@ -826,6 +837,11 @@ class PartitionImpl {
     void receive_data(int& node_id, int& input_index, int& name, int& ndims, int*& region_data,
                       int64_t& size, char*& data, CkDeviceBufferPost* devicePost);
     void send_complete(int send_id);
+    void receive_ipc(int node_id, int input_index, int name, int ndims, int* region_data,
+                     int64_t size, int src_node, int slab, int64_t offset, const char* handle,
+                     const CkCallback& done);
+    void receive_staged(int node_id, int input_index, int name, int ndims, int* region_data,
+                        int64_t size, char* data);
 #endif
     void comm_done(int node_id);
     void reduce_result(int node_id, int64_t size, char* data);
@@ -865,6 +881,16 @@ class Partition1D : public CBase_Partition1D {
     void send_complete(CkDataMsg* msg) {
         impl.send_complete(CkGetRefNum(msg));
         CkFreeMsg(msg);
+    }
+    void receive_ipc(int node_id, int input_index, int name, int ndims, int* region_data,
+                     int64_t size, int src_node, int slab, int64_t offset, int hsize,
+                     char* handle, CkCallback done) {
+        impl.receive_ipc(node_id, input_index, name, ndims, region_data, size, src_node, slab,
+                         offset, handle, done);
+    }
+    void receive_staged(int node_id, int input_index, int name, int ndims, int* region_data,
+                        int64_t size, char* data) {
+        impl.receive_staged(node_id, input_index, name, ndims, region_data, size, data);
     }
 #endif
     void comm_done(int node_id) { impl.comm_done(node_id); }
@@ -915,6 +941,16 @@ class Partition2D : public CBase_Partition2D {
         impl.send_complete(CkGetRefNum(msg));
         CkFreeMsg(msg);
     }
+    void receive_ipc(int node_id, int input_index, int name, int ndims, int* region_data,
+                     int64_t size, int src_node, int slab, int64_t offset, int hsize,
+                     char* handle, CkCallback done) {
+        impl.receive_ipc(node_id, input_index, name, ndims, region_data, size, src_node, slab,
+                         offset, handle, done);
+    }
+    void receive_staged(int node_id, int input_index, int name, int ndims, int* region_data,
+                        int64_t size, char* data) {
+        impl.receive_staged(node_id, input_index, name, ndims, region_data, size, data);
+    }
 #endif
     void comm_done(int node_id) { impl.comm_done(node_id); }
     void reduce_result(int node_id, int64_t size, char* data) {
@@ -963,6 +999,16 @@ class Partition3D : public CBase_Partition3D {
     void send_complete(CkDataMsg* msg) {
         impl.send_complete(CkGetRefNum(msg));
         CkFreeMsg(msg);
+    }
+    void receive_ipc(int node_id, int input_index, int name, int ndims, int* region_data,
+                     int64_t size, int src_node, int slab, int64_t offset, int hsize,
+                     char* handle, CkCallback done) {
+        impl.receive_ipc(node_id, input_index, name, ndims, region_data, size, src_node, slab,
+                         offset, handle, done);
+    }
+    void receive_staged(int node_id, int input_index, int name, int ndims, int* region_data,
+                        int64_t size, char* data) {
+        impl.receive_staged(node_id, input_index, name, ndims, region_data, size, data);
     }
 #endif
     void comm_done(int node_id) { impl.comm_done(node_id); }

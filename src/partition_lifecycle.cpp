@@ -44,8 +44,13 @@ PartitionImpl<N>::~PartitionImpl() {
         for (auto* arr : bucket)
             delete arr;
 #ifdef USE_KOKKOS
-    for (auto& [id, ptr] : pending_sends)
+    for (auto& [id, ptr] : pending_sends) {
+#ifdef USE_NVIDIA
+        if (gpu_ipc_forget(ptr)) // a receiver may still be copying it
+            continue;
+#endif
         comm_free(ptr);
+    }
     for (auto& [key, bufs] : posted_recv_bufs)
         for (char* p : bufs)
             comm_free(p);

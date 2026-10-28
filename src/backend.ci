@@ -12,6 +12,10 @@ mainmodule charmnumeric
         entry ArrayDAGGroup();
         entry void set_proxies(CkArrayID p1, CkArrayID p2, CkArrayID p3);
         entry [reductiontarget] void proxies_ready();
+#ifdef USE_KOKKOS
+        entry [reductiontarget] void ipc_probe_exports(int n, char data[n]);
+        entry [reductiontarget] void ipc_probe_results(int n, char data[n]);
+#endif
         entry void prewarm();
         entry void receive_dag(int epoch, int size, char msg[size]);
         entry void receive_get_request(int ndims, int epoch, int name, int size, int dtype);
@@ -35,6 +39,13 @@ mainmodule charmnumeric
                                 char data[size]);
 #ifdef USE_KOKKOS
         entry void send_complete(CkDataMsg* msg);
+        entry void receive_ipc(int node_id, int input_index, int name,
+                               int ndims, int region_data[ndims*3], int64_t size,
+                               int src_node, int slab, int64_t offset,
+                               int hsize, char handle[hsize], CkCallback done);
+        entry void receive_staged(int node_id, int input_index, int name,
+                                  int ndims, int region_data[ndims*3],
+                                  int64_t size, char data[size]);
 #endif
         entry void comm_done(int node_id);
         entry void reduce_result(int node_id, int64_t size, char data[size]);
@@ -58,6 +69,13 @@ mainmodule charmnumeric
                                 char data[size]);
 #ifdef USE_KOKKOS
         entry void send_complete(CkDataMsg* msg);
+        entry void receive_ipc(int node_id, int input_index, int name,
+                               int ndims, int region_data[ndims*3], int64_t size,
+                               int src_node, int slab, int64_t offset,
+                               int hsize, char handle[hsize], CkCallback done);
+        entry void receive_staged(int node_id, int input_index, int name,
+                                  int ndims, int region_data[ndims*3],
+                                  int64_t size, char data[size]);
 #endif
         entry void comm_done(int node_id);
         entry void reduce_result(int node_id, int64_t size, char data[size]);
@@ -81,6 +99,13 @@ mainmodule charmnumeric
                                 char data[size]);
 #ifdef USE_KOKKOS
         entry void send_complete(CkDataMsg* msg);
+        entry void receive_ipc(int node_id, int input_index, int name,
+                               int ndims, int region_data[ndims*3], int64_t size,
+                               int src_node, int slab, int64_t offset,
+                               int hsize, char handle[hsize], CkCallback done);
+        entry void receive_staged(int node_id, int input_index, int name,
+                                  int ndims, int region_data[ndims*3],
+                                  int64_t size, char data[size]);
 #endif
         entry void comm_done(int node_id);
         entry void reduce_result(int node_id, int64_t size, char data[size]);

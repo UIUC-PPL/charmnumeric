@@ -34,6 +34,9 @@ void ArrayDAGGroup::set_proxies(CkArrayID p1, CkArrayID p2, CkArrayID p3) {
     partition_proxy_1 = CProxy_Partition1D(p1);
     partition_proxy_2 = CProxy_Partition2D(p2);
     partition_proxy_3 = CProxy_Partition3D(p3);
+#ifdef USE_NVIDIA
+    ipc_probe_start();
+#endif
     CkCallback cb(CkReductionTarget(ArrayDAGGroup, proxies_ready), thisProxy[0]);
     contribute(cb);
 }
@@ -92,8 +95,12 @@ ArrayDAGGroup::~ArrayDAGGroup() {
         if (handle && freed.insert(handle).second)
             jit_free_module(handle);
 #ifdef USE_KOKKOS
-    if (--kokkos_users == 0 && Kokkos::is_initialized())
+    if (--kokkos_users == 0 && Kokkos::is_initialized()) {
+#ifdef USE_NVIDIA
+        gpu_comm_shutdown();
+#endif
         Kokkos::finalize();
+    }
 #endif
 }
 
