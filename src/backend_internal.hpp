@@ -58,8 +58,10 @@ inline void local_gemm(const T* a, int lda, const T* b, int ldb, T* c, int ldc, 
         if (inputs_ready == nullptr &&
             cudaEventCreateWithFlags(&inputs_ready, cudaEventDisableTiming) != cudaSuccess)
             CkAbort("cudaEventCreate failed");
-        cudaEventRecord(inputs_ready, Kokkos::DefaultExecutionSpace().cuda_stream());
-        cudaStreamWaitEvent(stream, inputs_ready, 0);
+        if (cudaEventRecord(inputs_ready, Kokkos::DefaultExecutionSpace().cuda_stream()) !=
+                cudaSuccess ||
+            cudaStreamWaitEvent(stream, inputs_ready, 0) != cudaSuccess)
+            CkAbort("ct_gemm: ordering after the default instance failed");
         // column-major view of the row-major product: C^T = B^T * A^T
         cublasHandle_t h = ct_cublas();
         cublasSetStream(h, stream);
