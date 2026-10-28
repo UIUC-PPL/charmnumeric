@@ -2,6 +2,8 @@
 #include "dispatch.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <climits>
 #include <cmath>
 #include <complex>
 #include <type_traits>
@@ -11,9 +13,9 @@
 #include <cufft.h>
 #endif
 
-// CONVOLVE / FLIP (opcodes 150-151). Each result chare gathers one box per
-// source view, then computes locally (direct sum, or overlap-save FFT; cuFFT
-// on NVIDIA). The result has any decomposition.
+// CONVOLVE / FLIP (opcodes 150-151), BATCHED_MATMUL (170). Each result chare
+// gathers one box per source view, then computes locally (direct sum, overlap-save
+// FFT, batched GEMM; cuFFT/cuBLAS on NVIDIA). The result has any decomposition.
 
 #ifdef USE_KOKKOS
 #define CT_SIG_FN KOKKOS_INLINE_FUNCTION
@@ -42,6 +44,7 @@ struct SigGeom {
     int method = CONV_DIRECT;
     std::array<int, N> shift{}; // CONVOLVE: out[j] = sum_k v[k] a[j + shift - k]
     int flip_mask = 0;
+    int dims[2][3] = {}; // BATCHED_MATMUL: dims of a (batch, m, k) and b (batch, n, k)
 };
 
 ASTNode* signal_root(DAGNode* node) {
@@ -78,7 +81,7 @@ bool make_view(ArrayDAGGroup* g, ASTNode* root, int i, SrcView<N>& v) {
 template <int N>
 bool make_geom(ArrayDAGGroup* g, ASTNode* root, SigGeom<N>& s) {
     s.op = static_cast<Opcode>(root->opcode);
-    s.nin = s.op == Opcode::CONVOLVE ? 2 : 1;
+    s.nin = s.op == Opcode::FLIP ? 1 : 2;
     for (int i = 0; i < s.nin; ++i)
         if (!make_view<N>(g, root, i, s.in[i]))
             return false;
@@ -90,6 +93,10 @@ bool make_geom(ArrayDAGGroup* g, ASTNode* root, SigGeom<N>& s) {
         s.method = (int)root->operands[2]->scalar;
         for (int d = 0; d < N; ++d)
             s.shift[d] = (int)root->operands[3 + d]->scalar;
+    } else if (s.op == Opcode::BATCHED_MATMUL) {
+        for (int i = 0; i < 2; ++i)
+            for (int j = 0; j < 3; ++j)
+                s.dims[i][j] = (int)root->operands[2 + 3 * i + j]->scalar;
     } else {
         s.flip_mask = (int)root->operands[1]->scalar;
     }
@@ -161,12 +168,15 @@ void with_elem_type(DType dt, F&& f) {
     }
 }
 
-/// with_conv_dtype or with_elem_type, by op.
+/// with_conv_dtype or with_elem_type, by op; the BLAS types for BATCHED_MATMUL.
 template <typename F>
 void with_sig_type(Opcode op, DType dt, F&& f) {
     if (op == Opcode::FLIP)
         with_elem_type(dt, f);
-    else
+    else if (op == Opcode::BATCHED_MATMUL) {
+        if (!cn_dispatch_blas(dt, f))
+            CkAbort("batched matmul: unsupported dtype %d", (int)dt);
+    } else
         with_conv_dtype(dt, f);
 }
 
@@ -201,15 +211,22 @@ void copy_box(PartitionImpl<N>* partition, T* dst, int64_t dbase, const int64_t*
         });
 #else
     (void)partition;
-    for (int64_t k = 0; k < total; ++k) {
-        int64_t rem = k, di = dbase, si = sbase;
-        for (int d = N - 1; d >= 0; --d) {
+    int64_t len = ext[N - 1], dl = ds[N - 1], sl = ss[N - 1];
+    for (int64_t r = 0; r < total / len; ++r) {
+        int64_t rem = r, di = dbase, si = sbase;
+        for (int d = N - 2; d >= 0; --d) {
             int64_t c = rem % ext[d];
             rem /= ext[d];
             di += c * ds[d];
             si += c * ss[d];
         }
-        dst[di] = src[si];
+        T* dp = dst + di;
+        const T* sp = src + si;
+        if (dl == 1 && sl == 1)
+            std::copy(sp, sp + len, dp);
+        else
+            for (int64_t j = 0; j < len; ++j)
+                dp[j * dl] = sp[j * sl];
     }
 #endif
 }
@@ -632,13 +649,14 @@ int expected_msgs(const SigGeom<N>& s, int i, const std::array<int, N>& olo,
 /// Dense box [lo, lo + ext) of source view i, zero outside the view.
 template <int N, typename T>
 T* assemble(PartitionImpl<N>* partition, PendingComm<N>& comm, int i, const int64_t* lo,
-            const int64_t* ext) {
+            const int64_t* ext, bool zero = true) {
     int64_t n = 1, stride[N];
     for (int d = 0; d < N; ++d)
         n *= ext[d];
     row_major_strides<N>(ext, stride);
     T* box = reinterpret_cast<T*>(alloc_buffer(n * (int64_t)sizeof(T)));
-    fill_zero<N, T>(partition, box, n);
+    if (zero)
+        fill_zero<N, T>(partition, box, n);
     auto rb_it = comm.remote_buffers.find(i);
     if (rb_it == comm.remote_buffers.end())
         return box;
@@ -723,6 +741,368 @@ void finish_conv(PartitionImpl<N>* partition, const SigGeom<N>& s, PendingComm<N
     free_buffer(reinterpret_cast<char*>(v));
 }
 
+
+// ---- BATCHED_MATMUL ----
+
+/// View-index range [lo, hi) along dim d of operand i that result range [olo, ohi) reads.
+template <int N>
+void bmm_need(const SigGeom<N>& s, int i, int d, const std::array<int, N>& olo,
+              const std::array<int, N>& ohi, int& lo, int& hi) {
+    const int* dm = s.dims[i];
+    int e = d == dm[0] ? 0 : d == dm[1] ? 1 + i : -1;
+    if (e < 0) {
+        lo = 0;
+        hi = s.in[i].vsize[d];
+    } else {
+        lo = olo[e];
+        hi = ohi[e];
+    }
+}
+
+/// True if this chare holds all of operand i its own result tile reads, with unit
+/// last-dim step: the GEMM then reads it in place and nothing is sent.
+template <int N>
+bool bmm_local(const SigGeom<N>& s, int i, const std::array<int, N>& me,
+               const std::array<int, N>& olo, const std::array<int, N>& ohi) {
+    const SrcView<N>& v = s.in[i];
+    if (v.vstep[N - 1] != 1)
+        return false;
+    for (int d = 0; d < N; ++d) {
+        int lo, hi, nlo, nhi;
+        if (olo[d] >= ohi[d] || !src_block_1d<N>(v, d, me[d], lo, hi))
+            return false;
+        bmm_need<N>(s, i, d, olo, ohi, nlo, nhi);
+        if (lo > nlo || hi < nhi)
+            return false;
+    }
+    return true;
+}
+
+/// Send each result chare the part of operand i this chare holds.
+template <int N, typename T>
+void send_bmm_input(PartitionImpl<N>* partition, int node_id, const SigGeom<N>& s, int i) {
+    const SrcView<N>& v = s.in[i];
+    auto it = partition->arrays.find(v.name);
+    if (it == partition->arrays.end() || it->second->local_size() == 0)
+        return;
+    CTArrayBase<N>* src = it->second;
+    auto me = partition->nd_index();
+    std::array<int, N> blo, bhi;
+    for (int d = 0; d < N; ++d)
+        if (!src_block_1d<N>(v, d, me[d], blo[d], bhi[d]))
+            return;
+    // Per result dim e: (result chare, lo, hi) on the operand dim read along e, or the
+    // whole block when no operand dim maps to e.
+    const int* dm = s.dims[i];
+    int src_of[3] = {dm[0], i == 0 ? dm[1] : -1, i == 0 ? -1 : dm[1]};
+    std::array<std::vector<std::array<int, 3>>, N> targets;
+    for (int e = 0; e < N; ++e) {
+        int first, last;
+        chare_span<N>(s.out, e, first, last);
+        int sd = src_of[e];
+        for (int c = first; c <= last; ++c) {
+            int olo, ohi;
+            out_range_1d<N>(s.out, e, c, olo, ohi);
+            if (olo >= ohi)
+                continue;
+            if (sd < 0) {
+                targets[e].push_back({c, 0, 0});
+                continue;
+            }
+            int lo = std::max(olo, blo[sd]), hi = std::min(ohi, bhi[sd]);
+            if (lo < hi)
+                targets[e].push_back({c, lo, hi});
+        }
+        if (targets[e].empty())
+            return;
+    }
+
+    int64_t tsize[N], lstride[N], sstride[N];
+    for (int d = 0; d < N; ++d)
+        tsize[d] = src->region.size(d);
+    row_major_strides<N>(tsize, lstride);
+    for (int d = 0; d < N; ++d)
+        sstride[d] = (int64_t)v.vstep[d] * lstride[d];
+    const T* src_ptr = static_cast<const T*>(src->device_data_ptr());
+
+    std::array<size_t, N> t{};
+    while (true) {
+        std::array<int, N> ci, olo, ohi;
+        int lo[N], hi[N];
+        for (int d = 0; d < N; ++d) {
+            lo[d] = blo[d];
+            hi[d] = bhi[d];
+        }
+        for (int e = 0; e < N; ++e) {
+            const auto& te = targets[e][t[e]];
+            ci[e] = te[0];
+            out_range_1d<N>(s.out, e, ci[e], olo[e], ohi[e]);
+            if (src_of[e] >= 0) {
+                lo[src_of[e]] = te[1];
+                hi[src_of[e]] = te[2];
+            }
+        }
+        if (ci != me || !bmm_local<N>(s, i, me, olo, ohi)) {
+            int64_t ext[N], pstride[N], base = 0, count = 1;
+            ChareIndex<N> target;
+            int region_data[N * 3];
+            for (int d = 0; d < N; ++d) {
+                ext[d] = hi[d] - lo[d];
+                count *= ext[d];
+                int cstart = v.dec.chare_start_global(d, me[d]);
+                base += (int64_t)(v.vstart[d] + lo[d] * v.vstep[d] - cstart) * lstride[d];
+                target.idx[d] = ci[d];
+                region_data[d * 3 + 0] = lo[d];
+                region_data[d * 3 + 1] = hi[d];
+                region_data[d * 3 + 2] = 1;
+            }
+            row_major_strides<N>(ext, pstride);
+            int64_t bytes = count * (int64_t)sizeof(T);
+            char* buf = alloc_buffer(bytes);
+            copy_box<N, T>(partition, reinterpret_cast<T*>(buf), 0, pstride, src_ptr, base,
+                           sstride, ext);
+            compute_fence(partition);
+#ifndef NDEBUG
+            partition->comm_bytes_sent += bytes;
+#endif
+#ifdef USE_KOKKOS
+            device_pack_send<N, N>(partition, partition->thisProxy, target, node_id, i, v.name,
+                                   region_data, bytes, buf);
+#else
+            proxy_at<N>(partition->thisProxy, target)
+                .receive_data(node_id, i, v.name, N, region_data, bytes, buf);
+            delete[] buf;
+#endif
+        }
+        int e = N - 1;
+        for (; e >= 0; --e) {
+            if (++t[e] < targets[e].size())
+                break;
+            t[e] = 0;
+        }
+        if (e < 0)
+            break;
+    }
+}
+
+/// Messages result chare `me` (range [olo, ohi)) receives for operand i.
+template <int N>
+int bmm_expected_msgs(const SigGeom<N>& s, int i, const std::array<int, N>& me,
+                      const std::array<int, N>& olo, const std::array<int, N>& ohi) {
+    if (bmm_local<N>(s, i, me, olo, ohi))
+        return 0;
+    const SrcView<N>& v = s.in[i];
+    int total = 1;
+    for (int d = 0; d < N; ++d) {
+        int nlo, nhi, first, last, count = 0;
+        bmm_need<N>(s, i, d, olo, ohi, nlo, nhi);
+        chare_span<N>(v.dec, d, first, last);
+        for (int c = first; c <= last; ++c) {
+            int lo, hi;
+            if (src_block_1d<N>(v, d, c, lo, hi) && lo < nhi && hi > nlo)
+                ++count;
+        }
+        total *= count;
+    }
+    return total;
+}
+
+/// Accumulator of the naive product: unsigned for ints, so overflow wraps (as in NumPy).
+template <typename T, bool = std::is_integral_v<T>>
+struct BmmAcc {
+    using type = T;
+};
+template <typename T>
+struct BmmAcc<T, true> {
+    using type = std::make_unsigned_t<T>;
+};
+
+/// Naive batched product, one thread per result element (types cuBLAS lacks).
+template <int N, typename T>
+void bmm_naive(PartitionImpl<N>* partition, int64_t bs, int64_t m, int64_t n, int64_t k,
+               const T* a, const int64_t* as, const T* b, const int64_t* bst, T* c) {
+    using U = typename BmmAcc<T>::type;
+    int64_t a0 = as[0], a1 = as[1], a2 = as[2], b0 = bst[0], b1 = bst[1], b2 = bst[2];
+#ifdef USE_KOKKOS
+    Kokkos::parallel_for(
+        CT_COMPUTE_POLICY(partition, bs * m * n), KOKKOS_LAMBDA(int64_t idx) {
+            int64_t j = idx % n, r = (idx / n) % m, q = idx / (m * n);
+            const T* ap = a + q * a0 + r * a1;
+            const T* bp = b + q * b0 + j * b2;
+            U acc = U(0);
+            for (int64_t t = 0; t < k; ++t)
+                acc += U(ap[t * a2]) * U(bp[t * b1]);
+            c[idx] = T(acc);
+        });
+#else
+    (void)partition;
+    for (int64_t idx = 0; idx < bs * m * n; ++idx) {
+        int64_t j = idx % n, r = (idx / n) % m, q = idx / (m * n);
+        const T* ap = a + q * a0 + r * a1;
+        const T* bp = b + q * b0 + j * b2;
+        U acc = U(0);
+        for (int64_t t = 0; t < k; ++t)
+            acc += U(ap[t * a2]) * U(bp[t * b1]);
+        c[idx] = T(acc);
+    }
+#endif
+}
+
+#ifdef USE_NVIDIA
+template <typename T>
+struct CublasBatched;
+#define CT_CUBLAS_BATCHED(T, CT, X)                                                                \
+    template <>                                                                                    \
+    struct CublasBatched<T> {                                                                      \
+        static cublasStatus_t run(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb,    \
+                                  int m, int n, int k, const T* a, int lda, long long sa,          \
+                                  const T* b, int ldb, long long sb, T* c, int ldc, long long sc,  \
+                                  int count) {                                                     \
+            const CT one = CT{1}, zero = CT{0};                                                    \
+            return cublas##X##gemmStridedBatched(                                                  \
+                h, ta, tb, m, n, k, &one, reinterpret_cast<const CT*>(a), lda, sa,                 \
+                reinterpret_cast<const CT*>(b), ldb, sb, &zero, reinterpret_cast<CT*>(c), ldc, sc, \
+                count);                                                                            \
+        }                                                                                          \
+    };
+CT_CUBLAS_BATCHED(float, float, S)
+CT_CUBLAS_BATCHED(double, double, D)
+CT_CUBLAS_BATCHED(cn_c64, cuComplex, C)
+CT_CUBLAS_BATCHED(cn_c128, cuDoubleComplex, Z)
+#undef CT_CUBLAS_BATCHED
+
+/// cuBLAS operation and leading dim of a (rows x cols) operand with element strides
+/// (rs, cs) seen column-major; false unless one stride is 1 and the other valid.
+inline bool cublas_layout(int64_t rows, int64_t cols, int64_t rs, int64_t cs,
+                          cublasOperation_t& op, int64_t& ld) {
+    if (std::max(rs, cs) > INT_MAX)
+        return false;
+    if (cs == 1 && rs >= std::max<int64_t>(1, cols)) {
+        op = CUBLAS_OP_N; // row-major (rows x cols) == column-major (cols x rows)
+        ld = rs;
+        return true;
+    }
+    if (rs == 1 && cs >= std::max<int64_t>(1, rows)) {
+        op = CUBLAS_OP_T;
+        ld = cs;
+        return true;
+    }
+    return false;
+}
+#endif
+
+/// c[q] = a[q] * b[q] for q < bs: a[q] is m x k with element strides (as[1], as[2]),
+/// b[q] k x n with (bst[1], bst[2]), batch strides as[0], bst[0]; c dense (bs, m, n).
+template <int N, typename T>
+void batched_gemm(PartitionImpl<N>* partition, int64_t bs, int64_t m, int64_t n, int64_t k,
+                  const T* a, const int64_t* as, const T* b, const int64_t* bst, T* c) {
+    if (bs <= 0 || m <= 0 || n <= 0)
+        return;
+#if defined(USE_NVIDIA)
+    if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double> ||
+                  std::is_same_v<T, cn_c64> || std::is_same_v<T, cn_c128>) {
+        // column-major view of the row-major product: C^T = B^T * A^T
+        cublasOperation_t oa, ob;
+        int64_t lda, ldb;
+        bool fits = std::max({bs, m, n, k}) <= INT_MAX;
+        if (fits && k > 0 && cublas_layout(m, k, as[1], as[2], oa, lda) &&
+            cublas_layout(k, n, bst[1], bst[2], ob, ldb)) {
+            // inputs may come from work on the default instance's stream
+            Kokkos::DefaultExecutionSpace().fence("ct_bmm inputs");
+            cublasHandle_t h = ct_cublas();
+            cublasSetStream(h, partition->compute_stream_raw);
+            cublasStatus_t st = CublasBatched<T>::run(h, ob, oa, (int)n, (int)m, (int)k, b,
+                                                      (int)ldb, bst[0], a, (int)lda, as[0], c,
+                                                      (int)n, m * n, (int)bs);
+            if (st != CUBLAS_STATUS_SUCCESS)
+                CkAbort("cuBLAS batched gemm failed (%d)", (int)st);
+            return;
+        }
+        static std::atomic<bool> warned{false};
+        if (k > 0 && !warned.exchange(true))
+            CkPrintf("[PE %d] batched matmul: layout or size not supported by cuBLAS, using the "
+                     "naive kernel\n", CkMyPe());
+    }
+    bmm_naive<N, T>(partition, bs, m, n, k, a, as, b, bst, c);
+#elif defined(USE_KOKKOS)
+    bmm_naive<N, T>(partition, bs, m, n, k, a, as, b, bst, c);
+#else
+    (void)partition;
+    using RM = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+    using CM = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
+    using OS = Eigen::OuterStride<>;
+    using GS = Eigen::Stride<Eigen::Dynamic, Eigen::Dynamic>;
+    // f(map) with the cheapest Eigen map of a (rows x cols) operand
+    auto with_map = [](const T* p, int64_t rows, int64_t cols, int64_t rs, int64_t cs,
+                       auto&& f) {
+        if (cs == 1 && rs >= cols)
+            f(Eigen::Map<const RM, 0, OS>(p, rows, cols, OS(rs)));
+        else if (rs == 1 && cs >= rows)
+            f(Eigen::Map<const CM, 0, OS>(p, rows, cols, OS(cs)));
+        else
+            f(Eigen::Map<const RM, 0, GS>(p, rows, cols, GS(rs, cs)));
+    };
+    for (int64_t q = 0; q < bs; ++q) {
+        Eigen::Map<RM> C(c + q * m * n, m, n);
+        with_map(a + q * as[0], m, k, as[1], as[2], [&](const auto& A) {
+            with_map(b + q * bst[0], k, n, bst[1], bst[2],
+                     [&](const auto& B) { C.noalias() = A * B; });
+        });
+    }
+#endif
+}
+
+template <int N, typename T>
+void finish_bmm(PartitionImpl<N>* partition, const SigGeom<N>& s, PendingComm<N>& comm, T* out,
+                const std::array<int, N>& olo, const std::array<int, N>& ohi) {
+    auto me = partition->nd_index();
+    const T* ptr[2];
+    int64_t str[2][3];
+    T* staged[2] = {nullptr, nullptr};
+    int64_t ksize = 1;
+    for (int i = 0; i < 2; ++i) {
+        const SrcView<N>& v = s.in[i];
+        int64_t lo[N], ext[N], stride[N];
+        for (int d = 0; d < N; ++d) {
+            int nlo, nhi;
+            bmm_need<N>(s, i, d, olo, ohi, nlo, nhi);
+            lo[d] = nlo;
+            ext[d] = nhi - nlo;
+        }
+        if (bmm_local<N>(s, i, me, olo, ohi)) {
+            CTArrayBase<N>* src = partition->arrays.at(v.name);
+            int64_t tsize[N], lstride[N], base = 0;
+            for (int d = 0; d < N; ++d)
+                tsize[d] = src->region.size(d);
+            row_major_strides<N>(tsize, lstride);
+            for (int d = 0; d < N; ++d) {
+                int cstart = v.dec.chare_start_global(d, me[d]);
+                base += (int64_t)(v.vstart[d] + lo[d] * v.vstep[d] - cstart) * lstride[d];
+                stride[d] = (int64_t)v.vstep[d] * lstride[d];
+            }
+            ptr[i] = static_cast<const T*>(src->device_data_ptr()) + base;
+        } else {
+            staged[i] = assemble<N, T>(partition, comm, i, lo, ext, false);
+            row_major_strides<N>(ext, stride);
+            ptr[i] = staged[i];
+        }
+        const int* dm = s.dims[i];
+        // a: (batch, m, k); b: (batch, k, n)
+        str[i][0] = stride[dm[0]];
+        str[i][1] = stride[i == 0 ? dm[1] : dm[2]];
+        str[i][2] = stride[i == 0 ? dm[2] : dm[1]];
+        ksize = ext[dm[2]];
+    }
+    batched_gemm<N, T>(partition, ohi[0] - olo[0], ohi[1] - olo[1], ohi[2] - olo[2], ksize,
+                       ptr[0], str[0], ptr[1], str[1], out);
+    if (staged[0] || staged[1]) {
+        compute_fence(partition);
+        for (T* p : staged)
+            if (p)
+                free_buffer(reinterpret_cast<char*>(p));
+    }
+}
+
 } // namespace signal_detail
 
 using namespace signal_detail;
@@ -746,6 +1126,12 @@ void ArrayDAGExecutorND<N>::execute_signal_node(DAGNode* node) {
     for (int i = 0; i < s.nin; ++i)
         with_sig_type(s.op, dt, [&](auto tag) {
             using T = decltype(tag);
+            if constexpr (N == 3) {
+                if (s.op == Opcode::BATCHED_MATMUL) {
+                    send_bmm_input<N, T>(partition, node->id, s, i);
+                    return;
+                }
+            }
             send_input<N, T>(partition, node->id, s, i);
         });
 
@@ -767,7 +1153,8 @@ void ArrayDAGExecutorND<N>::execute_signal_node(DAGNode* node) {
                             root->result_name, dt, s.out);
     int expected = 0;
     for (int i = 0; i < s.nin; ++i)
-        expected += expected_msgs<N>(s, i, olo, ohi);
+        expected += s.op == Opcode::BATCHED_MATMUL ? bmm_expected_msgs<N>(s, i, me, olo, ohi)
+                                                   : expected_msgs<N>(s, i, olo, ohi);
 
     DBG_PRINT("[PE %d] execute_signal_node<%d>: node=%d op=%d result=%d expected=%d\n",
               CkMyPe(), N, node->id, root->opcode, root->result_name, expected);
@@ -801,6 +1188,13 @@ void ArrayDAGExecutorND<N>::finish_signal_node(PendingComm<N>& comm) {
             using T = decltype(tag);
             finish_flip<N, T>(partition, s, comm, static_cast<T*>(out->device_data_ptr()), olo,
                               ohi);
+        });
+    else if (s.op == Opcode::BATCHED_MATMUL)
+        with_sig_type(s.op, out->dtype, [&](auto tag) {
+            using T = decltype(tag);
+            if constexpr (N == 3)
+                finish_bmm<N, T>(partition, s, comm, static_cast<T*>(out->device_data_ptr()),
+                                 olo, ohi);
         });
     else
         with_conv_dtype(out->dtype, [&](auto tag) {

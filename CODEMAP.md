@@ -8,7 +8,7 @@ Distributed N-dimensional array DSL built on charmtyles. The backend stores 1-3D
 | Symbol | Line | Description |
 |--------|------|-------------|
 | `DType` | 39 | Wire dtype codes — FLOAT32=0, FLOAT64=1, INT32=2, INT64=3, BOOL=4, INT8=5, INT16=6, UINT8..UINT64=7-10, FLOAT16=11, COMPLEX64=12, COMPLEX128=13; `from_numpy()`, `to_numpy()` |
-| `ArrayOperation` | 139 | Opcodes: add=0, sub=1, mul=2, div=3, matmul=4, tanh=5, exp=6, tile=7, reduce=8, matmatmul=9, diag=10; elementwise math/comparisons/where/clip 20-49; creation upload=50, random=51, iota=52; reduction=60, bincount=61; transpose=70; scan=81, sort=82, argsort=83; linalg=100; gather=120, scatter=121, expand=122, compress=123, mask_scatter=124; reshape=140, broadcast=141; convolve=150, flip=151; convert (fused astype)=160, real=161, imag=162, conj=163, bitwise_and/or/xor=164-166, invert=167, left_shift=168, right_shift=169 |
+| `ArrayOperation` | 139 | Opcodes: add=0, sub=1, mul=2, div=3, matmul=4, tanh=5, exp=6, tile=7, reduce=8, matmatmul=9, diag=10; elementwise math/comparisons/where/clip 20-49; creation upload=50, random=51, iota=52; reduction=60, bincount=61; transpose=70; scan=81, sort=82, argsort=83; linalg=100; gather=120, scatter=121, expand=122, compress=123, mask_scatter=124; reshape=140, broadcast=141; convolve=150, flip=151; convert (fused astype)=160, real=161, imag=162, conj=163, bitwise_and/or/xor=164-166, invert=167, left_shift=168, right_shift=169; batched_matmul=170 |
 | `ArrayRegion` | 153 | N-D region with start/stop/step per dim — `serialize()`:194, `shape()`:209, `compose()`:212, `overlaps()`:232, `covers()`:239, `intersect()`:246 |
 | `Array(FrontendObject)` | 618 | Main array class — `wire_dtype()`:639, `get()`:683, `get_region()`/`__getitem__()`:690/697, `__setitem__()`:708, `dot()`:724, `matvec()`:727, `copy()`:730, `fill()`:735, `astype()`:738; operators: +,-,*,/,@ at 713-722 |
 | `ArrayView(FrontendObjectView)` | 747 | View with same ops as Array — `get()`:796, `__getitem__()`:801, `__setitem__()`:812, `dot()`:828 |
@@ -29,7 +29,7 @@ Distributed N-dimensional array DSL built on charmtyles. The backend stores 1-3D
 | `_matvec()` | 536 | Matrix-vector multiply |
 | `_matmatmul()` | 595 | Matrix-matrix multiply (SUMMA) |
 | `_unstrided()` | — | Copies a stepped view before matvec/SUMMA (the executors ignore view steps) |
-| `_batched_matmul()` | — | N-D / FoldedArray / non-squeezable 3-D matmul via `einsum("...ij,...jk->...ik")` |
+| `_batched_matmul()` | — | N-D / FoldedArray / non-squeezable 3-D matmul via `einsum("...ij,...jk->...ik")` (one BATCHED_MATMUL node) |
 | `create_array()` | 851 | Array creation factory |
 | `empty/zeros/ones/full()` | 931-971 | Array constructors |
 | `empty_like/zeros_like/ones_like/full_like()` | 975-994 | Like-constructors |
@@ -100,7 +100,8 @@ Distributed N-dimensional array DSL built on charmtyles. The backend stores 1-3D
 | `einsum()` / `einsum_path()` | `numpy.einsum` (string or sublist form, `out=`, `dtype=`, `optimize=`); path from `numpy.einsum_path` on shape-only dummies |
 | `_parse()` / `_from_sublists()` | Ellipsis expansion and implicit output; sublist form to subscripts |
 | `_drop_broadcast()` / `_diagonals()` / `_sum_out()` | Per operand: size-1 broadcast dims, repeated labels (DIAG for 2-D, else permute + RESHAPE + strided view), single-operand sums (REDUCTION) |
-| `_fold()` / `_contract_pair()` | Pairwise contraction (smallest intermediate first within a path step): label-space or grouped broadcast multiply + sum, native dot/matvec, SUMMA, or one SUMMA per batch element on 3-D singleton views |
+| `_fold()` / `_contract_pair()` | Pairwise contraction (smallest intermediate first within a path step): label-space or grouped broadcast multiply + sum, native dot/matvec, SUMMA, or with batch labels one BATCHED_MATMUL node |
+| `_bmm()` / `bmm_reference()` | BATCHED_MATMUL (opcode 170) node: operands `a, b, dims of a holding (batch, m, k), dims of b holding (batch, n, k), result shape`; any layout with the batch dim not last needs no transpose; NumPy model for the simulator |
 | `permute()` | Any-rank transpose: drops size-1 axes, coalesces adjacent axes, >3-D via grouped 3-D transposes; `cnp.transpose`/`FoldedArray.T` use it |
 | `tensordot()` / `inner()` / `outer()` | NumPy API on top of `einsum` |
 
@@ -236,7 +237,7 @@ Bit-exact NumPy mirror of `src/creation_kernels.hpp` (Philox4x32-10, software lo
 | `partition_lifecycle.cpp` | `init()`, `create()`, `run()`, destructor |
 | `partition_comm.cpp` | `receive_data()` inter-chare communication |
 | `partition_get.cpp` | `process_get()` — gather results to PE 0 |
-| `executor_signal.cpp` | CONVOLVE/FLIP: each result chare receives the input window (halo of the filter size) and the filter, or its mirrored tile, point-to-point; direct sum or per-chare FFT (host mixed radix, cuFFT on NVIDIA) |
+| `executor_signal.cpp` | CONVOLVE/FLIP: each result chare receives the input window (halo of the filter size) and the filter, or its mirrored tile, point-to-point; direct sum or per-chare FFT (host mixed radix, cuFFT on NVIDIA). BATCHED_MATMUL: each result chare receives its (batch, m, all k) / (batch, all k, n) operand boxes (read in place when it holds them already) and runs one strided batched GEMM (cuBLAS `gemmStridedBatched` for float/complex on NVIDIA, Eigen on CPU, a Kokkos kernel for ints) |
 | `executor_shape.cpp` | RESHAPE/BROADCAST (opcodes 140-141): source chares send row runs (reshape) or the projected block (broadcast) to each result chare (`receive_shape`, host-staged); broadcast blocks are expanded on the device |
 | `executor_linalg.cpp` | LINALG: operand blocks gathered to chare 0 of the result partition (`receive_linalg`), factored there (Eigen on CPU, cuSOLVER/cuBLAS on NVIDIA), result tiles scattered back |
 | `executor_indexing.cpp` | GATHER/SCATTER/EXPAND: index chares send request lists to the data chares, which send value lists to the target chares (`receive_index_msg`); EXPAND scans segment counts on one coordinator chare. COMPRESS/MASK_SCATTER: device scan of each x block's mask, row offsets from one coordinator, compacted runs sent in bulk to the result tiles (or pulled from v's chares) |

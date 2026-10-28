@@ -3,9 +3,9 @@
 Each operand is first cleaned up: broadcast size-1 dims are dropped, repeated
 labels become diagonals, and labels found nowhere else are summed. Operands are
 then contracted pairwise in ``numpy.einsum_path`` order. A pair becomes a
-broadcast multiply when nothing is contracted, a side has no free labels, or
-the product is small; otherwise it becomes SUMMA (one per batch element on 3-D
-views). ``permute`` restores the output order.
+broadcast multiply when nothing is contracted or a side has no free labels;
+otherwise it becomes SUMMA, or one BATCHED_MATMUL node when there are batch
+labels. ``permute`` restores the output order.
 
 Deviations from NumPy: results are never views, ``order`` is ignored, and
 ``optimize=False`` contracts left to right.
@@ -19,6 +19,8 @@ import numpy as np
 from charmtyles.core import _shape_size
 
 from .charmnumeric import (
+    ArrayOperation,
+    _blas_dtype,
     _is_array_nd,
     _is_scalar_like,
     _normalize_dtype,
@@ -26,15 +28,10 @@ from .charmnumeric import (
     _transpose,
     _write_out,
     asarray,
-    empty,
+    nonfusible_op,
 )
 
 _LETTERS = string.ascii_letters
-
-# Limits for using one broadcast product instead of a matmul per batch element.
-_BCAST_IO_RATIO = 4
-_BCAST_MAX = 1 << 24
-_LOOP_MIN_BATCH = 64
 
 
 def _prod(values):
@@ -318,11 +315,8 @@ def _contract_pair(a, la, b, lb, keep, sizes, dtype, final=None):
     N = _prod([sizes[l] for l in fb])
     K = _prod([sizes[l] for l in con])
 
-    inter = Bt * M * N * K
-    io = Bt * (M * K + K * N + M * N)
     vector = M == 1 or N == 1
-    small = Bt > 1 and (inter <= _BCAST_IO_RATIO * io or (Bt > _LOOP_MIN_BATCH and inter <= _BCAST_MAX))
-    if K == 1 or vector or small:
+    if K == 1 or vector:
         if K > 1 and Bt == 1 and vector:
             if M == 1 and N == 1 and len(la) == len(lb) == 1:
                 return a @ b, []  # native dot
@@ -334,35 +328,52 @@ def _contract_pair(a, la, b, lb, keep, sizes, dtype, final=None):
             return _label_product(a, la, b, lb, keep, sizes, dtype, final)
         return _grouped_product(a, la, b, lb, batch, con, fa, fb, sizes, dtype)
 
-    # matmul: pick the orientation and batch position needing fewest transposes
+    # matmul: pick the orientation and operand layouts needing fewest transposes
+    # layouts as role strings: b batch, f free, c contracted
     def layout(x, lx, free, left):
-        mat = [free, con] if left else [con, free]
-        cands = [[batch] + mat, [mat[0], batch, mat[1]], mat + [batch]] if Bt > 1 else [mat]
-        return min(((_layout_cost(x, lx, g), g) for g in cands), key=lambda c: c[0])
+        if Bt > 1:  # batched: any order with the batch dim not last
+            codes = ["bfc", "bcf", "fbc", "cbf"]
+        else:
+            codes = ["fc" if left else "cf"]
+        roles = {"b": batch, "f": free, "c": con}
+        cands = [(code, [roles[r] for r in code]) for code in codes]
+        return min(((_layout_cost(x, lx, g), g, code) for code, g in cands), key=lambda c: c[0])
 
     plans = []
     for (x, lx, fx), (y, ly, fy) in (((a, la, fa), (b, lb, fb)), ((b, lb, fb), (a, la, fa))):
-        cx, gx = layout(x, lx, fx, True)
-        cy, gy = layout(y, ly, fy, False)
+        cx, gx, kx = layout(x, lx, fx, True)
+        cy, gy, ky = layout(y, ly, fy, False)
         out = batch + fx + fy
         cr = 0
         if final is not None and [l for l in final if l in out] != out:
             cr = Bt * M * N
-        plans.append((cx + cy + cr, x, lx, gx, fx, y, ly, gy, fy, out))
-    _, x, lx, gx, fx, y, ly, gy, fy, out = min(plans, key=lambda p: p[0])
+        plans.append((cx + cy + cr, x, lx, gx, kx, y, ly, gy, ky, out))
+    _, x, lx, gx, kx, y, ly, gy, ky, out = min(plans, key=lambda p: p[0])
     px = _arrange(x, lx, gx)
     py = _arrange(y, ly, gy)
     if Bt == 1:
         r = px @ py
     else:
-        bx = next(i for i, g in enumerate(gx) if g is batch)
-        by = next(i for i, g in enumerate(gy) if g is batch)
-        Mx = _prod([sizes[l] for l in fx])
-        Ny = _prod([sizes[l] for l in fy])
-        r = empty((Bt, Mx, Ny), dtype=dtype)
-        for i in range(Bt):
-            r[i] = px[(slice(None),) * bx + (slice(i, i + 1),)] @ py[(slice(None),) * by + (slice(i, i + 1),)]
+        r = _bmm(px, [kx.index(r) for r in "bfc"], py, [ky.index(r) for r in "bfc"], dtype)
     return _shaped(r, out, sizes), out
+
+
+def _bmm(a, da, b, db, dtype):
+    """(batch, m, n) products; da / db: dims of a holding (batch, m, k), of b (batch, n, k)."""
+    compute = _blas_dtype(dtype)
+    a = a if a.dtype == compute else a.astype(compute)
+    b = b if b.dtype == compute else b.astype(compute)
+    shape = (int(a.shape[da[0]]), int(a.shape[da[1]]), int(b.shape[db[1]]))
+    r = nonfusible_op(a, b, *da, *db, *shape, operation=ArrayOperation.batched_matmul,
+                      shape=shape, dtype=compute)
+    return r if compute == dtype else r.astype(dtype)
+
+
+def bmm_reference(a, b, dims):
+    """NumPy model of a BATCHED_MATMUL node (CNUM_SIM simulator)."""
+    a = np.transpose(a, dims[0:3])
+    b = np.transpose(b, (dims[3], dims[5], dims[4]))
+    return a @ b
 
 
 # ---- driver ----
@@ -441,6 +452,12 @@ def einsum(*operands, out=None, dtype=None, order="K", casting="safe", optimize=
     if not arrays:
         return _write_out(np.einsum(subscripts, *ops, dtype=dtype), out)
     res_dtype = _normalize_dtype(res_dtype)
+    if any(int(a.size) == 0 for a in arrays):
+        # nothing to multiply: zeros (empty sums) or an empty result, made on the host
+        host = [np.asarray(op) if _is_scalar_like(op) else np.zeros(s, dtype=d)
+                for op, s, d in zip(ops, shapes, dtypes)]
+        return _einsum_out(asarray(np.asarray(np.einsum(subscripts, *host)).astype(res_dtype)),
+                           out, casting)
 
     inputs, output = _parse(subscripts, shapes)
     sizes = {}
@@ -483,6 +500,10 @@ def einsum(*operands, out=None, dtype=None, order="K", casting="safe", optimize=
         x = x * np.asarray(factor).astype(res_dtype).item()
     if x.dtype != res_dtype:
         x = x.astype(res_dtype)
+    return _einsum_out(x, out, casting)
+
+
+def _einsum_out(x, out, casting):
     if out is not None and out.dtype != x.dtype:
         if not np.can_cast(x.dtype, out.dtype, casting=casting):
             raise TypeError(f"Cannot cast einsum output from {x.dtype} to {out.dtype}")
