@@ -3,9 +3,9 @@
 Each operand is first cleaned up: broadcast size-1 dims are dropped, repeated
 labels become diagonals, and labels found nowhere else are summed. Operands are
 then contracted pairwise in ``numpy.einsum_path`` order. A pair becomes a
-broadcast multiply when nothing is contracted, a side has no free labels, or
-the product is small; otherwise it becomes SUMMA (one per batch element on 3-D
-views). ``permute`` restores the output order.
+broadcast multiply when nothing is contracted or a side has no free labels;
+otherwise it becomes SUMMA, or one BATCHED_MATMUL node when there are batch
+labels. ``permute`` restores the output order.
 
 Deviations from NumPy: results are never views, ``order`` is ignored, and
 ``optimize=False`` contracts left to right.
@@ -19,6 +19,8 @@ import numpy as np
 from charmtyles.core import _shape_size
 
 from .charmnumeric import (
+    ArrayOperation,
+    _blas_dtype,
     _is_array_nd,
     _is_scalar_like,
     _normalize_dtype,
@@ -26,15 +28,10 @@ from .charmnumeric import (
     _transpose,
     _write_out,
     asarray,
-    empty,
+    nonfusible_op,
 )
 
 _LETTERS = string.ascii_letters
-
-# Limits for using one broadcast product instead of a matmul per batch element.
-_BCAST_IO_RATIO = 4
-_BCAST_MAX = 1 << 24
-_LOOP_MIN_BATCH = 64
 
 
 def _prod(values):
@@ -318,11 +315,8 @@ def _contract_pair(a, la, b, lb, keep, sizes, dtype, final=None):
     N = _prod([sizes[l] for l in fb])
     K = _prod([sizes[l] for l in con])
 
-    inter = Bt * M * N * K
-    io = Bt * (M * K + K * N + M * N)
     vector = M == 1 or N == 1
-    small = Bt > 1 and (inter <= _BCAST_IO_RATIO * io or (Bt > _LOOP_MIN_BATCH and inter <= _BCAST_MAX))
-    if K == 1 or vector or small:
+    if K == 1 or vector:
         if K > 1 and Bt == 1 and vector:
             if M == 1 and N == 1 and len(la) == len(lb) == 1:
                 return a @ b, []  # native dot
@@ -334,10 +328,12 @@ def _contract_pair(a, la, b, lb, keep, sizes, dtype, final=None):
             return _label_product(a, la, b, lb, keep, sizes, dtype, final)
         return _grouped_product(a, la, b, lb, batch, con, fa, fb, sizes, dtype)
 
-    # matmul: pick the orientation and batch position needing fewest transposes
+    # matmul: pick the orientation and operand layouts needing fewest transposes
     def layout(x, lx, free, left):
-        mat = [free, con] if left else [con, free]
-        cands = [[batch] + mat, [mat[0], batch, mat[1]], mat + [batch]] if Bt > 1 else [mat]
+        if Bt > 1:  # batched: any order with the batch dim not last
+            cands = [[batch, free, con], [batch, con, free], [free, batch, con], [con, batch, free]]
+        else:
+            cands = [[free, con] if left else [con, free]]
         return min(((_layout_cost(x, lx, g), g) for g in cands), key=lambda c: c[0])
 
     plans = []
@@ -355,14 +351,28 @@ def _contract_pair(a, la, b, lb, keep, sizes, dtype, final=None):
     if Bt == 1:
         r = px @ py
     else:
-        bx = next(i for i, g in enumerate(gx) if g is batch)
-        by = next(i for i, g in enumerate(gy) if g is batch)
-        Mx = _prod([sizes[l] for l in fx])
-        Ny = _prod([sizes[l] for l in fy])
-        r = empty((Bt, Mx, Ny), dtype=dtype)
-        for i in range(Bt):
-            r[i] = px[(slice(None),) * bx + (slice(i, i + 1),)] @ py[(slice(None),) * by + (slice(i, i + 1),)]
+        dims = [[next(i for i, h in enumerate(g) if h is grp) for grp in (batch, f, con)]
+                for g, f in ((gx, fx), (gy, fy))]
+        r = _bmm(px, dims[0], py, dims[1], dtype)
     return _shaped(r, out, sizes), out
+
+
+def _bmm(a, da, b, db, dtype):
+    """(batch, m, n) products; da / db: dims of a holding (batch, m, k), of b (batch, n, k)."""
+    compute = _blas_dtype(dtype)
+    a = a if a.dtype == compute else a.astype(compute)
+    b = b if b.dtype == compute else b.astype(compute)
+    shape = (int(a.shape[da[0]]), int(a.shape[da[1]]), int(b.shape[db[1]]))
+    r = nonfusible_op(a, b, *da, *db, *shape, operation=ArrayOperation.batched_matmul,
+                      shape=shape, dtype=compute)
+    return r if compute == dtype else r.astype(dtype)
+
+
+def bmm_reference(a, b, dims):
+    """NumPy model of a BATCHED_MATMUL node (CNUM_SIM simulator)."""
+    a = np.transpose(a, dims[0:3])
+    b = np.transpose(b, (dims[3], dims[5], dims[4]))
+    return a @ b
 
 
 # ---- driver ----
