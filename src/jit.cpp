@@ -9,7 +9,14 @@
 #include <limits>
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <sched.h>
+#include <set>
 #include <cerrno>
+#include <climits>
 #include <csignal>
 #include <ctime>
 #include <fcntl.h>
@@ -21,6 +28,7 @@
 
 #include "llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h"
 #include "llvm/Object/ObjectFile.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/DynamicLibrary.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -65,9 +73,13 @@ struct JitTimer {
     }
 };
 thread_local JitTimer* jitTimer = nullptr;
-// Set while jit_prewarm runs a cached kernel's constructors: CUDA failures there are
-// recorded here instead of aborting.
-thread_local bool* jitLoadFailed = nullptr;
+// Set while jit_prewarm runs a cached kernel's constructors: the first CUDA failure there
+// is recorded here instead of aborting (-1: not a CUDA error), with the modules loaded so far.
+struct SoftLoad {
+    int error = 0;
+    std::vector<void*> modules;
+};
+thread_local SoftLoad* jitSoftLoad = nullptr;
 void jitMark(const char* what) {
     if (jitTimer)
         jitTimer->mark(what);
@@ -90,7 +102,8 @@ const std::string& cubinDir();
 std::string cacheTmpName(const std::string& path) {
     char host[256] = {0};
     gethostname(host, sizeof(host) - 1);
-    return llvm::formatv("{0}.{1}.{2}.tmp", path, host, getpid()).str();
+    static std::atomic<unsigned> n{0}; // compile threads of a process
+    return llvm::formatv("{0}.{1}.{2}.{3}.tmp", path, host, getpid(), n++).str();
 }
 
 /// Publishes tmp as path unless path exists: an entry is never replaced, since
@@ -107,12 +120,23 @@ llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> readCacheFile(const std::stri
     return llvm::MemoryBuffer::getFile(path, /*IsText=*/false, /*RequiresNullTerminator=*/false,
                                        /*IsVolatile=*/true);
 }
+
+/// Refreshes an entry's mtime (recency for jit_prewarm and eviction) at most hourly, since
+/// the file system is shared.
+void touchCacheEntry(const std::string& path, std::time_t mtime = 0) {
+    struct stat st;
+    if (!mtime && stat(path.c_str(), &st) == 0)
+        mtime = st.st_mtime;
+    if (mtime && std::time(nullptr) - mtime > 3600)
+        utimes(path.c_str(), nullptr);
+}
 } // namespace
 
 namespace {
-// One context per process: per-kernel creation dominated compile time.
+// One context per thread (compiles run on CompilePool threads), kept: per-kernel creation
+// dominated compile time.
 mlir::MLIRContext& sharedContext() {
-    static mlir::MLIRContext* ctx = [] {
+    thread_local mlir::MLIRContext* ctx = [] {
         mlir::DialectRegistry registry;
         mlir::registerAllToLLVMIRTranslations(registry);
 #ifdef USE_NVIDIA
@@ -867,8 +891,10 @@ bool cnEnsureContext();
 
 /// The current device's sm with PTX ISA max(8.0, the sm's minimum), if both
 /// LLVM and the driver support them; else sm_80 PTX, which the driver JITs forward.
+/// Kernels embed a cubin for the device: sm and driver.
 struct NvTarget {
-    std::string chip, features;
+    std::string chip, features, device;
+    int driver;
 };
 NvTarget nvTarget() {
     thread_local CUdevice cachedDev = -1;
@@ -913,7 +939,9 @@ NvTarget nvTarget() {
              llvm::any_of(sti->getAllProcessorFeatures(),
                           [&](const llvm::SubtargetFeatureKV& f) { return feat == f.Key; });
     }
-    t = ok ? NvTarget{chip, "+" + feat} : NvTarget{"sm_80", "+ptx80"};
+    std::string device = llvm::formatv("{0} driver {1}", chip, driver).str();
+    t = ok ? NvTarget{chip, "+" + feat, device, driver}
+           : NvTarget{"sm_80", "+ptx80", device, driver};
     cachedDev = dev;
     return t;
 }
@@ -1046,7 +1074,8 @@ bool MLIRJitCompiler::lowerToNVIDIAHost() {
         op.erase();
     }
 
-    // 4. NVVM pipeline: kernels embed PTX (driver JITs it); host uses mgpu* calls.
+    // 4. NVVM pipeline: kernels embed PTX (generateNVIDIAHost assembles it); the host
+    //    uses mgpu* calls.
     jitMark("gpu-map");
     PassManager pm2(&context);
     gpu::GPUToNVVMPipelineOptions opts;
@@ -1110,19 +1139,26 @@ void cnCheck(CUresult r, const char* what) {
 bool cnOk(CUresult r, const char* what) {
     if (r == CUDA_SUCCESS)
         return true;
-    if (jitLoadFailed) {
-        *jitLoadFailed = true;
+    if (jitSoftLoad) {
+        if (!jitSoftLoad->error)
+            jitSoftLoad->error = r;
         return false;
     }
     cnCheck(r, what);
     return false;
 }
+/// The entry itself is bad (not e.g. out of memory): remove it.
+bool cnBadImage(int r) {
+    return r == CUDA_ERROR_INVALID_IMAGE || r == CUDA_ERROR_NO_BINARY_FOR_GPU ||
+           r == CUDA_ERROR_INVALID_PTX || r == CUDA_ERROR_INVALID_SOURCE ||
+           r == CUDA_ERROR_UNSUPPORTED_PTX_VERSION;
+}
 bool cnEnsureContext() {
     CUcontext ctx = nullptr;
     if (cuCtxGetCurrent(&ctx) == CUDA_SUCCESS && ctx)
         return true;
-    if (jitLoadFailed) { // jit_prewarm only loads into an existing context
-        *jitLoadFailed = true;
+    if (jitSoftLoad) { // jit_prewarm only loads into an existing context
+        cnOk(CUDA_ERROR_INVALID_CONTEXT, "");
         return false;
     }
     CUdevice dev;
@@ -1132,14 +1168,43 @@ bool cnEnsureContext() {
     cnCheck(cuCtxSetCurrent(ctx), "cuCtxSetCurrent");
     return true;
 }
+CUmodule cnLoaded(CUmodule m) {
+    if (jitSoftLoad)
+        jitSoftLoad->modules.push_back(m);
+    return m;
+}
 extern "C" CUmodule cn_mgpuModuleLoad(void* data, size_t) {
     CUmodule m = nullptr;
     if (!cnEnsureContext() || !cnOk(cuModuleLoadData(&m, data), "cuModuleLoadData"))
         return nullptr;
-    return m;
+    return cnLoaded(m);
 }
-/// PTX is assembled once per device architecture and driver; the cubin goes to
-/// the kernel cache (shared by all server builds).
+/// Assembles PTX for the current context's device with the driver's JIT; log gets its errors.
+CUresult cnPtxToCubin(llvm::StringRef ptx, int optLevel, std::string& cubin, std::string& log) {
+    char buf[4096] = {0};
+    CUjit_option opts[] = {CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+                           CU_JIT_OPTIMIZATION_LEVEL};
+    void* vals[] = {buf, reinterpret_cast<void*>(sizeof(buf)),
+                    reinterpret_cast<void*>(static_cast<intptr_t>(optLevel))};
+    CUlinkState link;
+    CUresult r = cuLinkCreate(3, opts, vals, &link);
+    if (r != CUDA_SUCCESS)
+        return r;
+    std::string text = ptx.str(); // NUL-terminated
+    void* out = nullptr;
+    size_t size = 0;
+    r = cuLinkAddData(link, CU_JIT_INPUT_PTX, text.data(), text.size() + 1, "fused_kernel", 0,
+                      nullptr, nullptr);
+    if (r == CUDA_SUCCESS)
+        r = cuLinkComplete(link, &out, &size);
+    if (r == CUDA_SUCCESS)
+        cubin.assign(static_cast<const char*>(out), size);
+    log = buf;
+    cuLinkDestroy(link);
+    return r;
+}
+/// Loads PTX (kernels whose cubin could not be embedded). It is assembled once per device
+/// architecture and driver; the cubin goes to the kernel cache (shared by all server builds).
 extern "C" CUmodule cn_mgpuModuleLoadJIT(void* data, int optLevel, size_t) {
     CUdevice dev;
     int cc[2] = {0, 0};
@@ -1157,42 +1222,36 @@ extern "C" CUmodule cn_mgpuModuleLoadJIT(void* data, int optLevel, size_t) {
         path = cubinDir() + "/" + llvm::toHex(h.final(), true) + ".cubin";
         if (auto buf = readCacheFile(path)) {
             CUmodule m = nullptr;
-            if (cuModuleLoadData(&m, (*buf)->getBufferStart()) == CUDA_SUCCESS)
-                return m;
-            unlink(path.c_str()); // corrupt entry: republished below
+            CUresult r = cuModuleLoadData(&m, (*buf)->getBufferStart());
+            if (r == CUDA_SUCCESS) {
+                touchCacheEntry(path);
+                return cnLoaded(m);
+            }
+            if (cnBadImage(r))
+                unlink(path.c_str()); // corrupt entry: republished below
+            else if (!cnOk(r, "cuModuleLoadData"))
+                return nullptr;
         }
     }
-    char log[4096] = {0};
-    CUjit_option opts[] = {CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
-                           CU_JIT_OPTIMIZATION_LEVEL};
-    void* vals[] = {log, reinterpret_cast<void*>(sizeof(log)),
-                    reinterpret_cast<void*>(static_cast<intptr_t>(optLevel))};
-    CUlinkState link;
-    if (!cnOk(cuLinkCreate(3, opts, vals, &link), "cuLinkCreate"))
-        return nullptr;
-    void* cubin = nullptr;
-    size_t size = 0;
-    if (cuLinkAddData(link, CU_JIT_INPUT_PTX, data, strlen(static_cast<const char*>(data)) + 1,
-                      "fused_kernel", 0, nullptr, nullptr) != CUDA_SUCCESS ||
-        cuLinkComplete(link, &cubin, &size) != CUDA_SUCCESS) {
-        if (jitLoadFailed) {
-            *jitLoadFailed = true;
-            cuLinkDestroy(link);
+    std::string cubin, log;
+    CUresult r =
+        cnPtxToCubin(llvm::StringRef(static_cast<const char*>(data)), optLevel, cubin, log);
+    if (r != CUDA_SUCCESS) {
+        if (jitSoftLoad) {
+            cnOk(r, "");
             return nullptr;
         }
         llvm::report_fatal_error(llvm::Twine("PTX JIT failed: ") + log);
     }
     CUmodule m = nullptr;
-    if (!cnOk(cuModuleLoadData(&m, cubin), "cuModuleLoadData")) {
-        cuLinkDestroy(link);
+    if (!cnOk(cuModuleLoadData(&m, cubin.data()), "cuModuleLoadData"))
         return nullptr;
-    }
     if (!path.empty()) {
         std::string tmp = cacheTmpName(path);
         std::error_code ec;
         llvm::raw_fd_ostream os(tmp, ec);
         if (!ec) {
-            os.write(static_cast<const char*>(cubin), size);
+            os << cubin;
             os.close();
             if (os.has_error()) {
                 os.clear_error();
@@ -1202,12 +1261,16 @@ extern "C" CUmodule cn_mgpuModuleLoadJIT(void* data, int optLevel, size_t) {
             }
         }
     }
-    cuLinkDestroy(link);
-    return m;
+    return cnLoaded(m);
 }
-extern "C" void cn_mgpuModuleUnload(CUmodule m) { cuModuleUnload(m); }
+extern "C" void cn_mgpuModuleUnload(CUmodule m) {
+    if (m)
+        cuModuleUnload(m);
+}
 extern "C" CUfunction cn_mgpuModuleGetFunction(CUmodule m, const char* name) {
     CUfunction f = nullptr;
+    if (!m && jitSoftLoad)
+        return nullptr;
     cnCheck(cuModuleGetFunction(&f, m, name), "cuModuleGetFunction");
     return f;
 }
@@ -1246,6 +1309,28 @@ std::unique_ptr<mlir::ExecutionEngine> MLIRJitCompiler::generateNVIDIAHost() {
         llvm::errs() << "generateNVIDIAHost: GPU lowering failed\n";
         return nullptr;
     }
+    // Embed cubins instead of PTX, so loading does not run the driver's JIT. A failure
+    // keeps the PTX (mgpuModuleLoadJIT then reports it).
+    module->walk([&](mlir::gpu::BinaryOp bin) {
+        llvm::SmallVector<mlir::Attribute> objects;
+        for (mlir::Attribute a : bin.getObjectsAttr()) {
+            auto obj = mlir::dyn_cast<mlir::gpu::ObjectAttr>(a);
+            std::string cubin, log;
+            int opt = 2; // as mgpuModuleLoadJIT gets it
+            if (auto props = obj ? obj.getProperties() : nullptr)
+                if (auto o = mlir::dyn_cast_or_null<mlir::IntegerAttr>(props.get("O")))
+                    opt = o.getInt();
+            if (obj && obj.getFormat() == mlir::gpu::CompilationTarget::Assembly &&
+                cnPtxToCubin(obj.getObject().getValue(), opt, cubin, log) == CUDA_SUCCESS)
+                a = mlir::gpu::ObjectAttr::get(&context, obj.getTarget(),
+                                               mlir::gpu::CompilationTarget::Binary,
+                                               mlir::StringAttr::get(&context, cubin),
+                                               obj.getProperties(), obj.getKernels());
+            objects.push_back(a);
+        }
+        bin.setObjectsAttr(mlir::ArrayAttr::get(&context, objects));
+    });
+    jitMark("cubin");
 
     llvm::InitializeNativeTarget();
     llvm::InitializeNativeTargetAsmPrinter();
@@ -2184,9 +2269,149 @@ std::string cacheBase() {
         d = std::string(xdg) + "/charmnumeric/jit";
     else if (home && *home)
         d = std::string(home) + "/.cache/charmnumeric/jit";
-    else
+    else {
         d = llvm::formatv("/tmp/cnum-jit-{0}", getuid()).str();
-    return d;
+        struct stat st;
+        if ((mkdir(d.c_str(), 0700) != 0 && errno != EEXIST) || lstat(d.c_str(), &st) != 0 ||
+            !S_ISDIR(st.st_mode) || st.st_uid != getuid() ||
+            ((st.st_mode & 077) && chmod(d.c_str(), 0700) != 0))
+            return {};
+    }
+    // one spelling (absolute, no dots or trailing separators), so paths built on it compare
+    llvm::SmallString<256> p(d);
+    if (llvm::sys::fs::make_absolute(p))
+        return {};
+    llvm::sys::path::remove_dots(p, /*remove_dot_dot=*/true);
+    while (p.size() > 1 && llvm::sys::path::is_separator(p.back()))
+        p.pop_back();
+    return std::string(p);
+}
+
+// Marks a dedicated cache root; evictCache only runs on marked roots.
+constexpr const char* kCacheMarker = ".cnum-jit-cache";
+
+bool isLowerHex(llvm::StringRef n) {
+    return llvm::all_of(n, [](char c) { return llvm::isDigit(c) || (c >= 'a' && c <= 'f'); });
+}
+
+/// A serverBuildId(): GNU build id, or "<size>-<mtime>".
+bool isBuildIdName(llvm::StringRef n) {
+    if ((n.size() == 16 || n.size() == 32 || n.size() == 40 || n.size() == 64) && isLowerHex(n))
+        return true;
+    auto [a, b] = n.split('-');
+    return !a.empty() && !b.empty() && llvm::all_of(a, llvm::isDigit) &&
+           llvm::all_of(b, llvm::isDigit);
+}
+
+/// A targetCacheDir() tag: [sm_<n>+ptx<n>-[sm_<n>-][d<driver>-]]<host CPU>.
+bool isTargetName(llvm::StringRef n) {
+    auto sm = [](llvm::StringRef& s) {
+        if (!s.consume_front("sm_") || s.empty() || !llvm::isDigit(s.front()))
+            return false;
+        s = s.drop_while(llvm::isDigit);
+        if (!s.empty() && s.front() >= 'a' && s.front() <= 'z')
+            s = s.drop_front();
+        return true;
+    };
+    auto number = [](llvm::StringRef& s) {
+        size_t k = s.find_if_not(llvm::isDigit);
+        bool ok = k > 0 && k != llvm::StringRef::npos && s[k] == '-';
+        s = ok ? s.drop_front(k + 1) : s;
+        return ok;
+    };
+    if (n.starts_with("sm_")) {
+        if (!sm(n) || !n.consume_front("+ptx") || !number(n))
+            return false;
+        llvm::StringRef t = n;
+        if (sm(t) && t.consume_front("-"))
+            n = t;
+        t = n;
+        if (t.consume_front("d") && number(t))
+            n = t;
+    }
+    return !n.empty() && n.size() <= 64 && llvm::isAlnum(n.front()) &&
+           llvm::all_of(n, [](char c) {
+               return llvm::isDigit(c) || (c >= 'a' && c <= 'z') || c == '-' || c == '_' ||
+                      c == '.';
+           });
+}
+
+/// What a file of a cache directory is; eviction deletes nothing else.
+enum class CacheFile { Other, Entry, Temp };
+/// Entries are <sha256>.o and <sha256>.cubin; temporaries are their cacheTmpName()s and
+/// compile claims (<sha256>.o.lock).
+CacheFile cacheFileKind(llvm::StringRef n) {
+    if (n.size() < 66 || !isLowerHex(n.take_front(64)))
+        return CacheFile::Other;
+    llvm::StringRef rest = n.drop_front(64);
+    if (rest == ".o" || rest == ".cubin")
+        return CacheFile::Entry;
+    if (rest == ".o.lock")
+        return CacheFile::Temp;
+    if (!(rest.consume_front(".o.") || rest.consume_front(".cubin.")) ||
+        !rest.consume_back(".tmp"))
+        return CacheFile::Other;
+    // <host>.<pid>[.<n>]
+    auto digits = [](llvm::StringRef x) { return !x.empty() && llvm::all_of(x, llvm::isDigit); };
+    auto [h1, n1] = rest.rsplit('.');
+    if (!digits(n1))
+        return CacheFile::Other;
+    auto [h2, n2] = h1.rsplit('.');
+    llvm::StringRef host = digits(n2) && !h2.empty() ? h2 : h1;
+    bool ok = !host.empty() && llvm::all_of(host, [](char c) {
+        return llvm::isAlnum(c) || c == '-' || c == '_' || c == '.';
+    });
+    return ok ? CacheFile::Temp : CacheFile::Other;
+}
+
+/// True if dir holds only cache files (fileOnly) or, recursively, the cache layout: cubin/,
+/// build directories with target directories (and entries of the layout before them).
+bool looksLikeCache(const std::string& dir, int level) {
+    namespace fs = llvm::sys::fs;
+    std::error_code ec;
+    for (fs::directory_iterator it(dir, ec, false), end; it != end && !ec; it.increment(ec)) {
+        fs::file_status st;
+        if (fs::status(it->path(), st, /*Follow=*/false))
+            return false;
+        llvm::StringRef n = llvm::sys::path::filename(it->path());
+        bool isDir = st.type() == fs::file_type::directory_file;
+        bool ok;
+        if (level == 0) // the root
+            ok = isDir ? (n == "cubin" ? looksLikeCache(it->path(), 2)
+                                       : isBuildIdName(n) && looksLikeCache(it->path(), 1))
+                       : st.type() == fs::file_type::regular_file &&
+                             (n == ".last-evict" || n == ".evict-lock");
+        else if (isDir) // a build directory's target directory
+            ok = level == 1 && isTargetName(n) && looksLikeCache(it->path(), 2);
+        else
+            ok = st.type() == fs::file_type::regular_file &&
+                 cacheFileKind(n) != CacheFile::Other;
+        if (!ok)
+            return false;
+    }
+    return !ec;
+}
+
+/// Marks base as a dedicated cache when it is new or empty, when it has exactly the cache
+/// layout (a cache from before the marker), or with CNUM_JIT_CACHE_ADOPT=1. Any other
+/// directory is used but never evicted.
+void markCacheBase(const std::string& base) {
+    static std::once_flag once;
+    std::call_once(once, [&] {
+        namespace fs = llvm::sys::fs;
+        std::string marker = base + "/" + kCacheMarker;
+        if (fs::exists(marker))
+            return;
+        const char* adopt = getenv("CNUM_JIT_CACHE_ADOPT");
+        if (fs::exists(base) && !(adopt && std::string(adopt) == "1") &&
+            !looksLikeCache(base, 0))
+            return;
+        if (fs::create_directories(base))
+            return;
+        int fd = open(marker.c_str(), O_CREAT | O_WRONLY, 0644);
+        if (fd >= 0)
+            close(fd);
+    });
 }
 
 /// base/sub, created; "" when the cache is off or the directory cannot be made.
@@ -2194,6 +2419,7 @@ std::string cacheSubdir(const std::string& sub) {
     std::string d = cacheBase();
     if (d.empty())
         return {};
+    markCacheBase(d);
     d += "/" + sub;
     if (llvm::sys::fs::create_directories(d))
         return {};
@@ -2215,7 +2441,9 @@ std::string targetCacheDir() {
     std::string tag = llvm::sys::getHostCPUName().str();
 #ifdef USE_NVIDIA
     NvTarget target = nvTarget();
-    tag = target.chip + target.features + "-" + tag;
+    llvm::StringRef sm = llvm::StringRef(target.device).split(' ').first;
+    tag = target.chip + target.features + (sm == target.chip ? "" : "-" + sm.str()) + "-d" +
+          std::to_string(target.driver) + "-" + tag;
 #endif
     std::string dir = cacheDir() + "/" + tag;
     thread_local std::string made;
@@ -2237,7 +2465,7 @@ std::string cachePath(const std::string& ir) {
     h.update(ir);
 #ifdef USE_NVIDIA
     NvTarget target = nvTarget();
-    h.update("nvidia " + target.chip + " " + target.features);
+    h.update("nvidia " + target.chip + " " + target.features + " cubin " + target.device);
 #endif
     h.update(llvm::sys::getHostCPUName());
     return dir + "/" + llvm::toHex(h.final(), true) + ".o";
@@ -2254,10 +2482,13 @@ llvm::orc::SymbolMap runtimeSymbols(llvm::orc::MangleAndInterner interner) {
 /// Loads a cached kernel object (running its constructors, which load the GPU
 /// binary); nullptr if that fails. With soft, CUDA failures in the constructors fail the
 /// load instead of aborting. Entries that fail to load are removed.
-void* loadCachedKernel(const std::string& path, void** moduleOut, bool soft = false) {
+void* loadCachedKernel(const std::string& path, void** moduleOut, bool soft = false,
+                       bool* found = nullptr) {
     auto buf = readCacheFile(path);
     if (!buf)
         return nullptr;
+    if (found)
+        *found = true;
     // ctors were turned into __orc_init_func.* functions when the object was built
     std::vector<std::string> inits;
     {
@@ -2334,22 +2565,29 @@ void* loadCachedKernel(const std::string& path, void** moduleOut, bool soft = fa
         return nullptr;
     }
     jitMark("c-link");
-    bool failed = false;
-    jitLoadFailed = soft ? &failed : nullptr;
+    SoftLoad sl;
+    jitSoftLoad = soft ? &sl : nullptr;
     for (const std::string& name : inits) {
         auto init = (*jit)->lookup(name);
         if (!init) {
             llvm::consumeError(init.takeError());
-            failed = true;
+            sl.error = -1;
             break;
         }
         init->toPtr<void (*)()>()();
-        if (failed)
+        if (sl.error)
             break;
     }
-    jitLoadFailed = nullptr;
-    if (failed) {
-        unlink(path.c_str());
+    jitSoftLoad = nullptr;
+    if (sl.error) {
+        bool bad = sl.error < 0;
+#ifdef USE_NVIDIA
+        bad = bad || cnBadImage(sl.error);
+        for (void* m : sl.modules)
+            cuModuleUnload(static_cast<CUmodule>(m));
+#endif
+        if (bad) // else transient (e.g. out of memory): keep the entry
+            unlink(path.c_str());
         return nullptr;
     }
     *moduleOut = new JitModule{nullptr, std::move(*jit)};
@@ -2408,63 +2646,20 @@ std::mutex& jitMutex() {
 }
 } // namespace
 
-static void* jit_compile_ast_impl(void* ast, void** moduleHandleOut);
+namespace {
+const bool jitTimeIt = getenv("CNUM_JIT_TIME") != nullptr;
 
-void* jit_compile_ast(void* ast, void** moduleHandleOut) {
-    static const bool timeIt = getenv("CNUM_JIT_TIME") != nullptr;
-    JitTimer timer;
-    jitTimer = timeIt ? &timer : nullptr;
-    void* fn;
-    {
-        std::lock_guard<std::mutex> lock(jitMutex());
-        fn = jit_compile_ast_impl(ast, moduleHandleOut);
-    }
-    if (timeIt && !timer.line.empty())
-        llvm::errs() << "jit:" << timer.line << "\n";
-    jitTimer = nullptr;
-    return fn;
-}
+/// What a waiter saw of another server's claim.
+struct LockWatch {
+    struct timespec mtime = {0, 0};
+    std::chrono::steady_clock::time_point since;
+    bool seen = false;
+};
 
-static void* jit_compile_ast_impl(void* ast, void** moduleHandleOut) {
+/// Compiles ast; the kernel goes to the disk cache at path unless that is "".
+void* compileKernel(void* ast, const std::string& path, void** moduleHandleOut) {
     MLIRJitCompiler node_jit;
     node_jit.buildFromAST(ast);
-    // Kernels take every array as a dynamic memref, so equal IR means an equal kernel.
-    std::string key;
-    {
-        llvm::raw_string_ostream os(key);
-        node_jit.printModule(os);
-    }
-    auto hit = kernelCache().find(key);
-    if (hit != kernelCache().end()) {
-        *moduleHandleOut = hit->second.first;
-        return hit->second.second;
-    }
-    jitMark("build");
-#if !defined(USE_AMD) && !defined(USE_INTEL)
-    std::string path = cachePath(key);
-    if (!path.empty()) {
-        void* fn = nullptr;
-        std::time_t mtime = 0;
-        auto pre = preloadedKernels().find(path);
-        if (pre != preloadedKernels().end()) {
-            *moduleHandleOut = pre->second.module;
-            fn = pre->second.fn;
-            mtime = pre->second.mtime;
-            preloadedKernels().erase(pre);
-        } else if ((fn = loadCachedKernel(path, moduleHandleOut))) {
-            struct stat st;
-            mtime = stat(path.c_str(), &st) == 0 ? st.st_mtime : std::time(nullptr);
-        }
-        if (fn) {
-            // recency orders jit_prewarm and eviction; touched at most hourly (shared file system)
-            if (std::time(nullptr) - mtime > 3600)
-                utimes(path.c_str(), nullptr);
-            jitMark("cache");
-            kernelCache().emplace(std::move(key), std::make_pair(*moduleHandleOut, fn));
-            return fn;
-        }
-    }
-#endif
     if (!node_jit.verify())
         return nullptr;
     node_jit.optimizeAndFuse();
@@ -2501,10 +2696,435 @@ static void* jit_compile_ast_impl(void* ast, void** moduleHandleOut) {
     jitMark("load");
 #if !defined(USE_AMD) && !defined(USE_INTEL)
     storeCachedKernel(path, moduleHandle);
+    jitMark("store");
 #endif
-    kernelCache().emplace(std::move(key), std::make_pair(moduleHandle, funcPtr));
     *moduleHandleOut = moduleHandle;
     return funcPtr;
+}
+
+#if !defined(USE_AMD) && !defined(USE_INTEL)
+/// A pre-warmed or disk-cached kernel; nullptr if there is none or it does not load. CUDA
+/// failures do not abort: invalid entries are removed, and *kept is set when an entry
+/// stays that could not be loaded (e.g. out of memory).
+void* loadCached(const std::string& path, void** moduleHandleOut, bool* kept = nullptr) {
+    if (path.empty())
+        return nullptr;
+    void* fn = nullptr;
+    std::time_t mtime = 0;
+    auto pre = preloadedKernels().find(path);
+    if (pre != preloadedKernels().end()) {
+        *moduleHandleOut = pre->second.module;
+        fn = pre->second.fn;
+        mtime = pre->second.mtime;
+        preloadedKernels().erase(pre);
+    } else {
+        bool found = false;
+        fn = loadCachedKernel(path, moduleHandleOut, /*soft=*/true, &found);
+        if (!fn) {
+            if (kept && found)
+                *kept = llvm::sys::fs::exists(path);
+            return nullptr;
+        }
+    }
+    touchCacheEntry(path, mtime);
+    jitMark("cache");
+    return fn;
+}
+
+/// The process's CPUs at startup, before Charm++ may pin the PE thread (+setcpuaffinity):
+/// compile threads run on all of them.
+struct StartupCpus {
+    cpu_set_t set;
+    bool ok;
+    StartupCpus() { ok = sched_getaffinity(0, sizeof(set), &set) == 0; }
+} startupCpus;
+
+/// Threads that compile kernels, made on demand and kept (each has its own MLIR context);
+/// big stacks, since LLVM codegen recursion grows with loop count. CNUM_JIT_THREADS sets
+/// their number (default: this process's CPUs, at most 8).
+class CompilePool {
+  public:
+    static CompilePool& get() {
+        static CompilePool* pool = new CompilePool;
+        return *pool;
+    }
+    int size() const { return max_; }
+    /// Runs the jobs, on the calling thread if no thread can be made.
+    void run(std::vector<std::function<void()>>& jobs) {
+        std::unique_lock<std::mutex> lk(m_);
+        while (threads_ < max_ && threads_ < static_cast<int>(jobs.size()) && spawn())
+            ++threads_;
+        if (threads_ == 0) {
+            lk.unlock();
+            for (auto& job : jobs)
+                job();
+            return;
+        }
+        for (auto& job : jobs)
+            queue_.push_back(&job);
+        pending_ += jobs.size();
+        work_.notify_all();
+        done_.wait(lk, [&] { return pending_ == 0; });
+    }
+
+  private:
+    CompilePool() {
+        int n = 8;
+        if (startupCpus.ok)
+            n = std::min(n, CPU_COUNT(&startupCpus.set));
+        if (const char* e = getenv("CNUM_JIT_THREADS"))
+            if (atoi(e) > 0)
+                n = atoi(e);
+        max_ = std::max(n, 1);
+    }
+    bool spawn() {
+        pthread_attr_t attr;
+        pthread_t t;
+        if (pthread_attr_init(&attr) != 0)
+            return false;
+        // the threads take no signals (they belong to the Charm++ scheduler thread)
+        sigset_t all, old;
+        sigfillset(&all);
+        pthread_sigmask(SIG_BLOCK, &all, &old);
+        auto body = [](void* pool) -> void* {
+            static_cast<CompilePool*>(pool)->work();
+            return nullptr;
+        };
+        bool ok = pthread_attr_setstacksize(&attr, size_t(1) << 30) == 0 &&
+                  (!startupCpus.ok || pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t),
+                                                                  &startupCpus.set) == 0) &&
+                  pthread_create(&t, &attr, body, this) == 0;
+        pthread_sigmask(SIG_SETMASK, &old, nullptr);
+        pthread_attr_destroy(&attr);
+        if (ok)
+            pthread_detach(t);
+        return ok;
+    }
+    void work() {
+        std::unique_lock<std::mutex> lk(m_);
+        for (;;) {
+            work_.wait(lk, [&] { return !queue_.empty(); });
+            std::function<void()>* job = queue_.front();
+            queue_.pop_front();
+            lk.unlock();
+            try {
+                (*job)();
+            } catch (...) { // the job's kernel stays missing
+            }
+            lk.lock();
+            if (--pending_ == 0)
+                done_.notify_all();
+        }
+    }
+    std::mutex m_;
+    std::condition_variable work_, done_;
+    std::deque<std::function<void()>*> queue_;
+    size_t pending_ = 0;
+    int threads_ = 0, max_ = 1;
+};
+
+const std::string& hostName() {
+    static const std::string name = [] {
+        char host[256] = {0};
+        gethostname(host, sizeof(host) - 1);
+        return std::string(host);
+    }();
+    return name;
+}
+
+/// Compile claims: <entry>.lock, created exclusively and held while a server compiles the
+/// entry, so the servers sharing a cache compile each kernel once. Holders refresh the
+/// lock's mtime every 2 s.
+class Claims {
+  public:
+    static Claims& get() {
+        static Claims* claims = new Claims;
+        return *claims;
+    }
+    /// The claim's fd; -1 if another server holds it, -2 if it cannot be made here.
+    int take(const std::string& lock) {
+        int fd = open(lock.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
+        if (fd < 0)
+            return errno == EEXIST ? -1 : -2;
+        std::string id = hostName() + " " + std::to_string(getpid()) + "\n";
+        ssize_t written = write(fd, id.data(), id.size());
+        (void)written;
+        std::lock_guard<std::mutex> g(m_);
+        held_.insert(lock);
+        if (!beating_)
+            beating_ = startHeartbeat();
+        return fd;
+    }
+    /// Removes the lock unless it was broken and taken by someone else meanwhile.
+    void release(int fd, const std::string& lock) {
+        if (fd < 0)
+            return;
+        struct stat a, b;
+        if (fstat(fd, &a) == 0 && stat(lock.c_str(), &b) == 0 && a.st_ino == b.st_ino &&
+            a.st_dev == b.st_dev)
+            unlink(lock.c_str());
+        close(fd);
+        std::lock_guard<std::mutex> g(m_);
+        held_.erase(lock);
+    }
+
+  private:
+    bool startHeartbeat() {
+        sigset_t all, old;
+        sigfillset(&all);
+        pthread_sigmask(SIG_BLOCK, &all, &old);
+        bool ok = true;
+        try {
+            std::thread([this] {
+                for (;;) {
+                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                    std::set<std::string> held;
+                    {
+                        std::lock_guard<std::mutex> g(m_);
+                        held = held_;
+                    }
+                    for (const std::string& lock : held)
+                        utimes(lock.c_str(), nullptr);
+                }
+            }).detach();
+        } catch (...) {
+            ok = false;
+        }
+        pthread_sigmask(SIG_SETMASK, &old, nullptr);
+        return ok;
+    }
+    std::mutex m_;
+    std::set<std::string> held_;
+    bool beating_ = false;
+};
+
+/// False once the process is gone, exiting (a killed GPU process can take many seconds to
+/// tear down) or a zombie (not reaped yet, e.g. under a launcher).
+bool processAlive(int pid) {
+    if (kill(pid, 0) != 0)
+        return errno != ESRCH;
+    auto stat = llvm::MemoryBuffer::getFileAsStream("/proc/" + std::to_string(pid) + "/stat");
+    if (!stat)
+        return true;
+    // after "(comm)": state ppid pgrp session tty_nr tpgid flags
+    llvm::SmallVector<llvm::StringRef, 8> f;
+    (*stat)->getBuffer().rsplit(')').second.ltrim().split(f, ' ', 7);
+    unsigned long flags = 0;
+    constexpr unsigned long PF_EXITING = 0x4;
+    if (f.size() > 6 && !f[6].getAsInteger(10, flags) && (flags & PF_EXITING))
+        return false;
+    return f.empty() || (!f[0].starts_with("Z") && !f[0].starts_with("X"));
+}
+
+/// True if the claim lock is gone, or stale and then removed: its holder died on this host,
+/// or its mtime stood still for 30 s (no heartbeat; 6 s for a holder on this host or a lock
+/// without its holder, which died between creating and writing it), or for 5 s and it is
+/// 2 min old (by the local clock, so only with an observed standstill).
+bool lockFree(const std::string& lock, LockWatch& w) {
+    int fd = open(lock.c_str(), O_RDONLY); // not stat: opening revalidates NFS attributes
+    if (fd < 0)
+        return errno == ENOENT;
+    struct stat st;
+    char buf[300] = {0};
+    bool ok = fstat(fd, &st) == 0;
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (!ok)
+        return false;
+    auto now = std::chrono::steady_clock::now();
+    bool stale = false;
+    llvm::StringRef id(buf, n > 0 ? n : 0);
+    auto [host, pid] = id.trim().split(' ');
+    int p = 0;
+    bool here = host == hostName();
+    if (here && !pid.getAsInteger(10, p) && p > 0 && !processAlive(p))
+        stale = true;
+    if (!w.seen || st.st_mtim.tv_sec != w.mtime.tv_sec || st.st_mtim.tv_nsec != w.mtime.tv_nsec) {
+        w = {st.st_mtim, now, true};
+    } else if (now - w.since > std::chrono::seconds(here || id.trim().empty() ? 6 : 30) ||
+               (now - w.since > std::chrono::seconds(5) &&
+                std::time(nullptr) - st.st_mtime > 120)) {
+        stale = true;
+    }
+    if (stale)
+        unlink(lock.c_str());
+    return stale;
+}
+#endif
+} // namespace
+
+void* jit_compile_ast(void* ast, void** moduleHandleOut) {
+    void* fn = nullptr;
+    jit_compile_batch(&ast, 1, &fn, moduleHandleOut);
+    return fn;
+}
+
+void jit_compile_batch(void* const* asts, int n, void** fns, void** moduleHandles) {
+    std::lock_guard<std::mutex> lock(jitMutex());
+    struct Item {
+        std::string key, path;
+        int same = -1; // index of the item with the same kernel
+        bool local = false; // compile without a claim
+        int fd = -1;
+        LockWatch watch;
+        std::chrono::steady_clock::time_point waitStart;
+    };
+    std::vector<Item> items(n);
+    std::unordered_map<std::string, int> first;
+    std::vector<int> todo;
+    for (int i = 0; i < n; ++i) {
+        Item& it = items[i];
+        fns[i] = moduleHandles[i] = nullptr;
+        JitTimer timer;
+        jitTimer = jitTimeIt ? &timer : nullptr;
+        {
+            MLIRJitCompiler node_jit;
+            node_jit.buildFromAST(asts[i]);
+            // Kernels take every array as a dynamic memref, so equal IR means an equal kernel.
+            llvm::raw_string_ostream os(it.key);
+            node_jit.printModule(os);
+        }
+        auto hit = kernelCache().find(it.key);
+        auto dup = first.find(it.key);
+        if (hit != kernelCache().end()) {
+            moduleHandles[i] = hit->second.first;
+            fns[i] = hit->second.second;
+        } else if (dup != first.end()) {
+            it.same = dup->second;
+        } else {
+            first.emplace(it.key, i);
+            jitMark("build");
+#if !defined(USE_AMD) && !defined(USE_INTEL)
+            it.path = cachePath(it.key);
+            fns[i] = loadCached(it.path, &moduleHandles[i], &it.local);
+#endif
+            if (fns[i])
+                kernelCache().emplace(it.key, std::make_pair(moduleHandles[i], fns[i]));
+            else
+                todo.push_back(i);
+        }
+        jitTimer = nullptr;
+        if (jitTimeIt && !timer.line.empty() && !std::count(todo.begin(), todo.end(), i))
+            llvm::errs() << "jit:" + timer.line + "\n";
+    }
+
+    if (!todo.empty()) {
+        auto t0 = std::chrono::steady_clock::now();
+        int compiled = 0, rounds = 0, width = 1;
+#if !defined(USE_AMD) && !defined(USE_INTEL)
+        // Servers sharing the cache split the kernels: each claims up to a pool's worth,
+        // compiles them in parallel and loads the others' once published. A waiter breaks
+        // stale claims (lockFree), and compiles without a claim after CNUM_JIT_WAIT_S (600) s
+        // or when a published entry does not load here.
+        width = CompilePool::get().size();
+        static const double maxWait = [] {
+            const char* e = getenv("CNUM_JIT_WAIT_S");
+            return e && atof(e) > 0 ? atof(e) : 600.0;
+        }();
+        // target registration is not thread-safe (a race can corrupt the registry's list)
+        llvm::InitializeNativeTarget();
+        llvm::InitializeNativeTargetAsmPrinter();
+#ifdef USE_NVIDIA
+        LLVMInitializeNVPTXTargetInfo();
+        LLVMInitializeNVPTXTarget();
+        LLVMInitializeNVPTXTargetMC();
+        LLVMInitializeNVPTXAsmPrinter();
+        cnEnsureContext();
+        CUcontext ctx = nullptr;
+        cuCtxGetCurrent(&ctx);
+#endif
+        std::rotate(todo.begin(), todo.begin() + getpid() % todo.size(), todo.end());
+        for (int i : todo)
+            items[i].waitStart = t0;
+        auto pause = std::chrono::milliseconds(10); // between polls; doubles up to 200 ms
+        while (!todo.empty()) {
+            auto now = std::chrono::steady_clock::now();
+            std::vector<int> mine, waiting;
+            for (int i : todo) {
+                Item& it = items[i];
+                std::string lockPath = it.path + ".lock";
+                // opened, not stat'ed: no stale negative NFS lookups
+                if (rounds > 0 && !it.local &&
+                    (fns[i] = loadCached(it.path, &moduleHandles[i], &it.local)))
+                    continue;
+                if (static_cast<int>(mine.size()) >= width) {
+                    waiting.push_back(i);
+                    continue;
+                }
+                int fd = -2;
+                if (!it.path.empty() && !it.local) {
+                    fd = rounds == 0 || lockFree(lockPath, it.watch)
+                             ? Claims::get().take(lockPath)
+                             : -1;
+                    if (fd == -1 &&
+                        std::chrono::duration<double>(now - it.waitStart).count() > maxWait)
+                        fd = -2;
+                }
+                if (fd == -1) {
+                    waiting.push_back(i);
+                    continue;
+                }
+                // claimed: the entry may have been published since it was looked up
+                if (fd >= 0 && (fns[i] = loadCached(it.path, &moduleHandles[i], &it.local))) {
+                    Claims::get().release(fd, lockPath);
+                    continue;
+                }
+                it.fd = fd;
+                mine.push_back(i);
+            }
+            if (!mine.empty()) {
+                std::vector<std::function<void()>> jobs;
+                for (int i : mine)
+                    jobs.push_back([&, i] {
+                        struct Release { // the claim, also if the compile throws
+                            int fd;
+                            std::string lock;
+                            ~Release() { Claims::get().release(fd, lock); }
+                        } release{items[i].fd, items[i].path + ".lock"};
+#ifdef USE_NVIDIA
+                        cuCtxSetCurrent(ctx);
+#endif
+                        JitTimer timer;
+                        jitTimer = jitTimeIt ? &timer : nullptr;
+                        fns[i] = compileKernel(asts[i], items[i].path, &moduleHandles[i]);
+                        jitTimer = nullptr;
+                        if (jitTimeIt)
+                            llvm::errs() << "jit:" + timer.line + "\n";
+                    });
+                CompilePool::get().run(jobs);
+                compiled += mine.size();
+            }
+            if (!waiting.empty() && mine.empty() && waiting.size() == todo.size()) {
+                std::this_thread::sleep_for(pause);
+                pause = std::min(pause * 2, std::chrono::milliseconds(200));
+            } else {
+                pause = std::chrono::milliseconds(10);
+            }
+            todo.swap(waiting);
+            ++rounds;
+        }
+#else
+        for (int i : todo)
+            fns[i] = compileKernel(asts[i], "", &moduleHandles[i]);
+        compiled = todo.size();
+#endif
+        for (int i = 0; i < n; ++i)
+            if (items[i].same < 0 && fns[i])
+                kernelCache().emplace(items[i].key, std::make_pair(moduleHandles[i], fns[i]));
+        if (jitTimeIt)
+            llvm::errs() << llvm::formatv("jit batch: {0} kernels, {1} compiled here, {2} rounds, "
+                                          "{3:F1} ms, {4} threads\n",
+                                          n, compiled, rounds,
+                                          std::chrono::duration<double, std::milli>(
+                                              std::chrono::steady_clock::now() - t0)
+                                              .count(),
+                                          width);
+    }
+    for (int i = 0; i < n; ++i)
+        if (items[i].same >= 0) {
+            fns[i] = fns[items[i].same];
+            moduleHandles[i] = moduleHandles[items[i].same];
+        }
 }
 
 int jit_prewarm(double budget_ms) {
@@ -2529,7 +3149,8 @@ int jit_prewarm(double budget_ms) {
         for (llvm::sys::fs::directory_iterator it(dir, ec), end;
              it != end && !ec && ++seen <= kScan && spent() < budget_ms; it.increment(ec)) {
             llvm::sys::fs::file_status st;
-            if (llvm::sys::path::extension(it->path()) == ".o" &&
+            llvm::StringRef name = llvm::sys::path::filename(it->path());
+            if (cacheFileKind(name) == CacheFile::Entry && name.ends_with(".o") &&
                 !llvm::sys::fs::status(it->path(), st))
                 files.emplace_back(st.getLastModificationTime(), it->path());
         }
@@ -2563,6 +3184,18 @@ void evictCache(std::string base, std::string current) {
     // exited first; then it is taken over after 10 minutes and the next pass resumes).
     std::string stamp = base + "/.last-evict", lock = base + "/.evict-lock";
     fs::file_status st;
+    char real[PATH_MAX], home[PATH_MAX];
+    const char* h = getenv("HOME");
+    if (!llvm::sys::path::is_absolute(base) || !realpath(base.c_str(), real) ||
+        std::string(real) == "/" || (h && realpath(h, home) && std::string(real) == home))
+        return;
+    if (!fs::exists(base + "/" + kCacheMarker)) {
+        fprintf(stderr,
+                "jit cache: %s is not marked %s (it held other files when first used); "
+                "it is not evicted\n",
+                base.c_str(), kCacheMarker);
+        return;
+    }
     if (!fs::status(stamp, st) && age(st.getLastModificationTime()) < 3600)
         return;
     int fd = open(lock.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
@@ -2585,10 +3218,10 @@ void evictCache(std::string base, std::string current) {
     size_t removed = 0;
     auto remove = [&](const std::string& p) { removed += !fs::remove(p); };
 
-    // Entries (.o, .cubin) of dir go to out; stale .tmp files go, and with legacy the .o
-    // files too (the layout before per-target directories). Returns the newest mtime.
+    // Entries of dir go to out and temporaries an hour old are removed; other files are
+    // left alone. Returns the newest mtime.
     std::vector<std::pair<TimePoint, std::string>> entries;
-    auto scan = [&](const std::string& dir, bool legacy, decltype(entries)& out,
+    auto scan = [&](const std::string& dir, decltype(entries)& out,
                     std::vector<std::string>* subdirs) {
         TimePoint newest{};
         if (!fs::status(dir, st))
@@ -2603,46 +3236,66 @@ void evictCache(std::string base, std::string current) {
                     subdirs->push_back(p);
                 continue;
             }
-            auto ext = llvm::sys::path::extension(p);
             TimePoint mt = st.getLastModificationTime();
-            if (ext == ".tmp") {
-                if (age(mt) > 3600)
-                    remove(p);
-            } else if (ext == ".o" || ext == ".cubin") {
-                if (legacy) {
-                    remove(p);
-                } else {
-                    newest = std::max(newest, mt);
-                    out.emplace_back(mt, p);
-                }
+            CacheFile kind = st.type() == fs::file_type::regular_file
+                                 ? cacheFileKind(llvm::sys::path::filename(p))
+                                 : CacheFile::Other;
+            if (kind == CacheFile::Temp && age(mt) > 3600) {
+                remove(p);
+            } else if (kind == CacheFile::Entry) {
+                newest = std::max(newest, mt);
+                out.emplace_back(mt, p);
             }
         }
         return newest;
     };
 
+    // Entries unused for maxAge go, the rest count towards maxFiles.
+    auto keepRecent = [&](const decltype(entries)& files) {
+        for (const auto& f : files) {
+            if (age(f.first) > maxAge)
+                remove(f.second);
+            else
+                entries.push_back(f);
+        }
+    };
     std::vector<std::string> dirs;
     decltype(entries) none;
-    scan(base, false, none, &dirs);
+    scan(base, none, &dirs);
+    // Only build, target and cubin/ directories are entered, only cache files are deleted,
+    // and directories go only once empty.
     for (const std::string& d : dirs) {
-        if (llvm::sys::path::filename(d) == "cubin") {
-            scan(d, false, entries, nullptr);
+        llvm::StringRef name = llvm::sys::path::filename(d);
+        decltype(entries) files;
+        if (name == "cubin") {
+            if (age(scan(d, files, nullptr)) > maxAge) { // unused (e.g. by newer servers)
+                for (const auto& f : files)
+                    remove(f.second);
+                rmdir(d.c_str());
+            } else {
+                keepRecent(files);
+            }
             continue;
         }
+        if (!isBuildIdName(name))
+            continue;
         std::vector<std::string> targets;
-        scan(d, /*legacy=*/true, none, &targets);
-        bool keep = d == current;
+        scan(d, files, &targets); // entries here predate the target directories
+        keepRecent(files);
         for (const std::string& t : targets) {
-            decltype(entries) files;
-            if (age(scan(t, false, files, nullptr)) > maxAge) {
-                fs::remove_directories(t, /*IgnoreErrors=*/true);
-                removed += files.size();
+            if (!isTargetName(llvm::sys::path::filename(t)))
+                continue;
+            files.clear();
+            if (age(scan(t, files, nullptr)) > maxAge) {
+                for (const auto& f : files)
+                    remove(f.second);
+                rmdir(t.c_str());
                 continue;
             }
-            keep = true;
             entries.insert(entries.end(), files.begin(), files.end());
         }
-        if (!keep)
-            fs::remove_directories(d, /*IgnoreErrors=*/true);
+        if (name != llvm::sys::path::filename(current))
+            rmdir(d.c_str());
     }
     if (entries.size() > maxFiles) {
         std::sort(entries.begin(), entries.end());
@@ -2664,14 +3317,23 @@ void evictCache(std::string base, std::string current) {
 
 void jit_cache_maintain() {
 #if !defined(USE_AMD) && !defined(USE_INTEL)
+    const char* on = getenv("CNUM_JIT_CACHE_EVICT");
     std::string base = cacheBase();
-    if (base.empty() || cacheDir().empty())
+    if ((on && std::string(on) == "0") || base.empty() || cacheDir().empty())
         return;
     // the thread takes no signals (they belong to the Charm++ scheduler thread)
     sigset_t all, old;
     sigfillset(&all);
     pthread_sigmask(SIG_BLOCK, &all, &old);
-    std::thread(evictCache, base, cacheDir()).detach();
+    try {
+        std::thread([base, current = cacheDir()] {
+            try {
+                evictCache(base, current);
+            } catch (...) {
+            }
+        }).detach();
+    } catch (...) {
+    }
     pthread_sigmask(SIG_SETMASK, &old, nullptr);
 #endif
 }
