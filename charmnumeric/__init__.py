@@ -1,6 +1,7 @@
 import numpy as np
 
 from . import linalg, random
+from ._display import register_ipython as _register_ipython, set_display
 from .charmnumeric import (
     Array,
     ArrayView,
@@ -150,6 +151,8 @@ from .signal import convolve, flip, fliplr, flipud
 
 
 __version__ = "0.1.dev"
+
+_register_ipython()
 
 ndarray = Array
 bool_ = np.bool_
@@ -340,6 +343,7 @@ __all__ = [
     "reshape",
     "rint",
     "round",
+    "set_display",
     "sign",
     "sin",
     "sort",
