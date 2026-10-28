@@ -1137,7 +1137,8 @@ bool cnOk(CUresult r, const char* what) {
 /// The entry itself is bad (not e.g. out of memory): remove it.
 bool cnBadImage(int r) {
     return r == CUDA_ERROR_INVALID_IMAGE || r == CUDA_ERROR_NO_BINARY_FOR_GPU ||
-           r == CUDA_ERROR_INVALID_PTX;
+           r == CUDA_ERROR_INVALID_PTX || r == CUDA_ERROR_INVALID_SOURCE ||
+           r == CUDA_ERROR_UNSUPPORTED_PTX_VERSION;
 }
 bool cnEnsureContext() {
     CUcontext ctx = nullptr;
@@ -2229,58 +2230,140 @@ std::string cacheBase() {
         d = llvm::formatv("/tmp/cnum-jit-{0}", getuid()).str();
         struct stat st;
         if ((mkdir(d.c_str(), 0700) != 0 && errno != EEXIST) || lstat(d.c_str(), &st) != 0 ||
-            !S_ISDIR(st.st_mode) || st.st_uid != getuid() || (st.st_mode & 077))
+            !S_ISDIR(st.st_mode) || st.st_uid != getuid() ||
+            ((st.st_mode & 077) && chmod(d.c_str(), 0700) != 0))
             return {};
     }
-    return d;
+    // one spelling (absolute, no dots or trailing separators), so paths built on it compare
+    llvm::SmallString<256> p(d);
+    if (llvm::sys::fs::make_absolute(p))
+        return {};
+    llvm::sys::path::remove_dots(p, /*remove_dot_dot=*/true);
+    while (p.size() > 1 && llvm::sys::path::is_separator(p.back()))
+        p.pop_back();
+    return std::string(p);
 }
 
 // Marks a dedicated cache root; evictCache only runs on marked roots.
 constexpr const char* kCacheMarker = ".cnum-jit-cache";
 
+bool isLowerHex(llvm::StringRef n) {
+    return llvm::all_of(n, [](char c) { return llvm::isDigit(c) || (c >= 'a' && c <= 'f'); });
+}
+
 /// A serverBuildId(): GNU build id, or "<size>-<mtime>".
 bool isBuildIdName(llvm::StringRef n) {
-    if (n.size() >= 8 && n.size() <= 128 && llvm::all_of(n, llvm::isHexDigit))
+    if ((n.size() == 16 || n.size() == 32 || n.size() == 40 || n.size() == 64) && isLowerHex(n))
         return true;
     auto [a, b] = n.split('-');
     return !a.empty() && !b.empty() && llvm::all_of(a, llvm::isDigit) &&
            llvm::all_of(b, llvm::isDigit);
 }
 
-/// A targetCacheDir() tag: [sm_<n>+ptx<n>-]<host CPU>.
+/// A targetCacheDir() tag: [sm_<n>+ptx<n>-[sm_<n>-][d<driver>-]]<host CPU>.
 bool isTargetName(llvm::StringRef n) {
-    if (n.consume_front("sm_")) {
-        auto [sm, rest] = n.split('+');
-        if (sm.empty() || !llvm::all_of(sm, llvm::isAlnum) || !rest.consume_front("ptx"))
+    auto sm = [](llvm::StringRef& s) {
+        if (!s.consume_front("sm_") || s.empty() || !llvm::isDigit(s.front()))
             return false;
-        auto [ptx, cpu] = rest.split('-');
-        if (ptx.empty() || !llvm::all_of(ptx, llvm::isDigit))
+        s = s.drop_while(llvm::isDigit);
+        if (!s.empty() && s.front() >= 'a' && s.front() <= 'z')
+            s = s.drop_front();
+        return true;
+    };
+    auto number = [](llvm::StringRef& s) {
+        size_t k = s.find_if_not(llvm::isDigit);
+        bool ok = k > 0 && k != llvm::StringRef::npos && s[k] == '-';
+        s = ok ? s.drop_front(k + 1) : s;
+        return ok;
+    };
+    if (n.starts_with("sm_")) {
+        if (!sm(n) || !n.consume_front("+ptx") || !number(n))
             return false;
-        n = cpu;
+        llvm::StringRef t = n;
+        if (sm(t) && t.consume_front("-"))
+            n = t;
+        t = n;
+        if (t.consume_front("d") && number(t))
+            n = t;
     }
-    return !n.empty() && n.size() <= 64 && n != "." && n != ".." &&
+    return !n.empty() && n.size() <= 64 && llvm::isAlnum(n.front()) &&
            llvm::all_of(n, [](char c) {
-               return llvm::isAlnum(c) || c == '-' || c == '_' || c == '.';
+               return llvm::isDigit(c) || (c >= 'a' && c <= 'z') || c == '-' || c == '_' ||
+                      c == '.';
            });
 }
 
-/// Marks base when it is new or empty, or holds only cache entries (a cache made before
-/// the marker existed); any other directory is used but never evicted.
+/// What a file of a cache directory is; eviction deletes nothing else.
+enum class CacheFile { Other, Entry, Temp };
+/// Entries are <sha256>.o and <sha256>.cubin; temporaries are their cacheTmpName()s and
+/// compile claims (<sha256>.o.lock).
+CacheFile cacheFileKind(llvm::StringRef n) {
+    if (n.size() < 66 || !isLowerHex(n.take_front(64)))
+        return CacheFile::Other;
+    llvm::StringRef rest = n.drop_front(64);
+    if (rest == ".o" || rest == ".cubin")
+        return CacheFile::Entry;
+    if (rest == ".o.lock")
+        return CacheFile::Temp;
+    if (!(rest.consume_front(".o.") || rest.consume_front(".cubin.")) ||
+        !rest.consume_back(".tmp"))
+        return CacheFile::Other;
+    // <host>.<pid>[.<n>]
+    auto digits = [](llvm::StringRef x) { return !x.empty() && llvm::all_of(x, llvm::isDigit); };
+    auto [h1, n1] = rest.rsplit('.');
+    if (!digits(n1))
+        return CacheFile::Other;
+    auto [h2, n2] = h1.rsplit('.');
+    llvm::StringRef host = digits(n2) && !h2.empty() ? h2 : h1;
+    bool ok = !host.empty() && llvm::all_of(host, [](char c) {
+        return llvm::isAlnum(c) || c == '-' || c == '_' || c == '.';
+    });
+    return ok ? CacheFile::Temp : CacheFile::Other;
+}
+
+/// True if dir holds only cache files (fileOnly) or, recursively, the cache layout: cubin/,
+/// build directories with target directories (and entries of the layout before them).
+bool looksLikeCache(const std::string& dir, int level) {
+    namespace fs = llvm::sys::fs;
+    std::error_code ec;
+    for (fs::directory_iterator it(dir, ec, false), end; it != end && !ec; it.increment(ec)) {
+        fs::file_status st;
+        if (fs::status(it->path(), st, /*Follow=*/false))
+            return false;
+        llvm::StringRef n = llvm::sys::path::filename(it->path());
+        bool isDir = st.type() == fs::file_type::directory_file;
+        bool ok;
+        if (level == 0) // the root
+            ok = isDir ? (n == "cubin" ? looksLikeCache(it->path(), 2)
+                                       : isBuildIdName(n) && looksLikeCache(it->path(), 1))
+                       : st.type() == fs::file_type::regular_file &&
+                             (n == ".last-evict" || n == ".evict-lock");
+        else if (isDir) // a build directory's target directory
+            ok = level == 1 && isTargetName(n) && looksLikeCache(it->path(), 2);
+        else
+            ok = st.type() == fs::file_type::regular_file &&
+                 cacheFileKind(n) != CacheFile::Other;
+        if (!ok)
+            return false;
+    }
+    return !ec;
+}
+
+/// Marks base as a dedicated cache when it is new or empty, when it has exactly the cache
+/// layout (a cache from before the marker), or with CNUM_JIT_CACHE_ADOPT=1. Any other
+/// directory is used but never evicted.
 void markCacheBase(const std::string& base) {
     static std::once_flag once;
     std::call_once(once, [&] {
+        namespace fs = llvm::sys::fs;
         std::string marker = base + "/" + kCacheMarker;
-        if (llvm::sys::fs::exists(marker))
+        if (fs::exists(marker))
             return;
-        std::error_code ec;
-        for (llvm::sys::fs::directory_iterator it(base, ec), end; it != end && !ec;
-             it.increment(ec)) {
-            llvm::StringRef n = llvm::sys::path::filename(it->path());
-            if (n != "cubin" && n != ".last-evict" && n != ".evict-lock" && !isBuildIdName(n))
-                return;
-        }
-        if ((ec && ec != std::errc::no_such_file_or_directory) ||
-            llvm::sys::fs::create_directories(base))
+        const char* adopt = getenv("CNUM_JIT_CACHE_ADOPT");
+        if (fs::exists(base) && !(adopt && std::string(adopt) == "1") &&
+            !looksLikeCache(base, 0))
+            return;
+        if (fs::create_directories(base))
             return;
         int fd = open(marker.c_str(), O_CREAT | O_WRONLY, 0644);
         if (fd >= 0)
@@ -2671,9 +2754,15 @@ void evictCache(std::string base, std::string current) {
     char real[PATH_MAX], home[PATH_MAX];
     const char* h = getenv("HOME");
     if (!llvm::sys::path::is_absolute(base) || !realpath(base.c_str(), real) ||
-        std::string(real) == "/" || (h && realpath(h, home) && std::string(real) == home) ||
-        !fs::exists(base + "/" + kCacheMarker))
+        std::string(real) == "/" || (h && realpath(h, home) && std::string(real) == home))
         return;
+    if (!fs::exists(base + "/" + kCacheMarker)) {
+        fprintf(stderr,
+                "jit cache: %s is not marked %s (it held other files when first used); "
+                "it is not evicted\n",
+                base.c_str(), kCacheMarker);
+        return;
+    }
     if (!fs::status(stamp, st) && age(st.getLastModificationTime()) < 3600)
         return;
     int fd = open(lock.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
@@ -2696,10 +2785,10 @@ void evictCache(std::string base, std::string current) {
     size_t removed = 0;
     auto remove = [&](const std::string& p) { removed += !fs::remove(p); };
 
-    // Entries (.o, .cubin) of dir go to out; stale .tmp files go, and with legacy the .o
-    // files too (the layout before per-target directories). Returns the newest mtime.
+    // Entries of dir go to out and temporaries an hour old are removed; other files are
+    // left alone. Returns the newest mtime.
     std::vector<std::pair<TimePoint, std::string>> entries;
-    auto scan = [&](const std::string& dir, bool legacy, decltype(entries)& out,
+    auto scan = [&](const std::string& dir, decltype(entries)& out,
                     std::vector<std::string>* subdirs) {
         TimePoint newest{};
         if (!fs::status(dir, st))
@@ -2714,43 +2803,57 @@ void evictCache(std::string base, std::string current) {
                     subdirs->push_back(p);
                 continue;
             }
-            auto ext = llvm::sys::path::extension(p);
             TimePoint mt = st.getLastModificationTime();
-            if (ext == ".tmp") {
-                if (age(mt) > 3600)
-                    remove(p);
-            } else if (ext == ".o" || ext == ".cubin") {
-                if (legacy) {
-                    remove(p);
-                } else {
-                    newest = std::max(newest, mt);
-                    out.emplace_back(mt, p);
-                }
+            CacheFile kind = st.type() == fs::file_type::regular_file
+                                 ? cacheFileKind(llvm::sys::path::filename(p))
+                                 : CacheFile::Other;
+            if (kind == CacheFile::Temp && age(mt) > 3600) {
+                remove(p);
+            } else if (kind == CacheFile::Entry) {
+                newest = std::max(newest, mt);
+                out.emplace_back(mt, p);
             }
         }
         return newest;
     };
 
+    // Entries unused for maxAge go, the rest count towards maxFiles.
+    auto keepRecent = [&](const decltype(entries)& files) {
+        for (const auto& f : files) {
+            if (age(f.first) > maxAge)
+                remove(f.second);
+            else
+                entries.push_back(f);
+        }
+    };
     std::vector<std::string> dirs;
     decltype(entries) none;
-    scan(base, false, none, &dirs);
-    // Only build and target directories are entered, only entries and temporaries are
-    // deleted, and directories go only once empty.
+    scan(base, none, &dirs);
+    // Only build, target and cubin/ directories are entered, only cache files are deleted,
+    // and directories go only once empty.
     for (const std::string& d : dirs) {
         llvm::StringRef name = llvm::sys::path::filename(d);
+        decltype(entries) files;
         if (name == "cubin") {
-            scan(d, false, entries, nullptr);
+            if (age(scan(d, files, nullptr)) > maxAge) { // unused (e.g. by newer servers)
+                for (const auto& f : files)
+                    remove(f.second);
+                rmdir(d.c_str());
+            } else {
+                keepRecent(files);
+            }
             continue;
         }
         if (!isBuildIdName(name))
             continue;
         std::vector<std::string> targets;
-        scan(d, /*legacy=*/true, none, &targets);
+        scan(d, files, &targets); // entries here predate the target directories
+        keepRecent(files);
         for (const std::string& t : targets) {
             if (!isTargetName(llvm::sys::path::filename(t)))
                 continue;
-            decltype(entries) files;
-            if (age(scan(t, false, files, nullptr)) > maxAge) {
+            files.clear();
+            if (age(scan(t, files, nullptr)) > maxAge) {
                 for (const auto& f : files)
                     remove(f.second);
                 rmdir(t.c_str());
@@ -2758,7 +2861,7 @@ void evictCache(std::string base, std::string current) {
             }
             entries.insert(entries.end(), files.begin(), files.end());
         }
-        if (d != current)
+        if (name != llvm::sys::path::filename(current))
             rmdir(d.c_str());
     }
     if (entries.size() > maxFiles) {
