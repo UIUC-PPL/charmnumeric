@@ -31,6 +31,54 @@ void PartitionImpl<N>::send_complete(int send_id) {
         pending_sends.erase(it);
     }
 }
+
+#ifdef USE_NVIDIA
+template <int N>
+struct CommRecvParam {
+    PartitionImpl<N>* partition;
+    int node_id, input_index, name, ndims;
+    std::vector<int> region_data;
+    int64_t size;
+    char* buf;
+    CkCallback done;
+};
+
+/// The payload is on this device: release the source, then deliver like receive_data.
+template <int N>
+static void comm_recv_cb(void* param, void* msg) {
+    auto* p = static_cast<CommRecvParam<N>*>(param);
+    p->done.send();
+    p->partition->receive_data(p->node_id, p->input_index, p->name, p->ndims,
+                               p->region_data.data(), p->size, p->buf);
+    delete p;
+}
+
+template <int N>
+static CommRecvParam<N>* comm_recv_param(PartitionImpl<N>* partition, int node_id,
+                                         int input_index, int name, int ndims,
+                                         const int* region_data, int64_t size) {
+    return new CommRecvParam<N>{partition, node_id, input_index, name, ndims,
+                                std::vector<int>(region_data, region_data + ndims * 3), size,
+                                static_cast<char*>(comm_alloc(size)),
+                                CkCallback(CkCallback::ignore)};
+}
+#endif
+
+template <int N>
+void PartitionImpl<N>::receive_ipc(int node_id, int input_index, int name, int ndims,
+                                   int* region_data, int64_t size, int src_node, int slab,
+                                   int64_t offset, const char* handle, const CkCallback& done) {
+#ifdef USE_NVIDIA
+    char* src = gpu_ipc_peer_slab(src_node, slab, handle) + offset;
+    auto* p = comm_recv_param(this, node_id, input_index, name, ndims, region_data, size);
+    p->done = done;
+    hapiCheck(cudaMemcpyAsync(p->buf, src, size, cudaMemcpyDeviceToDevice, comm_stream_raw));
+    CkCallback cb(comm_recv_cb<N>, p);
+    hapiAddCallback(comm_stream_raw, &cb);
+#else
+    CkAbort("receive_ipc: needs an NVIDIA build");
+#endif
+}
 #endif
 
 template <int N>
@@ -100,6 +148,13 @@ template void PartitionImpl<2>::receive_data(int&, int&, int&, int&, int*&, int6
                                              CkDeviceBufferPost*);
 template void PartitionImpl<3>::receive_data(int&, int&, int&, int&, int*&, int64_t&, char*&,
                                              CkDeviceBufferPost*);
+
+template void PartitionImpl<1>::receive_ipc(int, int, int, int, int*, int64_t, int, int, int64_t,
+                                            const char*, const CkCallback&);
+template void PartitionImpl<2>::receive_ipc(int, int, int, int, int*, int64_t, int, int, int64_t,
+                                            const char*, const CkCallback&);
+template void PartitionImpl<3>::receive_ipc(int, int, int, int, int*, int64_t, int, int, int64_t,
+                                            const char*, const CkCallback&);
 
 template void PartitionImpl<1>::send_complete(int);
 template void PartitionImpl<2>::send_complete(int);

@@ -116,6 +116,7 @@ using HostSpace = Kokkos::HostSpace;
 #ifdef USE_NVIDIA
 #include "hapi.h"
 #include <cuda_runtime.h>
+#include "gpu_comm.hpp"
 #endif
 
 /// Device message buffers, cached by power-of-two size class: cudaMalloc/cudaFree per
@@ -160,6 +161,10 @@ inline void comm_free(void* ptr) {
     std::lock_guard<std::mutex> lock(pool.mu);
     auto it = pool.live.find(ptr);
     if (it == pool.live.end()) {
+#ifdef USE_NVIDIA
+        if (gpu_ipc_free(ptr))
+            return;
+#endif
         Kokkos::kokkos_free<DeviceSpace>(ptr);
         return;
     }
@@ -826,6 +831,9 @@ class PartitionImpl {
     void receive_data(int& node_id, int& input_index, int& name, int& ndims, int*& region_data,
                       int64_t& size, char*& data, CkDeviceBufferPost* devicePost);
     void send_complete(int send_id);
+    void receive_ipc(int node_id, int input_index, int name, int ndims, int* region_data,
+                     int64_t size, int src_node, int slab, int64_t offset, const char* handle,
+                     const CkCallback& done);
 #endif
     void comm_done(int node_id);
     void reduce_result(int node_id, int64_t size, char* data);
@@ -865,6 +873,12 @@ class Partition1D : public CBase_Partition1D {
     void send_complete(CkDataMsg* msg) {
         impl.send_complete(CkGetRefNum(msg));
         CkFreeMsg(msg);
+    }
+    void receive_ipc(int node_id, int input_index, int name, int ndims, int* region_data,
+                     int64_t size, int src_node, int slab, int64_t offset, int hsize,
+                     char* handle, CkCallback done) {
+        impl.receive_ipc(node_id, input_index, name, ndims, region_data, size, src_node, slab,
+                         offset, handle, done);
     }
 #endif
     void comm_done(int node_id) { impl.comm_done(node_id); }
@@ -915,6 +929,12 @@ class Partition2D : public CBase_Partition2D {
         impl.send_complete(CkGetRefNum(msg));
         CkFreeMsg(msg);
     }
+    void receive_ipc(int node_id, int input_index, int name, int ndims, int* region_data,
+                     int64_t size, int src_node, int slab, int64_t offset, int hsize,
+                     char* handle, CkCallback done) {
+        impl.receive_ipc(node_id, input_index, name, ndims, region_data, size, src_node, slab,
+                         offset, handle, done);
+    }
 #endif
     void comm_done(int node_id) { impl.comm_done(node_id); }
     void reduce_result(int node_id, int64_t size, char* data) {
@@ -963,6 +983,12 @@ class Partition3D : public CBase_Partition3D {
     void send_complete(CkDataMsg* msg) {
         impl.send_complete(CkGetRefNum(msg));
         CkFreeMsg(msg);
+    }
+    void receive_ipc(int node_id, int input_index, int name, int ndims, int* region_data,
+                     int64_t size, int src_node, int slab, int64_t offset, int hsize,
+                     char* handle, CkCallback done) {
+        impl.receive_ipc(node_id, input_index, name, ndims, region_data, size, src_node, slab,
+                         offset, handle, done);
     }
 #endif
     void comm_done(int node_id) { impl.comm_done(node_id); }

@@ -35,6 +35,10 @@ mainmodule charmnumeric
                                 char data[size]);
 #ifdef USE_KOKKOS
         entry void send_complete(CkDataMsg* msg);
+        entry void receive_ipc(int node_id, int input_index, int name,
+                               int ndims, int region_data[ndims*3], int64_t size,
+                               int src_node, int slab, int64_t offset,
+                               int hsize, char handle[hsize], CkCallback done);
 #endif
         entry void comm_done(int node_id);
         entry void reduce_result(int node_id, int64_t size, char data[size]);
@@ -58,6 +62,10 @@ mainmodule charmnumeric
                                 char data[size]);
 #ifdef USE_KOKKOS
         entry void send_complete(CkDataMsg* msg);
+        entry void receive_ipc(int node_id, int input_index, int name,
+                               int ndims, int region_data[ndims*3], int64_t size,
+                               int src_node, int slab, int64_t offset,
+                               int hsize, char handle[hsize], CkCallback done);
 #endif
         entry void comm_done(int node_id);
         entry void reduce_result(int node_id, int64_t size, char data[size]);
@@ -81,6 +89,10 @@ mainmodule charmnumeric
                                 char data[size]);
 #ifdef USE_KOKKOS
         entry void send_complete(CkDataMsg* msg);
+        entry void receive_ipc(int node_id, int input_index, int name,
+                               int ndims, int region_data[ndims*3], int64_t size,
+                               int src_node, int slab, int64_t offset,
+                               int hsize, char handle[hsize], CkCallback done);
 #endif
         entry void comm_done(int node_id);
         entry void reduce_result(int node_id, int64_t size, char data[size]);

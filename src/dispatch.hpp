@@ -72,6 +72,9 @@ struct DeferredSendParam {
     int64_t byte_size;
     void* send_buf;
     int send_id;
+    void* ipc_buf = nullptr;  // CUDA IPC copy of send_buf (another process on this host)
+    int ipc_slab;
+    int64_t ipc_offset;
 
     /// Same-dimension send constructor: target_proxy defaults to partition's own proxy.
     DeferredSendParam(PartitionImpl<N_sender>* p)
@@ -94,9 +97,18 @@ static void deferred_send_cb(void* param, void* msg) {
     CkCallback cb(PartitionTraits<N_sender>::CkIndexType::send_complete(nullptr),
                   proxy_at<N_sender>(p->partition->thisProxy, self_ci));
     cb.setRefnum(static_cast<CMK_REFNUM_TYPE>(p->send_id));
-    proxy_at<N_target>(p->target_proxy, p->target_ci).receive_data(
-        p->node_id, p->input_index, p->inp_name, N_target, p->region_data, p->byte_size,
-        CkDeviceBuffer(reinterpret_cast<char*>(p->send_buf), cb));
+    if (p->ipc_buf) {
+        comm_free(p->send_buf);
+        cudaIpcMemHandle_t h = gpu_ipc_handle(p->ipc_slab);
+        proxy_at<N_target>(p->target_proxy, p->target_ci).receive_ipc(
+            p->node_id, p->input_index, p->inp_name, N_target, p->region_data, p->byte_size,
+            CkMyNode(), p->ipc_slab, p->ipc_offset, (int)sizeof(h),
+            reinterpret_cast<const char*>(&h), cb);
+    } else {
+        proxy_at<N_target>(p->target_proxy, p->target_ci).receive_data(
+            p->node_id, p->input_index, p->inp_name, N_target, p->region_data, p->byte_size,
+            CkDeviceBuffer(reinterpret_cast<char*>(p->send_buf), cb));
+    }
     delete p;
 }
 
@@ -128,6 +140,17 @@ static void device_pack_send(PartitionImpl<N_sender>* partition,
     while (pending.count(ds->send_id));
     pending[ds->send_id] = send_buf;
 #ifdef USE_NVIDIA
+    auto target = proxy_at<N_target>(target_proxy, target_ci);
+    int target_pe = target.ckLocalBranch()->lastKnown(target.ckGetIndex());
+    if (CmiNodeOf(target_pe) != CkMyNode()) {
+        if (gpu_ipc_peer(target_pe))
+            ds->ipc_buf = gpu_ipc_alloc(byte_size, ds->ipc_slab, ds->ipc_offset);
+        if (ds->ipc_buf) {
+            hapiCheck(cudaMemcpyAsync(ds->ipc_buf, send_buf, byte_size,
+                                      cudaMemcpyDeviceToDevice, partition->comm_stream_raw));
+            pending[ds->send_id] = ds->ipc_buf;
+        }
+    }
     CkCallback hapi_cb(deferred_send_cb<N_sender, N_target>, ds);
     hapiAddCallback(partition->comm_stream_raw, &hapi_cb);
 #else
