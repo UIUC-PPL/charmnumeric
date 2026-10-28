@@ -329,31 +329,32 @@ def _contract_pair(a, la, b, lb, keep, sizes, dtype, final=None):
         return _grouped_product(a, la, b, lb, batch, con, fa, fb, sizes, dtype)
 
     # matmul: pick the orientation and operand layouts needing fewest transposes
+    # layouts as role strings: b batch, f free, c contracted
     def layout(x, lx, free, left):
         if Bt > 1:  # batched: any order with the batch dim not last
-            cands = [[batch, free, con], [batch, con, free], [free, batch, con], [con, batch, free]]
+            codes = ["bfc", "bcf", "fbc", "cbf"]
         else:
-            cands = [[free, con] if left else [con, free]]
-        return min(((_layout_cost(x, lx, g), g) for g in cands), key=lambda c: c[0])
+            codes = ["fc" if left else "cf"]
+        roles = {"b": batch, "f": free, "c": con}
+        cands = [(code, [roles[r] for r in code]) for code in codes]
+        return min(((_layout_cost(x, lx, g), g, code) for code, g in cands), key=lambda c: c[0])
 
     plans = []
     for (x, lx, fx), (y, ly, fy) in (((a, la, fa), (b, lb, fb)), ((b, lb, fb), (a, la, fa))):
-        cx, gx = layout(x, lx, fx, True)
-        cy, gy = layout(y, ly, fy, False)
+        cx, gx, kx = layout(x, lx, fx, True)
+        cy, gy, ky = layout(y, ly, fy, False)
         out = batch + fx + fy
         cr = 0
         if final is not None and [l for l in final if l in out] != out:
             cr = Bt * M * N
-        plans.append((cx + cy + cr, x, lx, gx, fx, y, ly, gy, fy, out))
-    _, x, lx, gx, fx, y, ly, gy, fy, out = min(plans, key=lambda p: p[0])
+        plans.append((cx + cy + cr, x, lx, gx, kx, y, ly, gy, ky, out))
+    _, x, lx, gx, kx, y, ly, gy, ky, out = min(plans, key=lambda p: p[0])
     px = _arrange(x, lx, gx)
     py = _arrange(y, ly, gy)
     if Bt == 1:
         r = px @ py
     else:
-        dims = [[next(i for i, h in enumerate(g) if h is grp) for grp in (batch, f, con)]
-                for g, f in ((gx, fx), (gy, fy))]
-        r = _bmm(px, dims[0], py, dims[1], dtype)
+        r = _bmm(px, [kx.index(r) for r in "bfc"], py, [ky.index(r) for r in "bfc"], dtype)
     return _shaped(r, out, sizes), out
 
 
@@ -451,6 +452,12 @@ def einsum(*operands, out=None, dtype=None, order="K", casting="safe", optimize=
     if not arrays:
         return _write_out(np.einsum(subscripts, *ops, dtype=dtype), out)
     res_dtype = _normalize_dtype(res_dtype)
+    if any(int(a.size) == 0 for a in arrays):
+        # nothing to multiply: zeros (empty sums) or an empty result, made on the host
+        host = [np.asarray(op) if _is_scalar_like(op) else np.zeros(s, dtype=d)
+                for op, s, d in zip(ops, shapes, dtypes)]
+        return _einsum_out(asarray(np.asarray(np.einsum(subscripts, *host)).astype(res_dtype)),
+                           out, casting)
 
     inputs, output = _parse(subscripts, shapes)
     sizes = {}
@@ -493,6 +500,10 @@ def einsum(*operands, out=None, dtype=None, order="K", casting="safe", optimize=
         x = x * np.asarray(factor).astype(res_dtype).item()
     if x.dtype != res_dtype:
         x = x.astype(res_dtype)
+    return _einsum_out(x, out, casting)
+
+
+def _einsum_out(x, out, casting):
     if out is not None and out.dtype != x.dtype:
         if not np.can_cast(x.dtype, out.dtype, casting=casting):
             raise TypeError(f"Cannot cast einsum output from {x.dtype} to {out.dtype}")

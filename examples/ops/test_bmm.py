@@ -123,6 +123,38 @@ def main():
     cnp.matmul(cnp.array(ha), cnp.array(hb), out=M)
     chk.check("matmul out=", M, ha @ hb, rtol=2e-5, atol=2e-5)
 
+    print("integer wraparound")
+    rng = np.random.default_rng(3)
+    for dt, lo, hi, k in (("int8", -128, 128, 50), ("int32", -(1 << 20), 1 << 20, 64),
+                          ("uint32", 0, 1 << 31, 8), ("int64", -(1 << 40), 1 << 40, 70)):
+        for expr, shapes in (("bij,bjk->bik", [(5, 7, k), (5, k, 6)]),
+                             ("kac,kbc->kab", [(5, 7, k), (5, 6, k)])):
+            hs = [rng.integers(lo, hi, size=sh, dtype=dt) for sh in shapes]
+            check(chk, f"wrap {expr} {dt}", expr, hs, [cnp.array(h) for h in hs])
+    hb = [np.ones((4, 5, 300), dtype=bool), rng.integers(0, 2, size=(4, 300, 3)).astype(bool)]
+    hb[1][:, :, 0] = True
+    check(chk, "bool count > 255", "bij,bjk->bik", hb, [cnp.array(h) for h in hb])
+
+    print("zero-size dims")
+    for expr, shapes in (("bij,bjk->bik", [(3, 0, 4), (3, 4, 5)]),
+                         ("bij,bjk->bik", [(3, 2, 4), (3, 4, 0)]),
+                         ("bij,bjk->bik", [(3, 2, 0), (3, 0, 5)]),
+                         ("bij,bjk->bik", [(0, 2, 4), (0, 4, 5)]),
+                         ("kac,kbc->kab", [(3, 2, 0), (3, 5, 0)]),
+                         ("ij,jk->ik", [(2, 0), (0, 5)]),
+                         ("ij,jk->ik", [(0, 4), (4, 5)])):
+        for dt in ("float64", "int32"):
+            hs = [host(sh, dt) for sh in shapes]
+            check(chk, f"zero {expr} {shapes} {dt}", expr, hs, [cnp.array(h) for h in hs])
+    for sa, sb in (((3, 2, 0), (3, 0, 5)), ((0, 2, 4), (0, 4, 5)), ((2, 0), (0, 5)),
+                   ((0, 4), (4, 5))):
+        ha, hb0 = host(sa, "float64"), host(sb, "float64")
+        chk.check(f"zero matmul {sa} @ {sb}", cnp.array(ha) @ cnp.array(hb0), ha @ hb0)
+    Z = cnp.ones((3, 2, 5), dtype="float64")
+    cnp.einsum("bij,bjk->bik", cnp.array(host((3, 2, 0), "float64")),
+               cnp.array(host((3, 0, 5), "float64")), out=Z)
+    chk.check("zero K out=", Z, np.zeros((3, 2, 5)))
+
     print("chained (results as operands, out=)")
     ha, hb = host((100, 30, 30), "float64"), host((100, 30, 30), "float64")
     A, B = cnp.array(ha), cnp.array(hb)

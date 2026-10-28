@@ -2,6 +2,8 @@
 #include "dispatch.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <climits>
 #include <cmath>
 #include <complex>
 #include <type_traits>
@@ -905,10 +907,21 @@ int bmm_expected_msgs(const SigGeom<N>& s, int i, const std::array<int, N>& me,
     return total;
 }
 
+/// Accumulator of the naive product: unsigned for ints, so overflow wraps (as in NumPy).
+template <typename T, bool = std::is_integral_v<T>>
+struct BmmAcc {
+    using type = T;
+};
+template <typename T>
+struct BmmAcc<T, true> {
+    using type = std::make_unsigned_t<T>;
+};
+
 /// Naive batched product, one thread per result element (types cuBLAS lacks).
 template <int N, typename T>
 void bmm_naive(PartitionImpl<N>* partition, int64_t bs, int64_t m, int64_t n, int64_t k,
                const T* a, const int64_t* as, const T* b, const int64_t* bst, T* c) {
+    using U = typename BmmAcc<T>::type;
     int64_t a0 = as[0], a1 = as[1], a2 = as[2], b0 = bst[0], b1 = bst[1], b2 = bst[2];
 #ifdef USE_KOKKOS
     Kokkos::parallel_for(
@@ -916,10 +929,10 @@ void bmm_naive(PartitionImpl<N>* partition, int64_t bs, int64_t m, int64_t n, in
             int64_t j = idx % n, r = (idx / n) % m, q = idx / (m * n);
             const T* ap = a + q * a0 + r * a1;
             const T* bp = b + q * b0 + j * b2;
-            T acc = T(0);
+            U acc = U(0);
             for (int64_t t = 0; t < k; ++t)
-                acc += ap[t * a2] * bp[t * b1];
-            c[idx] = acc;
+                acc += U(ap[t * a2]) * U(bp[t * b1]);
+            c[idx] = T(acc);
         });
 #else
     (void)partition;
@@ -927,10 +940,10 @@ void bmm_naive(PartitionImpl<N>* partition, int64_t bs, int64_t m, int64_t n, in
         int64_t j = idx % n, r = (idx / n) % m, q = idx / (m * n);
         const T* ap = a + q * a0 + r * a1;
         const T* bp = b + q * b0 + j * b2;
-        T acc = T(0);
+        U acc = U(0);
         for (int64_t t = 0; t < k; ++t)
-            acc += ap[t * a2] * bp[t * b1];
-        c[idx] = acc;
+            acc += U(ap[t * a2]) * U(bp[t * b1]);
+        c[idx] = T(acc);
     }
 #endif
 }
@@ -962,6 +975,8 @@ CT_CUBLAS_BATCHED(cn_c128, cuDoubleComplex, Z)
 /// (rs, cs) seen column-major; false unless one stride is 1 and the other valid.
 inline bool cublas_layout(int64_t rows, int64_t cols, int64_t rs, int64_t cs,
                           cublasOperation_t& op, int64_t& ld) {
+    if (std::max(rs, cs) > INT_MAX)
+        return false;
     if (cs == 1 && rs >= std::max<int64_t>(1, cols)) {
         op = CUBLAS_OP_N; // row-major (rows x cols) == column-major (cols x rows)
         ld = rs;
@@ -989,7 +1004,8 @@ void batched_gemm(PartitionImpl<N>* partition, int64_t bs, int64_t m, int64_t n,
         // column-major view of the row-major product: C^T = B^T * A^T
         cublasOperation_t oa, ob;
         int64_t lda, ldb;
-        if (k > 0 && cublas_layout(m, k, as[1], as[2], oa, lda) &&
+        bool fits = std::max({bs, m, n, k}) <= INT_MAX;
+        if (fits && k > 0 && cublas_layout(m, k, as[1], as[2], oa, lda) &&
             cublas_layout(k, n, bst[1], bst[2], ob, ldb)) {
             // inputs may come from work on the default instance's stream
             Kokkos::DefaultExecutionSpace().fence("ct_bmm inputs");
@@ -1002,6 +1018,10 @@ void batched_gemm(PartitionImpl<N>* partition, int64_t bs, int64_t m, int64_t n,
                 CkAbort("cuBLAS batched gemm failed (%d)", (int)st);
             return;
         }
+        static std::atomic<bool> warned{false};
+        if (k > 0 && !warned.exchange(true))
+            CkPrintf("[PE %d] batched matmul: layout or size not supported by cuBLAS, using the "
+                     "naive kernel\n", CkMyPe());
     }
     bmm_naive<N, T>(partition, bs, m, n, k, a, as, b, bst, c);
 #elif defined(USE_KOKKOS)

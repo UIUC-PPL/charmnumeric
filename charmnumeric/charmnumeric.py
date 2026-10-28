@@ -1459,7 +1459,7 @@ def _array_matmul(self, other):
     other = _coerce_operand(other)
     if not _is_array_nd(other):
         raise ValueError("matmul does not support scalar operands")
-    if _needs_batched(self) or _needs_batched(other):
+    if _needs_batched(self) or _needs_batched(other) or not (int(self.size) and int(other.size)):
         return _batched_matmul(self, other)
     self, other, compute, result = _promote_operands(self, other)
     out = _matmul_blas(self, other)
