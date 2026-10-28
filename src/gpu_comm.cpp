@@ -77,6 +77,7 @@ void ArrayDAGGroup::ipc_probe_start() {
     std::vector<char> out;
 #ifdef USE_NVIDIA
     if (CkMyRank() == 0) {
+        cudaSetDevice(Kokkos::Cuda().cuda_device());
         ProbeRec rec{};
         rec.node = CkMyNode();
         host_identity(rec.host, rec.boot);
@@ -96,8 +97,10 @@ void ArrayDAGGroup::ipc_probe_exports(int n, char* data) {
     std::vector<char> out;
 #ifdef USE_NVIDIA
     if (CkMyRank() == 0) {
-        const auto* recs = reinterpret_cast<const ProbeRec*>(data);
+        cudaSetDevice(Kokkos::Cuda().cuda_device());
         int count = n / (int)sizeof(ProbeRec);
+        std::vector<ProbeRec> recs(count);
+        std::memcpy(recs.data(), data, count * sizeof(ProbeRec));
         const ProbeRec* me = nullptr;
         for (int i = 0; i < count; ++i)
             if (recs[i].node == CkMyNode())
@@ -130,8 +133,9 @@ void ArrayDAGGroup::ipc_probe_results(int n, char* data) {
 #ifdef USE_NVIDIA
     if (CkMyRank() != 0)
         return;
-    const auto* pairs = reinterpret_cast<const ProbePair*>(data);
     int count = n / (int)sizeof(ProbePair);
+    std::vector<ProbePair> pairs(count);
+    std::memcpy(pairs.data(), data, count * sizeof(ProbePair));
     auto& a = gpu_ipc_arena();
     a.peer_ok.assign(CkNumNodes(), 0);
     for (int i = 0; i < count; ++i)

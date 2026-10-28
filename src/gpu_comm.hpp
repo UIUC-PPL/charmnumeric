@@ -43,7 +43,7 @@ struct GpuIpcArena {
     std::atomic<bool> probed{false};
     int64_t limit = 0;
     int enabled = -1;
-    bool slab_failed = false, warned = false;
+    bool slab_failed = false, warned = false, closed = false;
     std::mutex mu;
 };
 
@@ -67,7 +67,7 @@ inline bool gpu_ipc_enabled() {
 inline bool gpu_ipc_peer(int pe) {
     auto& a = gpu_ipc_arena();
     return a.probed.load(std::memory_order_acquire) && a.peer_ok[CmiNodeOf(pe)] &&
-           gpu_ipc_enabled();
+           gpu_ipc_enabled() && !a.closed;
 }
 
 inline void gpu_ipc_warn(GpuIpcArena& a, const char* why) {
@@ -85,6 +85,8 @@ inline void* gpu_ipc_alloc(int64_t bytes, int& slab, int64_t& offset) {
     while (cls <= GpuIpcArena::kSlabClass && (int64_t(1) << cls) < bytes)
         ++cls;
     std::lock_guard<std::mutex> lock(a.mu);
+    if (a.closed || a.limit == 0)
+        return nullptr;
     if (cls > GpuIpcArena::kSlabClass) {
         gpu_ipc_warn(a, "a message is larger than a 256 MB slab");
         return nullptr;
@@ -154,6 +156,8 @@ inline bool gpu_ipc_free(void* ptr) {
     auto it = a.live.find(ptr);
     if (it == a.live.end())
         return false;
+    if (a.closed)
+        return true;
     auto [s, cls] = it->second;
     a.free_lists[cls].push_back({s, static_cast<char*>(ptr) - a.slabs[s].base});
     a.live.erase(it);
@@ -164,21 +168,25 @@ inline bool gpu_ipc_free(void* ptr) {
 inline bool gpu_ipc_forget(void* ptr) {
     auto& a = gpu_ipc_arena();
     std::lock_guard<std::mutex> lock(a.mu);
-    return a.live.erase(ptr) > 0;
+    return a.closed ? a.live.count(ptr) > 0 : a.live.erase(ptr) > 0;
 }
 
 inline cudaIpcMemHandle_t gpu_ipc_handle(int slab) {
     auto& a = gpu_ipc_arena();
     std::lock_guard<std::mutex> lock(a.mu);
-    return a.slabs[slab].handle;
+    cudaIpcMemHandle_t h{};
+    if (slab >= 0 && slab < (int)a.slabs.size())
+        h = a.slabs[slab].handle;
+    return h;
 }
 
-/// Device pointer to slab `slab` of process `node`, mapped on first use.
+/// Device pointer to slab `slab` of process `node`, mapped on first use; nullptr after
+/// gpu_comm_shutdown.
 inline char* gpu_ipc_peer_slab(int node, int slab, const char* handle) {
     auto& a = gpu_ipc_arena();
     std::lock_guard<std::mutex> lock(a.mu);
     char*& p = a.peers[{node, slab}];
-    if (!p) {
+    if (!p && !a.closed) {
         cudaIpcMemHandle_t h;
         std::memcpy(&h, handle, sizeof(h));
         void* q = nullptr;
@@ -245,6 +253,8 @@ inline void pinned_free(void* p) {
     {
         std::lock_guard<std::mutex> lock(pool.mu);
         auto it = pool.live.find(p);
+        if (it == pool.live.end())
+            return;
         int cls = it->second;
         pool.live.erase(it);
         if (pool.cached + (int64_t(1) << cls) <= pool.limit) {
@@ -256,29 +266,10 @@ inline void pinned_free(void* p) {
     cudaFreeHost(p);
 }
 
-/// Process exit: unmap peer slabs, free our slabs and the cached pinned blocks.
+/// Process exit: no new IPC sends or mappings, and late frees become no-ops. Slabs, peer
+/// mappings and pinned blocks stay until the process ends (a peer may still be copying).
 inline void gpu_comm_shutdown() {
     auto& a = gpu_ipc_arena();
-    {
-        std::lock_guard<std::mutex> lock(a.mu);
-        for (auto& [key, p] : a.peers)
-            if (p)
-                cudaIpcCloseMemHandle(p);
-        a.peers.clear();
-        for (auto& s : a.slabs)
-            cudaFree(s.base);
-        a.slabs.clear();
-        a.live.clear();
-        for (auto& l : a.free_lists)
-            l.clear();
-    }
-    auto& pool = pinned_pool();
-    std::lock_guard<std::mutex> lock(pool.mu);
-    for (auto& l : pool.free_lists) {
-        for (void* p : l)
-            cudaFreeHost(p);
-        l.clear();
-    }
-    pool.cached = 0;
-    cudaGetLastError();
+    std::lock_guard<std::mutex> lock(a.mu);
+    a.closed = true;
 }

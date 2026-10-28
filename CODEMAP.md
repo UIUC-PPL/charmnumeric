@@ -221,7 +221,7 @@ Bit-exact NumPy mirror of `src/creation_kernels.hpp` (Philox4x32-10, software lo
 | `gpu_ipc_alloc()` / `gpu_ipc_free()` | Send blocks in lazily created 256 MB `cudaMalloc` slabs with CUDA IPC handles (`CNUM_GPU_IPC=0` disables, `CNUM_GPU_IPC_MB` bounds them, default 1024): free blocks of larger classes are split, alignment gaps go to smaller classes, a failed slab allocation is not retried, one warning on the first fallback; `comm_free()` returns arena blocks here |
 | `gpu_ipc_peer_slab()` | Receiver: maps a peer slab once (`cudaIpcOpenMemHandle`) and caches it |
 | `pinned_alloc()` / `pinned_free()` | Pinned host pool by size class for cross-host messages (`CNUM_GPU_STAGE=0` disables, `CNUM_GPU_STAGE_MB` caps the cached blocks, default 512); released from the stream callback after the copy |
-| `gpu_comm_shutdown()` | Unmaps peer slabs, frees slabs and cached pinned blocks (before `Kokkos::finalize`) |
+| `gpu_comm_shutdown()` | Before `Kokkos::finalize`: no new IPC sends or mappings, late frees become no-ops; slabs, mappings and pinned blocks are left to process exit (a peer may still be copying) |
 
 ### `gpu_comm.cpp` — CUDA IPC probe (`ArrayDAGGroup::ipc_probe_*`)
 Started from `set_proxies`, off the CCS-ready path: rank 0 of each process exports a 4 KB buffer; processes with the same hostname and `/proc/sys/kernel/random/boot_id` map and read each peer's buffer; the working (sender, receiver) pairs are gathered into `peer_ok`. Never aborts; PE 0 prints `gpu ipc: k of n same-host process pairs use CUDA IPC`. `CNUM_GPU_IPC_PROBE_FAIL="src-dst,..."` injects failures (testing).

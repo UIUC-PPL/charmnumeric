@@ -72,7 +72,10 @@ void PartitionImpl<N>::receive_ipc(int node_id, int input_index, int name, int n
                                    int* region_data, int64_t size, int src_node, int slab,
                                    int64_t offset, const char* handle, const CkCallback& done) {
 #ifdef USE_NVIDIA
-    char* src = gpu_ipc_peer_slab(src_node, slab, handle) + offset;
+    char* base = gpu_ipc_peer_slab(src_node, slab, handle);
+    if (!base)
+        return;
+    char* src = base + offset;
     auto* p = comm_recv_param(this, node_id, input_index, name, ndims, region_data, size);
     p->done = done;
     hapiCheck(cudaMemcpyAsync(p->buf, src, size, cudaMemcpyDeviceToDevice, comm_stream_raw));
