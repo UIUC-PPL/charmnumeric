@@ -2898,20 +2898,28 @@ class Claims {
     bool beating_ = false;
 };
 
-/// False once the process is gone or a zombie (not reaped yet, e.g. under a launcher).
+/// False once the process is gone, exiting (a killed GPU process can take many seconds to
+/// tear down) or a zombie (not reaped yet, e.g. under a launcher).
 bool processAlive(int pid) {
     if (kill(pid, 0) != 0)
         return errno != ESRCH;
     auto stat = llvm::MemoryBuffer::getFileAsStream("/proc/" + std::to_string(pid) + "/stat");
     if (!stat)
         return true;
-    llvm::StringRef rest = (*stat)->getBuffer().rsplit(')').second.ltrim();
-    return !rest.starts_with("Z") && !rest.starts_with("X");
+    // after "(comm)": state ppid pgrp session tty_nr tpgid flags
+    llvm::SmallVector<llvm::StringRef, 8> f;
+    (*stat)->getBuffer().rsplit(')').second.ltrim().split(f, ' ', 7);
+    unsigned long flags = 0;
+    constexpr unsigned long PF_EXITING = 0x4;
+    if (f.size() > 6 && !f[6].getAsInteger(10, flags) && (flags & PF_EXITING))
+        return false;
+    return f.empty() || (!f[0].starts_with("Z") && !f[0].starts_with("X"));
 }
 
 /// True if the claim lock is gone, or stale and then removed: its holder died on this host,
-/// or its mtime stood still for 30 s (no heartbeat; 6 s for a holder on this host), or for
-/// 5 s and it is 2 min old (by the local clock, so only with an observed standstill).
+/// or its mtime stood still for 30 s (no heartbeat; 6 s for a holder on this host or a lock
+/// without its holder, which died between creating and writing it), or for 5 s and it is
+/// 2 min old (by the local clock, so only with an observed standstill).
 bool lockFree(const std::string& lock, LockWatch& w) {
     int fd = open(lock.c_str(), O_RDONLY); // not stat: opening revalidates NFS attributes
     if (fd < 0)
@@ -2933,7 +2941,7 @@ bool lockFree(const std::string& lock, LockWatch& w) {
         stale = true;
     if (!w.seen || st.st_mtim.tv_sec != w.mtime.tv_sec || st.st_mtim.tv_nsec != w.mtime.tv_nsec) {
         w = {st.st_mtim, now, true};
-    } else if (now - w.since > std::chrono::seconds(here ? 6 : 30) ||
+    } else if (now - w.since > std::chrono::seconds(here || id.trim().empty() ? 6 : 30) ||
                (now - w.since > std::chrono::seconds(5) &&
                 std::time(nullptr) - st.st_mtime > 120)) {
         stale = true;
