@@ -448,6 +448,9 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
         node_finished(node->id);
         return;
     }
+#ifdef USE_NVIDIA
+    partition->join_streams();
+#endif
 
     if (is_reduction_node) {
         execute_reduction_node(node);
@@ -817,16 +820,8 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
             return;
         }
         dispatch_execute<N>(dt, static_cast<ArrayDAGGroup*>(group), node, partition, nullptr);
-#ifdef USE_NVIDIA
-        {
-            auto* p = new ComputeDoneParam<N>{partition, node->id, false};
-            CkCallback hcb(compute_done_cb<N>, p);
-            hapiAddCallback(partition->compute_stream_raw, &hcb);
-        }
-#else
         CT_KOKKOS_FENCE();
         node_finished(node->id);
-#endif
         return;
     }
 
@@ -899,30 +894,14 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
                 dispatch_execute<N>(dt, static_cast<ArrayDAGGroup*>(group), node, partition,
                                     &comm_local);
             }
-#ifdef USE_NVIDIA
-            {
-                auto* p = new ComputeDoneParam<N>{partition, node->id, false};
-                CkCallback hcb(compute_done_cb<N>, p);
-                hapiAddCallback(partition->compute_stream_raw, &hcb);
-            }
-#else
             CT_KOKKOS_FENCE();
             node_finished(node->id);
-#endif
         } else {
             PendingComm<N> comm_local = {node, 0, std::move(li.my_inputs), {}};
             dispatch_execute<N>(dt, static_cast<ArrayDAGGroup*>(group), node, partition,
                                 &comm_local);
-#ifdef USE_NVIDIA
-            {
-                auto* p = new ComputeDoneParam<N>{partition, node->id, false};
-                CkCallback hcb(compute_done_cb<N>, p);
-                hapiAddCallback(partition->compute_stream_raw, &hcb);
-            }
-#else
             CT_KOKKOS_FENCE();
             node_finished(node->id);
-#endif
         }
     } else {
         wait_for_msgs(li.expected_msgs + n_expected_broadcasts, std::move(li.my_inputs));
@@ -952,19 +931,20 @@ void ArrayDAGExecutorND<N>::on_comm_done(int node_id) {
     }
 
 #ifdef USE_NVIDIA
-    // Defer cleanup + node_finished until GPU work completes on compute_stream
-    {
-        auto* p = new ComputeDoneParam<N>{partition, node_id, true};
-        CkCallback hcb(compute_done_cb<N>, p);
+    // The streams order the queued work; only the received buffers wait for it.
+    if (!comm.remote_buffers.empty()) {
+        partition->compute_after_others();
+        auto* bufs = new RemoteBuffers<N>(std::move(comm.remote_buffers));
+        CkCallback hcb(free_remote_buffers_cb<N>, bufs);
         hapiAddCallback(partition->compute_stream_raw, &hcb);
     }
 #else
     CT_KOKKOS_FENCE();
     comm.clear_remote_buffers();
+#endif
     pending.erase(it);
     // on_comm_done is high-volume; node_finished already prints
     node_finished(node_id);
-#endif
 }
 
 template void ArrayDAGExecutorND<1>::delete_array(int);

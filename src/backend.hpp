@@ -815,6 +815,10 @@ class PartitionImpl {
     cudaStream_t comm_stream_raw;
     Kokkos::Cuda compute_exec;
     Kokkos::Cuda comm_exec;
+    cudaEvent_t join_event;
+    void join_streams();
+    void compute_after_others();
+    void default_after_compute();
 #endif
 #endif
 

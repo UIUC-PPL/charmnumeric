@@ -57,6 +57,19 @@ static void compute_done_cb(void* param, void* msg) {
     delete p;
 }
 
+template <int N>
+using RemoteBuffers = std::unordered_map<int, std::vector<RemoteBuffer<N>>>;
+
+/// HAPI callback freeing a finished node's received buffers once its kernels have run.
+template <int N>
+static void free_remote_buffers_cb(void* param, void* msg) {
+    auto* bufs = static_cast<RemoteBuffers<N>*>(param);
+    for (auto& [idx, list] : *bufs)
+        for (auto& rb : list)
+            comm_free(rb.data);
+    delete bufs;
+}
+
 /// Param struct for deferred-send callbacks (hapiAddCallback).
 /// N_sender is the sender partition dimension, N_target is the target partition dimension.
 /// For same-dimension sends, N_sender == N_target (the default).

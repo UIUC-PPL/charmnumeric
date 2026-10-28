@@ -21,6 +21,7 @@ void PartitionImpl<N>::init(typename PartitionTraits<N>::ProxyType proxy, std::a
     CT_CUDA_CHECK(cudaStreamCreate(&comm_stream_raw));
     compute_exec = Kokkos::Cuda(compute_stream_raw);
     comm_exec = Kokkos::Cuda(comm_stream_raw);
+    CT_CUDA_CHECK(cudaEventCreateWithFlags(&join_event, cudaEventDisableTiming));
 #endif
     auto* dag_group = static_cast<ArrayDAGGroup*>(dag_proxy_.ckLocalBranch());
     executor = new ArrayDAGExecutorND<N>(dag_group, this);
@@ -51,10 +52,45 @@ PartitionImpl<N>::~PartitionImpl() {
             comm_free(p);
 #endif
 #ifdef USE_NVIDIA
+    cudaEventDestroy(join_event);
     cudaStreamDestroy(compute_stream_raw);
     cudaStreamDestroy(comm_stream_raw);
 #endif
 }
+
+#ifdef USE_NVIDIA
+/// Nodes finish once their work is queued, so each node starts by ordering this chare's
+/// compute stream after its comm stream and the Kokkos default instance, and the comm
+/// stream after the compute stream, without a host wait. Default-instance work that
+/// reads compute results must wait for the compute stream itself.
+template <int N>
+void PartitionImpl<N>::join_streams() {
+    CT_CUDA_CHECK(cudaEventRecord(join_event, comm_stream_raw));
+    CT_CUDA_CHECK(cudaStreamWaitEvent(compute_stream_raw, join_event, 0));
+    CT_CUDA_CHECK(cudaEventRecord(join_event, Kokkos::DefaultExecutionSpace().cuda_stream()));
+    CT_CUDA_CHECK(cudaStreamWaitEvent(compute_stream_raw, join_event, 0));
+    CT_CUDA_CHECK(cudaEventRecord(join_event, compute_stream_raw));
+    CT_CUDA_CHECK(cudaStreamWaitEvent(comm_stream_raw, join_event, 0));
+}
+
+/// Orders the compute stream after the work queued on the comm stream and the Kokkos
+/// default instance.
+template <int N>
+void PartitionImpl<N>::compute_after_others() {
+    CT_CUDA_CHECK(cudaEventRecord(join_event, comm_stream_raw));
+    CT_CUDA_CHECK(cudaStreamWaitEvent(compute_stream_raw, join_event, 0));
+    CT_CUDA_CHECK(cudaEventRecord(join_event, Kokkos::DefaultExecutionSpace().cuda_stream()));
+    CT_CUDA_CHECK(cudaStreamWaitEvent(compute_stream_raw, join_event, 0));
+}
+
+/// Orders the Kokkos default instance after the work queued on the compute stream.
+template <int N>
+void PartitionImpl<N>::default_after_compute() {
+    CT_CUDA_CHECK(cudaEventRecord(join_event, compute_stream_raw));
+    CT_CUDA_CHECK(
+        cudaStreamWaitEvent(Kokkos::DefaultExecutionSpace().cuda_stream(), join_event, 0));
+}
+#endif
 
 template <int N>
 int PartitionImpl<N>::create(ArrayRegion<N>* region, int name, DType dtype,
@@ -165,6 +201,18 @@ void PartitionImpl<N>::run() {
 template void PartitionImpl<1>::init(CProxy_Partition1D, std::array<int, 1>, CProxy_ArrayDAGGroup);
 template void PartitionImpl<2>::init(CProxy_Partition2D, std::array<int, 2>, CProxy_ArrayDAGGroup);
 template void PartitionImpl<3>::init(CProxy_Partition3D, std::array<int, 3>, CProxy_ArrayDAGGroup);
+
+#ifdef USE_NVIDIA
+template void PartitionImpl<1>::join_streams();
+template void PartitionImpl<2>::join_streams();
+template void PartitionImpl<3>::join_streams();
+template void PartitionImpl<1>::compute_after_others();
+template void PartitionImpl<2>::compute_after_others();
+template void PartitionImpl<3>::compute_after_others();
+template void PartitionImpl<1>::default_after_compute();
+template void PartitionImpl<2>::default_after_compute();
+template void PartitionImpl<3>::default_after_compute();
+#endif
 
 template PartitionImpl<1>::~PartitionImpl();
 template PartitionImpl<2>::~PartitionImpl();

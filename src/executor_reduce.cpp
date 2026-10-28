@@ -54,6 +54,10 @@ void ArrayDAGExecutorND<N>::execute_reduce_node(DAGNode* node) {
                 std::min(lhs_it->second->local_size(), rhs_it->second->local_size());
 
 #ifdef USE_KOKKOS
+#ifdef USE_NVIDIA
+            // the dot runs on the default instance
+            partition->compute_exec.fence("ct_dot inputs");
+#endif
             auto kokkos_dot = [&](auto dummy) {
                 using VT = decltype(dummy);
                 Kokkos::View<VT*, DeviceSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>

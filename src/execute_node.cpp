@@ -575,6 +575,10 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                         if (rb_it != comm->remote_buffers.end() && !rb_it->second.empty()) {
                             auto& buffers = rb_it->second;
                             T* res_data = static_cast<T*>(partition->arrays[result_name]->data_ptr());
+#ifdef USE_NVIDIA
+                            // the partials are added on the default instance
+                            partition->default_after_compute();
+#endif
 
                             // Accumulate partials with offset awareness.
                             // Each partial has a 1D region [start, stop) in output space.
