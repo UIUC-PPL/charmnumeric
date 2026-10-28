@@ -1,9 +1,12 @@
 #pragma once
 
-// GPU messages between processes on one host through CUDA IPC, bypassing Charm++'s
-// CkDeviceBuffer host staging (a cudaMallocHost, a blocking stream sync and a cudaFreeHost per
-// message). Each process carves send blocks out of a few cudaMalloc slabs whose IPC handles
-// travel with the messages; the receiver maps a peer slab once and copies device to device.
+// GPU messages between processes, bypassing Charm++'s CkDeviceBuffer host staging (a
+// cudaMallocHost, a blocking stream sync and a cudaFreeHost per message).
+// - Same host: CUDA IPC. Each process carves send blocks out of a few cudaMalloc slabs whose
+//   IPC handles travel with the messages; the receiver maps a peer slab once and copies
+//   device to device.
+// - Other hosts (or CNUM_GPU_IPC=0): staged through pooled pinned host buffers and sent as
+//   a plain message.
 
 #include <cstdlib>
 #include <cstring>
@@ -148,3 +151,59 @@ inline char* gpu_ipc_peer_slab(int node, int slab, const char* handle) {
     return p;
 }
 
+/// Pinned host buffers by power-of-two size class. A block is released from the stream
+/// callback that follows its last async copy, so reuse never races a copy.
+struct PinnedPool {
+    static constexpr int kMinClass = 12, kMaxClass = 28; // 4 KB .. 256 MB
+    std::vector<void*> free_lists[kMaxClass + 1];
+    std::unordered_map<void*, int> live;
+    int64_t cached = 0, limit = -1;
+    std::mutex mu;
+};
+
+inline PinnedPool& pinned_pool() {
+    static PinnedPool pool;
+    return pool;
+}
+
+/// Staged sends on unless CNUM_GPU_STAGE=0; CNUM_GPU_STAGE_MB bounds the cached blocks
+/// (default 512). nullptr: use the CkDeviceBuffer path.
+inline void* pinned_alloc(int64_t bytes) {
+    auto& pool = pinned_pool();
+    int cls = PinnedPool::kMinClass;
+    while (cls <= PinnedPool::kMaxClass && (int64_t(1) << cls) < bytes)
+        ++cls;
+    std::lock_guard<std::mutex> lock(pool.mu);
+    if (pool.limit < 0) {
+        const char* env = std::getenv("CNUM_GPU_STAGE");
+        const char* mb = std::getenv("CNUM_GPU_STAGE_MB");
+        pool.limit = env && std::atoi(env) == 0 ? 0 : (mb ? std::atoll(mb) : 512) << 20;
+    }
+    if (cls > PinnedPool::kMaxClass || pool.limit == 0)
+        return nullptr;
+    void* p;
+    if (!pool.free_lists[cls].empty()) {
+        p = pool.free_lists[cls].back();
+        pool.free_lists[cls].pop_back();
+        pool.cached -= int64_t(1) << cls;
+    } else if (cudaMallocHost(&p, size_t(1) << cls) != cudaSuccess) {
+        cudaGetLastError();
+        return nullptr;
+    }
+    pool.live[p] = cls;
+    return p;
+}
+
+inline void pinned_free(void* p) {
+    auto& pool = pinned_pool();
+    std::lock_guard<std::mutex> lock(pool.mu);
+    auto it = pool.live.find(p);
+    int cls = it->second;
+    pool.live.erase(it);
+    if (pool.cached + (int64_t(1) << cls) > pool.limit) {
+        cudaFreeHost(p);
+        return;
+    }
+    pool.free_lists[cls].push_back(p);
+    pool.cached += int64_t(1) << cls;
+}

@@ -39,6 +39,9 @@ mainmodule charmnumeric
                                int ndims, int region_data[ndims*3], int64_t size,
                                int src_node, int slab, int64_t offset,
                                int hsize, char handle[hsize], CkCallback done);
+        entry void receive_staged(int node_id, int input_index, int name,
+                                  int ndims, int region_data[ndims*3],
+                                  int64_t size, char data[size]);
 #endif
         entry void comm_done(int node_id);
         entry void reduce_result(int node_id, int64_t size, char data[size]);
@@ -66,6 +69,9 @@ mainmodule charmnumeric
                                int ndims, int region_data[ndims*3], int64_t size,
                                int src_node, int slab, int64_t offset,
                                int hsize, char handle[hsize], CkCallback done);
+        entry void receive_staged(int node_id, int input_index, int name,
+                                  int ndims, int region_data[ndims*3],
+                                  int64_t size, char data[size]);
 #endif
         entry void comm_done(int node_id);
         entry void reduce_result(int node_id, int64_t size, char data[size]);
@@ -93,6 +99,9 @@ mainmodule charmnumeric
                                int ndims, int region_data[ndims*3], int64_t size,
                                int src_node, int slab, int64_t offset,
                                int hsize, char handle[hsize], CkCallback done);
+        entry void receive_staged(int node_id, int input_index, int name,
+                                  int ndims, int region_data[ndims*3],
+                                  int64_t size, char data[size]);
 #endif
         entry void comm_done(int node_id);
         entry void reduce_result(int node_id, int64_t size, char data[size]);

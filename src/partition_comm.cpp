@@ -40,6 +40,7 @@ struct CommRecvParam {
     std::vector<int> region_data;
     int64_t size;
     char* buf;
+    char* host; // pinned staging block, or nullptr
     CkCallback done;
 };
 
@@ -47,6 +48,8 @@ struct CommRecvParam {
 template <int N>
 static void comm_recv_cb(void* param, void* msg) {
     auto* p = static_cast<CommRecvParam<N>*>(param);
+    if (p->host)
+        pinned_free(p->host);
     p->done.send();
     p->partition->receive_data(p->node_id, p->input_index, p->name, p->ndims,
                                p->region_data.data(), p->size, p->buf);
@@ -59,7 +62,7 @@ static CommRecvParam<N>* comm_recv_param(PartitionImpl<N>* partition, int node_i
                                          const int* region_data, int64_t size) {
     return new CommRecvParam<N>{partition, node_id, input_index, name, ndims,
                                 std::vector<int>(region_data, region_data + ndims * 3), size,
-                                static_cast<char*>(comm_alloc(size)),
+                                static_cast<char*>(comm_alloc(size)), nullptr,
                                 CkCallback(CkCallback::ignore)};
 }
 #endif
@@ -77,6 +80,25 @@ void PartitionImpl<N>::receive_ipc(int node_id, int input_index, int name, int n
     hapiAddCallback(comm_stream_raw, &cb);
 #else
     CkAbort("receive_ipc: needs an NVIDIA build");
+#endif
+}
+
+template <int N>
+void PartitionImpl<N>::receive_staged(int node_id, int input_index, int name, int ndims,
+                                      int* region_data, int64_t size, char* data) {
+#ifdef USE_NVIDIA
+    auto* p = comm_recv_param(this, node_id, input_index, name, ndims, region_data, size);
+    // pageable source: cudaMemcpyAsync returns once it has consumed the message
+    const char* src = data;
+    if ((p->host = static_cast<char*>(pinned_alloc(size)))) {
+        memcpy(p->host, data, size);
+        src = p->host;
+    }
+    hapiCheck(cudaMemcpyAsync(p->buf, src, size, cudaMemcpyHostToDevice, comm_stream_raw));
+    CkCallback cb(comm_recv_cb<N>, p);
+    hapiAddCallback(comm_stream_raw, &cb);
+#else
+    CkAbort("receive_staged: needs an NVIDIA build");
 #endif
 }
 #endif
@@ -155,6 +177,10 @@ template void PartitionImpl<2>::receive_ipc(int, int, int, int, int*, int64_t, i
                                             const char*, const CkCallback&);
 template void PartitionImpl<3>::receive_ipc(int, int, int, int, int*, int64_t, int, int, int64_t,
                                             const char*, const CkCallback&);
+
+template void PartitionImpl<1>::receive_staged(int, int, int, int, int*, int64_t, char*);
+template void PartitionImpl<2>::receive_staged(int, int, int, int, int*, int64_t, char*);
+template void PartitionImpl<3>::receive_staged(int, int, int, int, int*, int64_t, char*);
 
 template void PartitionImpl<1>::send_complete(int);
 template void PartitionImpl<2>::send_complete(int);

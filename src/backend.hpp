@@ -834,6 +834,8 @@ class PartitionImpl {
     void receive_ipc(int node_id, int input_index, int name, int ndims, int* region_data,
                      int64_t size, int src_node, int slab, int64_t offset, const char* handle,
                      const CkCallback& done);
+    void receive_staged(int node_id, int input_index, int name, int ndims, int* region_data,
+                        int64_t size, char* data);
 #endif
     void comm_done(int node_id);
     void reduce_result(int node_id, int64_t size, char* data);
@@ -879,6 +881,10 @@ class Partition1D : public CBase_Partition1D {
                      char* handle, CkCallback done) {
         impl.receive_ipc(node_id, input_index, name, ndims, region_data, size, src_node, slab,
                          offset, handle, done);
+    }
+    void receive_staged(int node_id, int input_index, int name, int ndims, int* region_data,
+                        int64_t size, char* data) {
+        impl.receive_staged(node_id, input_index, name, ndims, region_data, size, data);
     }
 #endif
     void comm_done(int node_id) { impl.comm_done(node_id); }
@@ -935,6 +941,10 @@ class Partition2D : public CBase_Partition2D {
         impl.receive_ipc(node_id, input_index, name, ndims, region_data, size, src_node, slab,
                          offset, handle, done);
     }
+    void receive_staged(int node_id, int input_index, int name, int ndims, int* region_data,
+                        int64_t size, char* data) {
+        impl.receive_staged(node_id, input_index, name, ndims, region_data, size, data);
+    }
 #endif
     void comm_done(int node_id) { impl.comm_done(node_id); }
     void reduce_result(int node_id, int64_t size, char* data) {
@@ -989,6 +999,10 @@ class Partition3D : public CBase_Partition3D {
                      char* handle, CkCallback done) {
         impl.receive_ipc(node_id, input_index, name, ndims, region_data, size, src_node, slab,
                          offset, handle, done);
+    }
+    void receive_staged(int node_id, int input_index, int name, int ndims, int* region_data,
+                        int64_t size, char* data) {
+        impl.receive_staged(node_id, input_index, name, ndims, region_data, size, data);
     }
 #endif
     void comm_done(int node_id) { impl.comm_done(node_id); }

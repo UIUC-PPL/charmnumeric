@@ -75,6 +75,7 @@ struct DeferredSendParam {
     void* ipc_buf = nullptr;  // CUDA IPC copy of send_buf (another process on this host)
     int ipc_slab;
     int64_t ipc_offset;
+    void* host_buf = nullptr; // pinned copy of send_buf (another host)
 
     /// Same-dimension send constructor: target_proxy defaults to partition's own proxy.
     DeferredSendParam(PartitionImpl<N_sender>* p)
@@ -97,7 +98,13 @@ static void deferred_send_cb(void* param, void* msg) {
     CkCallback cb(PartitionTraits<N_sender>::CkIndexType::send_complete(nullptr),
                   proxy_at<N_sender>(p->partition->thisProxy, self_ci));
     cb.setRefnum(static_cast<CMK_REFNUM_TYPE>(p->send_id));
-    if (p->ipc_buf) {
+    if (p->host_buf) {
+        proxy_at<N_target>(p->target_proxy, p->target_ci).receive_staged(
+            p->node_id, p->input_index, p->inp_name, N_target, p->region_data, p->byte_size,
+            static_cast<char*>(p->host_buf));
+        pinned_free(p->host_buf);
+        p->partition->send_complete(p->send_id);
+    } else if (p->ipc_buf) {
         comm_free(p->send_buf);
         cudaIpcMemHandle_t h = gpu_ipc_handle(p->ipc_slab);
         proxy_at<N_target>(p->target_proxy, p->target_ci).receive_ipc(
@@ -149,6 +156,9 @@ static void device_pack_send(PartitionImpl<N_sender>* partition,
             hapiCheck(cudaMemcpyAsync(ds->ipc_buf, send_buf, byte_size,
                                       cudaMemcpyDeviceToDevice, partition->comm_stream_raw));
             pending[ds->send_id] = ds->ipc_buf;
+        } else if ((ds->host_buf = pinned_alloc(byte_size))) {
+            hapiCheck(cudaMemcpyAsync(ds->host_buf, send_buf, byte_size, cudaMemcpyDeviceToHost,
+                                      partition->comm_stream_raw));
         }
     }
     CkCallback hapi_cb(deferred_send_cb<N_sender, N_target>, ds);
