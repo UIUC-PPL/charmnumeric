@@ -753,6 +753,10 @@ class PartitionImpl {
 #ifdef USE_KOKKOS
         if (zero)
             Kokkos::deep_copy(arr->d_view, T(0));
+#ifdef USE_NVIDIA
+        else
+            compute_after_others(); // e.g. a pack of the retired array on the comm stream
+#endif
         arr->h_view = {};
 #else
         if (zero) {
