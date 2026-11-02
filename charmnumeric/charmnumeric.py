@@ -829,6 +829,9 @@ def _axis_index(axis, ndim):
 
 
 _SCAN_KINDS = {"cumsum": 0, "cumprod": 1, "nancumsum": 2, "nancumprod": 3}
+_SCAN_WIDE = (np.dtype(np.int64), np.dtype(np.uint64))
+_SCAN_NARROW = tuple(np.dtype(t) for t in (np.bool_, np.int8, np.int16, np.int32, np.uint8,
+                                            np.uint16, np.uint32))
 
 
 def _scan(name, a, axis=None, dtype=None, out=None):
@@ -849,8 +852,13 @@ def _scan(name, a, axis=None, dtype=None, out=None):
     if dtype is None:
         # NumPy's accumulation dtype (int64/uint64 for bool and small ints)
         dtype = getattr(np, name)(np.zeros(1, a.dtype)).dtype
+        odt = np.dtype(out.dtype) if _is_array_nd(out) else None
+        if odt is not None and dtype.kind in "iu" and odt.kind in "iu":
+            dtype = odt  # same result modulo 2**bits, no int64 temporary
     dtype = _normalize_dtype(dtype)
-    src = _materialize(_astype(a, dtype))
+    if a.dtype != dtype and not (dtype in _SCAN_WIDE and a.dtype in _SCAN_NARROW):
+        a = _astype(a, dtype)  # SCAN casts the narrow integer inputs itself
+    src = _materialize(a)
     result = nonfusible_op(
         src,
         axis,
