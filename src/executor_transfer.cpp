@@ -201,6 +201,18 @@ void ArrayDAGExecutorND<N>::execute_cross_set_region_node(DAGNode* node) {
     }
 }
 
+/// Receivers place data by array_meta's offset; it must match the sender's buffer.
+template <int N>
+static void check_meta_offset(ArrayDAGGroup* dag_group, int name, ArrayDecomp<N> const& decomp) {
+#ifndef NDEBUG
+    auto it = dag_group->array_meta.find(name);
+    for (int d = 0; it != dag_group->array_meta.end() && d < N; ++d)
+        if (it->second.offset[d] != decomp.offset[d])
+            CkAbort("array %d: decomposition offset %d != metadata offset %d (dim %d)", name,
+                    decomp.offset[d], it->second.offset[d], d);
+#endif
+}
+
 template <int N_src, typename T>
 static void diag_send(PartitionImpl<N_src>* partition, DAGNode* node, int source_name,
                       int result_name, int k_offset, ArrayDAGGroup* dag_group) {
@@ -209,6 +221,7 @@ static void diag_send(PartitionImpl<N_src>* partition, DAGNode* node, int source
         return;
 
     auto* src = static_cast<Array<N_src, T>*>(src_it->second);
+    check_meta_offset<N_src>(dag_group, source_name, src_it->second->decomp);
 
     if constexpr (N_src == 1) {
         int tile_2d = array_tile(dag_group->array_meta, result_name, 2);
@@ -598,6 +611,7 @@ static void tile_send(PartitionImpl<N_src>* partition, DAGNode* node, int source
     auto* src = static_cast<Array<N_src, T>*>(src_it->second);
     auto nd_idx = partition->nd_index();
     auto src_decomp = src_it->second->decomp;
+    check_meta_offset<N_src>(dag_group, source_name, src_decomp);
 
     std::array<int, N_src> src_start, src_stop;
     for (int d = 0; d < N_src; ++d) {
