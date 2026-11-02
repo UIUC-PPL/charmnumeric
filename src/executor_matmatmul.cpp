@@ -68,7 +68,7 @@ static void cross_matmatmul_send_panel_2d(
     int sc = sub_cols;
     Kokkos::parallel_for(
         CT_COMM_POLICY(partition, send_count),
-        KOKKOS_LAMBDA(int i) { send_buf[i] = src[(i / sc) * lc + i % sc]; });
+        KOKKOS_LAMBDA(int64_t i) { send_buf[i] = src[(i / sc) * lc + i % sc]; });
     device_pack_send<2>(partition, proxy_2d, target_ci, node->id, input_index, arr_name,
                         region_data, byte_size, send_buf);
 #endif
