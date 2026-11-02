@@ -410,7 +410,8 @@ struct IndexState {
     std::vector<std::vector<char>> reqs;   // v holder: requests, served once all arrived
     // GATHER / SCATTER
     bool gx_target = false, gx_issued = false;
-    int lmsg_left = 0, rep_left = 0;           // target: L pieces / buckets, replies to come
+    int lmsg_left = 0, rep_left = 0;           // target: L pieces / buckets, direct copies to come
+    int64_t rep_elems = 0;                     // target: elements of replies to come
     char* gx_lblk = nullptr;                   // target: L values of its b range (GATHER)
     char* gx_ent = nullptr;                    // target: entry pairs grouped by holder
     std::vector<std::vector<char>> gx_msgs;    // SCATTER target: received buckets

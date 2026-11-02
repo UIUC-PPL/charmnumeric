@@ -142,6 +142,17 @@ C.check("ai2 at 1200", A2, r)
 R = cnp.repeat(1, N)
 C.check("repeat(A2, R, axis=1)", cnp.repeat(A2, R, axis=1), np.repeat(r, np.ones(N, int), axis=1))
 
+# ---- a long 1-D array: many chares, so many destination buckets ----
+nl = 10_000_000
+big = cnp.arange(nl, dtype=np.int64)
+gi = rng.integers(-nl, nl, size=200_000)
+C.check("take from 10M", cnp.take(big, dev(gi)), np.arange(nl)[gi])
+gv = rng.integers(0, 1000, size=200_000)
+big[dev(gi)] = dev(gv)
+bh = np.arange(nl)
+bh[gi] = gv
+C.check("10M[dup] = v", big, bh)
+
 # ---- out-of-bounds device indices are dropped, the rest is written ----
 o = cnp.zeros((50,), dtype=np.int64)
 o[dev(np.array([3, 60, 7]))] = 1
