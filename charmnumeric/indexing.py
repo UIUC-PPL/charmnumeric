@@ -16,7 +16,7 @@ Differences from NumPy:
   by the backend); host index lists are checked.
 - Device index arrays must have equal shapes (no broadcasting); results have at
   most 3 dimensions (more for >3-D sources, see folded.py).
-- Gathered and scattered elements are at most 8 bytes (no complex128).
+- nonzero / repeat counts take elements of at most 8 bytes (no complex128).
 """
 
 import numbers
@@ -117,26 +117,30 @@ def _geometry(x):
 # ---- backend nodes ----
 
 
-def _gather(root, L, E, npre, npost, strides):
-    _check_itemsize(root)
+def _slice_operands(strides, sdims, sstarts):
+    return [int(s) for s in strides] + [int(d) for d in sdims] + [int(a) for a in sstarts]
+
+
+def _gather(root, L, E, npre, npost, strides, sdims=(), sstarts=()):
+    """out[e] = root.flat[L[b] + sum(s_k * strides[k])]; slice k walks root dim sdims[k]
+    from root coordinate sstarts[k]."""
     E = tuple(int(e) for e in E)
     if int(np.prod(E)) == 0:
         return create_array(E, dtype=root.dtype)
     return nonfusible_op(
-        root, L, npre, npost, len(E), *E, *[int(s) for s in strides],
+        root, L, npre, npost, len(E), *E, *_slice_operands(strides, sdims, sstarts),
         operation=ArrayOperation.gather, shape=E, dtype=root.dtype,
     )
 
 
-def _scatter(root, L, value, E, npre, npost, strides):
-    _check_itemsize(root)
+def _scatter(root, L, value, E, npre, npost, strides, sdims=(), sstarts=()):
     E = tuple(int(e) for e in E)
     if int(np.prod(E)) == 0:
         return
     _fresh_operands((root, L, value))
     result = create_result(
         Array, ArrayOperation.scatter,
-        [root, L, value, npre, npost, len(E), *E, *[int(s) for s in strides]],
+        [root, L, value, npre, npost, len(E), *E, *_slice_operands(strides, sdims, sstarts)],
         fusible=False, region=_full_region(E), dtype=root.dtype, shape=E,
     )
     result.writes = ((root.name, root.region),)  # in place: the result name is unused
@@ -295,7 +299,11 @@ def _items(x, key, newaxes=None):
 class _Plan:
     """Index linearization: element e of E reads root.flat[L[b] + sum(s_k * strides[k])]."""
 
-    __slots__ = ("root", "L", "E", "final", "npre", "npost", "strides")
+    __slots__ = ("root", "L", "E", "final", "npre", "npost", "strides", "sdims", "sstarts")
+
+    def args(self):
+        return (self.root, self.L, self.E, self.npre, self.npost, self.strides, self.sdims,
+                self.sstarts)
 
 
 def _plan(x, items, mode="raise", newaxes=()):
@@ -344,6 +352,8 @@ def _plan(x, items, mode="raise", newaxes=()):
     plan.final = plan_final
     plan.npre, plan.npost = len(pre), len(post)
     plan.strides = [items[d][2] * mult[d] for d in pre + post]
+    plan.sdims = list(pre + post)
+    plan.sstarts = [int(x.region.start[d]) + items[d][1] * int(x.region.step[d]) for d in pre + post]
     plan.L = None
     if int(np.prod(E)) == 0:
         return plan
@@ -471,7 +481,7 @@ def getitem(x, key):
     plan = _key_plan(x, key)
     if plan is None:  # e.g. a[[...]] parsed to plain slices
         raise IndexError(f"unsupported index {key!r}")
-    result = _gather(plan.root, plan.L, plan.E, plan.npre, plan.npost, plan.strides)
+    result = _gather(*plan.args())
     return result if plan.final == plan.E else _reshape(result, plan.final)
 
 
@@ -514,7 +524,8 @@ def setitem(x, key, value):
         if vs != plan.E and squeezed(vs) == squeezed(plan.E):
             value = _reshape(value, plan.E)
     value = _scatter_value(x, value, plan.E)
-    _scatter(plan.root, plan.L, value, plan.E, plan.npre, plan.npost, plan.strides)
+    root, L, E, npre, npost, strides, sdims, sstarts = plan.args()
+    _scatter(root, L, value, E, npre, npost, strides, sdims, sstarts)
 
 
 # ---- >3-D (folded) arrays: offsets computed on the host ----
@@ -671,7 +682,7 @@ def take(a, indices, axis=None, out=None, mode="raise"):
         axis = _axis_index(axis, a.ndims)
         items = _items(a, (slice(None),) * axis + (indices,))
         plan = _plan(a, items, mode)
-        result = _gather(plan.root, plan.L, plan.E, plan.npre, plan.npost, plan.strides)
+        result = _gather(*plan.args())
     if out is not None:
         out[...] = result
         return out
