@@ -202,6 +202,7 @@ class CTArrayBase {
     virtual void* data_ptr() = 0;        // host pointer
     virtual void* device_data_ptr() = 0; // device pointer (or host if no GPU)
     virtual int elem_size() const = 0;
+    virtual int64_t host_bytes() const { return 0; } // host mirror (GPU builds)
 };
 
 template <int N, typename T = float>
@@ -291,6 +292,12 @@ class Array : public CTArrayBase<N> {
     }
 
     int elem_size() const override { return sizeof(T); }
+
+#ifdef USE_KOKKOS
+    int64_t host_bytes() const override {
+        return this->owner ? static_cast<int64_t>(h_view.extent(0)) * sizeof(T) : 0;
+    }
+#endif
 
     void copyToHost() override {
 #ifdef USE_KOKKOS
@@ -904,6 +911,16 @@ class PartitionImpl {
     void receive_upload_tile(int node_id, int name, int64_t size, char* data);
     void process_get(int epoch);
 };
+
+/// This PE's chares of each rank (CNUM_MEM_STATS reports).
+template <int N>
+std::vector<PartitionImpl<N>*>& local_partitions() {
+    thread_local std::vector<PartitionImpl<N>*> parts;
+    return parts;
+}
+
+/// CNUM_MEM_STATS=1: one line of memory use per PE at each barrier (partition_get.cpp).
+void mem_stats_report(ArrayDAGGroup* g, int epoch);
 
 // ---- Thin wrapper chare classes ----
 

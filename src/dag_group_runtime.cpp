@@ -215,6 +215,7 @@ void ArrayDAGGroup::barrier_arrive(int epoch) {
     if (--barrier_pending[epoch] != 0)
         return;
     barrier_pending.erase(epoch);
+    mem_stats_report(this, epoch);
     char none = 0;
     Server<CProxy_ArrayDAGGroup>::send_reply(epoch, 1, &none); // CCS needs a non-empty reply
 }
