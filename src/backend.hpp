@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <deque>
 #include <map>
@@ -260,6 +261,11 @@ inline void comm_free(void* ptr) {
 
 #include "dtypes.hpp"
 
+inline int64_t& retired_device_bytes() {
+    thread_local int64_t bytes = 0; // per PE
+    return bytes;
+}
+
 /// Type-erased base class for N-D arrays.
 template <int N>
 class CTArrayBase {
@@ -280,6 +286,7 @@ class CTArrayBase {
     virtual void* device_data_ptr() = 0; // device pointer (or host if no GPU)
     virtual int elem_size() const = 0;
     virtual int64_t host_bytes() const { return 0; } // host mirror (GPU builds)
+    virtual void drop_host() {}
 };
 
 template <int N, typename T = float>
@@ -373,6 +380,10 @@ class Array : public CTArrayBase<N> {
 #ifdef USE_KOKKOS
     int64_t host_bytes() const override {
         return this->owner ? static_cast<int64_t>(h_view.extent(0)) * sizeof(T) : 0;
+    }
+    void drop_host() override {
+        if (this->owner)
+            h_view = {};
     }
 #endif
 
@@ -723,7 +734,31 @@ class PartitionImpl {
 
     // Free list for array reuse: retired arrays keyed by exact buffer metadata.
     // A buffer is only reusable when dtype, shape, and decomposition match.
+#ifdef USE_NVIDIA
+    // Bounded by retired bytes per PE: freeing the surplus costs a cudaFree (a device sync)
+    // and a later cudaMalloc per array.
+    static constexpr int FREE_LIST_MAX = 64; // max entries per key
+#else
     static constexpr int FREE_LIST_MAX = 4; // max entries per key
+#endif
+    /// Bytes of retired arrays held by this PE's free lists (all ranks).
+    static int64_t& retired_bytes() {
+        return retired_device_bytes();
+    }
+    static int64_t retired_limit() {
+#ifdef USE_NVIDIA
+        static const int64_t limit = [] {
+            const char* env = std::getenv("CNUM_FREE_LIST_MB");
+            size_t fr = 0, total = 0;
+            cudaMemGetInfo(&fr, &total);
+            return env ? std::atoll(env) << 20 : static_cast<int64_t>(total / 8);
+        }();
+        return limit;
+#else
+        return std::numeric_limits<int64_t>::max();
+#endif
+    }
+
     struct FreeKey {
         DType dtype;
         std::array<int, N> local_shape;
@@ -793,8 +828,12 @@ class PartitionImpl {
         arrays.erase(it);
         FreeKey key = make_free_key(arr->dtype, arr->region, arr->global_shape, arr->decomp);
         auto& bucket = free_arrays[key];
-        if (static_cast<int>(bucket.size()) < FREE_LIST_MAX) {
+        int64_t bytes = arr->local_size() * arr->elem_size();
+        if (static_cast<int>(bucket.size()) < FREE_LIST_MAX &&
+            retired_bytes() + bytes <= retired_limit()) {
+            arr->drop_host();
             bucket.push_back(arr);
+            retired_bytes() += bytes;
             DBG_PRINT("[PE %d] Partition<%d> retire_array name=%d: moved to freelist "
                       "(dtype=%d local_size=%lld bucket=%d/%d)\n",
                       CkMyPe(), N, name, static_cast<int>(arr->dtype), (long long)arr->local_size(),
@@ -808,6 +847,28 @@ class PartitionImpl {
         }
     }
 
+#ifdef USE_KOKKOS
+    /// Free the retired arrays and the cached message buffers.
+    void release_cached() {
+        for (auto& [key, bucket] : free_arrays)
+            for (auto* arr : bucket) {
+                retired_bytes() -= arr->local_size() * arr->elem_size();
+                delete arr;
+            }
+        free_arrays.clear();
+        Kokkos::fence("ct_release_cached");
+        auto& pool = comm_pool();
+        std::lock_guard<std::mutex> lock(pool.mu);
+        comm_release_large(pool);
+        for (auto& list : pool.free_lists) {
+            for (void* p : list)
+                Kokkos::kokkos_free<DeviceSpace>(p);
+            list.clear();
+        }
+        pool.cached = 0;
+    }
+#endif
+
     /// Try to pop a reusable buffer from the free list.
     /// Returns nullptr if none available.
     CTArrayBase<N>* try_reuse(DType dtype,
@@ -820,6 +881,7 @@ class PartitionImpl {
             return nullptr;
         CTArrayBase<N>* arr = it->second.back();
         it->second.pop_back();
+        retired_bytes() -= arr->local_size() * arr->elem_size();
         if (it->second.empty())
             free_arrays.erase(it);
         return arr;
@@ -857,7 +919,21 @@ class PartitionImpl {
                                          bool zero = true) {
         CTArrayBase<N>* reused = try_reuse(dtype_of<T>(), region, global_shape, decomp);
         if (reused == nullptr) {
-            auto* arr = new Array<N, T>(region, global_shape, name, decomp, zero);
+            Array<N, T>* arr;
+#ifdef USE_NVIDIA
+            // zero-filled on the compute stream below, not by a blocking Kokkos init
+            try {
+                arr = new Array<N, T>(region, global_shape, name, decomp, false);
+            } catch (const std::exception&) {
+                // out of device memory: drop the cached buffers and retry
+                release_cached();
+                arr = new Array<N, T>(region, global_shape, name, decomp, false);
+            }
+            if (zero)
+                zero_async(arr->d_view.data(), arr->local_size() * sizeof(T));
+#else
+            arr = new Array<N, T>(region, global_shape, name, decomp, zero);
+#endif
             if (!zero)
                 poison_uninit(arr);
             return arr;
@@ -874,13 +950,14 @@ class PartitionImpl {
         arr->owner = true;
         arr->dtype = dtype_of<T>();
 
-#ifdef USE_KOKKOS
+#ifdef USE_NVIDIA
+        compute_after_others(); // e.g. a pack of the retired array on the comm stream
+        if (zero)
+            zero_async(arr->d_view.data(), arr->local_size() * sizeof(T));
+        arr->h_view = {};
+#elif defined(USE_KOKKOS)
         if (zero)
             Kokkos::deep_copy(arr->d_view, T(0));
-#ifdef USE_NVIDIA
-        else
-            compute_after_others(); // e.g. a pack of the retired array on the comm stream
-#endif
         arr->h_view = {};
 #else
         if (zero) {
@@ -949,6 +1026,7 @@ class PartitionImpl {
     void join_streams();
     void compute_after_others();
     void default_after_compute();
+    void zero_async(void* ptr, int64_t bytes);
 #endif
 #endif
 

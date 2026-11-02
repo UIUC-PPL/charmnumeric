@@ -45,8 +45,10 @@ PartitionImpl<N>::~PartitionImpl() {
     for (auto& [name, arr] : arrays)
         delete arr;
     for (auto& [key, bucket] : free_arrays)
-        for (auto* arr : bucket)
+        for (auto* arr : bucket) {
+            retired_bytes() -= arr->local_size() * arr->elem_size();
             delete arr;
+        }
 #ifdef USE_KOKKOS
     for (auto& [id, ptr] : pending_sends) {
 #ifdef USE_NVIDIA
@@ -89,6 +91,19 @@ void PartitionImpl<N>::compute_after_others() {
     CT_CUDA_CHECK(cudaStreamWaitEvent(compute_stream_raw, join_event, 0));
     CT_CUDA_CHECK(cudaEventRecord(join_event, Kokkos::DefaultExecutionSpace().cuda_stream()));
     CT_CUDA_CHECK(cudaStreamWaitEvent(compute_stream_raw, join_event, 0));
+}
+
+/// Zero-fills `bytes` at `ptr` on the compute stream, and orders the comm stream and the
+/// Kokkos default instance after it.
+template <int N>
+void PartitionImpl<N>::zero_async(void* ptr, int64_t bytes) {
+    if (bytes <= 0)
+        return;
+    CT_CUDA_CHECK(cudaMemsetAsync(ptr, 0, bytes, compute_stream_raw));
+    CT_CUDA_CHECK(cudaEventRecord(join_event, compute_stream_raw));
+    CT_CUDA_CHECK(cudaStreamWaitEvent(comm_stream_raw, join_event, 0));
+    CT_CUDA_CHECK(
+        cudaStreamWaitEvent(Kokkos::DefaultExecutionSpace().cuda_stream(), join_event, 0));
 }
 
 /// Orders the Kokkos default instance after the work queued on the compute stream.
@@ -217,6 +232,9 @@ template void PartitionImpl<3>::join_streams();
 template void PartitionImpl<1>::compute_after_others();
 template void PartitionImpl<2>::compute_after_others();
 template void PartitionImpl<3>::compute_after_others();
+template void PartitionImpl<1>::zero_async(void*, int64_t);
+template void PartitionImpl<2>::zero_async(void*, int64_t);
+template void PartitionImpl<3>::zero_async(void*, int64_t);
 template void PartitionImpl<1>::default_after_compute();
 template void PartitionImpl<2>::default_after_compute();
 template void PartitionImpl<3>::default_after_compute();
