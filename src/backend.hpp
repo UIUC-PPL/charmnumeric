@@ -524,9 +524,9 @@ class ArrayDAGGroup : public CBase_ArrayDAGGroup {
 
     // Unified DAG handling — dispatches to all relevant partition types
     void receive_dag(int epoch, int size, char* serialized_dag);
-    void receive_get_request(int ndims, int epoch, int name, int size, int dtype = 0);
+    void receive_get_request(int ndims, int epoch, int name, int64_t size, int dtype = 0);
     void receive_dag_now(int epoch, int size, char* serialized_dag);
-    void receive_get_request_now(int ndims, int epoch, int name, int size, int dtype);
+    void receive_get_request_now(int ndims, int epoch, int name, int64_t size, int dtype);
     // Broadcasts from PE 0 may arrive out of order (e.g. a small GET overtaking a large
     // DAG); epochs are processed in client order, later ones wait here.
     int next_epoch = 0;

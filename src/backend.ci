@@ -18,7 +18,7 @@ mainmodule charmnumeric
 #endif
         entry void prewarm();
         entry void receive_dag(int epoch, int size, char msg[size]);
-        entry void receive_get_request(int ndims, int epoch, int name, int size, int dtype);
+        entry void receive_get_request(int ndims, int epoch, int name, int64_t size, int dtype);
         entry void gather(int epoch, int name, int64_t offset, int64_t size, char data[size]);
         entry void barrier_arrive(int epoch);
         entry void fetch_upload_tile(int node_id, int name, int nd, int i0, int i1, int i2);
