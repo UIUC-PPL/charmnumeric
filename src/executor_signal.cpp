@@ -182,6 +182,53 @@ void with_sig_type(Opcode op, DType dt, F&& f) {
 
 // ---- device/host buffers and kernels ----
 
+#ifdef USE_NVIDIA
+/// copy_box as one cudaMemcpy/2D/3D on the compute stream: unit last-dim strides and
+/// positive pitches, at most two outer dims of extent > 1; false if it does not apply.
+template <int N, typename T>
+bool copy_box_memcpy(PartitionImpl<N>* partition, T* dst, const int64_t* ds, const T* src,
+                     const int64_t* ss, const int64_t* ext) {
+    if (ds[N - 1] != 1 || ss[N - 1] != 1)
+        return false;
+    int64_t e[2], dp[2], sp[2];
+    int k = 0;
+    for (int d = 0; d < N - 1; ++d) {
+        if (ext[d] == 1)
+            continue;
+        if (k == 2 || ds[d] < ext[N - 1] || ss[d] < ext[N - 1])
+            return false;
+        e[k] = ext[d];
+        dp[k] = ds[d];
+        sp[k] = ss[d];
+        ++k;
+    }
+    const size_t sz = sizeof(T), w = size_t(ext[N - 1]) * sz;
+    cudaStream_t st = partition->compute_stream_raw;
+    cudaError_t err;
+    if (k == 0) {
+        err = cudaMemcpyAsync(dst, src, w, cudaMemcpyDeviceToDevice, st);
+    } else if (k == 1) {
+        err = cudaMemcpy2DAsync(dst, dp[0] * sz, src, sp[0] * sz, w, e[0],
+                                cudaMemcpyDeviceToDevice, st);
+    } else {
+        // outer stride a whole number of rows, the rows of one slice in its pitch
+        if (dp[0] % dp[1] || sp[0] % sp[1] || dp[0] / dp[1] < e[1] || sp[0] / sp[1] < e[1])
+            return false;
+        cudaMemcpy3DParms p = {};
+        p.srcPtr = make_cudaPitchedPtr(const_cast<T*>(src), sp[1] * sz, w, sp[0] / sp[1]);
+        p.dstPtr = make_cudaPitchedPtr(dst, dp[1] * sz, w, dp[0] / dp[1]);
+        p.extent = make_cudaExtent(w, e[1], e[0]);
+        p.kind = cudaMemcpyDeviceToDevice;
+        err = cudaMemcpy3DAsync(&p, st);
+    }
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+#endif
+
 /// Strided box copy: dst[dbase + sum i_d*ds_d] = src[sbase + sum i_d*ss_d] over
 /// the box ext (row-major order); strides may be negative.
 template <int N, typename T>
@@ -197,6 +244,10 @@ void copy_box(PartitionImpl<N>* partition, T* dst, int64_t dbase, const int64_t*
     }
     if (total <= 0)
         return;
+#ifdef USE_NVIDIA
+    if (copy_box_memcpy<N, T>(partition, dst + dbase, ds, src + sbase, ss, ext))
+        return;
+#endif
 #ifdef USE_KOKKOS
     Kokkos::parallel_for(
         CT_COMPUTE_POLICY(partition, total), KOKKOS_LAMBDA(int64_t k) {
