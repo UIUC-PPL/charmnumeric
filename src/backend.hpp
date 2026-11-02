@@ -14,6 +14,7 @@
 
 #include "charmnumeric.decl.h"
 
+#ifndef CT_MIN_TILE_1D
 #ifdef USE_KOKKOS
 #define CT_MIN_TILE_1D 1048576
 #define CT_MIN_TILE_2D 1024
@@ -22,6 +23,7 @@
 #define CT_MIN_TILE_1D 262144
 #define CT_MIN_TILE_2D 512
 #define CT_MIN_TILE_3D 64
+#endif
 #endif
 
 
