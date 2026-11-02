@@ -6,6 +6,7 @@
 #include <mutex>
 #include <deque>
 #include <map>
+#include <memory>
 
 #include "array_region.hpp"
 #include "opcodes.hpp"
@@ -430,6 +431,10 @@ struct ShapeState {
 
 // ---- ArrayDAGGroup ----
 
+/// receive_data input_index base of the distributed sort's data messages (executor_sort.cpp).
+constexpr int kDsDataTag = 1 << 20;
+struct DsState;
+
 /// GET of this array name: a barrier, answered (with no data) once every chare
 /// of every partition has finished all earlier epochs.
 constexpr int kBarrierName = -1;
@@ -578,6 +583,7 @@ class ArrayDAGExecutorND : public DAGExecutor {
     std::unordered_map<int, LinalgState<N>> la_state;
     std::unordered_map<int, IndexState<N>> ix_state;
     std::unordered_map<int, ShapeState<N>> shape_state;
+    std::unordered_map<int, std::shared_ptr<DsState>> ds_state;
     std::unordered_map<int, std::pair<DAGNode*, int>> upload_wait; // node -> tiles still fetched
 
     ArrayDAGExecutorND(ArrayDAGGroup* group_, PartitionImpl<N>* partition_)
@@ -606,6 +612,13 @@ class ArrayDAGExecutorND : public DAGExecutor {
     void on_shape_msg(int node_id, char* data, int64_t size);
     void execute_castscansort_node(DAGNode* node);
     void finish_castscansort_node(PendingComm<N>& comm);
+    void execute_ds_node(DAGNode* node);
+    void ds_progress_start(int node_id);
+    void on_ds_msg(int node_id, char* data, int64_t size);
+    void on_ds_data(int node_id, int phase, const int* region_data, char* buf, int64_t size);
+    void ds_take_piece(int node_id, int phase, int src, int64_t start, int64_t count, char* buf);
+    void ds_sort_progress(int node_id);
+    void ds_select_msg(int node_id, char* data, int64_t size);
     void execute_signal_node(DAGNode* node);
     void finish_signal_node(PendingComm<N>& comm);
     void execute_index_node(DAGNode* node);
@@ -902,6 +915,7 @@ class PartitionImpl {
     void receive_index_msg(int node_id, int64_t size, char* data);
     void receive_shape(int node_id, int64_t size, char* data);
     void receive_upload_tile(int node_id, int name, int64_t size, char* data);
+    void receive_sort_msg(int node_id, int64_t size, char* data);
     void process_get(int epoch);
 };
 
@@ -963,6 +977,9 @@ class Partition1D : public CBase_Partition1D {
     }
     void receive_upload_tile(int node_id, int name, int64_t size, char* data) {
         impl.receive_upload_tile(node_id, name, size, data);
+    }
+    void receive_sort_msg(int node_id, int64_t size, char* data) {
+        impl.receive_sort_msg(node_id, size, data);
     }
 };
 

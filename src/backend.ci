@@ -54,6 +54,7 @@ mainmodule charmnumeric
         entry void receive_index_msg(int node_id, int64_t size, char data[size]);
         entry void receive_shape(int node_id, int64_t size, char data[size]);
         entry void receive_upload_tile(int node_id, int name, int64_t size, char data[size]);
+        entry void receive_sort_msg(int node_id, int64_t size, char data[size]);
     };
 
     array [2D] Partition2D

@@ -217,6 +217,7 @@ class ArrayOperation(Operation):
     scan = 81
     sort = 82
     argsort = 83
+    select = 190  # order statistics of a 1-D array (quantile; src/executor_sort.cpp)
     linalg = 100  # factorizations and solves (charmnumeric/linalg.py)
     # Data-dependent indexing (120-139, src/executor_indexing.cpp)
     gather = 120
@@ -874,9 +875,11 @@ def _scan(name, a, axis=None, dtype=None, out=None):
 
 
 def _sort(a, axis=-1, kind=None, order=None, arg=False):
-    """sort / argsort along one axis; gathers on one chare (not scalable). NaNs last, stable."""
+    """sort / argsort along one axis (stable, NaNs last: valid for every NumPy kind)."""
     if order is not None:
         raise NotImplementedError("sort(order=...) needs structured dtypes")
+    if kind is not None and not (isinstance(kind, str) and kind[:1].lower() in "qhms" and kind):
+        raise ValueError(f"sort kind must be one of 'quick', 'heap', or 'stable' (got {kind!r})")
     a = asarray(a)
     if axis is None:
         a = _reshape(a, (-1,))

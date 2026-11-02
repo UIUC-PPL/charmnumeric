@@ -129,6 +129,10 @@ void PartitionImpl<N>::receive_data(int node_id, int input_index, int name, int 
     char* buf = new char[size];
     memcpy(buf, data, size);
 #endif
+    if (input_index >= kDsDataTag) {
+        executor->on_ds_data(node_id, input_index - kDsDataTag, region_data, buf, size);
+        return;
+    }
 
     // Unpack region from region_data: [start0, stop0, step0, start1, stop1, step1, ...]
     std::array<int, N> start, stop, step;

@@ -404,27 +404,42 @@ def quantile(a, q, axis=None, out=None, overwrite_input=False, method="linear",
     rest = tuple(a.shape[:ax]) + tuple(a.shape[ax + 1:])
     props = npq._QuantileMethods[method]
     vi = np.asanyarray(props["get_virtual_index"](n, q))
-    s = _sort(a, ax)
-
-    def at(idx):
-        # s[idx] along ax, with the q dims first
-        flat = np.asarray(idx, dtype=np.int64).reshape(-1) % n
-        t = take(s, flat, axis=ax)
-        if ax != 0:
-            perm = (ax,) + tuple(d for d in range(t.ndim) if d != ax)
-            t = _transpose(t, perm)
-        return _reshape(t, np.shape(idx) + rest)
-
-    if props["fix_gamma"] is None or (method == "linear" and vi.dtype.kind in "iu"):
-        result = at(vi)
+    direct = props["fix_gamma"] is None or (method == "linear" and vi.dtype.kind in "iu")
+    if direct:
+        idxs = [vi]
     else:
         prev, nxt = npq._get_indexes(np.empty(0, a.dtype), vi, n)
+        idxs = [prev, nxt]
+    if a.dtype.kind == "f":
+        idxs.append(np.full(vi.shape, -1))  # slices holding a NaN (sorted last) give NaN
+    flat = [np.asarray(i, dtype=np.int64).reshape(-1) % n for i in idxs]
+    if a.ndim == 1 and n > 0 and builtins.sum(f.size for f in flat) <= _SELECT_MAX:
+        # order statistics without sorting (SELECT)
+        vals = _select(a, np.concatenate(flat))
+        offs = np.cumsum([0] + [f.size for f in flat])
+
+        def at(k):
+            return _reshape(vals[int(offs[k]):int(offs[k + 1])], np.shape(idxs[k]))
+    else:
+        s = _sort(a, ax)
+
+        def at(k):
+            # s[idxs[k]] along ax, with the q dims first
+            t = take(s, flat[k], axis=ax)
+            if ax != 0:
+                perm = (ax,) + tuple(d for d in range(t.ndim) if d != ax)
+                t = _transpose(t, perm)
+            return _reshape(t, np.shape(idxs[k]) + rest)
+
+    if direct:
+        result = at(0)
+    else:
         gamma = npq._get_gamma(vi, prev, props)
         if weak_q:
             gamma = float(gamma)
         else:
             gamma = gamma.reshape(vi.shape + (1,) * len(rest))
-        lo, hi = at(prev), at(nxt)
+        lo, hi = at(0), at(1)
         diff = hi - lo
         lerp = lo + diff * gamma
         alt = hi - diff * (1 - gamma)
@@ -435,14 +450,25 @@ def quantile(a, q, axis=None, out=None, overwrite_input=False, method="linear",
         if result.dtype != lerp.dtype:
             result = result.astype(lerp.dtype)
     if a.dtype.kind == "f":
-        # slices holding a NaN (sorted last) give NaN
-        last = at(np.full(vi.shape, -1))
+        last = at(len(idxs) - 1)
         result = _where(last != last, last, result)
     if keepdims:
         kept = ((1,) * len(in_shape) if axis is None
                 else tuple(1 if d == ax else m for d, m in enumerate(in_shape)))
         result = _reshape(result, q.shape + kept)
     return _write_out(result, out)
+
+
+_SELECT_MAX = 256
+
+
+def _select(a, ranks):
+    """``np.sort(a)[ranks]`` of a 1-D array (SELECT node; NaNs last)."""
+    from .charmnumeric import ArrayOperation, _materialize
+
+    src = _materialize(a)
+    return nonfusible_op(src, *[int(r) for r in ranks], operation=ArrayOperation.select,
+                         shape=(len(ranks),), dtype=src.dtype)
 
 
 def percentile(a, q, axis=None, out=None, overwrite_input=False, method="linear",

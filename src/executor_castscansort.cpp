@@ -24,8 +24,9 @@
 #endif
 
 // SCAN / SORT / ARGSORT executors (opcodes 81-83). The result has the
-// input's decomposition (pinned in dag_group_receive.cpp).
-// SORT is not scalable: it gathers to the chare holding element 0.
+// input's decomposition (pinned in dag_group_receive.cpp). 1-D sorts of real
+// types and SELECT run in executor_sort.cpp; the other sorts gather to the
+// chare holding element 0.
 
 // Named namespace: these types are captured by device lambdas.
 namespace castscansort_detail {
@@ -615,10 +616,21 @@ void sort_root(PartitionImpl<N>* partition, int node_id, int out_name, CTArrayBa
 
 using namespace castscansort_detail;
 
+bool ds_handles(ASTNode* root, DType dt, int ndims);
+template <int N>
+bool ds_axis_whole(CTArrayBase<N>* in, int axis);
+template <int N>
+void ds_axis_local(PartitionImpl<N>* p, CTArrayBase<N>* in, CTArrayBase<N>* out, int axis,
+                   bool arg);
+
 template <int N>
 void ArrayDAGExecutorND<N>::execute_castscansort_node(DAGNode* node) {
     ASTNode* root = castscansort_root(node);
     Opcode op = static_cast<Opcode>(root->opcode);
+    if (op != Opcode::SCAN && ds_handles(root, root->operands[0]->dtype, N)) {
+        execute_ds_node(node);
+        return;
+    }
     int in_name = root->operands[0]->result_name;
     int out_name = root->result_name;
 
@@ -643,6 +655,8 @@ void ArrayDAGExecutorND<N>::execute_castscansort_node(DAGNode* node) {
             expected = scan_execute<N, decltype(to), decltype(ti)>(partition, node, out_name, in,
                                                                    axis, kind);
         });
+    } else if (ds_axis_whole<N>(in, scalar_param(root, 1, 0))) {
+        ds_axis_local<N>(partition, in, out, scalar_param(root, 1, 0), op == Opcode::ARGSORT);
     } else if (op == Opcode::SORT || op == Opcode::ARGSORT) {
         const ArrayDecomp<N>& dec = in->decomp;
         auto me = partition->nd_index();
@@ -695,6 +709,8 @@ void ArrayDAGExecutorND<N>::finish_castscansort_node(PendingComm<N>& comm) {
     }
 
     // SORT / ARGSORT
+    if (ds_axis_whole<N>(in, axis))
+        return;
     const ArrayDecomp<N>& dec = in->decomp;
     auto me = partition->nd_index();
     bool is_root = true;
