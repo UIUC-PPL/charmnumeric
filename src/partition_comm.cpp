@@ -146,7 +146,10 @@ void PartitionImpl<N>::receive_data(int node_id, int input_index, int name, int 
 
     if (comm.incremental) {
         // Incremental mode: compute with this panel immediately
-        executor->on_matmatmul_receive(node_id, input_index);
+        if constexpr (N == 3)
+            executor->on_signal_receive(node_id, input_index);
+        else
+            executor->on_matmatmul_receive(node_id, input_index);
     }
 
     if (comm.expected_msgs > 0) {

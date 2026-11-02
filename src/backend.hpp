@@ -608,6 +608,7 @@ class ArrayDAGExecutorND : public DAGExecutor {
     void finish_castscansort_node(PendingComm<N>& comm);
     void execute_signal_node(DAGNode* node);
     void finish_signal_node(PendingComm<N>& comm);
+    void on_signal_receive(int node_id, int input_index);
     void execute_index_node(DAGNode* node);
     void on_index_msg(int node_id, char* data, int64_t size);
     void index_progress(int node_id);
