@@ -4,6 +4,8 @@
 #include <cstring>
 #include <map>
 #include <numeric>
+#include <climits>
+#include <cstdint>
 #include <type_traits>
 
 // Indexing with data-dependent communication.
@@ -1450,15 +1452,23 @@ struct GxIter {
     int64_t size() const { return nb * psize; }
     CT_IX_FN void split(int64_t i, int64_t& j, int64_t& u0, int64_t& u1) const {
         int64_t r;
-        if (jinner) {
-            j = i % nb;
-            r = i / nb;
+        int64_t d = jinner ? nb : psize;
+        if (nb * psize <= (int64_t)UINT32_MAX) { // 32-bit division
+            uint32_t q = (uint32_t)i / (uint32_t)d;
+            r = jinner ? q : (uint32_t)i - q * (uint32_t)d;
+            j = jinner ? (uint32_t)i - q * (uint32_t)d : q;
         } else {
-            j = i / psize;
-            r = i - j * psize;
+            int64_t q = i / d;
+            r = jinner ? q : i - q * d;
+            j = jinner ? i - q * d : q;
         }
-        u0 = r / pc1;
-        u1 = r - u0 * pc1;
+        if (pc1 == 1) {
+            u0 = r;
+            u1 = 0;
+        } else {
+            u0 = r / pc1;
+            u1 = r - u0 * pc1;
+        }
     }
 };
 
