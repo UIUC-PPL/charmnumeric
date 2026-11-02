@@ -618,7 +618,7 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                 // also needs x and weights laid out identically.
                 if (is_reduction_op(op) || op == Opcode::LINALG || is_shape_op(op) ||
                     is_signal_op(op) || op == Opcode::GATHER || op == Opcode::EXPAND ||
-                    op == Opcode::COMPRESS) {
+                    op == Opcode::COMPRESS || op == Opcode::TILE || op == Opcode::DIAG) {
                     matmul_arrays.insert(ast_node->result_name);
                     if (op == Opcode::BINCOUNT)
                         for (ASTNode* operand : ast_node->operands)

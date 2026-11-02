@@ -869,6 +869,40 @@ def dot_after_partition_growth():
     check("inner float32 view", get(cnp.inner(v, v)), np.inner(h32[0:524289:2], h32[0:524289:2]))
 
 
+@case
+def tile_diag_at_offsets():
+    # TILE/DIAG results written into a shifted region
+    n = 600
+    h, v, A = data((1, n)), data((n,), seed=1), data((n, n), seed=2)
+    hh, vh, Ah = made(h, v, A)
+    Z = cnp.zeros((40, 2 * n + 37))
+    Z[:, n + 30:2 * n + 30] = cnp.tile(h, (40, 1))
+    Zh = np.zeros((40, 2 * n + 37))
+    Zh[:, n + 30:2 * n + 30] = np.tile(hh, (40, 1))
+    check("Z[:, s] = tile(h)", get(Z), Zh)
+    Z = cnp.zeros((40, 2 * n + 37))
+    Z[:, n + 30:2 * n + 30] = cnp.tile(v, (40, 1))
+    Zh[:, n + 30:2 * n + 30] = np.tile(vh, (40, 1))
+    check("Z[:, s] = tile(v)", get(Z), Zh)
+    s3 = data((1, 3, 70), seed=3)
+    s3h = made(s3)
+    Y = cnp.zeros((4, 7, 300))
+    Y[1:3, 1:7, 140:280] = cnp.tile(s3, (2, 2, 2))
+    Yh = np.zeros((4, 7, 300))
+    Yh[1:3, 1:7, 140:280] = np.tile(s3h, (2, 2, 2))
+    check("Y[s] = tile(s3)", get(Y), Yh)
+    z = cnp.zeros((2 * n + 9,))
+    z[n + 5:2 * n + 5] = cnp.diag(A)
+    zh = np.zeros((2 * n + 9,))
+    zh[n + 5:2 * n + 5] = np.diag(Ah)
+    check("z[s] = diag(A)", get(z), zh)
+    Z = cnp.zeros((n, 2 * n + 9))
+    Z[:, n + 5:2 * n + 5] = cnp.diag(v)
+    Zh = np.zeros((n, 2 * n + 9))
+    Zh[:, n + 5:2 * n + 5] = np.diag(vh)
+    check("Z[:, s] = diag(v)", get(Z), Zh)
+
+
 def main():
     global iface
     iface = connect()
