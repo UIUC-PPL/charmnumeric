@@ -820,9 +820,18 @@ def repeat(a, repeats, axis=None):
     else:
         idx = np.repeat(np.arange(n), np.broadcast_to(np.asarray(repeats), (n,)))
 
+    return _take_valid(a, idx, axis)
+
+
+def _take_valid(a, idx, axis):
+    """take(a, idx, axis) for indices known to be in range (no wrap node for device ones)."""
+    if not _is_array(idx):
+        return _flat_gather(a, idx, "raise") if axis is None else take(a, idx, axis=axis)
     if axis is None:
-        return _flat_gather(a, idx, "raise")
-    return take(a, idx, axis=axis)
+        return _gather(_flat_source(a), idx, tuple(idx.shape), 0, 0, [])
+    items = [(it[0], it[1], True) if it[0] == "a" else it
+             for it in _items(a, (slice(None),) * axis + (idx,))]
+    return _gather(*_plan(a, items).args())
 
 
 def choose(a, choices, out=None, mode="raise"):
