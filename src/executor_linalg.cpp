@@ -127,6 +127,47 @@ int linalg_result_meta(ASTNode* root,
     return s.out_nd;
 }
 
+// ---- Profiling (CNUM_LA_TIME=1) ----
+
+static bool la_timing() {
+    static const bool on = getenv("CNUM_LA_TIME") != nullptr;
+    return on;
+}
+
+struct LaProf {
+    double t0 = -1, send = 0, write = 0, todev = 0;
+    bool done = false;
+    std::vector<std::pair<const char*, double>> marks;
+};
+
+thread_local int la_cur_node = -1;
+
+static LaProf& la_prof(int node_id = la_cur_node) {
+    thread_local std::unordered_map<int, LaProf> p;
+    return p[node_id];
+}
+
+static void la_mark(const char* what) {
+    if (la_timing())
+        la_prof().marks.emplace_back(what, CkWallTimer());
+}
+
+static void la_report(int node_id, const char* who) {
+    LaProf& p = la_prof(node_id);
+    if (!la_timing() || p.t0 < 0)
+        return;
+    std::string s;
+    double prev = p.t0;
+    for (auto& [w, t] : p.marks) {
+        s += " " + std::string(w) + "=" + std::to_string(1e3 * (t - prev)).substr(0, 8);
+        prev = t;
+    }
+    p.done = true;
+    CkPrintf("[la] pe %d node %d %s: total=%.1f ms send=%.1f write=%.1f todev=%.1f |%s\n",
+             CkMyPe(), node_id, who, 1e3 * (CkWallTimer() - p.t0), 1e3 * p.send, 1e3 * p.write,
+             1e3 * p.todev, s.c_str());
+}
+
 // ---- Messaging ----
 
 template <int M>
@@ -179,6 +220,7 @@ static void la_send_block(PartitionImpl<N>* partition, ArrayDAGGroup* g, int nod
     if (!ok || blk.size() <= 0)
         return;
 
+    double ts = CkWallTimer();
     arr->copyToHost();
     const S* data = static_cast<const S*>(arr->data_ptr());
     std::array<int64_t, N> tstride{};
@@ -213,6 +255,7 @@ static void la_send_block(PartitionImpl<N>* partition, ArrayDAGGroup* g, int nod
         }
     }
     la_send_root(g, s.out_nd, node_id, buf);
+    la_prof(node_id).send += CkWallTimer() - ts;
 }
 
 /// Cut the column-major result into the output decomposition and send each tile.
@@ -767,6 +810,13 @@ CT_LA_OVERLOADS_C(cn_c128, double, cuDoubleComplex, Z)
 
 static int la_info(const DevBuf<int>& info) { return info.download(1)[0]; }
 
+static void la_smark(cudaStream_t st, const char* what) {
+    if (la_timing()) {
+        cudaStreamSynchronize(st);
+        la_mark(what);
+    }
+}
+
 /// SVD of a host column-major m x n matrix. U is m x (full ? m : k), VT is
 /// (full ? n : k) x n. gesvd needs m >= n, so m < n factors A^T instead.
 template <typename T>
@@ -824,11 +874,14 @@ void la_compute(const LaSpec& s, LaProblem<T>& P, PartitionImpl<N>* partition) {
         bool upper = s.p[0] != 0;
         cublasFillMode_t u = upper ? CUBLAS_FILL_MODE_UPPER : CUBLAS_FILL_MODE_LOWER;
         DevBuf<T> dA(P.a, st);
+        la_smark(st, "h2d");
         int lw = 0;
         CT_CUSOLVER_CHECK(cula::potrf_bs(h.solver, u, n, dA.p, n, &lw));
         DevBuf<T> dW(std::max(lw, 1), st);
         CT_CUSOLVER_CHECK(cula::potrf(h.solver, u, n, dA.p, n, dW.p, lw, dInfo.p));
+        la_smark(st, "factor");
         std::vector<T> L = dA.download();
+        la_mark("d2h");
         for (int j = 0; j < n; ++j)
             for (int i = 0; i < n; ++i)
                 P.at(i, j) = (upper ? i <= j : i >= j) ? L[i + static_cast<int64_t>(j) * n] : T(0);
@@ -840,11 +893,14 @@ void la_compute(const LaSpec& s, LaProblem<T>& P, PartitionImpl<N>* partition) {
         int mode = static_cast<int>(s.p[0]);
         int rr = mode == 2 ? m : k, qc = mode == 2 ? m : k;
         DevBuf<T> dA(P.a, st), dTau(std::max(k, 1), st);
+        la_smark(st, "h2d");
         int lw = 0;
         CT_CUSOLVER_CHECK(cula::geqrf_bs(h.solver, m, n, dA.p, m, &lw));
         DevBuf<T> dW(std::max(lw, 1), st);
         CT_CUSOLVER_CHECK(cula::geqrf(h.solver, m, n, dA.p, m, dTau.p, dW.p, lw, dInfo.p));
+        la_smark(st, "geqrf");
         std::vector<T> F = dA.download();
+        la_mark("d2h");
         int r0 = mode == 1 ? 0 : m;
         for (int j = 0; j < n; ++j)
             for (int i = 0; i < rr; ++i)
@@ -858,7 +914,9 @@ void la_compute(const LaSpec& s, LaProblem<T>& P, PartitionImpl<N>* partition) {
         CT_CUSOLVER_CHECK(cula::orgqr_bs(h.solver, m, qc, k, dQ.p, m, dTau.p, &lq));
         DevBuf<T> dWq(std::max(lq, 1), st);
         CT_CUSOLVER_CHECK(cula::orgqr(h.solver, m, qc, k, dQ.p, m, dTau.p, dWq.p, lq, dInfo.p));
+        la_smark(st, "orgqr");
         std::vector<T> Q = dQ.download();
+        la_mark("d2h");
         for (int j = 0; j < qc; ++j)
             for (int i = 0; i < m; ++i)
                 P.at(i, j) = Q[i + static_cast<int64_t>(j) * m];
@@ -870,10 +928,12 @@ void la_compute(const LaSpec& s, LaProblem<T>& P, PartitionImpl<N>* partition) {
     case LA_SLOGDET: {
         DevBuf<T> dA(P.a, st);
         DevBuf<int> dPiv(std::max(n, 1), st);
+        la_smark(st, "h2d");
         int lw = 0;
         CT_CUSOLVER_CHECK(cula::getrf_bs(h.solver, n, n, dA.p, n, &lw));
         DevBuf<T> dW(std::max(lw, 1), st);
         CT_CUSOLVER_CHECK(cula::getrf(h.solver, n, n, dA.p, n, dW.p, dPiv.p, dInfo.p));
+        la_smark(st, "getrf");
         if (s.op == LA_DET || s.op == LA_SLOGDET) {
             std::vector<T> LU = dA.download();
             std::vector<int> piv = dPiv.download();
@@ -897,6 +957,7 @@ void la_compute(const LaSpec& s, LaProblem<T>& P, PartitionImpl<N>* partition) {
         }
         DevBuf<T> dB(Bh, st);
         CT_CUSOLVER_CHECK(cula::getrs(h.solver, n, nrhs, dA.p, n, dPiv.p, dB.p, n, dInfo.p));
+        la_smark(st, "getrs");
         P.out = dB.download();
         break;
     }
@@ -915,8 +976,10 @@ void la_compute(const LaSpec& s, LaProblem<T>& P, PartitionImpl<N>* partition) {
         if (s.op == LA_TSSVD) {
             if constexpr (!cn_is_complex_v<T>) {
                 DevBuf<T> dA(P.a, st);
+                la_smark(st, "h2d");
                 CT_CUBLAS_CHECK(cula::gemm(h.blas, CUBLAS_OP_T, CUBLAS_OP_N, n, n, m, dA.p, m,
                                            dA.p, m, dG.p, n));
+                la_smark(st, "gram");
             }
         } else {
             dG.upload(P.a);
@@ -925,6 +988,7 @@ void la_compute(const LaSpec& s, LaProblem<T>& P, PartitionImpl<N>* partition) {
         CT_CUSOLVER_CHECK(cula::syevd_bs(h.solver, jz, u, n, dG.p, n, dWv.p, &lw));
         DevBuf<T> dW(std::max(lw, 1), st);
         CT_CUSOLVER_CHECK(cula::syevd(h.solver, jz, u, n, dG.p, n, dWv.p, dW.p, lw, dInfo.p));
+        la_smark(st, "syevd");
         std::vector<R> w = dWv.download(n);
         std::vector<T> V = vecs ? dG.download() : std::vector<T>();
         if constexpr (!cn_is_complex_v<T>)
@@ -1050,6 +1114,7 @@ static void la_root_compute(PartitionImpl<N>* partition, ArrayDAGGroup* g, int n
             place_gather<T>(P.b, s.in[1].rows(), h, payload);
     }
     st.inputs.clear();
+    la_mark("place");
     P.R = s.out_rows();
     P.C = s.out_cols();
     P.out.assign(static_cast<size_t>(P.R) * P.C, T(0));
@@ -1064,10 +1129,12 @@ static void la_root_compute(PartitionImpl<N>* partition, ArrayDAGGroup* g, int n
         la_compute<T>(s, P);
 #endif
     }
+    la_mark("compute");
     if (s.out_nd == 1)
         la_scatter<1, T>(g, node_id, s, P.out);
     else
         la_scatter<2, T>(g, node_id, s, P.out);
+    la_mark("scatter");
 }
 
 template <int N, typename T>
@@ -1124,20 +1191,27 @@ static bool la_progress(PartitionImpl<N>* partition, ArrayDAGGroup* g, int node_
             st.in_covered += h.count;
             st.inputs.push_back(std::move(msg));
         } else {
+            double tw = CkWallTimer();
             la_dispatch(s.dt, [&](auto tag) {
                 la_write_piece<N, decltype(tag)>(partition, s, st, h, msg.data() + sizeof(h));
             });
+            la_prof(node_id).write += CkWallTimer() - tw;
         }
     }
     if (st.root && !st.computed && st.in_covered == st.in_expected) {
         st.computed = true;
+        la_cur_node = node_id;
+        la_mark("gathered");
         la_dispatch(s.dt, [&](auto tag) {
             la_root_compute<N, decltype(tag)>(partition, g, node_id, s, st);
         });
     }
     if (!st.owner || st.out_covered < st.out_expected)
         return false;
+    double td = CkWallTimer();
     partition->arrays[s.out_name]->copyToDevice();
+    la_prof(node_id).todev += CkWallTimer() - td;
+    la_report(node_id, st.root ? "root" : "owner");
     return true;
 }
 
@@ -1151,6 +1225,10 @@ template <int N>
 void ArrayDAGExecutorND<N>::execute_linalg_node(DAGNode* node) {
     auto* g = static_cast<ArrayDAGGroup*>(group);
     LaSpec s = la_spec_of(node, g);
+    if (la_timing() && (la_prof(node->id).t0 < 0 || la_prof(node->id).done)) {
+        la_prof(node->id) = LaProf();
+        la_prof(node->id).t0 = CkWallTimer();
+    }
     if (s.dt != DType::FLOAT32 && s.dt != DType::FLOAT64 && !dtype_is_complex(s.dt))
         CkAbort("linalg: unsupported result dtype %d", (int)s.dt);
     auto nd_idx = partition->nd_index();
