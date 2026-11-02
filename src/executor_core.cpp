@@ -135,9 +135,8 @@ static void send_remote_input(PartitionImpl<N>* partition, DAGNode* node, const 
         }
     }
 
-    proxy_at<N>(partition->thisProxy, send.target)
-        .receive_data(node->id, send.input_index, inp_name, N, region_data, byte_size,
-                      reinterpret_cast<char*>(send_buf));
+    ct_send_data(proxy_at<N>(partition->thisProxy, send.target), node->id, send.input_index,
+                 inp_name, N, region_data, byte_size, reinterpret_cast<char*>(send_buf));
     delete[] send_buf;
 #endif
 }
@@ -637,18 +636,18 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
             case 1: {
                 ChareIndex<1> ci;
                 ci.idx[0] = tgt_idx[0];
-                proxy_at<1>(dag_group->partition_proxy_1, ci)
-                    .receive_data(node->id, bcast_input_idx, source_name, tgt_nd,
-                                  region_data.data(), elem_sz, send_buf);
+                ct_send_data(proxy_at<1>(dag_group->partition_proxy_1, ci), node->id,
+                             bcast_input_idx, source_name, tgt_nd, region_data.data(), elem_sz,
+                             send_buf);
                 break;
             }
             case 2: {
                 ChareIndex<2> ci;
                 ci.idx[0] = tgt_idx[0];
                 ci.idx[1] = tgt_idx[1];
-                proxy_at<2>(dag_group->partition_proxy_2, ci)
-                    .receive_data(node->id, bcast_input_idx, source_name, tgt_nd,
-                                  region_data.data(), elem_sz, send_buf);
+                ct_send_data(proxy_at<2>(dag_group->partition_proxy_2, ci), node->id,
+                             bcast_input_idx, source_name, tgt_nd, region_data.data(), elem_sz,
+                             send_buf);
                 break;
             }
             case 3: {
@@ -656,9 +655,9 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
                 ci.idx[0] = tgt_idx[0];
                 ci.idx[1] = tgt_idx[1];
                 ci.idx[2] = tgt_idx[2];
-                proxy_at<3>(dag_group->partition_proxy_3, ci)
-                    .receive_data(node->id, bcast_input_idx, source_name, tgt_nd,
-                                  region_data.data(), elem_sz, send_buf);
+                ct_send_data(proxy_at<3>(dag_group->partition_proxy_3, ci), node->id,
+                             bcast_input_idx, source_name, tgt_nd, region_data.data(), elem_sz,
+                             send_buf);
                 break;
             }
             }

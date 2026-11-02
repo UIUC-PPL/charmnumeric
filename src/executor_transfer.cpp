@@ -278,9 +278,9 @@ static void diag_send(PartitionImpl<N_src>* partition, DAGNode* node, int source
             T* send_buf = new T[r.count];
             for (int j = 0; j < r.count; ++j)
                 send_buf[j] = src_data[r.first_local + j];
-            proxy_at<2>(dag_group->partition_proxy_2, r.target_ci)
-                .receive_data(node->id, /*input_index=*/0, source_name, 2, region_data,
-                              byte_size, reinterpret_cast<char*>(send_buf));
+            ct_send_data(proxy_at<2>(dag_group->partition_proxy_2, r.target_ci), node->id,
+                         /*input_index=*/0, source_name, 2, region_data, byte_size,
+                         reinterpret_cast<char*>(send_buf));
             delete[] send_buf;
 #endif
         }
@@ -372,9 +372,9 @@ static void diag_send(PartitionImpl<N_src>* partition, DAGNode* node, int source
                 int local_col = col - col_start;
                 send_buf[j] = src_data[local_row * local_cols + local_col];
             }
-            proxy_at<1>(dag_group->partition_proxy_1, r.target_ci)
-                .receive_data(node->id, /*input_index=*/0, source_name, 1, region_data,
-                              byte_size, reinterpret_cast<char*>(send_buf));
+            ct_send_data(proxy_at<1>(dag_group->partition_proxy_1, r.target_ci), node->id,
+                         /*input_index=*/0, source_name, 1, region_data, byte_size,
+                         reinterpret_cast<char*>(send_buf));
             delete[] send_buf;
 #endif
         }
@@ -677,9 +677,9 @@ static void tile_send(PartitionImpl<N_src>* partition, DAGNode* node, int source
 #ifndef NDEBUG
             partition->comm_bytes_sent += byte_size;
 #endif
-            proxy_at<N_tgt>(PartitionProxyHelper<N_tgt>::get(dag_group), ci)
-                .receive_data(node->id, /*input_index=*/0, source_name, N_tgt, region_data,
-                              byte_size, reinterpret_cast<char*>(send_buf));
+            ct_send_data(proxy_at<N_tgt>(PartitionProxyHelper<N_tgt>::get(dag_group), ci), node->id,
+                         /*input_index=*/0, source_name, N_tgt, region_data, byte_size,
+                         reinterpret_cast<char*>(send_buf));
             delete[] send_buf;
 #else
             T* send_buf = static_cast<T*>(comm_alloc(byte_size));

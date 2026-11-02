@@ -134,11 +134,14 @@ static void la_send_to(ArrayDAGGroup* g, const ChareIndex<M>& ci, int node_id,
                        std::vector<char>& buf) {
     int64_t bytes = static_cast<int64_t>(buf.size());
     if constexpr (M == 1)
-        proxy_at<1>(g->partition_proxy_1, ci).receive_linalg(node_id, bytes, buf.data());
+        ct_send_bytes(proxy_at<1>(g->partition_proxy_1, ci), MSG_LINALG, node_id,
+                      bytes, buf.data());
     else if constexpr (M == 2)
-        proxy_at<2>(g->partition_proxy_2, ci).receive_linalg(node_id, bytes, buf.data());
+        ct_send_bytes(proxy_at<2>(g->partition_proxy_2, ci), MSG_LINALG, node_id,
+                      bytes, buf.data());
     else
-        proxy_at<3>(g->partition_proxy_3, ci).receive_linalg(node_id, bytes, buf.data());
+        ct_send_bytes(proxy_at<3>(g->partition_proxy_3, ci), MSG_LINALG, node_id,
+                      bytes, buf.data());
 }
 
 static void la_send_root(ArrayDAGGroup* g, int out_nd, int node_id, std::vector<char>& buf) {

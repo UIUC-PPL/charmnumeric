@@ -2,6 +2,7 @@
 #include "dispatch.hpp"
 
 #include <cstring>
+#include <cstdlib>
 
 #ifdef USE_KOKKOS
 static std::vector<int> recv_key(int node_id, int input_index, int name, int ndims,
@@ -165,6 +166,57 @@ void PartitionImpl<N>::reduce_result(int node_id, int64_t size, char* data) {
     if constexpr (N == 1)
         executor->on_dot_partial(node_id, data, size);
 }
+
+int64_t ct_msg_max_bytes() {
+    static const int64_t limit = [] {
+        int64_t v = int64_t(1) << 30;
+        if (const char* e = getenv("CNUM_MSG_MAX_BYTES")) {
+            char* end = nullptr;
+            long long x = strtoll(e, &end, 10);
+            if (end != e && *end == '\0' && x > 0)
+                v = std::min<int64_t>(x, v);
+        }
+        return v;
+    }();
+    return limit;
+}
+
+template <int N>
+void PartitionImpl<N>::receive_frag(int node_id, int kind, int src, int64_t seq, int nmeta,
+                                    int* meta, int64_t total, int64_t offset, int64_t size,
+                                    char* data) {
+    auto key = std::make_pair(src, seq);
+    FragBuf& f = frags[key];
+    if (!f.data)
+        f.data.reset(new char[total]);
+    memcpy(f.data.get() + offset, data, size);
+    f.got += size;
+    if (f.got < total)
+        return;
+    std::unique_ptr<char[]> buf = std::move(f.data);
+    frags.erase(key);
+    char* b = buf.get();
+    switch (kind) {
+#ifdef USE_KOKKOS
+    case MSG_STAGED: receive_staged(node_id, meta[0], meta[1], meta[2], meta + 3, total, b); break;
+#else
+    case MSG_DATA: receive_data(node_id, meta[0], meta[1], meta[2], meta + 3, total, b); break;
+#endif
+    case MSG_REDUCE_PARTIAL: receive_reduce_partial(node_id, total, b); break;
+    case MSG_LINALG: receive_linalg(node_id, total, b); break;
+    case MSG_INDEX: receive_index_msg(node_id, total, b); break;
+    case MSG_SHAPE: receive_shape(node_id, total, b); break;
+    case MSG_UPLOAD_TILE: receive_upload_tile(node_id, meta[0], total, b); break;
+    default: CkAbort("receive_frag: unexpected message kind %d", kind);
+    }
+}
+
+template void PartitionImpl<1>::receive_frag(int, int, int, int64_t, int, int*, int64_t, int64_t,
+                                             int64_t, char*);
+template void PartitionImpl<2>::receive_frag(int, int, int, int64_t, int, int*, int64_t, int64_t,
+                                             int64_t, char*);
+template void PartitionImpl<3>::receive_frag(int, int, int, int64_t, int, int*, int64_t, int64_t,
+                                             int64_t, char*);
 
 #ifdef USE_KOKKOS
 template void PartitionImpl<1>::receive_data(int&, int&, int&, int&, int*&, int64_t&, char*&,

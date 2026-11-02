@@ -6,6 +6,7 @@
 #include <mutex>
 #include <deque>
 #include <map>
+#include <memory>
 
 #include "array_region.hpp"
 #include "opcodes.hpp"
@@ -902,7 +903,14 @@ class PartitionImpl {
     void receive_index_msg(int node_id, int64_t size, char* data);
     void receive_shape(int node_id, int64_t size, char* data);
     void receive_upload_tile(int node_id, int name, int64_t size, char* data);
+    void receive_frag(int node_id, int kind, int src, int64_t seq, int nmeta, int* meta,
+                      int64_t total, int64_t offset, int64_t size, char* data);
     void process_get(int epoch);
+    struct FragBuf {
+        std::unique_ptr<char[]> data;
+        int64_t got = 0;
+    };
+    std::map<std::pair<int, int64_t>, FragBuf> frags; // (source PE, sequence number)
 };
 
 // ---- Thin wrapper chare classes ----
@@ -964,6 +972,10 @@ class Partition1D : public CBase_Partition1D {
     void receive_upload_tile(int node_id, int name, int64_t size, char* data) {
         impl.receive_upload_tile(node_id, name, size, data);
     }
+    void receive_frag(int node_id, int kind, int src, int64_t seq, int nmeta, int* meta,
+                      int64_t total, int64_t offset, int64_t size, char* data) {
+        impl.receive_frag(node_id, kind, src, seq, nmeta, meta, total, offset, size, data);
+    }
 };
 
 class Partition2D : public CBase_Partition2D {
@@ -1023,6 +1035,10 @@ class Partition2D : public CBase_Partition2D {
     void receive_upload_tile(int node_id, int name, int64_t size, char* data) {
         impl.receive_upload_tile(node_id, name, size, data);
     }
+    void receive_frag(int node_id, int kind, int src, int64_t seq, int nmeta, int* meta,
+                      int64_t total, int64_t offset, int64_t size, char* data) {
+        impl.receive_frag(node_id, kind, src, seq, nmeta, meta, total, offset, size, data);
+    }
 };
 
 class Partition3D : public CBase_Partition3D {
@@ -1081,5 +1097,9 @@ class Partition3D : public CBase_Partition3D {
     }
     void receive_upload_tile(int node_id, int name, int64_t size, char* data) {
         impl.receive_upload_tile(node_id, name, size, data);
+    }
+    void receive_frag(int node_id, int kind, int src, int64_t seq, int nmeta, int* meta,
+                      int64_t total, int64_t offset, int64_t size, char* data) {
+        impl.receive_frag(node_id, kind, src, seq, nmeta, meta, total, offset, size, data);
     }
 };

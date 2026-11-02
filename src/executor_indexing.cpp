@@ -458,16 +458,16 @@ void send_msg(ArrayDAGGroup* g, int nd, const int ci[3], int node_id, std::vecto
     int64_t size = (int64_t)buf.size();
     switch (nd) {
     case 1:
-        proxy_at<1>(g->partition_proxy_1, ChareIndex<1>{{ci[0]}})
-            .receive_index_msg(node_id, size, buf.data());
+        ct_send_bytes(proxy_at<1>(g->partition_proxy_1, ChareIndex<1>{{ci[0]}}),
+                      MSG_INDEX, node_id, size, buf.data());
         break;
     case 2:
-        proxy_at<2>(g->partition_proxy_2, ChareIndex<2>{{ci[0], ci[1]}})
-            .receive_index_msg(node_id, size, buf.data());
+        ct_send_bytes(proxy_at<2>(g->partition_proxy_2, ChareIndex<2>{{ci[0], ci[1]}}),
+                      MSG_INDEX, node_id, size, buf.data());
         break;
     case 3:
-        proxy_at<3>(g->partition_proxy_3, ChareIndex<3>{{ci[0], ci[1], ci[2]}})
-            .receive_index_msg(node_id, size, buf.data());
+        ct_send_bytes(proxy_at<3>(g->partition_proxy_3, ChareIndex<3>{{ci[0], ci[1], ci[2]}}),
+                      MSG_INDEX, node_id, size, buf.data());
         break;
     }
 }

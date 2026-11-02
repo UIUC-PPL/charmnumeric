@@ -1,6 +1,7 @@
 #pragma once
 
 #include "backend.hpp"
+#include "big_msg.hpp"
 #include "jit_api.hpp"
 
 #include <limits>
@@ -104,9 +105,14 @@ static void deferred_send_cb(void* param, void* msg) {
                   proxy_at<N_sender>(p->partition->thisProxy, self_ci));
     cb.setRefnum(static_cast<CMK_REFNUM_TYPE>(p->send_id));
     if (p->host_buf) {
-        proxy_at<N_target>(p->target_proxy, p->target_ci).receive_staged(
-            p->node_id, p->input_index, p->inp_name, N_target, p->region_data, p->byte_size,
-            static_cast<char*>(p->host_buf));
+        auto target = proxy_at<N_target>(p->target_proxy, p->target_ci);
+        if (p->byte_size > ct_msg_max_bytes())
+            ct_send_frags(target, MSG_STAGED, p->node_id,
+                          ct_data_meta(p->input_index, p->inp_name, N_target, p->region_data),
+                          p->byte_size, static_cast<const char*>(p->host_buf));
+        else
+            target.receive_staged(p->node_id, p->input_index, p->inp_name, N_target,
+                                  p->region_data, p->byte_size, static_cast<char*>(p->host_buf));
         pinned_free(p->host_buf);
         p->partition->send_complete(p->send_id);
     } else if (p->ipc_buf) {
