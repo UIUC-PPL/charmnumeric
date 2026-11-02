@@ -123,13 +123,19 @@ using HostSpace = Kokkos::HostSpace;
 
 /// Device message buffers, cached by power-of-two size class: cudaMalloc/cudaFree per
 /// message cost tens of us, and cudaFree also synchronizes the device. Only for buffers
-/// freed after their last GPU use (send_complete, compute-done callbacks).
+/// freed after their last GPU use (send_complete, compute-done callbacks). Larger blocks
+/// are cached by size in 2 MB steps: cudaMalloc of hundreds of MB gets slower the more
+/// such blocks a process has freed. CNUM_DEVICE_CACHE_MB caps the cached bytes (default:
+/// 1/8 of device memory); an allocation that fails releases the large blocks and retries.
 struct CommPool {
     static constexpr int kMinClass = 8, kMaxClass = 26; // 256 B .. 64 MB
-    static constexpr int64_t kMaxCached = int64_t(1) << 30;
+    static constexpr int64_t kLargeStep = int64_t(2) << 20;
     std::unordered_map<void*, int> live; // pooled block -> size class
     std::vector<void*> free_lists[kMaxClass + 1];
     int64_t cached = 0;
+    std::unordered_map<void*, int64_t> live_large; // block -> bytes
+    std::multimap<int64_t, void*> free_large;
+    int64_t large_cached = 0, limit = -1;
     std::mutex mu; // shared by the PEs of a process (SMP)
 };
 
@@ -138,21 +144,85 @@ inline CommPool& comm_pool() {
     return pool;
 }
 
+inline void comm_release_large(CommPool& pool) {
+    for (auto& [bytes, ptr] : pool.free_large)
+        Kokkos::kokkos_free<DeviceSpace>(ptr);
+    pool.free_large.clear();
+    pool.large_cached = 0;
+}
+
+inline void* comm_device_malloc(CommPool& pool, int64_t bytes) {
+    try {
+        return Kokkos::kokkos_malloc<DeviceSpace>(bytes);
+    } catch (const std::exception&) {
+        if (pool.free_large.empty())
+            throw;
+    }
+    comm_release_large(pool);
+    return Kokkos::kokkos_malloc<DeviceSpace>(bytes);
+}
+
+inline void* comm_alloc_large(CommPool& pool, int64_t bytes) {
+    bytes = (bytes + CommPool::kLargeStep - 1) / CommPool::kLargeStep * CommPool::kLargeStep;
+    void* ptr;
+    auto it = pool.free_large.lower_bound(bytes);
+    if (it != pool.free_large.end() && it->first <= bytes + bytes / 4) {
+        bytes = it->first;
+        ptr = it->second;
+        pool.free_large.erase(it);
+        pool.large_cached -= bytes;
+    } else {
+        ptr = comm_device_malloc(pool, bytes);
+    }
+    pool.live_large[ptr] = bytes;
+    return ptr;
+}
+
+/// May `bytes` more be cached?
+inline bool comm_cache_fits(CommPool& pool, int64_t bytes) {
+    if (pool.limit < 0) {
+        const char* env = std::getenv("CNUM_DEVICE_CACHE_MB");
+        size_t fr = 0, total = 0;
+#ifdef USE_NVIDIA
+        cudaMemGetInfo(&fr, &total);
+#endif
+        pool.limit = env ? std::atoll(env) << 20
+                         : std::max<int64_t>(int64_t(1) << 30, static_cast<int64_t>(total / 8));
+    }
+    return pool.cached + pool.large_cached + bytes <= pool.limit;
+}
+
+inline void comm_free_large(CommPool& pool, void* ptr, int64_t bytes) {
+    // evict the largest cached blocks first
+    while (!comm_cache_fits(pool, bytes) && !pool.free_large.empty()) {
+        auto last = std::prev(pool.free_large.end());
+        Kokkos::kokkos_free<DeviceSpace>(last->second);
+        pool.large_cached -= last->first;
+        pool.free_large.erase(last);
+    }
+    if (!comm_cache_fits(pool, bytes)) {
+        Kokkos::kokkos_free<DeviceSpace>(ptr);
+        return;
+    }
+    pool.free_large.emplace(bytes, ptr);
+    pool.large_cached += bytes;
+}
+
 inline void* comm_alloc(int64_t bytes) {
     int cls = CommPool::kMinClass;
     while (cls <= CommPool::kMaxClass && (int64_t(1) << cls) < bytes)
         ++cls;
-    if (cls > CommPool::kMaxClass)
-        return Kokkos::kokkos_malloc<DeviceSpace>(bytes);
     auto& pool = comm_pool();
     std::lock_guard<std::mutex> lock(pool.mu);
+    if (cls > CommPool::kMaxClass)
+        return comm_alloc_large(pool, bytes);
     void* ptr;
     if (!pool.free_lists[cls].empty()) {
         ptr = pool.free_lists[cls].back();
         pool.free_lists[cls].pop_back();
         pool.cached -= int64_t(1) << cls;
     } else {
-        ptr = Kokkos::kokkos_malloc<DeviceSpace>(size_t(1) << cls);
+        ptr = comm_device_malloc(pool, size_t(1) << cls);
     }
     pool.live[ptr] = cls;
     return ptr;
@@ -163,6 +233,13 @@ inline void comm_free(void* ptr) {
     std::lock_guard<std::mutex> lock(pool.mu);
     auto it = pool.live.find(ptr);
     if (it == pool.live.end()) {
+        auto lt = pool.live_large.find(ptr);
+        if (lt != pool.live_large.end()) {
+            int64_t bytes = lt->second;
+            pool.live_large.erase(lt);
+            comm_free_large(pool, ptr, bytes);
+            return;
+        }
 #ifdef USE_NVIDIA
         if (gpu_ipc_free(ptr))
             return;
@@ -172,7 +249,7 @@ inline void comm_free(void* ptr) {
     }
     int cls = it->second;
     pool.live.erase(it);
-    if (pool.cached + (int64_t(1) << cls) > CommPool::kMaxCached) {
+    if (!comm_cache_fits(pool, int64_t(1) << cls)) {
         Kokkos::kokkos_free<DeviceSpace>(ptr);
         return;
     }
