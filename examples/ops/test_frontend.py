@@ -871,7 +871,7 @@ def dot_after_partition_growth():
 
 @case
 def tile_diag_at_offsets():
-    # TILE/DIAG results written into a shifted region
+    # TILE/DIAG results written into a shifted region, and inputs placed at an offset
     n = 600
     h, v, A = data((1, n)), data((n,), seed=1), data((n, n), seed=2)
     hh, vh, Ah = made(h, v, A)
@@ -901,6 +901,19 @@ def tile_diag_at_offsets():
     Zh = np.zeros((n, 2 * n + 9))
     Zh[:, n + 5:2 * n + 5] = np.diag(vh)
     check("Z[:, s] = diag(v)", get(Z), Zh)
+    y = h + 1.0
+    W = cnp.zeros((5, 2 * n + 37))
+    W[2:3, n + 30:2 * n + 30] = y
+    t = cnp.tile(y, (3, 2))
+    y2 = A + 1.0
+    Z = cnp.zeros((n, 2 * n + 9))
+    Z[:, n + 5:2 * n + 5] = y2
+    d = cnp.diag(y2)
+    check("tile of a shifted input", get(t), np.tile(hh + 1.0, (3, 2)))
+    check("diag of a shifted input", get(d), np.diag(Ah + 1.0))
+    Wh = np.zeros((5, 2 * n + 37))
+    Wh[2:3, n + 30:2 * n + 30] = hh + 1.0
+    check("W after shifted tile input", get(W), Wh)
 
 
 def main():
