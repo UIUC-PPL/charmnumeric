@@ -126,7 +126,7 @@ using HostSpace = Kokkos::HostSpace;
 /// freed after their last GPU use (send_complete, compute-done callbacks).
 struct CommPool {
     static constexpr int kMinClass = 8, kMaxClass = 26; // 256 B .. 64 MB
-    static constexpr int64_t kMaxCached = int64_t(1) << 30;
+    static constexpr int64_t kMaxCached = int64_t(4) << 30; // a 4-GPU einsum moves 2-3 GB a step
     std::unordered_map<void*, int> live; // pooled block -> size class
     std::vector<void*> free_lists[kMaxClass + 1];
     int64_t cached = 0;
