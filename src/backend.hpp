@@ -398,11 +398,7 @@ struct IndexState {
     int val_left = 0;  // target: value lists still expected
     int seg_left = 0;  // EXPAND coordinator: segment lists still expected
     bool wait_offsets = false; // EXPAND driver: segment offsets not yet received
-    std::vector<int64_t> updates; // target: received entries
-    int upd_width = 0;
     std::vector<std::vector<char>> segs; // coordinator: received segment lists
-    std::vector<int64_t> counts, seg_start; // EXPAND driver: element counts, row starts
-    int64_t row = 1;
     // COMPRESS / MASK_SCATTER
     bool mx_pending = false; // this chare holds a block of x that is not done yet
     bool mx_scanned = false;
