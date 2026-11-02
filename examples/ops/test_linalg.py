@@ -85,12 +85,24 @@ def check_cholesky(chk, n, dt):
           np.linalg.cholesky(ah.astype(np.float64), upper=True), tol(dt))
 
 
-def check_qr(chk, m, n, dt):
+def check_notpd(chk, n, k):
+    """cholesky of eye(n) with a[k, k] = -1 is all NaN, wherever the failing tile is."""
+    a = cnp.eye(n)
+    a[k, k] = -1.0
+    chk.count += 1
+    if np.isnan(get(cnp.linalg.cholesky(a))).all():
+        print(f"  PASS cholesky not-PD n={n} k={k} -> NaN")
+    else:
+        print(f"  FAIL cholesky not-PD n={n} k={k} -> NaN")
+        chk.failures.append(f"cholesky not-PD n={n} k={k}")
+
+
+def check_qr(chk, m, n, dt, modes=("reduced", "complete")):
     a = rand(m, n, dt)
     ah = get(a).astype(np.float64)
     k = min(m, n)
     t = tol(dt) * 10
-    for mode in ("reduced", "complete"):
+    for mode in modes:
         q, r = cnp.linalg.qr(a, mode=mode)
         qh, rh = get(q), get(r)
         qn, rn = np.linalg.qr(ah, mode=mode)
@@ -305,6 +317,14 @@ def main():
     check_eigh(chk, 700, np.float64)
     check_solve_triangular(chk, 900, np.float32)
     check_tssvd(chk, 2000, 40, np.float64)
+    # GPU builds (2-D tile 1024): tiled cholesky on several chares; tssvd columns in two tiles
+    for dt in (np.float64, np.float32):
+        check_cholesky(chk, 2600, dt)
+    for k in (0, 1500, 2599):
+        check_notpd(chk, 2600, k)
+    check_tssvd(chk, 3000, 1100, np.float64)
+    for dt in (np.float64, np.float32):
+        check_qr(chk, 20000, 64, dt, ("reduced",))  # several row tiles: TSQR on GPU builds
     # Size-1 operands use constant inputs only; random 1x1 inputs hit backend hangs.
     check_views_and_ints(chk)
     chk.finish()
