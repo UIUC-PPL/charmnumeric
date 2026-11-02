@@ -203,6 +203,24 @@ void send_buffer(PartitionImpl<N>* partition, const std::array<int, N>& target, 
 #endif
 }
 
+/// Small message/scratch buffers: pooled device memory in GPU builds. Free only
+/// after the GPU is done with them (comm_free reuses them at once).
+inline char* pooled_alloc(int64_t bytes) {
+#ifdef USE_KOKKOS
+    return static_cast<char*>(comm_alloc(std::max<int64_t>(bytes, 8)));
+#else
+    return alloc_buffer(bytes);
+#endif
+}
+
+inline void pooled_free(char* p) {
+#ifdef USE_KOKKOS
+    comm_free(p);
+#else
+    free_buffer(p);
+#endif
+}
+
 // ---- SCAN ----
 // Each chare sends its line totals to the later chares along the axis, then scans
 // its tile once with the folded carry. The input may be a narrower integer type
@@ -317,7 +335,7 @@ void lines_cub(PartitionImpl<N>* partition, const Tin* in, Tout* out, Tout* tota
                 out, thrust::make_transform_iterator(thrust::counting_iterator<int64_t>(0),
                                                      Strided{astride})),
             bin, len, st));
-    char* tmp = alloc_buffer((int64_t)tb);
+    char* tmp = pooled_alloc((int64_t)tb);
     for (int64_t l = 0; l < g.lines; ++l) {
         if (totals) {
             hapiCheck(cub::DeviceReduce::Reduce(tmp, tb, it_of(l), totals + l, len, bin,
@@ -336,7 +354,7 @@ void lines_cub(PartitionImpl<N>* partition, const Tin* in, Tout* out, Tout* tota
         }
     }
     compute_fence(partition);
-    free_buffer(tmp);
+    pooled_free(tmp);
 }
 #endif
 
@@ -393,16 +411,16 @@ int scan_execute(PartitionImpl<N>* partition, DAGNode* node, int out_name, CTArr
     int n_targets = last - me[axis];
     if (n_targets > 0) {
         int64_t bytes = g.lines * (int64_t)sizeof(Tout);
-        char* totals = alloc_buffer(bytes);
+        char* totals = pooled_alloc(bytes);
         line_totals<N, Tout, Tin>(partition, static_cast<const Tin*>(in->device_data_ptr()),
                                   reinterpret_cast<Tout*>(totals), g, op);
         std::vector<char*> bufs(n_targets);
         for (int t = 0; t < n_targets; ++t) {
-            bufs[t] = alloc_buffer(bytes);
+            bufs[t] = pooled_alloc(bytes);
             copy_bytes<N>(partition, bufs[t], totals, bytes);
         }
         compute_fence(partition);
-        free_buffer(totals);
+        pooled_free(totals);
         ArrayRegion<N> my_region = chare_array_region<N>(dec, me);
         for (int t = 0; t < n_targets; ++t) {
             auto target = me;
@@ -422,7 +440,7 @@ void scan_finish(PartitionImpl<N>* partition, CTArrayBase<N>* in, CTArrayBase<N>
     char* carry_buf = nullptr;
     auto rb_it = comm.remote_buffers.find(0);
     if (rb_it != comm.remote_buffers.end() && !rb_it->second.empty()) {
-        carry_buf = alloc_buffer(g.lines * (int64_t)sizeof(Tout));
+        carry_buf = pooled_alloc(g.lines * (int64_t)sizeof(Tout));
         bool init = true;
         for (auto& rb : rb_it->second) {
             fold_totals<N, Tout>(partition, reinterpret_cast<Tout*>(carry_buf),
@@ -435,7 +453,7 @@ void scan_finish(PartitionImpl<N>* partition, CTArrayBase<N>* in, CTArrayBase<N>
                              reinterpret_cast<const Tout*>(carry_buf), g, op);
     if (carry_buf) {
         compute_fence(partition);
-        free_buffer(carry_buf);
+        pooled_free(carry_buf);
     }
 }
 
@@ -644,8 +662,8 @@ void ArrayDAGExecutorND<N>::execute_castscansort_node(DAGNode* node) {
     DType out_dt = op == Opcode::ARGSORT ? DType::INT64
                    : op == Opcode::SCAN  ? root->dtype
                                          : in->dtype;
-    CTArrayBase<N>* out =
-        partition->ensure_array(in->region, in->global_shape, out_name, out_dt, in->decomp);
+    CTArrayBase<N>* out = partition->ensure_array(in->region, in->global_shape, out_name, out_dt,
+                                                  in->decomp, false);
 
     int expected = 0;
     if (op == Opcode::SCAN) {

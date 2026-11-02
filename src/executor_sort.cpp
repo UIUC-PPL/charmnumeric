@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <unordered_set>
 #include <vector>
 
 // Distributed 1-D SORT / ARGSORT (sample sort) and SELECT (order statistics by radix
@@ -160,20 +162,99 @@ DS_FN uint64_t mix64(uint64_t x) {
 }
 
 // ---- buffers: device memory in GPU builds ----
+// NVIDIA: scratch comes from the device's stream-ordered pool on the stream of the
+// chare being served (ds_stream_scope), so large buffers are cached instead of
+// cudaMalloc/cudaFree per call; buffers for device_pack_send come from comm_alloc.
 
-inline char* ds_alloc(int64_t bytes) {
+#ifdef USE_NVIDIA
+thread_local cudaStream_t ds_cur_stream = nullptr;
+
+struct DsPool {
+    std::mutex mu;
+    std::unordered_set<void*> live;
+};
+
+inline DsPool& ds_pool() {
+    static DsPool pool;
+    return pool;
+}
+
+/// Keep up to CNUM_SORT_POOL_MB (default a fifth of device memory) cached in the pool.
+inline void ds_pool_init() {
+    static bool done = [] {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaMemPool_t pool;
+        if (cudaDeviceGetDefaultMemPool(&pool, dev) != cudaSuccess)
+            return true;
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        uint64_t keep = total_b / 5;
+        if (const char* e = getenv("CNUM_SORT_POOL_MB"))
+            keep = (uint64_t)atoll(e) << 20;
+        cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &keep);
+        return true;
+    }();
+    (void)done;
+}
+#endif
+
+struct ds_stream_scope {
+#ifdef USE_NVIDIA
+    cudaStream_t prev;
+    explicit ds_stream_scope(cudaStream_t s) : prev(ds_cur_stream) { ds_cur_stream = s; }
+    ~ds_stream_scope() { ds_cur_stream = prev; }
+#else
+    explicit ds_stream_scope(int) {}
+#endif
+};
+
+#ifdef USE_NVIDIA
+#define DS_SCOPE(p) ds_stream_scope ds_scope_((p)->compute_stream_raw)
+#else
+#define DS_SCOPE(p) ds_stream_scope ds_scope_(0)
+#endif
+
+/// `comm`: the buffer may be passed to device_pack_send (freed with comm_free).
+inline char* ds_alloc(int64_t bytes, bool comm = false) {
     bytes = std::max<int64_t>(bytes, 8);
-#ifdef USE_KOKKOS
+#if defined(USE_NVIDIA)
+    if (!comm) {
+        ds_pool_init();
+        void* p = nullptr;
+        hapiCheck(cudaMallocAsync(&p, bytes, ds_cur_stream));
+        auto& pool = ds_pool();
+        std::lock_guard<std::mutex> lock(pool.mu);
+        pool.live.insert(p);
+        return static_cast<char*>(p);
+    }
+    return static_cast<char*>(comm_alloc(bytes));
+#elif defined(USE_KOKKOS)
+    (void)comm;
     return static_cast<char*>(comm_alloc(bytes));
 #else
+    (void)comm;
     return new char[bytes];
 #endif
 }
 
+/// Frees ds_alloc and received (comm_alloc) buffers once the serving stream is past them.
 inline void ds_free(void* p) {
     if (p == nullptr)
         return;
-#ifdef USE_KOKKOS
+#if defined(USE_NVIDIA)
+    {
+        auto& pool = ds_pool();
+        std::lock_guard<std::mutex> lock(pool.mu);
+        auto it = pool.live.find(p);
+        if (it != pool.live.end()) {
+            pool.live.erase(it);
+            hapiCheck(cudaFreeAsync(p, ds_cur_stream));
+            return;
+        }
+    }
+    comm_free(p);
+#elif defined(USE_KOKKOS)
     comm_free(p);
 #else
     delete[] static_cast<char*>(p);
@@ -771,7 +852,7 @@ void sort_partition(PartitionImpl<1>* p, DsState& s, const T* in, int64_t n,
     for (int b = 0; b < P; ++b)
         cnt[b] = (b + 1 < P ? hb[b + 1] : n) - hb[b];
     for (int b = 0; b < P; ++b)
-        bufs[b] = ds_alloc(cnt[b] * esize);
+        bufs[b] = ds_alloc(cnt[b] * esize, pe_of(p, s.first + b) != CkMyPe());
     std::vector<K*> pk(P);
     std::vector<int64_t*> pg(P);
     for (int b = 0; b < P; ++b) {
@@ -870,7 +951,7 @@ void sort_bucket(PartitionImpl<1>* p, DsState& s, void* outp) {
         if (lo >= hi)
             continue;
         char* dst = c == me ? static_cast<char*>(outp) + (lo - s.pstart[c]) * osize
-                            : ds_alloc((hi - lo) * osize);
+                            : ds_alloc((hi - lo) * osize, pe_of(p, s.first + c) != CkMyPe());
         if (s.arg)
             ds_copy(p, dst, gs + (lo - G), (hi - lo) * 8);
         else
@@ -1105,6 +1186,7 @@ bool ds_axis_whole(CTArrayBase<N>* in, int axis) {
 template <int N>
 void ds_axis_local(PartitionImpl<N>* p, CTArrayBase<N>* in, CTArrayBase<N>* out, int axis,
                    bool arg) {
+    DS_SCOPE(p);
     AxisGeom g;
     g.nd = N;
     g.axis = axis;
@@ -1161,6 +1243,7 @@ bool ds_handles(ASTNode* root, DType dt, int ndims) {
 
 template <int N>
 void ArrayDAGExecutorND<N>::execute_ds_node(DAGNode* node) {
+    DS_SCOPE(partition);
     if constexpr (N != 1) {
         CkAbort("execute_ds_node: 1-D partitions only");
     } else {
@@ -1288,6 +1371,7 @@ void ArrayDAGExecutorND<N>::on_ds_data(int node_id, int phase, const int* region
 template <int N>
 void ArrayDAGExecutorND<N>::ds_take_piece(int node_id, int phase, int src, int64_t start,
                                           int64_t count, char* buf) {
+    DS_SCOPE(partition);
     DsState::Piece pc{phase, src, start, count, buf};
     auto& st = ds_state[node_id];
     if (!st)
@@ -1308,6 +1392,7 @@ void ArrayDAGExecutorND<N>::ds_take_piece(int node_id, int phase, int src, int64
 
 template <int N>
 void ArrayDAGExecutorND<N>::on_ds_msg(int node_id, char* data, int64_t size) {
+    DS_SCOPE(partition);
     auto& st = ds_state[node_id];
     if (!st)
         st = std::make_shared<DsState>();
