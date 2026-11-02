@@ -220,7 +220,7 @@ Bit-exact NumPy mirror of `src/creation_kernels.hpp` (Philox4x32-10, software lo
 | Symbol | Description |
 |--------|-------------|
 | `gpu_ipc_peer()` | IPC only to processes that passed the startup probe (`peer_ok`); everything else is staged |
-| `gpu_ipc_alloc()` / `gpu_ipc_free()` | Send blocks in lazily created 256 MB `cudaMalloc` slabs with CUDA IPC handles (`CNUM_GPU_IPC=0` disables, `CNUM_GPU_IPC_MB` bounds them, default 1024): free blocks of larger classes are split, alignment gaps go to smaller classes, a failed slab allocation is not retried, one warning on the first fallback; `comm_free()` returns arena blocks here |
+| `gpu_ipc_alloc()` / `gpu_ipc_free()` | Send blocks in lazily created 256 MB `cudaMalloc` slabs with CUDA IPC handles (`CNUM_GPU_IPC=0` disables, `CNUM_GPU_IPC_MB` bounds them, default 1024): free blocks of larger classes are split, alignment gaps go to smaller classes, a failed slab allocation is not retried, one warning on the first fallback; when the slabs are full a send waits for a block its PE frees (`gpu_ipc_wait`/`gpu_ipc_retry`, from `send_complete`) and is staged only once that PE has nothing in flight; `comm_free()` returns arena blocks here |
 | `gpu_ipc_peer_slab()` | Receiver: maps a peer slab once (`cudaIpcOpenMemHandle`) and caches it |
 | `pinned_alloc()` / `pinned_free()` | Pinned host pool by size class for cross-host messages (`CNUM_GPU_STAGE=0` disables, `CNUM_GPU_STAGE_MB` caps the cached blocks, default 512); released from the stream callback after the copy |
 | `gpu_comm_shutdown()` | Before `Kokkos::finalize`: no new IPC sends or mappings, late frees become no-ops; slabs, mappings and pinned blocks are left to process exit (a peer may still be copying) |

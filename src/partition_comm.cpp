@@ -30,6 +30,9 @@ void PartitionImpl<N>::send_complete(int send_id) {
         comm_free(it->second);
         pending_sends.erase(it);
     }
+#ifdef USE_NVIDIA
+    gpu_ipc_retry();
+#endif
 }
 
 #ifdef USE_NVIDIA
