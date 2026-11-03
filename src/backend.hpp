@@ -827,8 +827,8 @@ class PartitionImpl {
     int64_t comm_bytes_sent = 0; // cumulative communication volume (bytes) sent from this chare
 #endif
 
-    // Free list for array reuse: retired arrays keyed by exact buffer metadata.
-    // A buffer is only reusable when dtype, shape, and decomposition match.
+    // Free list for array reuse: retired arrays keyed by dtype and local size; a reused
+    // array takes the new region, shape and decomposition.
 #ifdef USE_NVIDIA
     // Bounded by retired bytes per PE: freeing the surplus costs a cudaFree (a device sync)
     // and a later cudaMalloc per array.
@@ -850,58 +850,18 @@ class PartitionImpl {
 
     struct FreeKey {
         DType dtype;
-        std::array<int, N> local_shape;
-        std::array<int, N> global_shape;
-        std::array<int, N> decomp_offset;
-        std::array<int, N> decomp_global_shape;
-        int decomp_tile;
-
-        bool operator==(const FreeKey& o) const {
-            return dtype == o.dtype &&
-                   local_shape == o.local_shape &&
-                   global_shape == o.global_shape &&
-                   decomp_offset == o.decomp_offset &&
-                   decomp_global_shape == o.decomp_global_shape &&
-                   decomp_tile == o.decomp_tile;
-        }
+        int64_t size;
+        bool operator==(const FreeKey& o) const { return dtype == o.dtype && size == o.size; }
     };
     struct FreeKeyHash {
-        static inline void hash_combine(std::size_t& seed, std::size_t value) {
-            seed ^= value + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-        }
-
-        static inline void hash_int_array(std::size_t& seed, const std::array<int, N>& values) {
-            for (int value : values)
-                hash_combine(seed, std::hash<int>()(value));
-        }
-
         std::size_t operator()(const FreeKey& k) const {
-            std::size_t seed = std::hash<int>()(static_cast<int>(k.dtype));
-            hash_int_array(seed, k.local_shape);
-            hash_int_array(seed, k.global_shape);
-            hash_int_array(seed, k.decomp_offset);
-            hash_int_array(seed, k.decomp_global_shape);
-            hash_combine(seed, std::hash<int>()(k.decomp_tile));
-            return seed;
+            return std::hash<int64_t>()(k.size) * 31 + static_cast<int>(k.dtype);
         }
     };
     std::unordered_map<FreeKey, std::vector<CTArrayBase<N>*>, FreeKeyHash> free_arrays;
 
-    static FreeKey make_free_key(DType dtype,
-                                 const ArrayRegion<N>& region,
-                                 const std::array<int, N>& global_shape,
-                                 const ArrayDecomp<N>& decomp) {
-        std::array<int, N> local_shape{};
-        for (int d = 0; d < N; ++d)
-            local_shape[d] = region.size(d);
-        return FreeKey{
-            dtype,
-            local_shape,
-            global_shape,
-            decomp.offset,
-            decomp.global_shape,
-            decomp.tile,
-        };
+    static FreeKey make_free_key(DType dtype, const ArrayRegion<N>& region) {
+        return FreeKey{dtype, region.size()};
     }
 
     /// Move an array from `arrays` into the free list (or delete it if the
@@ -915,8 +875,7 @@ class PartitionImpl {
         }
         CTArrayBase<N>* arr = it->second;
         arrays.erase(it);
-        FreeKey key = make_free_key(arr->dtype, arr->region, arr->global_shape, arr->decomp);
-        auto& bucket = free_arrays[key];
+        auto& bucket = free_arrays[make_free_key(arr->dtype, arr->region)];
         int64_t bytes = arr->local_size() * arr->elem_size();
         if (static_cast<int>(bucket.size()) < FREE_LIST_MAX &&
             retired_bytes() + bytes <= retired_limit()) {
@@ -948,12 +907,8 @@ class PartitionImpl {
 
     /// Try to pop a reusable buffer from the free list.
     /// Returns nullptr if none available.
-    CTArrayBase<N>* try_reuse(DType dtype,
-                              const ArrayRegion<N>& region,
-                              const std::array<int, N>& global_shape,
-                              const ArrayDecomp<N>& decomp) {
-        FreeKey key = make_free_key(dtype, region, global_shape, decomp);
-        auto it = free_arrays.find(key);
+    CTArrayBase<N>* try_reuse(DType dtype, const ArrayRegion<N>& region) {
+        auto it = free_arrays.find(make_free_key(dtype, region));
         if (it == free_arrays.end() || it->second.empty())
             return nullptr;
         CTArrayBase<N>* arr = it->second.back();
@@ -994,7 +949,7 @@ class PartitionImpl {
                                          int name,
                                          const ArrayDecomp<N>& decomp,
                                          bool zero = true) {
-        CTArrayBase<N>* reused = try_reuse(dtype_of<T>(), region, global_shape, decomp);
+        CTArrayBase<N>* reused = try_reuse(dtype_of<T>(), region);
         if (reused == nullptr) {
             Array<N, T>* arr;
 #ifdef USE_NVIDIA
