@@ -9,6 +9,7 @@
 #include <functional>
 #include <limits>
 #include <queue>
+#include <set>
 #include <stack>
 #include <unordered_map>
 #include <unordered_set>
@@ -30,18 +31,6 @@ namespace decomposition_solver {
 
 namespace detail {
 
-inline int next_pow2(int v) {
-    if (v <= 1)
-        return 1;
-    v--;
-    v |= v >> 1;
-    v |= v >> 2;
-    v |= v >> 4;
-    v |= v >> 8;
-    v |= v >> 16;
-    return v + 1;
-}
-
 inline int ct_min_tile(int ndims) {
     switch (ndims) {
     case 1:
@@ -53,6 +42,60 @@ inline int ct_min_tile(int ndims) {
     default:
         return 1;
     }
+}
+
+inline int64_t tile_count(const std::array<int, 3>& shape, int ndims, int tile) {
+    int64_t count = 1;
+    for (int d = 0; d < ndims; ++d)
+        count *= (std::max(1, shape[d]) + tile - 1) / tile;
+    return count;
+}
+
+// Near-equal tiles: ceil(n / k) along the largest dimension, rounded up to a small
+// multiple. Picks the k that minimizes the busiest PE's work (tiles per PE times the
+// tile volume); near-ties prefer tiles of at least min_tile, then more tiles.
+inline int balanced_tile(const std::array<int, 3>& shape, int ndims, int64_t max_tiles,
+                         int num_pes, int min_tile) {
+    int smax = 1;
+    for (int d = 0; d < ndims; ++d)
+        smax = std::max(smax, shape[d]);
+    if (smax <= min_tile)
+        return min_tile;
+    int align = std::max(1, std::min(ndims == 1 ? 1024 : ndims == 2 ? 32 : 16, min_tile));
+    int floor_tile = std::max(1, (min_tile + 1) / 2);
+    num_pes = std::max(1, num_pes);
+    int best = -1;
+    double best_cost = 0;
+    bool best_full = false;
+    int64_t best_count = 0;
+    for (int64_t k = 1; k <= std::max<int64_t>(1, max_tiles); ++k) {
+        int64_t t64 = ((smax + k - 1) / k + align - 1) / align * align;
+        if (t64 < floor_tile)
+            break;
+        int t = (int)t64;
+        int64_t count = tile_count(shape, ndims, t);
+        if (count > max_tiles && k > 1)
+            continue;
+        double vol = 1;
+        for (int d = 0; d < ndims; ++d)
+            vol *= std::min(t, std::max(1, shape[d]));
+        double cost = double((count + num_pes - 1) / num_pes) * vol;
+        bool full = t >= min_tile;
+        bool better;
+        if (best < 0 || cost < best_cost * 0.98)
+            better = true;
+        else if (cost > best_cost * 1.02)
+            better = false;
+        else
+            better = full != best_full ? full : count > best_count;
+        if (better) {
+            best = t;
+            best_cost = cost;
+            best_full = full;
+            best_count = count;
+        }
+    }
+    return best;
 }
 
 template <typename Fn>
@@ -97,16 +140,9 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
 
     auto zero_offset = std::array<int, 3>{0, 0, 0};
 
-    auto compute_tile_count = [](const ArrayMetadata& m) -> int {
-        int count = 1;
-        for (int d = 0; d < m.ndims; d++)
-            count *= (m.global_shape[d] + m.tile - 1) / m.tile;
-        return count;
-    };
-
     // Tiles are square, so a skinny matrix gets many tiny tiles; also cap the count by
     // size so each 2-D tile holds at least a quarter of a minimum square tile.
-    auto clamp_tile_for_max_count = [&](ArrayMetadata& m) {
+    auto max_tiles_for = [&](const ArrayMetadata& m) -> int64_t {
         int64_t elems = 1, min_elems = 1;
         for (int d = 0; d < m.ndims; d++) {
             elems *= std::max(1, m.global_shape[d]);
@@ -114,9 +150,15 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
         }
         int64_t by_size = m.ndims == 2 ? std::max<int64_t>(1, 4 * elems / min_elems)
                                        : std::numeric_limits<int>::max();
-        int max_tiles = (int)std::min<int64_t>(std::max(1, odf) * std::max(1, num_pes), by_size);
-        while (compute_tile_count(m) > max_tiles)
-            m.tile *= 2;
+        return std::min<int64_t>(std::max(1, odf) * std::max(1, num_pes), by_size);
+    };
+    auto own_tile = [&](const ArrayMetadata& m) {
+        return detail::balanced_tile(m.global_shape, m.ndims, max_tiles_for(m), num_pes,
+                                     detail::ct_min_tile(m.ndims));
+    };
+    auto clamp_tile_for_max_count = [&](ArrayMetadata& m) {
+        if (detail::tile_count(m.global_shape, m.ndims, m.tile) > max_tiles_for(m))
+            m.tile = std::max(m.tile, own_tile(m));
     };
 
     for (auto& [name, meta] : array_meta) {
@@ -124,8 +166,7 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
             meta.tile = detail::ct_min_tile(meta.ndims);
 
         if (!meta.decomp_final) {
-            meta.tile = std::max(detail::next_pow2(meta.tile), detail::ct_min_tile(meta.ndims));
-            clamp_tile_for_max_count(meta);
+            meta.tile = own_tile(meta);
             meta.offset = zero_offset;
         }
     }
@@ -212,10 +253,10 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
             }
         };
 
-        auto tile_fits_grid = [](const ArrayMetadata& meta, int tile) {
-            (void)meta;
-            return tile > 0;
-        };
+        // smallest tile each array was offered through a strided or cross-rank access
+        std::unordered_map<int, int> tile_cap;
+        std::set<std::pair<int, int>> unit_links;
+        std::unordered_set<int> anchored;
 
         auto try_assign_tile = [&](int array_name, int candidate_tile) {
             auto array_it = array_meta.find(array_name);
@@ -228,12 +269,11 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
             if (candidate_tile <= 0)
                 return false;
 
-            candidate_tile =
-                std::max(detail::next_pow2(candidate_tile), detail::ct_min_tile(meta.ndims));
+            candidate_tile = std::max(candidate_tile, detail::ct_min_tile(meta.ndims));
+            auto cap = tile_cap.emplace(array_name, candidate_tile).first;
+            cap->second = std::min(cap->second, candidate_tile);
 
             if (meta.tile > 0 && candidate_tile >= meta.tile)
-                return false;
-            if (!tile_fits_grid(meta, candidate_tile))
                 return false;
 
             meta.tile = candidate_tile;
@@ -249,11 +289,14 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
             if (src_it == array_meta.end() || src_it->second.ndims != ndims)
                 return false;
 
-            int candidate_tile = src_it->second.tile;
+            // unit-stride accesses share a tile (assign_class_tiles)
             int stride_factor = region_stride_factor(access_region, ndims);
-            if (stride_factor > 1)
-                candidate_tile = std::max(1, candidate_tile / stride_factor);
-
+            if (stride_factor <= 1) {
+                unit_links.insert({std::min(array_name, source_name),
+                                   std::max(array_name, source_name)});
+                return false;
+            }
+            int candidate_tile = std::max(1, src_it->second.tile / stride_factor);
             return try_assign_tile(array_name, candidate_tile);
         };
 
@@ -308,9 +351,111 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
             return true;
         };
 
+        // Arrays joined by unit-stride elementwise accesses form one tile class, so their
+        // tiles line up and only halos move. A class with an array from an earlier DAG
+        // (or a TRANSPOSE result) takes the heaviest such array's tile; otherwise the
+        // balanced tile of its largest extents, capped by strided accesses.
+        auto assign_class_tiles = [&]() -> bool {
+            std::unordered_map<int, int> parent;
+            std::function<int(int)> find = [&](int x) -> int {
+                auto it = parent.find(x);
+                if (it == parent.end() || it->second == x)
+                    return parent[x] = x;
+                int r = find(it->second);
+                return parent[x] = r;
+            };
+            auto unite = [&](int a, int b) {
+                auto ia = array_meta.find(a), ib = array_meta.find(b);
+                if (a == b || ia == array_meta.end() || ib == array_meta.end() ||
+                    ia->second.ndims != ib->second.ndims)
+                    return;
+                int ra = find(a), rb = find(b);
+                parent[rb] = ra;
+            };
+            std::unordered_set<int> anchors;
+            for (auto& [name, meta] : array_meta)
+                if (meta.decomp_final)
+                    anchors.insert(name);
+            detail::for_each_node_topo(dag, [&](DAGNode* dag_node) {
+                for (ASTNode* root : dag_node->ast->roots) {
+                    Opcode op = static_cast<Opcode>(root->opcode);
+                    if (op == Opcode::TRANSPOSE && !root->operands.empty()) {
+                        auto in = array_meta.find(root->operands[0]->result_name);
+                        auto out = array_meta.find(root->result_name);
+                        if (in != array_meta.end() && out != array_meta.end() &&
+                            !out->second.decomp_final) {
+                            out->second.tile = in->second.tile;
+                            anchors.insert(root->result_name);
+                        }
+                    } else if (op == Opcode::REDUCE && root->operands.size() >= 2) {
+                        unite(root->operands[0]->result_name, root->operands[1]->result_name);
+                    }
+                }
+            });
+            for (auto& [a, b] : unit_links)
+                unite(a, b);
+
+            struct TileClass {
+                std::vector<int> members;
+                int anchor = -1;
+                int64_t anchor_elems = -1;
+                int cap = std::numeric_limits<int>::max();
+                ArrayMetadata envelope{};
+            };
+            std::unordered_map<int, TileClass> classes;
+            for (auto& [name, meta] : array_meta) {
+                if (!parent.count(name))
+                    continue;
+                auto& c = classes[find(name)];
+                if (c.members.empty())
+                    c.envelope = meta;
+                c.members.push_back(name);
+                for (int d = 0; d < meta.ndims; ++d)
+                    c.envelope.global_shape[d] =
+                        std::max(c.envelope.global_shape[d], meta.global_shape[d]);
+                int64_t elems = 1;
+                for (int d = 0; d < meta.ndims; ++d)
+                    elems *= std::max(1, meta.global_shape[d]);
+                if (anchors.count(name) && elems > c.anchor_elems) {
+                    c.anchor = name;
+                    c.anchor_elems = elems;
+                }
+                if (auto cap = tile_cap.find(name); cap != tile_cap.end())
+                    c.cap = std::min(c.cap, cap->second);
+            }
+
+            bool changed = false;
+            for (auto& [rep, c] : classes) {
+                if (c.members.size() < 2)
+                    continue;
+                int tile = c.anchor >= 0 ? array_meta[c.anchor].tile
+                                         : std::min(own_tile(c.envelope), c.cap);
+                int64_t anchor_tiles = 0;
+                if (c.anchor >= 0) {
+                    auto& a = array_meta[c.anchor];
+                    anchor_tiles = detail::tile_count(a.global_shape, a.ndims, a.tile);
+                }
+                for (int name : c.members) {
+                    auto& meta = array_meta[name];
+                    if (c.anchor >= 0)
+                        anchored.insert(name);
+                    if (anchors.count(name) || meta.tile == tile ||
+                        detail::tile_count(meta.global_shape, meta.ndims, tile) >
+                            std::max(max_tiles_for(meta), anchor_tiles))
+                        continue;
+                    meta.tile = tile;
+                    changed = true;
+                }
+            }
+            return changed;
+        };
+
         bool tiles_changed = true;
         int max_tile_passes = std::max(64, static_cast<int>(array_meta.size()));
-        for (int iter = 0; iter < max_tile_passes && tiles_changed; ++iter) {
+        // strided proposals to a fixpoint, then tile classes; repeat while classes move
+        for (int iter = 0, rounds = 0; iter < max_tile_passes; ++iter) {
+            if (!tiles_changed && (rounds++ == 4 || !assign_class_tiles()))
+                break;
             tiles_changed = false;
 
             detail::for_each_node_topo(dag, [&](DAGNode* dag_node) {
@@ -392,7 +537,7 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
         }
 
         for (auto& [name, meta] : array_meta) {
-            if (!meta.decomp_final)
+            if (!meta.decomp_final && !anchored.count(name))
                 clamp_tile_for_max_count(meta);
         }
 
@@ -604,6 +749,19 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                     }
                     for (int src_name : union_leaves)
                         uf_unite(out_name, src_name);
+                    continue;
+                }
+
+                // REDUCE takes the dot of the two operands' local tiles
+                if (op == Opcode::REDUCE && ast_node->operands.size() >= 2) {
+                    int a = ast_node->operands[0]->result_name;
+                    int b = ast_node->operands[1]->result_name;
+                    auto ia = array_meta.find(a), ib = array_meta.find(b);
+                    if (a != b && ia != array_meta.end() && ib != array_meta.end() &&
+                        ia->second.tile == ib->second.tile &&
+                        !ia->second.decomp_final && !source_arrays.count(a) &&
+                        !ib->second.decomp_final && !source_arrays.count(b))
+                        uf_unite(a, b);
                     continue;
                 }
 
@@ -851,6 +1009,20 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                                                {1, 1, 1}, weight_cd, true, from_to_to_cd,
                                                to_to_from_cd});
                     }
+                    continue;
+                }
+
+                if (op == Opcode::REDUCE && ast_node->operands.size() >= 2) {
+                    int a = ast_node->operands[0]->result_name;
+                    int b = ast_node->operands[1]->result_name;
+                    auto ia = array_meta.find(a), ib = array_meta.find(b);
+                    if (a == b || ia == array_meta.end() || ib == array_meta.end() ||
+                        ia->second.ndims != 1 || ib->second.ndims != 1 ||
+                        uf_find(a) == uf_find(b))
+                        continue;
+                    int64_t weight = 4 * (int64_t)std::max(1, ia->second.global_shape[0]);
+                    shift_edges.push_back(
+                        {uf_find(a), uf_find(b), {0, 0, 0}, {1, 1, 1}, weight, true});
                     continue;
                 }
 

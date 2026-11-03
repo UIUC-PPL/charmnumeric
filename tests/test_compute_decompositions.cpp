@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <iostream>
@@ -99,7 +100,9 @@ ArrayRegion<N>* make_region(std::array<int, N> start, std::array<int, N> stop,
 DAG* make_single_node_dag(std::vector<ASTNode*> roots) {
     auto* ast = new AST(std::move(roots));
     auto* node = new DAGNode(0, ast);
-    auto* dag = new DAG({node});
+    auto* dag = new DAG();
+    dag->roots.push_back(node);
+    dag->nodes[0] = node;
     dag->num_nodes = 1;
     return dag;
 }
@@ -446,6 +449,71 @@ void test_transpose_result_aligned_to_source_tiles() {
     delete dag;
 }
 
+
+void test_balanced_tiles() {
+    std::cout << "=== test_balanced_tiles ===" << std::endl;
+    using decomposition_solver::detail::balanced_tile;
+    expect_eq("800^3 on 4 PEs", balanced_tile({800, 800, 800}, 3, 16, 4, 128), 400);
+    expect_eq("800^3 on 1 PE", balanced_tile({800, 800, 800}, 3, 4, 1, 128), 800);
+    expect_eq("4096^2 on 4 PEs", balanced_tile({4096, 4096, 0}, 2, 16, 4, 1024), 1024);
+    expect_eq("4096^2 on 1 PE", balanced_tile({4096, 4096, 0}, 2, 4, 1, 1024), 2048);
+    expect_eq("8194^2 on 4 PEs", balanced_tile({8194, 8194, 0}, 2, 16, 4, 1024), 2080);
+    expect_eq("1500^2 on 4 PEs", balanced_tile({1500, 1500, 0}, 2, 16, 4, 1024), 768);
+    expect_eq("small array", balanced_tile({300, 200, 0}, 2, 16, 4, 1024), 1024);
+}
+
+void test_misaligned_after_flush_takes_source_tile() {
+    std::cout << "=== test_misaligned_after_flush_takes_source_tile ===" << std::endl;
+
+    constexpr int G = 1;
+    constexpr int W = 2;
+
+    // grid from an earlier DAG (8194^2, tile 2080); W = grid[1:-1, 1:-1] + grid[0:-2, 1:-1]
+    MetaMap meta;
+    meta[G] = make_meta(2, {8194, 8194, 0}, {0, 0, 0}, 2080, /*final=*/true);
+    meta[W] = make_meta(2, {8192, 8192, 0}, {0, 0, 0}, 0, false);
+    ASTNode* w = make_add(W, make_leaf(G, 2), make_region<2>({1, 1}, {8193, 8193}, {1, 1}),
+                          make_leaf(G, 2), make_region<2>({0, 1}, {8192, 8193}, {1, 1}),
+                          /*is_temp=*/false, /*ndims=*/2);
+    DAG* dag = make_single_node_dag({w});
+
+    decomposition_solver::compute_decompositions(meta, dag, /*odf=*/4, /*num_pes=*/4);
+
+    expect_eq("W.tile", meta.at(W).tile, 2080);
+    expect_eq("W.offset[1]", meta.at(W).offset[1], 1);
+    expect_true("W.offset[0] in {0, 1}", meta.at(W).offset[0] == 0 || meta.at(W).offset[0] == 1);
+
+    delete dag;
+}
+
+void test_reduce_operands_share_layout() {
+    std::cout << "=== test_reduce_operands_share_layout ===" << std::endl;
+
+    constexpr int A = 1;
+    constexpr int C = 2;
+    constexpr int X = 3;
+    constexpr int R = 4;
+
+    MetaMap meta;
+    meta[A] = make_meta(1, 500, /*offset0=*/5, /*tile=*/64, /*final=*/true);
+    meta[C] = make_meta(1, 500, 0, 64, true);
+    meta[X] = make_meta(1, 500, 0, 0, false);
+    meta[R] = make_meta(1, 1, 0, 0, false);
+    ASTNode* x = make_copy(X, make_leaf(C), nullptr);
+    auto* r = new ASTNode(R, static_cast<int>(Opcode::REDUCE), false, false, 0.0, 1);
+    r->add_operand(make_leaf(X));
+    r->operand_regions.push_back(nullptr);
+    r->add_operand(make_leaf(A));
+    r->operand_regions.push_back(nullptr);
+    DAG* dag = make_single_node_dag({x, r});
+
+    decomposition_solver::compute_decompositions(meta, dag, /*odf=*/4, /*num_pes=*/1);
+
+    expect_eq("X.tile", meta.at(X).tile, 64);
+    expect_eq("X.offset[0]", meta.at(X).offset[0], 5);
+
+    delete dag;
+}
 } // namespace
 
 int main() {
@@ -458,6 +526,9 @@ int main() {
         test_jacobi3d_temp_offset();
         test_strided_copy_reduces_tile_and_sets_offset();
         test_transpose_result_aligned_to_source_tiles();
+        test_balanced_tiles();
+        test_misaligned_after_flush_takes_source_tile();
+        test_reduce_operands_share_layout();
     } catch (const std::exception& ex) {
         std::cerr << "test_compute_decompositions failed: " << ex.what() << std::endl;
         return 1;
