@@ -160,11 +160,13 @@ void PartitionImpl<N>::process_get(int epoch) {
                 global_offset += ((int64_t)global_region.start[d] + idx[d]) * global_strides[d];
                 local_offset += (int64_t)idx[d] * local_strides[d];
             }
-            // Send as bytes: offset and size in bytes
             int64_t byte_offset = global_offset * esz;
             int64_t byte_size = inner_size * esz;
-            char* base = static_cast<char*>(arr->data_ptr());
-            dag_proxy[0].gather(epoch, name, byte_offset, byte_size, base + local_offset * esz);
+            char* src = static_cast<char*>(arr->data_ptr()) + local_offset * esz;
+            int64_t lim = ct_msg_max_bytes();
+            for (int64_t off = 0; off < byte_size; off += lim)
+                dag_proxy[0].gather(epoch, name, byte_offset + off,
+                                    std::min(lim, byte_size - off), src + off);
 
             int d = N - 2;
             while (d >= 0) {
