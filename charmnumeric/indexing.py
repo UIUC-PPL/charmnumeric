@@ -12,8 +12,8 @@ are repeat with array counts and compress with a device condition.
 Differences from NumPy:
 - Negative-step slices next to an index array are part of the gather; keys of
   only slices and integers go through views and FLIP (charmnumeric/signal.py).
-- Device index arrays are not bounds-checked (out-of-range offsets are dropped
-  by the backend); host index lists are checked.
+- Device index arrays are not bounds-checked: out-of-range indices (mode "raise")
+  are dropped by the backend with a warning; host index lists are checked.
 - Device index arrays must have equal shapes (no broadcasting); results have at
   most 3 dimensions (more for >3-D sources, see folded.py).
 - nonzero / repeat counts take elements of at most 8 bytes (no complex128).
@@ -80,11 +80,11 @@ _COUNT_CACHE_MAX = 8
 
 
 def _count(x, kind="nonzero"):
-    """count_nonzero(x) or (kind "sum") sum(x) as an int, a blocking get; cached on x's
+    """count_nonzero(x), or sum(x) / amin(x) (kind "sum" / "min"), as an int, a blocking get; cached on x's
     root until the root is written."""
-    from .reductions import count_nonzero, sum as _sum
+    from .reductions import amin, count_nonzero, sum as _sum
 
-    fn = count_nonzero if kind == "nonzero" else _sum
+    fn = {"nonzero": count_nonzero, "sum": _sum, "min": amin}[kind]
     if x.__class__ is not Array and x.__class__ is not ArrayView:
         return _fetch_int(fn(x))
     _fresh(x)  # a linked copy may refresh (a write) first
@@ -174,12 +174,25 @@ def _wrap_host(idx, n, mode, axis=0):
     return np.where(idx < 0, idx + n, idx)
 
 
-def _wrap_device(idx, n, mode):
+def _index_int64(idx):
+    """A device index array as int64 (offset arithmetic in narrower dtypes would wrap)."""
+    if idx.dtype == _BOOL or not np.issubdtype(idx.dtype, np.integer):
+        raise IndexError("arrays used as indices must be of integer type")
+    return idx if idx.dtype == _INT64 else _cast_operand(idx, _INT64)
+
+
+def _wrap_device(idx, n, mode, oob=None):
+    """int64 indices in [0, n); with mode 'raise' an out-of-range index becomes `oob`
+    (default n), chosen by the caller so that its flat offset lies past the end of the
+    array: the backend drops it with a warning instead of writing a neighbour."""
+    idx = _index_int64(idx)
     if mode == "wrap":
         return idx % n
     if mode == "clip":
         return _clip(idx, 0, n - 1)
-    return _where(_compare(idx, 0, "less"), idx + n, idx)
+    w = _where(_compare(idx, 0, "less"), idx + n, idx)
+    oob = n if oob is None else oob
+    return _where(_compare(w, n, "greater_equal"), oob, _where(_compare(w, 0, "less"), oob, w))
 
 
 def _nonzero_flat(x):
@@ -368,7 +381,8 @@ def _plan(x, items, mode="raise", newaxes=()):
                     f"device index arrays must all have the same shape (got {tuple(idx.shape)} "
                     f"and {B})"
                 )
-            devs.append((idx if trusted else _wrap_device(idx, x.shape[d], mode), mult[d]))
+            oob = root.size // mult[d] + 1  # oob * mult[d] > every offset into root
+            devs.append((idx if trusted else _wrap_device(idx, x.shape[d], mode, oob), mult[d]))
         else:
             host = host + _wrap_host(idx, x.shape[d], mode, d) * mult[d]
     if not devs:
@@ -502,8 +516,8 @@ def _scatter_value(x, value, E):
             return asarray(np.ascontiguousarray(host))
         value = host.item()
     value = _coerce_scalar(value)
-    if isinstance(value, complex) or (isinstance(value, int) and abs(value) > 2**53
-                                      and x.dtype.kind in "iu"):
+    if isinstance(value, complex) or x.dtype.itemsize > 8 or (
+            isinstance(value, int) and abs(value) > 2**53 and x.dtype.kind in "iu"):
         return full(E, value, dtype=x.dtype)  # not exact as a double
     return value
 
@@ -643,8 +657,7 @@ def _flat_gather(a, idx, mode):
     a = _flat_source(a)
     n = a.size
     if _is_array(idx):
-        L = _wrap_device(idx, n, mode)
-        return _gather(a, L, tuple(idx.shape), 0, 0, [])
+        return _gather(a, _wrap_device(idx, n, mode), tuple(idx.shape), 0, 0, [])
     idx = _wrap_host(idx, n, mode)
     if idx.size == 0:
         return create_array(idx.shape, dtype=a.dtype)
@@ -660,6 +673,8 @@ def take(a, indices, axis=None, out=None, mode="raise"):
         h = np.asarray(indices)
         if h.size and not np.issubdtype(h.dtype, np.integer):
             raise IndexError("arrays used as indices must be of integer type")
+    else:
+        _index_int64(indices)
     if not _is_array(indices) and np.ndim(indices) == 0:
         # scalar index: the axis is dropped
         if axis is None:
@@ -745,10 +760,10 @@ def _along_axis(arr, indices, axis):
         return root, (asarray(np.ascontiguousarray(L)) if L.size else None), ishape
     if not np.issubdtype(indices.dtype, np.integer):
         raise IndexError("arrays used as indices must be of integer type")
-    L = _wrap_device(indices, n, "raise") * mult[axis]
+    L = _wrap_device(indices, n, "raise", root.size // mult[axis] + 1) * mult[axis]
     for d in range(nd):
         if d != axis and ishape[d] > 1:
-            L = L + _axis_range(ishape, d, ishape[d], indices.dtype) * mult[d]
+            L = L + _axis_range(ishape, d, ishape[d], _INT64) * mult[d]
     if base:
         L = L + base
     return root, L, ishape
@@ -807,6 +822,8 @@ def repeat(a, repeats, axis=None):
             raise ValueError(f"operands could not be broadcast together with shape ({n},)")
         if repeats.shape[0] == 1 and n != 1:
             raise NotImplementedError("repeat with a size-1 device repeats array")
+        if _count(repeats, "min") < 0:
+            raise ValueError("repeats may not contain negative values")
         total = _count(repeats, "sum")
         idx = _expand(repeats, True, total) if total else np.zeros(0, np.int64)
     elif np.ndim(repeats) == 0:
@@ -876,11 +893,11 @@ def _choose_gather(idx, choices, arrays):
     for k, c in enumerate(choices):
         stacked[k] = c
     size = int(np.prod(shape))
-    L = idx * size
+    L = _index_int64(idx) * size
     stride = 1
     for d in range(len(shape) - 1, -1, -1):
         if shape[d] > 1:
-            L = L + _axis_range(shape, d, shape[d], idx.dtype) * stride
+            L = L + _axis_range(shape, d, shape[d], _INT64) * stride
         stride *= shape[d]
     return _gather(stacked, L, shape, 0, 0, [])
 

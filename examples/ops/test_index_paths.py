@@ -122,10 +122,12 @@ for dt in (np.bool_, np.int8, np.uint16, np.float16, np.int32, np.float32, np.in
     a[ri[:20], 3:9] = a[ri[20:40], 0:6]
     hc[ri[:20], 3:9] = hc[ri[20:40], 0:6].copy()
     C.check(f"{name} rows = gathered", a, hc, dtype=dt)
-    if np.dtype(dt).itemsize <= 8:
-        a[::7, [2, 4]] = h.flat[1]
-        hc[::7, [2, 4]] = h.flat[1]
-        C.check(f"{name} [::7, [2, 4]] = scalar", a, hc, dtype=dt)
+    a[::7, [2, 4]] = h.flat[1]
+    hc[::7, [2, 4]] = h.flat[1]
+    C.check(f"{name} [::7, [2, 4]] = scalar", a, hc, dtype=dt)
+    a[dev(ri[:5])] = 2
+    hc[ri[:5]] = 2
+    C.check(f"{name} [dev rows] = real scalar", a, hc, dtype=dt)
 
 # ---- indexing_routines patterns at a size with several chares ----
 N = 1200
@@ -152,6 +154,71 @@ big[dev(gi)] = dev(gv)
 bh = np.arange(nl)
 bh[gi] = gv
 C.check("10M[dup] = v", big, bh)
+
+# ---- narrow index dtypes: offsets are computed in int64 ----
+w2 = ints((300, 200), -99, 99, dtype=np.int64)
+w2h = C.fetch(w2)
+for idt in (np.int8, np.uint8, np.int16, np.int32):
+    hi = np.iinfo(idt).max
+    ri = rng.integers(-60 if np.dtype(idt).kind == "i" else 0, min(hi, 299), size=40).astype(idt)
+    cj = rng.integers(0, min(hi, 199), size=40).astype(idt)
+    n = np.dtype(idt).name
+    C.check(f"w2[{n} rows, {n} cols]", w2[dev(ri), dev(cj)], w2h[ri.astype(int), cj.astype(int)])
+    C.check(f"take {n} axis=0", cnp.take(w2, dev(ri), axis=0), w2h.take(ri.astype(int), axis=0))
+    C.check(f"take_along_axis {n}", cnp.take_along_axis(w2[:40], dev(cj.reshape(40, 1)), 1),
+            np.take_along_axis(w2h[:40], cj.astype(int).reshape(40, 1), 1))
+    t, th = w2.copy(), w2h.copy()
+    t[dev(ri), dev(cj)] = 3
+    th[ri.astype(int), cj.astype(int)] = 3
+    C.check(f"t[{n} rows, {n} cols] = 3", t, th)
+
+# ---- a per-dimension index out of range never reaches a neighbouring element ----
+oz = cnp.zeros((50, 40), dtype=np.int64)
+oz[dev(np.array([1, 2, 3, 4])), dev(np.array([5, 40, -41, -40]))] = 7
+ozh = np.zeros((50, 40), dtype=np.int64)
+ozh[[1, 4], [5, 0]] = 7
+C.check("oz[i, j] = 7, j out of range dropped", oz, ozh)
+src = cnp.arange(2000, dtype=np.int64).reshape(50, 40)
+C.check("src[i, j], j out of range reads 0",
+        src[dev(np.array([1, 2, 49])), dev(np.array([39, 40, 0]))], np.array([79, 0, 1960]))
+
+# ---- bad device inputs raise as in NumPy ----
+fidx = cnp.zeros((3,), dtype=np.float64)
+C.raises("take float device index", IndexError, lambda: cnp.take(src, fidx))
+C.raises("take axis float device index", IndexError, lambda: cnp.take(src, fidx, axis=1))
+C.raises("put float device index", IndexError, lambda: cnp.put(oz, fidx, 1))
+C.raises("negative device repeats", ValueError,
+         lambda: cnp.repeat(cnp.arange(3), dev(np.array([1, -1, 2]))))
+
+# ---- values aliasing the target across several chares ----
+q2 = cnp.arange(600_000, dtype=np.int64)
+q2h = np.arange(600_000)
+perm2 = rng.permutation(600_000)[:20_000]
+q2[dev(perm2)] = q2[250_000:270_000]
+q2h[perm2] = q2h[250_000:270_000].copy()
+C.check("q2[perm] = q2[250000:270000] (several chares)", q2, q2h)
+r3 = ints((3000, 40), -50, 50, dtype=np.int64)
+r3h = C.fetch(r3)
+rr = rng.integers(0, 3000, size=1200)
+r3[dev(rr)] = r3[1000:2200]
+r3h[rr] = r3h[1000:2200].copy()
+C.check("r3[rows] = r3[1000:2200] (2-D, dup rows)", r3, r3h)
+
+# ---- operands with shifted (offset) decompositions ----
+base1 = cnp.arange(300_001, dtype=np.float64)
+sh = base1[3:] * 2 + base1[:-3]
+shh = np.arange(300_001.0)[3:] * 2 + np.arange(300_001.0)[:-3]
+oi = rng.integers(-300_000 + 2, 300_000 - 2, size=3000)
+C.check("shifted[dev idx]", sh[dev(oi)], shh[oi])
+sv = rng.random(3000)
+sh[dev(oi)] = dev(sv)
+shh[oi] = sv
+C.check("shifted[dev idx] = v", sh, shh)
+sh2 = base1[5:] - base1[:-5]
+sh2[dev(oi[:500] % 1000)] = sh[dev(oi[:500])]
+s2h = np.arange(300_001.0)[5:] - np.arange(300_001.0)[:-5]
+s2h[oi[:500] % 1000] = shh[oi[:500]]
+C.check("shifted[idx] = shifted[idx]", sh2, s2h)
 
 # ---- out-of-bounds device indices are dropped, the rest is written ----
 o = cnp.zeros((50,), dtype=np.int64)
