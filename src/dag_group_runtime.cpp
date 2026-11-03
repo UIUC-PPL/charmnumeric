@@ -129,18 +129,22 @@ void ArrayDAGGroup::compute_decompositions(DAG* dag) {
         for (ASTNode* op : n->operands)
             stack.push_back(op);
     }
+    static const bool log = getenv("CNUM_DECOMP_LOG") != nullptr && CkMyPe() == 0;
+    std::unordered_set<int> was_final;
+    for (auto& [name, meta] : sub)
+        if (log && meta.decomp_final)
+            was_final.insert(name);
     decomposition_solver::compute_decompositions(sub, dag, odf, CkNumPes());
     for (auto& [name, meta] : sub)
         array_meta[name] = meta;
 
-    DBG_PRINT("[PE %d] compute_decompositions: assigned tiles and offsets for %d arrays\n",
-              CkMyPe(), (int)sub.size());
-    for (auto& [name, meta] : sub) {
-        DBG_PRINT("  array %d: ndims=%d shape=(%d,%d,%d) tile=%d offset=(%d,%d,%d)\n", name,
-                  meta.ndims, meta.global_shape[0], meta.global_shape[1],
-                  meta.global_shape[2], meta.tile, meta.offset[0], meta.offset[1],
-                  meta.offset[2]);
-    }
+    if (!log)
+        return;
+    for (auto& [name, meta] : sub)
+        if (!was_final.count(name))
+            CkPrintf("decomp: array %d shape (%d,%d,%d) tile %d offset (%d,%d,%d)\n", name,
+                     meta.global_shape[0], meta.global_shape[1], meta.global_shape[2],
+                     meta.tile, meta.offset[0], meta.offset[1], meta.offset[2]);
 }
 
 void ArrayDAGGroup::receive_get_request(int ndims, int epoch, int name, int size, int dtype) {
