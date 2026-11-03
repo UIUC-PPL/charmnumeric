@@ -1020,6 +1020,86 @@ def _tile_diag_offsets_wide():
     check("Z[:, s] = tile(h) + 1", get(Z), Zh)
 
 
+@contextlib.contextmanager
+def max_fused_ops(count):
+    import charmtyles.ast as ct_ast
+    old = ct_ast.max_fused_ops
+    ct_ast.set_max_fused_ops(count)
+    try:
+        yield
+    finally:
+        ct_ast.set_max_fused_ops(old)
+
+
+@case
+def misaligned_across_flush():
+    # Results that meet arrays of other shapes or offsets from earlier DAGs, fused and one
+    # op per kernel: every op between them moves halos or whole tiles.
+    with deadline(300):
+        for fused in (0, 1):
+            with max_fused_ops(fused):
+                _stencil_across_flush(61, fused)
+                _views_across_flush(57, fused)
+
+
+def _stencil_across_flush(n, fused):
+    g = data((n + 2, n + 2))
+    gh = made(g)
+    center, north, east = g[1:-1, 1:-1], g[0:-2, 1:-1], g[1:-1, 2:]
+    west, south = g[1:-1, 0:-2], g[2:, 1:-1]
+    for it in range(3):
+        work = 0.2 * (center + north + east + west + south)
+        wh = 0.2 * (gh[1:-1, 1:-1] + gh[0:-2, 1:-1] + gh[1:-1, 2:] + gh[1:-1, 0:-2]
+                    + gh[2:, 1:-1])
+        if it == 1:
+            check(f"stencil work (fused={fused})", get(work), wh, rtol=1e-12)
+        center[:] = work
+        gh[1:-1, 1:-1] = wh
+        check(f"stencil it {it} (fused={fused})", get(g), gh, rtol=1e-12)
+    check(f"stencil sum (fused={fused})", get(cnp.sum(center)), np.sum(gh[1:-1, 1:-1]),
+          rtol=1e-12)
+
+
+def _views_across_flush(n, fused):
+    a = data((n + 5, n + 3), seed=1)
+    ah = made(a)
+    b = a[2:-1, 1:] * 3.0
+    bh = made(b)
+    d = b + a[1:-2, 0:-1]
+    e = d[1:, :-1] - b[:-1, 1:]
+    dh = bh + ah[1:-2, 0:-1]
+    check(f"2-D d (fused={fused})", get(d), dh, rtol=1e-12)
+    check(f"2-D e (fused={fused})", get(e), dh[1:, :-1] - bh[:-1, 1:], rtol=1e-12)
+    check(f"2-D e.sum(0) (fused={fused})", get(e.sum(axis=0)),
+          (dh[1:, :-1] - bh[:-1, 1:]).sum(axis=0), rtol=1e-12)
+    v = data((5 * n + 7,), seed=2)
+    vh = made(v)
+    w = v[3:] + 1.0
+    wh = made(w)
+    x = w[2:] * v[5:]
+    check(f"1-D x (fused={fused})", get(x), wh[2:] * vh[5:], rtol=1e-12)
+    check(f"1-D max (fused={fused})", get(cnp.max(x)), np.max(wh[2:] * vh[5:]), rtol=1e-12)
+    z = v[:-3] * 2.0
+    zh = made(z)
+    check(f"dot of differently placed vectors (fused={fused})", get(cnp.dot(w, z)),
+          np.dot(wh, zh), rtol=1e-12)
+    if fused:
+        # above the default 1-D tiles, so the two layouts split at different elements
+        big = data((2_100_003,), seed=4)
+        w2, z2 = big[3:] + 1.0, big[:-3] * 2.0
+        w2h, z2h = made(w2, z2)
+        check("dot of large differently placed vectors", get(cnp.dot(w2, z2)),
+              np.dot(w2h, z2h), rtol=1e-10)
+    t = data((9, 11, 13), seed=3)
+    th = made(t)
+    u = t[1:, 2:, :-3] + 1.0
+    uh = made(u)
+    y = u * t[:-1, :-2, 3:]
+    check(f"3-D y (fused={fused})", get(y), uh * th[:-1, :-2, 3:], rtol=1e-12)
+    check(f"3-D y.sum(2) (fused={fused})", get(y.sum(axis=2)),
+          (uh * th[:-1, :-2, 3:]).sum(axis=2), rtol=1e-12)
+
+
 def main():
     global iface
     iface = connect()
