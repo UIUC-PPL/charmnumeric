@@ -50,6 +50,7 @@ PartitionImpl<N>::~PartitionImpl() {
             delete arr;
         }
 #ifdef USE_KOKKOS
+    Kokkos::fence("ct_partition_exit"); // packs and copies on the comm stream
     for (auto& [id, ptr] : pending_sends) {
 #ifdef USE_NVIDIA
         if (gpu_ipc_forget(ptr)) // a receiver may still be copying it
