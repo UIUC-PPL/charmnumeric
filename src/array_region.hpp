@@ -450,16 +450,31 @@ class ChareIndex {
 // Home PE of a chare. Power-of-two PE counts: a GF(2)-linear map of the index bits
 // (low bits of the last dimension, reversed bits of the one before, a mix for the
 // first of three), so aligned boxes such as 2x2, 4x4, 4x1 or 2x2x2 chares from the
-// origin spread evenly. Other counts: a skewed round-robin.
+// origin spread evenly. Other counts: a linear map whose strides are coprime with the
+// PE count, so every row, column and pillar of chares cycles through all PEs.
 inline int chare_home_pe(int ndims, const int* idx, int num_pes) {
     if (num_pes <= 1)
         return 0;
     if (ndims == 1)
         return idx[0] % num_pes;
     if ((num_pes & (num_pes - 1)) != 0) {
-        int64_t v = 0;
-        for (int d = 0; d < ndims; ++d)
-            v = v * 2 + idx[d];
+        auto coprime_from = [num_pes](int s) {
+            auto gcd = [](int a, int b) {
+                while (b) {
+                    int t = a % b;
+                    a = b;
+                    b = t;
+                }
+                return a;
+            };
+            while (gcd(s, num_pes) != 1)
+                ++s;
+            return s;
+        };
+        int s1 = coprime_from(2), s0 = coprime_from(s1 + 1);
+        int64_t v = idx[ndims - 1] + (int64_t)s1 * idx[ndims - 2];
+        if (ndims == 3)
+            v += (int64_t)s0 * idx[0];
         return (int)(v % num_pes);
     }
     int m = 0;

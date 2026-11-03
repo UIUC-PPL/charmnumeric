@@ -477,6 +477,23 @@ void test_chare_home_pe_balance() {
     std::vector<std::array<int, 3>> boxes = {{2, 2, 0}, {4, 4, 0}, {4, 1, 0}, {1, 4, 0},
                                              {2, 4, 0}, {2, 2, 2}, {4, 4, 4}, {2, 1, 2},
                                              {2, 2, 1}, {1, 2, 2}};
+    // other PE counts: no PE left idle by a thin grid
+    for (int pes : {3, 6, 12}) {
+        for (std::array<int, 3> box : {std::array<int, 3>{pes, 1, 0}, {1, pes, 0},
+                                       {pes, 1, 1}, {1, pes, 1}, {1, 1, pes}}) {
+            int nd = box[2] == 0 ? 2 : 3;
+            std::vector<int> load(pes, 0);
+            for (int i = 0; i < box[0]; ++i)
+                for (int j = 0; j < box[1]; ++j)
+                    for (int k = 0; k < (nd == 3 ? box[2] : 1); ++k) {
+                        int idx[3] = {i, j, k};
+                        load[chare_home_pe(nd, idx, pes)]++;
+                    }
+            std::ostringstream label;
+            label << "thin box " << box[0] << "x" << box[1] << "x" << box[2] << " on " << pes;
+            expect_eq(label.str(), *std::max_element(load.begin(), load.end()), 1);
+        }
+    }
     for (int pes : {4, 8}) {
         for (auto box : boxes) {
             int nd = box[2] == 0 ? 2 : 3;
