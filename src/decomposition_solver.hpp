@@ -8,9 +8,11 @@
 #include <cassert>
 #include <functional>
 #include <limits>
+#include <map>
 #include <queue>
 #include <set>
 #include <stack>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -51,9 +53,37 @@ inline int64_t tile_count(const std::array<int, 3>& shape, int ndims, int tile) 
     return count;
 }
 
-// Near-equal tiles: ceil(n / k) along the largest dimension, rounded up to a small
-// multiple. Picks the k that minimizes the busiest PE's work (tiles per PE times the
-// tile volume); near-ties prefer tiles of at least min_tile, then more tiles.
+// Elements on the busiest PE when an array of this shape (offset 0) is cut into
+// tiles placed by chare_home_pe(); past 4096 tiles, tiles per PE times a full tile.
+inline int64_t busiest_pe_elems(const std::array<int, 3>& shape, int ndims, int tile,
+                                int num_pes) {
+    std::array<int, 3> n = {1, 1, 1};
+    int64_t count = 1, full = 1;
+    for (int d = 0; d < ndims; ++d) {
+        n[d] = (std::max(1, shape[d]) + tile - 1) / tile;
+        count *= n[d];
+        full *= std::min(tile, std::max(1, shape[d]));
+    }
+    if (count > 4096)
+        return (count + num_pes - 1) / num_pes * full;
+    std::unordered_map<int, int64_t> load;
+    int64_t busiest = 0;
+    std::array<int, 3> idx = {0, 0, 0};
+    for (int64_t c = 0; c < count; ++c) {
+        int64_t elems = 1;
+        for (int d = 0; d < ndims; ++d)
+            elems *= std::min(tile, std::max(1, shape[d]) - idx[d] * tile);
+        busiest = std::max(busiest, load[chare_home_pe(ndims, idx.data(), num_pes)] += elems);
+        for (int d = ndims - 1; d >= 0 && ++idx[d] == n[d]; --d)
+            idx[d] = 0;
+    }
+    return busiest;
+}
+
+// Near-equal tiles: ceil(n / k) along some dimension, rounded up to a small multiple,
+// at most max_tiles of them; the one that minimizes the busiest PE's elements (near-ties:
+// tiles of at least min_tile, then more tiles) replaces the smallest power-of-two
+// multiple of min_tile within max_tiles when it unloads the busiest PE by 10%.
 inline int balanced_tile(const std::array<int, 3>& shape, int ndims, int64_t max_tiles,
                          int num_pes, int min_tile) {
     int smax = 1;
@@ -61,41 +91,64 @@ inline int balanced_tile(const std::array<int, 3>& shape, int ndims, int64_t max
         smax = std::max(smax, shape[d]);
     if (smax <= min_tile)
         return min_tile;
+    struct Key {
+        std::array<int, 3> shape;
+        int ndims, num_pes, min_tile;
+        int64_t max_tiles;
+        bool operator<(const Key& o) const {
+            return std::tie(shape, ndims, num_pes, min_tile, max_tiles) <
+                   std::tie(o.shape, o.ndims, o.num_pes, o.min_tile, o.max_tiles);
+        }
+    };
+    static thread_local std::map<Key, int> cache;
+    Key key{{shape[0], ndims > 1 ? shape[1] : 0, ndims > 2 ? shape[2] : 0}, ndims,
+            std::max(1, num_pes), min_tile, max_tiles};
+    if (auto it = cache.find(key); it != cache.end())
+        return it->second;
+    int pow2 = min_tile;
+    while (tile_count(shape, ndims, pow2) > max_tiles && pow2 < smax)
+        pow2 *= 2;
+    if (key.num_pes == 1)
+        return cache[key] = pow2;
+
     int align = std::max(1, std::min(ndims == 1 ? 1024 : ndims == 2 ? 32 : 16, min_tile));
     int floor_tile = std::max(1, (min_tile + 1) / 2);
-    num_pes = std::max(1, num_pes);
+    std::set<int> cands;
+    for (int d = 0; d < ndims; ++d)
+        for (int64_t k = 1; k <= std::min<int64_t>(std::max<int64_t>(1, max_tiles), 256); ++k) {
+            int64_t t = ((std::max(1, shape[d]) + k - 1) / k + align - 1) / align * align;
+            if (t < floor_tile)
+                break;
+            cands.insert((int)std::min<int64_t>(t, std::numeric_limits<int>::max()));
+        }
+    cands.insert((smax + align - 1) / align * align);
     int best = -1;
-    double best_cost = 0;
+    int64_t best_load = 0, best_count = 0;
     bool best_full = false;
-    int64_t best_count = 0;
-    for (int64_t k = 1; k <= std::max<int64_t>(1, max_tiles); ++k) {
-        int64_t t64 = ((smax + k - 1) / k + align - 1) / align * align;
-        if (t64 < floor_tile)
-            break;
-        int t = (int)t64;
+    for (auto it = cands.rbegin(); it != cands.rend(); ++it) {
+        int t = *it;
         int64_t count = tile_count(shape, ndims, t);
-        if (count > max_tiles && k > 1)
+        if (count > max_tiles && best >= 0)
             continue;
-        double vol = 1;
-        for (int d = 0; d < ndims; ++d)
-            vol *= std::min(t, std::max(1, shape[d]));
-        double cost = double((count + num_pes - 1) / num_pes) * vol;
+        int64_t load = busiest_pe_elems(shape, ndims, t, key.num_pes);
         bool full = t >= min_tile;
         bool better;
-        if (best < 0 || cost < best_cost * 0.98)
+        if (best < 0 || load < best_load * 0.98)
             better = true;
-        else if (cost > best_cost * 1.02)
+        else if (load > best_load * 1.02)
             better = false;
         else
             better = full != best_full ? full : count > best_count;
         if (better) {
             best = t;
-            best_cost = cost;
+            best_load = load;
             best_full = full;
             best_count = count;
         }
     }
-    return best;
+    if (best_load >= 0.9 * busiest_pe_elems(shape, ndims, pow2, key.num_pes))
+        best = pow2;
+    return cache[key] = best;
 }
 
 template <typename Fn>

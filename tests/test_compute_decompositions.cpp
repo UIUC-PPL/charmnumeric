@@ -454,12 +454,16 @@ void test_balanced_tiles() {
     std::cout << "=== test_balanced_tiles ===" << std::endl;
     using decomposition_solver::detail::balanced_tile;
     expect_eq("800^3 on 4 PEs", balanced_tile({800, 800, 800}, 3, 16, 4, 128), 400);
-    expect_eq("800^3 on 1 PE", balanced_tile({800, 800, 800}, 3, 4, 1, 128), 800);
+    expect_eq("800^3 on 1 PE", balanced_tile({800, 800, 800}, 3, 4, 1, 128), 1024);
     expect_eq("4096^2 on 4 PEs", balanced_tile({4096, 4096, 0}, 2, 16, 4, 1024), 1024);
     expect_eq("4096^2 on 1 PE", balanced_tile({4096, 4096, 0}, 2, 4, 1, 1024), 2048);
-    expect_eq("8194^2 on 4 PEs", balanced_tile({8194, 8194, 0}, 2, 16, 4, 1024), 2080);
+    expect_eq("10000^2 on 4 PEs", balanced_tile({10000, 10000, 0}, 2, 16, 4, 1024), 2528);
     expect_eq("1500^2 on 4 PEs", balanced_tile({1500, 1500, 0}, 2, 16, 4, 1024), 768);
     expect_eq("small array", balanced_tile({300, 200, 0}, 2, 16, 4, 1024), 1024);
+    // 192 would leave a 48-wide slab on one PE; the power of two is as good here
+    expect_eq("160x365x240 on 4 PEs", balanced_tile({160, 365, 240}, 3, 16, 4, 128), 128);
+    expect_eq("14016000 on 4 PEs", balanced_tile({14016000, 0, 0}, 1, 16, 4, 1 << 20),
+              1168384);
 }
 
 void test_chare_home_pe_balance() {
