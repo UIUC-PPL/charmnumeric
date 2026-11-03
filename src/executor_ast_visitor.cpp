@@ -528,6 +528,7 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
     case Opcode::TRANSPOSE:
     case Opcode::CONVOLVE:
     case Opcode::FLIP:
+    case Opcode::BATCHED_MATMUL:
     case Opcode::RESHAPE:
     case Opcode::BROADCAST:
         // Handled by their own executors.

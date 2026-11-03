@@ -350,7 +350,7 @@ void ArrayDAGExecutorND<N>::on_upload_tile(int node_id, int name, char* data, in
 template <int N>
 void ArrayDAGExecutorND<N>::finish_creation_node(int node_id) {
 #ifdef USE_NVIDIA
-    auto* p = new ComputeDoneParam<N>{partition, node_id, false};
+    auto* p = new ComputeDoneParam<N>{partition, node_id};
     CkCallback hcb(compute_done_cb<N>, p);
     hapiAddCallback(partition->compute_stream_raw, &hcb);
 #else
