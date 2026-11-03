@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <unordered_set>
@@ -33,6 +34,8 @@ enum : int32_t {
     S_SAMPLES = 1,
     S_SPLIT,
     S_COUNTS,
+    S_NB,
+    S_G,
     S_PIECE,
     Q_HIST,
     Q_REQ,
@@ -179,23 +182,40 @@ inline DsPool& ds_pool() {
     return pool;
 }
 
-/// Keep up to CNUM_SORT_POOL_MB (default a fifth of device memory) cached in the pool.
+/// Per device: keep up to CNUM_SORT_POOL_MB (default a fifth of the device) cached in the pool.
 inline void ds_pool_init() {
-    static bool done = [] {
-        int dev = 0;
-        cudaGetDevice(&dev);
-        cudaMemPool_t pool;
-        if (cudaDeviceGetDefaultMemPool(&pool, dev) != cudaSuccess)
-            return true;
-        size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
-        uint64_t keep = total_b / 5;
-        if (const char* e = getenv("CNUM_SORT_POOL_MB"))
-            keep = (uint64_t)atoll(e) << 20;
-        cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &keep);
-        return true;
-    }();
-    (void)done;
+    static std::mutex mu;
+    static std::unordered_set<int> done;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    std::lock_guard<std::mutex> lock(mu);
+    if (!done.insert(dev).second)
+        return;
+    cudaMemPool_t pool;
+    if (cudaDeviceGetDefaultMemPool(&pool, dev) != cudaSuccess)
+        return;
+    size_t free_b = 0, total_b = 0;
+    cudaMemGetInfo(&free_b, &total_b);
+    uint64_t keep = total_b / 5;
+    if (const char* e = getenv("CNUM_SORT_POOL_MB"))
+        keep = (uint64_t)atoll(e) << 20;
+    cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &keep);
+}
+
+/// Device attribute of the current device, cached per device.
+inline int ds_dev_attr(cudaDeviceAttr attr) {
+    static std::mutex mu;
+    static std::map<std::pair<int, int>, int> cache;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    std::lock_guard<std::mutex> lock(mu);
+    auto key = std::make_pair(dev, (int)attr);
+    auto it = cache.find(key);
+    if (it != cache.end())
+        return it->second;
+    int v = 0;
+    cudaDeviceGetAttribute(&v, attr, dev);
+    return cache[key] = v;
 }
 #endif
 
@@ -270,6 +290,25 @@ inline void ds_copy(PartitionImpl<1>* p, void* dst, const void* src, int64_t byt
         return;
 #ifdef USE_NVIDIA
     hapiCheck(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, ds_stream(p)));
+#else
+    (void)p;
+    std::memcpy(dst, src, bytes);
+#endif
+}
+
+/// Host -> device (host -> host in CPU builds).
+inline void ds_to_dev(PartitionImpl<1>* p, void* dst, const void* src, int64_t bytes) {
+    if (bytes <= 0)
+        return;
+#if defined(USE_NVIDIA)
+    hapiCheck(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, ds_stream(p)));
+    hapiCheck(cudaStreamSynchronize(ds_stream(p)));
+#elif defined(USE_KOKKOS)
+    (void)p;
+    using U = Kokkos::MemoryTraits<Kokkos::Unmanaged>;
+    Kokkos::deep_copy(Kokkos::View<char*, DeviceSpace, U>(static_cast<char*>(dst), bytes),
+                      Kokkos::View<const char*, HostSpace, U>(static_cast<const char*>(src),
+                                                              bytes));
 #else
     (void)p;
     std::memcpy(dst, src, bytes);
@@ -416,6 +455,36 @@ __global__ void ds_scatter_kernel(const T* in, int64_t n, int64_t g0,
         }
         __syncwarp();
     }
+}
+
+/// Many buckets (no shared-memory split): bucket id and local index of every element.
+template <typename T>
+__global__ void ds_bid_kernel(const T* in, int64_t n, int64_t g0, const typename Key<T>::K* spk,
+                              const int64_t* spg, int nspl, bool canon, unsigned* bid,
+                              unsigned* idx, unsigned* cnt) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n)
+        return;
+    int b = bucket_of(Key<T>::enc(in[i], canon), g0 + i, spk, spg, nspl);
+    bid[i] = b;
+    idx[i] = (unsigned)i;
+    atomicAdd(&cnt[b], 1u);
+}
+
+/// Elements sorted by bucket id (stable) into the per-bucket buffers.
+template <typename T, bool ARG>
+__global__ void ds_gscatter_kernel(const T* in, int64_t n, int64_t g0, bool canon,
+                                   const unsigned* bid, const unsigned* idx,
+                                   const int64_t* bstart, typename Key<T>::K* const* dk,
+                                   int64_t* const* dg) {
+    int64_t j = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n)
+        return;
+    unsigned b = bid[j], i = idx[j];
+    int64_t pos = j - bstart[b];
+    dk[b][pos] = Key<T>::enc(in[i], canon);
+    if constexpr (ARG)
+        dg[b][pos] = g0 + i;
 }
 
 __global__ void ds_bucket_starts(const unsigned* offs, int nblocks, int P, int64_t* bstart) {
@@ -619,9 +688,11 @@ struct DsState {
     std::vector<std::vector<char>> samples;
     int samples_got = 0;
     bool split_done = false;
-    std::vector<int64_t> counts; // [src * P + dst]
-    std::vector<char> row_got;
-    int rows = 0;
+    std::vector<int64_t> col;  // elements each source sends to this bucket
+    int ncol = 0;
+    int64_t nb = 0, G = -1;    // bucket size, global rank of its first element
+    std::vector<int64_t> nbs;  // first chare: bucket sizes
+    int nbs_got = 0;
     std::vector<Piece> pieces; // phase 0, by source
     bool sorted = false;
     std::vector<Piece> rebal; // phase 1
@@ -740,7 +811,8 @@ void sort_send_samples(PartitionImpl<1>* p, DsState& s, const T* in, int64_t n) 
     int64_t tile = 0;
     for (int i = 0; i < s.P; ++i)
         tile = std::max(tile, s.pstart[i + 1] - s.pstart[i]);
-    int64_t want = (kSamplesPerTile * n + tile - 1) / tile;
+    int64_t per = std::max<int64_t>(64, std::min<int64_t>(kSamplesPerTile, (1 << 22) / s.P));
+    int64_t want = (per * n + tile - 1) / tile;
     int ns = (int)std::max<int64_t>(1, std::min<int64_t>(n, want));
     int64_t g0 = s.pstart[s.rank];
     uint64_t seed = mix64(((uint64_t)s.node->id << 32) ^ (uint64_t)s.rank);
@@ -820,60 +892,116 @@ void sort_partition(PartitionImpl<1>* p, DsState& s, const T* in, int64_t n,
     std::vector<K> vsk(hsk, hsk + nspl);
     int64_t* dsg = ds_upload(p, vsg);
     K* dsk = ds_upload(p, vsk);
-    int nblocks = (int)std::max<int64_t>(1, (n + DS_TILE - 1) / DS_TILE);
-    int64_t hn = (int64_t)P * nblocks;
-    char* work = ds_alloc(2 * hn * sizeof(unsigned) + (P + 1) * sizeof(int64_t));
-    unsigned* hist = reinterpret_cast<unsigned*>(work);
-    unsigned* offs = hist + hn;
-    int64_t* bstart = reinterpret_cast<int64_t*>(offs + hn);
     size_t sm1 = split_smem(nspl, sizeof(K)) + P * sizeof(unsigned);
     size_t sm2 = split_smem(nspl, sizeof(K)) + (size_t)DS_WARPS * P * sizeof(unsigned);
-    if (sm1 > 48 * 1024)
-        hapiCheck(cudaFuncSetAttribute(ds_count_kernel<T>,
-                                       cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm1));
-    if (sm2 > 48 * 1024) {
-        hapiCheck(cudaFuncSetAttribute(ds_scatter_kernel<T, true>,
-                                       cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm2));
-        hapiCheck(cudaFuncSetAttribute(ds_scatter_kernel<T, false>,
-                                       cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm2));
-    }
-    ds_count_kernel<T><<<nblocks, DS_BLOCK, sm1, st>>>(in, n, g0, dsk, dsg, nspl, s.arg, hist,
-                                                        nblocks);
-    DS_LAUNCHED();
-    size_t tb = 0;
-    hapiCheck(cub::DeviceScan::ExclusiveSum(nullptr, tb, hist, offs, (int)hn, st));
-    char* tmp = ds_alloc((int64_t)tb);
-    hapiCheck(cub::DeviceScan::ExclusiveSum(tmp, tb, hist, offs, (int)hn, st));
-    ds_bucket_starts<<<(P + 255) / 256, 256, 0, st>>>(offs, nblocks, P, bstart);
-    DS_LAUNCHED();
-    std::vector<int64_t> hb(P);
-    ds_to_host(p, hb.data(), bstart, P * sizeof(int64_t));
-    ds_free(tmp);
-    for (int b = 0; b < P; ++b)
-        cnt[b] = (b + 1 < P ? hb[b + 1] : n) - hb[b];
-    for (int b = 0; b < P; ++b)
-        bufs[b] = ds_alloc(cnt[b] * esize, pe_of(p, s.first + b) != CkMyPe());
+    static const int max_parts = getenv("CNUM_SORT_SMEM_PARTS")
+                                     ? atoi(getenv("CNUM_SORT_SMEM_PARTS"))
+                                     : 1024;
+    size_t optin = (size_t)ds_dev_attr(cudaDevAttrMaxSharedMemoryPerBlockOptin);
     std::vector<K*> pk(P);
     std::vector<int64_t*> pg(P);
-    for (int b = 0; b < P; ++b) {
-        pk[b] = reinterpret_cast<K*>(bufs[b] + (s.arg ? 8 * cnt[b] : 0));
-        pg[b] = reinterpret_cast<int64_t*>(bufs[b]);
+    auto make_bufs = [&](const std::vector<int64_t>& hb) {
+        for (int b = 0; b < P; ++b)
+            cnt[b] = (b + 1 < P ? hb[b + 1] : n) - hb[b];
+        for (int b = 0; b < P; ++b) {
+            bufs[b] = ds_alloc(cnt[b] * esize, pe_of(p, s.first + b) != CkMyPe());
+            pk[b] = reinterpret_cast<K*>(bufs[b] + (s.arg ? 8 * cnt[b] : 0));
+            pg[b] = reinterpret_cast<int64_t*>(bufs[b]);
+        }
+    };
+    if (P > max_parts || sm1 > optin || sm2 > optin) {
+        // bucket ids, stable radix sort by id, then a gather into the buckets
+        int bits = 1;
+        while ((1 << bits) < P)
+            ++bits;
+        char* work = ds_alloc(16 * n + (int64_t)(2 * P + 1) * 8);
+        unsigned* bid = reinterpret_cast<unsigned*>(work);
+        unsigned* bid2 = bid + n;
+        unsigned* idx = bid2 + n;
+        unsigned* idx2 = idx + n;
+        unsigned* dcnt = idx2 + n;
+        int64_t* bstart = reinterpret_cast<int64_t*>(work + 16 * n + ((P * 4 + 7) / 8) * 8);
+        hapiCheck(cudaMemsetAsync(dcnt, 0, P * sizeof(unsigned), st));
+        ds_bid_kernel<T><<<grid_for(n), 256, 0, st>>>(in, n, g0, dsk, dsg, nspl, s.arg, bid, idx,
+                                                     dcnt);
+        DS_LAUNCHED();
+        cub::DoubleBuffer<unsigned> kb(bid, bid2), vb(idx, idx2);
+        size_t tb = 0;
+        hapiCheck(cub::DeviceRadixSort::SortPairs(nullptr, tb, kb, vb, (int)n, 0, bits, st));
+        char* tmp = ds_alloc((int64_t)tb);
+        hapiCheck(cub::DeviceRadixSort::SortPairs(tmp, tb, kb, vb, (int)n, 0, bits, st));
+        std::vector<unsigned> hc(P);
+        ds_to_host(p, hc.data(), dcnt, P * sizeof(unsigned));
+        std::vector<int64_t> hb(P);
+        int64_t acc = 0;
+        for (int b = 0; b < P; ++b) {
+            hb[b] = acc;
+            acc += hc[b];
+        }
+        make_bufs(hb);
+        ds_copy(p, bstart, hb.data(), P * sizeof(int64_t));
+        K** dpk = ds_upload(p, pk);
+        int64_t** dpg = ds_upload(p, pg);
+        if (s.arg)
+            ds_gscatter_kernel<T, true><<<grid_for(n), 256, 0, st>>>(
+                in, n, g0, s.arg, kb.Current(), vb.Current(), bstart, dpk, dpg);
+        else
+            ds_gscatter_kernel<T, false><<<grid_for(n), 256, 0, st>>>(
+                in, n, g0, s.arg, kb.Current(), vb.Current(), bstart, dpk, dpg);
+        DS_LAUNCHED();
+        ds_fence(p);
+        ds_free(tmp);
+        ds_free(work);
+        ds_free(dsg);
+        ds_free(dsk);
+        ds_free(dpk);
+        ds_free(dpg);
+    } else {
+        int nblocks = (int)std::max<int64_t>(1, (n + DS_TILE - 1) / DS_TILE);
+        int64_t hn = (int64_t)P * nblocks;
+        char* work = ds_alloc(2 * hn * sizeof(unsigned) + (P + 1) * sizeof(int64_t));
+        unsigned* hist = reinterpret_cast<unsigned*>(work);
+        unsigned* offs = hist + hn;
+        int64_t* bstart = reinterpret_cast<int64_t*>(offs + hn);
+        if (sm1 > 48 * 1024)
+            hapiCheck(cudaFuncSetAttribute(
+                ds_count_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm1));
+        if (sm2 > 48 * 1024) {
+            hapiCheck(cudaFuncSetAttribute(
+                ds_scatter_kernel<T, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm2));
+            hapiCheck(cudaFuncSetAttribute(
+                ds_scatter_kernel<T, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                (int)sm2));
+        }
+        ds_count_kernel<T><<<nblocks, DS_BLOCK, sm1, st>>>(in, n, g0, dsk, dsg, nspl, s.arg,
+                                                            hist, nblocks);
+        DS_LAUNCHED();
+        size_t tb = 0;
+        hapiCheck(cub::DeviceScan::ExclusiveSum(nullptr, tb, hist, offs, (int)hn, st));
+        char* tmp = ds_alloc((int64_t)tb);
+        hapiCheck(cub::DeviceScan::ExclusiveSum(tmp, tb, hist, offs, (int)hn, st));
+        ds_bucket_starts<<<(P + 255) / 256, 256, 0, st>>>(offs, nblocks, P, bstart);
+        DS_LAUNCHED();
+        std::vector<int64_t> hb(P);
+        ds_to_host(p, hb.data(), bstart, P * sizeof(int64_t));
+        ds_free(tmp);
+        make_bufs(hb);
+        K** dpk = ds_upload(p, pk);
+        int64_t** dpg = ds_upload(p, pg);
+        if (s.arg)
+            ds_scatter_kernel<T, true><<<nblocks, DS_BLOCK, sm2, st>>>(
+                in, n, g0, dsk, dsg, nspl, s.arg, offs, nblocks, bstart, dpk, dpg);
+        else
+            ds_scatter_kernel<T, false><<<nblocks, DS_BLOCK, sm2, st>>>(
+                in, n, g0, dsk, dsg, nspl, s.arg, offs, nblocks, bstart, dpk, dpg);
+        DS_LAUNCHED();
+        ds_fence(p);
+        ds_free(work);
+        ds_free(dsg);
+        ds_free(dsk);
+        ds_free(dpk);
+        ds_free(dpg);
     }
-    K** dpk = ds_upload(p, pk);
-    int64_t** dpg = ds_upload(p, pg);
-    if (s.arg)
-        ds_scatter_kernel<T, true><<<nblocks, DS_BLOCK, sm2, st>>>(
-            in, n, g0, dsk, dsg, nspl, s.arg, offs, nblocks, bstart, dpk, dpg);
-    else
-        ds_scatter_kernel<T, false><<<nblocks, DS_BLOCK, sm2, st>>>(
-            in, n, g0, dsk, dsg, nspl, s.arg, offs, nblocks, bstart, dpk, dpg);
-    DS_LAUNCHED();
-    ds_fence(p);
-    ds_free(work);
-    ds_free(dsg);
-    ds_free(dsk);
-    ds_free(dpk);
-    ds_free(dpg);
 #else
     (void)p;
     std::vector<int> bk(n);
@@ -894,10 +1022,8 @@ void sort_partition(PartitionImpl<1>* p, DsState& s, const T* in, int64_t n,
         pos[b]++;
     }
 #endif
-    auto row = make_msg(Hdr{S_COUNTS, s.rank, 0, 0, P, 0, 0, 0});
-    put(row, cnt.data(), P);
-    for (int i = 0; i < P; ++i)
-        send_ctrl(p, s.first + i, s.node->id, row);
+    for (int b = 0; b < P; ++b)
+        send_ctrl(p, s.first + b, s.node->id, make_msg(Hdr{S_COUNTS, s.rank, 0, 0, cnt[b]}));
     for (int b = 0; b < P; ++b) {
         if (b == s.rank) {
             s.pieces[b] = DsState::Piece{0, b, 0, cnt[b], bufs[b]};
@@ -916,12 +1042,7 @@ template <typename T>
 void sort_bucket(PartitionImpl<1>* p, DsState& s, void* outp) {
     using K = typename Key<T>::K;
     int P = s.P, me = s.rank;
-    int64_t nb = 0, G = 0;
-    for (int i = 0; i < P; ++i) {
-        nb += s.counts[i * P + me];
-        for (int j = 0; j < me; ++j)
-            G += s.counts[i * P + j];
-    }
+    int64_t nb = s.nb, G = s.G;
     char* kb = ds_alloc(2 * nb * sizeof(K));
     K* k = reinterpret_cast<K*>(kb);
     K* ka = k + nb;
@@ -1002,7 +1123,7 @@ void select_hist(PartitionImpl<1>* p, DsState& s, const T* in, int64_t n) {
         unsigned* dh = reinterpret_cast<unsigned*>(ds_alloc(s.hist.size() * sizeof(unsigned)));
         hapiCheck(cudaMemsetAsync(dh, 0, s.hist.size() * sizeof(unsigned), ds_stream(p)));
         size_t sm = ((size_t)G * sizeof(K) + 7) / 8 * 8 + s.hist.size() * sizeof(unsigned);
-        int grid = std::min(grid_for(n), 108 * 8);
+        int grid = std::min(grid_for(n), 8 * ds_dev_attr(cudaDevAttrMultiProcessorCount));
         if (n > 0) {
             dq_hist_kernel<T><<<grid, 256, sm, ds_stream(p)>>>(in, n, s.depth, b, dg, G, dh);
             DS_LAUNCHED();
@@ -1050,7 +1171,8 @@ std::vector<typename Key<T>::K> select_compact(PartitionImpl<1>* p, DsState& s, 
             unsigned* cur = reinterpret_cast<unsigned*>(d);
             K* dk = reinterpret_cast<K*>(d + 8);
             hapiCheck(cudaMemsetAsync(cur, 0, 4, ds_stream(p)));
-            dq_compact_kernel<T><<<std::min(grid_for(n), 108 * 8), 256, 0, ds_stream(p)>>>(
+            int grid = std::min(grid_for(n), 8 * ds_dev_attr(cudaDevAttrMultiProcessorCount));
+            dq_compact_kernel<T><<<grid, 256, 0, ds_stream(p)>>>(
                 in, n, depth, dg, (int)grp.size(), dk, cur);
             DS_LAUNCHED();
             ds_to_host(p, out.data(), dk, total * sizeof(K));
@@ -1298,8 +1420,8 @@ void ArrayDAGExecutorND<N>::execute_ds_node(DAGNode* node) {
         }
         s.started = true;
         s.pieces.assign(s.P, DsState::Piece{});
-        s.row_got.assign(s.P, 0);
-        s.counts.assign((size_t)s.P * s.P, 0);
+        s.col.assign(s.P, 0);
+        s.nbs.assign(s.P, 0);
         ds_progress_start(node->id);
     }
 }
@@ -1431,15 +1553,27 @@ void ArrayDAGExecutorND<N>::on_ds_msg(int node_id, char* data, int64_t size) {
             ds_sort_progress(node_id);
             return;
         }
-        case S_COUNTS: {
-            const int64_t* c = reinterpret_cast<const int64_t*>(data + sizeof(h));
-            for (int j = 0; j < s.P; ++j)
-                s.counts[(size_t)h.src * s.P + j] = c[j];
-            s.row_got[h.src] = 1;
-            s.rows++;
+        case S_COUNTS:
+            s.col[h.src] = h.a;
+            s.nb += h.a;
+            if (++s.ncol == s.P)
+                send_ctrl(partition, s.first, node_id, make_msg(Hdr{S_NB, s.rank, 0, 0, s.nb}));
+            return;
+        case S_NB:
+            s.nbs[h.src] = h.a;
+            if (++s.nbs_got == s.P) {
+                int64_t G = 0;
+                for (int i = 0; i < s.P; ++i) {
+                    send_ctrl(partition, s.first + i, node_id,
+                              make_msg(Hdr{S_G, s.rank, 0, 0, G}));
+                    G += s.nbs[i];
+                }
+            }
+            return;
+        case S_G:
+            s.G = h.a;
             ds_sort_progress(node_id);
             return;
-        }
         default:
             ds_select_msg(node_id, data, size);
         }
@@ -1451,12 +1585,12 @@ void ArrayDAGExecutorND<N>::ds_sort_progress(int node_id) {
     if constexpr (N == 1) {
         auto keep = ds_state.at(node_id);
         DsState& s = *keep;
-        if (!s.split_done || s.rows < s.P)
+        if (!s.split_done || s.G < 0)
             return;
         int P = s.P, me = s.rank;
         if (!s.sorted) {
             for (int i = 0; i < P; ++i)
-                if (s.counts[(size_t)i * P + me] > 0 && s.pieces[i].buf == nullptr)
+                if (s.col[i] > 0 && s.pieces[i].buf == nullptr)
                     return;
             void* outp = partition->arrays.at(s.out_name)->device_data_ptr();
             cn_dispatch(s.dt, [&](auto tag) {
@@ -1466,12 +1600,7 @@ void ArrayDAGExecutorND<N>::ds_sort_progress(int node_id) {
             });
         }
         // elements of my tile that other buckets hold
-        int64_t G = 0, nb = 0;
-        for (int i = 0; i < P; ++i) {
-            nb += s.counts[(size_t)i * P + me];
-            for (int j = 0; j < me; ++j)
-                G += s.counts[(size_t)i * P + j];
-        }
+        int64_t G = s.G, nb = s.nb;
         int64_t t0 = s.pstart[me], t1 = s.pstart[me + 1];
         int64_t own = std::max<int64_t>(0, std::min(G + nb, t1) - std::max(G, t0));
         if (s.rebal_got < (t1 - t0) - own)
@@ -1540,8 +1669,7 @@ void ArrayDAGExecutorND<N>::ds_select_msg(int node_id, char* data, int64_t size)
                 case Q_RESULT: {
                     CTArrayBase<1>* out = partition->arrays.at(s.out_name);
                     const T* v = reinterpret_cast<const T*>(data + sizeof(h));
-                    ds_copy(partition, out->device_data_ptr(), v, h.a * sizeof(T));
-                    ds_fence(partition);
+                    ds_to_dev(partition, out->device_data_ptr(), v, h.a * sizeof(T));
                     ds_state.erase(node_id);
                     node_finished(node_id);
                     return;
