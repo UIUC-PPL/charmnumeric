@@ -4,7 +4,8 @@
 Sizes span uneven tiles and many chares (+p4: up to 16), every dtype, duplicates,
 NaNs, signed zeros, infinities, empty and size-1 arrays. Argsort is compared with
 NumPy's stable argsort. Env: CNUM_HOST, CNUM_PORT, CNUM_ODF (default 4),
-SSC_ONLY (sort,scan,quantile).
+SSC_ONLY (sort,scan,quantile), SSC_BIGP (size of the many-chare case; with a
+small CT_MIN_TILE_1D build and a large CNUM_ODF it spans thousands of chares).
 """
 
 import os
@@ -103,6 +104,17 @@ def main(chk):
             chk.true("bad kind raises", True)
         e = cnp.asarray(np.zeros(0))
         same("sort empty", cnp.sort(e), np.sort(np.zeros(0)))
+        # known difference: equal keys of sort() are interchangeable, so -0.0 may come
+        # before 0.0 and NaNs come out as one canonical quiet NaN
+        z = np.array([0.0, -0.0, 1.0, -np.nan, np.nan, -1.0])
+        got = cnp.sort(cnp.asarray(z)).get(iface)
+        chk.true("sort signed zeros/NaNs: values", np.array_equal(got, np.sort(z), equal_nan=True))
+        chk.true("sort signed zeros: -0.0 first (documented)",
+                 list(np.signbit(got[1:3])) == [True, False], f"{got}")
+        chk.true("sort NaN payloads: canonical positive NaNs (documented)",
+                 bool(np.all(np.isnan(got[4:])) and not np.any(np.signbit(got[4:]))), f"{got}")
+        same("argsort signed zeros stable", cnp.argsort(cnp.asarray(z)),
+             np.argsort(z, kind="stable"))
 
     if "scan" in only:
         for n in SIZES:
@@ -141,6 +153,42 @@ def main(chk):
         of = cnp.zeros(1_000_003, dtype=np.float64)
         cnp.cumsum(cnp.asarray(i8), out=of)
         same("cumsum int8 out=float64", of, np.cumsum(i8).astype(np.float64))
+        # out= without dtype accumulates in promote_types(default, out.dtype), like NumPy
+        f32 = np.ones(1_000_003, dtype=np.float32)
+        f32[0] = 1e8
+        o64 = cnp.zeros(f32.size, dtype=np.float64)
+        cnp.cumsum(cnp.asarray(f32), out=o64)
+        r64 = np.zeros(f32.size, dtype=np.float64)
+        np.cumsum(f32, out=r64)
+        same("cumsum float32 out=float64 accumulates in float64", o64, r64)
+        big = np.array([2**53 + 1, 1], dtype=np.int64)
+        ob = cnp.zeros(2, dtype=np.float64)
+        cnp.cumsum(cnp.asarray(big), out=ob)
+        rb = np.zeros(2, dtype=np.float64)
+        np.cumsum(big, out=rb)
+        same("cumsum int64 > 2**53 out=float64", ob, rb)
+        o32 = cnp.zeros(2, dtype=np.float32)
+        i24 = np.array([2**24 + 1, 1], dtype=np.int32)
+        cnp.cumsum(cnp.asarray(i24), out=o32)
+        r32 = np.zeros(2, dtype=np.float32)
+        np.cumsum(i24, out=r32)
+        same("cumsum int32 out=float32 (float64 accumulation)", o32, r32)
+
+    big_p = int(os.environ.get("SSC_BIGP", "0"))
+    if big_p:
+        # many chares (small-tile builds or a large CNUM_ODF): splitters, counts, rebalance
+        for dt in (np.uint32, np.float64, np.int8):
+            h = make(big_p, dt, rng, "rand" if dt != np.int8 else "dups")
+            a = cnp.asarray(h)
+            same(f"sort many chares {np.dtype(dt).name} n={big_p}", cnp.sort(a), np.sort(h))
+            same(f"argsort many chares {np.dtype(dt).name} n={big_p}", cnp.argsort(a),
+                 np.argsort(h, kind="stable"))
+        h = make(big_p, np.float64, rng, "rand")
+        h = np.where(np.isfinite(h), h, 0.5)
+        g = cnp.quantile(cnp.asarray(h), [0.0, 0.25, 0.5, 0.99, 1.0]).get(iface)
+        chk.close("quantile many chares", g, np.quantile(h, [0.0, 0.25, 0.5, 0.99, 1.0]))
+        g = cnp.cumsum(cnp.asarray(np.ones(big_p, dtype=np.int64))).get(iface)
+        chk.true("cumsum many chares", bool(np.array_equal(g, np.arange(1, big_p + 1))))
 
     if "quantile" in only:
         methods = ["linear", "lower", "higher", "nearest", "midpoint", "inverted_cdf",
