@@ -176,12 +176,15 @@ inline int64_t device_reserve() {
     return r;
 }
 
-/// Whether a cache holding `cached` bytes may keep another block: always up to 1/8 of the
-/// device per sharing process, beyond that while device_reserve() stays free.
+/// Bytes a cache may always hold: 1/8 of the device per sharing process.
+inline int64_t device_cache_floor() {
+    return device_total() / 8 / std::max(1, gpu_sharers().load(std::memory_order_relaxed));
+}
+
+/// Whether a cache holding `cached` bytes may keep another block: always up to
+/// device_cache_floor(), beyond that while device_reserve() stays free.
 inline bool device_cache_room(int64_t cached) {
-    if (cached <= device_total() / 8 / std::max(1, gpu_sharers().load(std::memory_order_relaxed)))
-        return true;
-    return device_free() >= device_reserve();
+    return cached <= device_cache_floor() || device_free() >= device_reserve();
 }
 
 /// Evicts cached blocks and retired arrays, oldest first, until `bytes` and a margin
@@ -1261,6 +1264,14 @@ inline bool evict_oldest_cached() {
 
 inline void device_make_room(int64_t bytes) {
 #ifdef USE_NVIDIA
+    int64_t cached = retired_device_bytes();
+    {
+        auto& pool = comm_pool();
+        std::lock_guard<std::mutex> lock(pool.mu);
+        cached += pool.large_cached;
+    }
+    if (cached <= device_cache_floor())
+        return; // a failed allocation still releases everything
     int64_t need = bytes + device_total() / 32;
     while (device_free() < need && evict_oldest_cached()) {
     }
