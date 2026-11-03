@@ -33,8 +33,13 @@ static void send_remote_input(PartitionImpl<N>* partition, DAGNode* node, const 
                 break;
             }
         }
-        if (out_of_bounds)
+        if (out_of_bounds) {
+#ifndef NDEBUG
+            CkAbort("array %d: send of %s past the chare's buffer (node %d): the receiver "
+                    "would wait for it", inp_name, fmt_region(overlap).c_str(), node->id);
+#endif
             return;
+        }
     }
 
     std::array<int, N> arr_strides;
@@ -152,6 +157,24 @@ static void dispatch_send(PartitionImpl<N>* partition, DAGNode* node, const Remo
     cn_dispatch(arr_it->second->dtype, [&](auto tag) {
         send_remote_input<N, decltype(tag)>(partition, node, send, inp_name, nd_idx);
     });
+}
+
+/// Senders plan with their buffer's decomposition, receivers without one with
+/// array_meta's; a difference leaves receivers waiting.
+template <int N>
+static void check_buffer_decomp(ArrayDAGGroup* group, int name, const ArrayDecomp<N>& decomp) {
+#ifndef NDEBUG
+    auto it = group->array_meta.find(name);
+    if (it == group->array_meta.end())
+        return;
+    bool same = it->second.tile == decomp.tile;
+    for (int d = 0; d < N; ++d)
+        same &= it->second.offset[d] == decomp.offset[d];
+    if (!same)
+        CkAbort("array %d: buffer decomposition (tile %d, offset %d) != metadata (tile %d, "
+                "offset %d)", name, decomp.tile, decomp.offset[0], it->second.tile,
+                it->second.offset[0]);
+#endif
 }
 
 /// REDUCE of operands with different layouts: rhs moves to lhs's tiles like an
@@ -867,6 +890,7 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
     for (int i = 0; i < (int)input_source_names.size(); ++i) {
         auto arr_it = partition->arrays.find(input_source_names[i]);
         if (arr_it != partition->arrays.end()) {
+            check_buffer_decomp<N>(dag_group, input_source_names[i], arr_it->second->decomp);
             input_decomps.push_back(arr_it->second->decomp);
         } else {
             auto meta_it = dag_group->array_meta.find(input_source_names[i]);
@@ -886,6 +910,7 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
         int result_name = fused_output_decomp_name(node);
         auto arr_it = partition->arrays.find(result_name);
         if (arr_it != partition->arrays.end()) {
+            check_buffer_decomp<N>(dag_group, result_name, arr_it->second->decomp);
             output_decomp = arr_it->second->decomp;
         } else {
             auto meta_it = dag_group->array_meta.find(result_name);
