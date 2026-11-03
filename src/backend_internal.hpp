@@ -237,6 +237,43 @@ struct GemvRowFunctor {
     }
 };
 
+/// Item i: column chunk i % chunks of row i / chunks, as GemvChunkFunctor, but the vector
+/// lanes read consecutive columns (coalesced).
+template <typename T, typename Exec>
+struct GemvLaneFunctor {
+    using member_type = typename Kokkos::TeamPolicy<Exec>::member_type;
+    const T* mat;
+    int64_t ld;
+    int rows, cols, chunks, chunk_len;
+    const T* vec;
+    double* tmp;
+    T* res;
+
+    KOKKOS_INLINE_FUNCTION void operator()(const member_type& m) const {
+        Kokkos::parallel_for(Kokkos::TeamThreadRange(m, m.team_size()), [&](int t) {
+            int64_t i = (int64_t)m.league_rank() * m.team_size() + t;
+            if (i >= (int64_t)rows * chunks)
+                return;
+            int r = (int)(i / chunks), c0 = (int)(i % chunks) * chunk_len;
+            int c1 = c0 + chunk_len < cols ? c0 + chunk_len : cols;
+            const T* row = mat + r * ld;
+            double s = 0.0;
+            Kokkos::parallel_reduce(
+                Kokkos::ThreadVectorRange(m, c0, c1),
+                [&](int c, double& acc) {
+                    acc += static_cast<double>(row[c]) * static_cast<double>(vec[c]);
+                },
+                s);
+            Kokkos::single(Kokkos::PerThread(m), [&]() {
+                if (chunks == 1)
+                    res[r] = static_cast<T>(s);
+                else
+                    tmp[i] = s;
+            });
+        });
+    }
+};
+
 /// Row-major res[rows] = mat[rows x cols] * vec (device pointers, row stride ld), queued on
 /// `exec` after the default instance's work; under USE_NVIDIA callers order the readers of
 /// `res` after `exec`.
@@ -267,8 +304,19 @@ inline void local_gemv(const Exec& exec, const T* mat, int ld, int rows, int col
         double* tmp = chunks > 1
                           ? static_cast<double*>(comm_alloc((int64_t)rows * chunks * sizeof(double)))
                           : nullptr;
-        Kokkos::parallel_for("ct_gemv", Kokkos::RangePolicy<Exec>(exec, 0, rows * chunks),
-                             GemvChunkFunctor<T>{mat, ld, cols, chunks, chunk_len, vec, tmp, res});
+#ifdef USE_NVIDIA
+        if (cols >= 256) {
+            constexpr int team = 8, lanes = 32;
+            int64_t items = (int64_t)rows * chunks;
+            Kokkos::parallel_for(
+                "ct_gemv_lanes",
+                Kokkos::TeamPolicy<Exec>(exec, (int)((items + team - 1) / team), team, lanes),
+                GemvLaneFunctor<T, Exec>{mat, ld, rows, cols, chunks, chunk_len, vec, tmp, res});
+        } else
+#endif
+            Kokkos::parallel_for("ct_gemv", Kokkos::RangePolicy<Exec>(exec, 0, rows * chunks),
+                                 GemvChunkFunctor<T>{mat, ld, cols, chunks, chunk_len, vec, tmp,
+                                                     res});
         if (chunks > 1)
             Kokkos::parallel_for("ct_gemv_join", Kokkos::RangePolicy<Exec>(exec, 0, rows),
                                  GemvJoinFunctor<T>{tmp, chunks, res});
