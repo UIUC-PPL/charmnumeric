@@ -201,6 +201,18 @@ void ArrayDAGExecutorND<N>::execute_cross_set_region_node(DAGNode* node) {
     }
 }
 
+/// Receivers place data by array_meta's offset; it must match the sender's buffer.
+template <int N>
+static void check_meta_offset(ArrayDAGGroup* dag_group, int name, ArrayDecomp<N> const& decomp) {
+#ifndef NDEBUG
+    auto it = dag_group->array_meta.find(name);
+    for (int d = 0; it != dag_group->array_meta.end() && d < N; ++d)
+        if (it->second.offset[d] != decomp.offset[d])
+            CkAbort("array %d: decomposition offset %d != metadata offset %d (dim %d)", name,
+                    decomp.offset[d], it->second.offset[d], d);
+#endif
+}
+
 template <int N_src, typename T>
 static void diag_send(PartitionImpl<N_src>* partition, DAGNode* node, int source_name,
                       int result_name, int k_offset, ArrayDAGGroup* dag_group) {
@@ -209,12 +221,14 @@ static void diag_send(PartitionImpl<N_src>* partition, DAGNode* node, int source
         return;
 
     auto* src = static_cast<Array<N_src, T>*>(src_it->second);
+    check_meta_offset<N_src>(dag_group, source_name, src_it->second->decomp);
 
     if constexpr (N_src == 1) {
         int tile_2d = array_tile(dag_group->array_meta, result_name, 2);
 
         auto nd_idx = partition->nd_index();
-        int my_start = src_it->second->decomp.chare_start_global(0, nd_idx[0]);
+        auto const& src_decomp = src_it->second->decomp;
+        int my_start = src_decomp.chare_start_global(0, nd_idx[0]) - src_decomp.offset[0];
         int local_size = src->region.size(0);
 
         struct ChareRange {
@@ -289,8 +303,8 @@ static void diag_send(PartitionImpl<N_src>* partition, DAGNode* node, int source
 
         auto nd_idx = partition->nd_index();
         auto src_decomp = src_it->second->decomp;
-        int row_start = src_decomp.chare_start_global(0, nd_idx[0]);
-        int col_start = src_decomp.chare_start_global(1, nd_idx[1]);
+        int row_start = src_decomp.chare_start_global(0, nd_idx[0]) - src_decomp.offset[0];
+        int col_start = src_decomp.chare_start_global(1, nd_idx[1]) - src_decomp.offset[1];
         int local_rows = src->region.size(0);
         int local_cols = src->region.size(1);
 
@@ -478,8 +492,9 @@ void ArrayDAGExecutorND<N>::execute_diag_node(DAGNode* node) {
                 return;
             }
 
-            int first_1d_chare = diag_lo / tile_1d;
-            int last_1d_chare = (diag_hi - 1) / tile_1d;
+            int in_off = meta_it->second.offset[0];
+            int first_1d_chare = (diag_lo + in_off) / tile_1d;
+            int last_1d_chare = (diag_hi - 1 + in_off) / tile_1d;
             int expected_msgs = last_1d_chare - first_1d_chare + 1;
 
             std::array<int, 2> my_start = {row_start, col_start};
@@ -536,8 +551,8 @@ void ArrayDAGExecutorND<N>::execute_diag_node(DAGNode* node) {
                     col = vec_idx;
                 }
                 if (row >= 0 && row < M && col >= 0 && col < N_cols) {
-                    int src_row_chare = row / tile_2d;
-                    int src_col_chare = col / tile_2d;
+                    int src_row_chare = (row + meta_it->second.offset[0]) / tile_2d;
+                    int src_col_chare = (col + meta_it->second.offset[1]) / tile_2d;
                     ChareIndex<2> src_ci;
                     src_ci.idx[0] = src_row_chare;
                     src_ci.idx[1] = src_col_chare;
@@ -596,12 +611,12 @@ static void tile_send(PartitionImpl<N_src>* partition, DAGNode* node, int source
     auto* src = static_cast<Array<N_src, T>*>(src_it->second);
     auto nd_idx = partition->nd_index();
     auto src_decomp = src_it->second->decomp;
+    check_meta_offset<N_src>(dag_group, source_name, src_decomp);
 
     std::array<int, N_src> src_start, src_stop;
     for (int d = 0; d < N_src; ++d) {
-        src_start[d] = src_decomp.chare_start_global(d, nd_idx[d]);
-        src_stop[d] = std::min(src_start[d] + src->region.size(d),
-                               src_decomp.offset[d] + src_decomp.global_shape[d]);
+        src_start[d] = src_decomp.chare_start_global(d, nd_idx[d]) - src_decomp.offset[d];
+        src_stop[d] = std::min(src_start[d] + src->region.size(d), src_decomp.global_shape[d]);
     }
 
     auto result_meta_it = dag_group->array_meta.find(result_name);
@@ -821,22 +836,22 @@ void ArrayDAGExecutorND<N>::execute_tile_node(DAGNode* node) {
         }
 
         int delta = out_ndims - input_ndims;
-        auto input_decomp_meta = dag_group->array_meta.find(input_name);
-        int input_tile = input_decomp_meta->second.tile;
+        int input_tile = meta_it->second.tile;
 
         int expected_msgs = 1;
         for (int src_d = 0; src_d < input_ndims; ++src_d) {
             int out_d = src_d + delta;
             int in_size = input_shape[src_d];
+            int in_off = meta_it->second.offset[src_d];
             int chare_lo = result_chare.start[out_d];
             int chare_hi = result_chare.stop[out_d];
 
             std::set<int> needed_src_chares;
             for (int p = chare_lo; p < chare_hi;) {
                 int inp_pos = p % in_size;
-                int src_chare = inp_pos / input_tile;
+                int src_chare = (inp_pos + in_off) / input_tile;
                 needed_src_chares.insert(src_chare);
-                int next_boundary = (src_chare + 1) * input_tile - inp_pos + p;
+                int next_boundary = (src_chare + 1) * input_tile - in_off - inp_pos + p;
                 int next_wrap = p + (in_size - inp_pos);
                 p = std::min({next_boundary, next_wrap, chare_hi});
             }

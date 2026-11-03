@@ -19,6 +19,7 @@ struct ProbeRec {
     cudaIpcMemHandle_t handle;
     char host[64];
     char boot[48];
+    char pci[32]; // the process's GPU
 };
 struct ProbePair {
     int src, dst;
@@ -81,6 +82,7 @@ void ArrayDAGGroup::ipc_probe_start() {
         ProbeRec rec{};
         rec.node = CkMyNode();
         host_identity(rec.host, rec.boot);
+        cudaDeviceGetPCIBusId(rec.pci, sizeof(rec.pci), Kokkos::Cuda().cuda_device());
         if (gpu_ipc_enabled() && cudaMalloc(&probe_buf, 4096) == cudaSuccess)
             rec.exported = cudaMemset(probe_buf, kProbeByte, 4096) == cudaSuccess &&
                            cudaDeviceSynchronize() == cudaSuccess &&
@@ -105,6 +107,12 @@ void ArrayDAGGroup::ipc_probe_exports(int n, char* data) {
         for (int i = 0; i < count; ++i)
             if (recs[i].node == CkMyNode())
                 me = &recs[i];
+        if (me && me->pci[0]) {
+            int sharers = 0;
+            for (int i = 0; i < count; ++i)
+                sharers += same_host(recs[i], *me) && std::strcmp(recs[i].pci, me->pci) == 0;
+            gpu_sharers().store(std::max(sharers, 1));
+        }
         for (int i = 0; i < count; ++i)
             for (int j = 0; CkMyPe() == 0 && j < count; ++j)
                 probe_expected += i != j && recs[i].exported && recs[j].exported &&

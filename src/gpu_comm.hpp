@@ -17,6 +17,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -38,7 +39,7 @@ struct GpuIpcArena {
         cudaIpcMemHandle_t handle;
     };
     std::vector<Slab> slabs;
-    std::vector<std::pair<int, int64_t>> free_lists[kSlabClass + 1]; // (slab, offset)
+    std::set<std::pair<int, int64_t>> free_lists[kSlabClass + 1]; // (slab, offset)
     std::unordered_map<void*, std::pair<int, int>> live;              // block -> (slab, class)
     std::unordered_map<void*, int> owner;                             // block -> sending PE
     std::unordered_map<int, int> in_flight;                           // PE -> live blocks
@@ -88,6 +89,19 @@ inline void gpu_ipc_warn(GpuIpcArena& a, const char* why) {
     }
 }
 
+/// Free block `cls` at `offset`, merged with its free buddies: freed blocks otherwise stay split
+/// and the arena fills up with pieces too small for later messages.
+inline void gpu_ipc_release(GpuIpcArena& a, int slab, int64_t offset, int cls) {
+    for (; cls < GpuIpcArena::kSlabClass; ++cls) {
+        auto it = a.free_lists[cls].find({slab, offset ^ (int64_t(1) << cls)});
+        if (it == a.free_lists[cls].end())
+            break;
+        a.free_lists[cls].erase(it);
+        offset &= ~(int64_t(1) << cls);
+    }
+    a.free_lists[cls].insert({slab, offset});
+}
+
 /// gpu_ipc_alloc with a.mu held; `quiet`: no warning when the arena is full.
 inline void* gpu_ipc_alloc_locked(GpuIpcArena& a, int64_t bytes, int& slab, int64_t& offset,
                                   bool quiet) {
@@ -106,10 +120,10 @@ inline void* gpu_ipc_alloc_locked(GpuIpcArena& a, int64_t bytes, int& slab, int6
         ++k;
     if (k <= GpuIpcArena::kSlabClass) {
         // free block, split down to this class
-        std::tie(slab, offset) = a.free_lists[k].back();
-        a.free_lists[k].pop_back();
+        std::tie(slab, offset) = *a.free_lists[k].begin();
+        a.free_lists[k].erase(a.free_lists[k].begin());
         for (int j = k - 1; j >= cls; --j)
-            a.free_lists[j].push_back({slab, offset + (int64_t(1) << j)});
+            a.free_lists[j].insert({slab, offset + (int64_t(1) << j)});
     } else {
         // bump allocation; blocks are aligned to their size, the gap goes to smaller classes
         slab = -1;
@@ -149,7 +163,7 @@ inline void* gpu_ipc_alloc_locked(GpuIpcArena& a, int64_t bytes, int& slab, int6
             int j = GpuIpcArena::kMinClass;
             while (j < cls && u % (int64_t(2) << j) == 0 && u + (int64_t(2) << j) <= offset)
                 ++j;
-            a.free_lists[j].push_back({slab, u});
+            gpu_ipc_release(a, slab, u, j);
             u += int64_t(1) << j;
         }
         a.slabs[slab].used = offset + sz;
@@ -230,7 +244,7 @@ inline bool gpu_ipc_free(void* ptr) {
     if (a.closed)
         return true;
     auto [s, cls] = it->second;
-    a.free_lists[cls].push_back({s, static_cast<char*>(ptr) - a.slabs[s].base});
+    gpu_ipc_release(a, s, static_cast<char*>(ptr) - a.slabs[s].base, cls);
     a.live.erase(it);
     gpu_ipc_release_locked(a, ptr);
     return true;
