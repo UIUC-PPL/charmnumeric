@@ -191,13 +191,16 @@ static void device_pack_send(PartitionImpl<N_sender>* partition,
                 ipc_send_start<N_sender, N_target>(ds, buf, slab, offset);
                 return;
             }
-            // arena full: wait for a block this PE frees rather than stage through the host
-            if (gpu_ipc_wait(byte_size, [ds](void* buf, int slab, int64_t offset) {
-                    if (buf)
-                        ipc_send_start<N_sender, N_target>(ds, buf, slab, offset);
-                    else
-                        staged_send_start<N_sender, N_target>(ds);
-                }))
+            // arena full, or earlier sends waiting: queue behind them rather than stage
+            if (gpu_ipc_wait(
+                    byte_size, partition,
+                    [ds](void* buf, int slab, int64_t offset) {
+                        if (buf)
+                            ipc_send_start<N_sender, N_target>(ds, buf, slab, offset);
+                        else
+                            staged_send_start<N_sender, N_target>(ds);
+                    },
+                    [ds] { delete ds; }))
                 return;
         }
         if ((ds->host_buf = pinned_alloc(byte_size))) {

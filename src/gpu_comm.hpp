@@ -46,7 +46,9 @@ struct GpuIpcArena {
     struct Waiter {
         int pe;
         int64_t bytes;
+        const void* part;                         // sending partition
         std::function<void(void*, int, int64_t)> go;
+        std::function<void()> cancel;             // the partition is going away
     };
     std::deque<Waiter> waiters; // sends waiting for a block (gpu_ipc_wait)
     std::map<std::pair<int, int>, char*> peers; // (node, slab) -> mapped peer slab
@@ -175,11 +177,19 @@ inline void* gpu_ipc_alloc_locked(GpuIpcArena& a, int64_t bytes, int& slab, int6
     return p;
 }
 
-/// Block of at least `bytes` in an exported slab, or nullptr (too large or arena full).
-/// `quiet`: no warning when the arena is full (the caller may wait, gpu_ipc_wait).
+inline bool gpu_ipc_has_waiters_locked(GpuIpcArena& a, int pe) {
+    return std::any_of(a.waiters.begin(), a.waiters.end(),
+                       [pe](const GpuIpcArena::Waiter& w) { return w.pe == pe; });
+}
+
+/// Block of at least `bytes` in an exported slab, or nullptr (too large, arena full, or this
+/// PE has sends waiting: they go first). `quiet`: no warning when the arena is full (the
+/// caller may wait, gpu_ipc_wait).
 inline void* gpu_ipc_alloc(int64_t bytes, int& slab, int64_t& offset, bool quiet = false) {
     auto& a = gpu_ipc_arena();
     std::lock_guard<std::mutex> lock(a.mu);
+    if (gpu_ipc_has_waiters_locked(a, CkMyPe()))
+        return nullptr;
     return gpu_ipc_alloc_locked(a, bytes, slab, offset, quiet);
 }
 
@@ -192,9 +202,14 @@ inline void gpu_ipc_release_locked(GpuIpcArena& a, void* ptr) {
 }
 
 /// The arena is full: queue `go(block, slab, offset)` to run once this PE frees a block
-/// (gpu_ipc_retry), or go(nullptr, ...) once none is in flight and it still does not fit. False (send it another way) unless this PE has blocks in flight and
-/// the message fits a slab.
-inline bool gpu_ipc_wait(int64_t bytes, std::function<void(void*, int, int64_t)> go) {
+/// (gpu_ipc_retry), or go(nullptr, ...) once it has none in flight and the send still does
+/// not fit; `cancel` runs instead if partition `part` goes away first. False (send it
+/// another way) unless this PE has blocks in flight and the message fits a slab.
+/// Only the waiter's own PE retries it: it has blocks in flight, whose frees on that PE
+/// retry it, so frees on sibling PEs (SMP) need not wake it.
+inline bool gpu_ipc_wait(int64_t bytes, const void* part,
+                         std::function<void(void*, int, int64_t)> go,
+                         std::function<void()> cancel) {
     auto& a = gpu_ipc_arena();
     std::lock_guard<std::mutex> lock(a.mu);
     if (a.closed || a.limit == 0 || bytes > (int64_t(1) << GpuIpcArena::kSlabClass))
@@ -203,12 +218,31 @@ inline bool gpu_ipc_wait(int64_t bytes, std::function<void(void*, int, int64_t)>
         gpu_ipc_warn(a, "the IPC slabs are full (CNUM_GPU_IPC_MB)");
         return false;
     }
-    a.waiters.push_back({CkMyPe(), bytes, std::move(go)});
+    a.waiters.push_back({CkMyPe(), bytes, part, std::move(go), std::move(cancel)});
     return true;
 }
 
-/// Start this PE's waiting sends, in order, while blocks are available. Freed blocks are not
-/// merged, so a send that does not fit once this PE has nothing in flight goes another way.
+/// Drop the waiting sends of partition `part` (its destructor).
+inline void gpu_ipc_cancel(const void* part) {
+    auto& a = gpu_ipc_arena();
+    std::vector<std::function<void()>> cancels;
+    {
+        std::lock_guard<std::mutex> lock(a.mu);
+        for (auto it = a.waiters.begin(); it != a.waiters.end();)
+            if (it->part == part) {
+                cancels.push_back(std::move(it->cancel));
+                it = a.waiters.erase(it);
+            } else {
+                ++it;
+            }
+    }
+    for (auto& c : cancels)
+        c();
+}
+
+/// Start this PE's waiting sends, in order, while blocks are available. A send that does not
+/// fit once this PE has nothing in flight (the rest of the arena is held by sibling PEs, or
+/// CNUM_GPU_IPC_MB is below the message) goes another way.
 inline void gpu_ipc_retry() {
     auto& a = gpu_ipc_arena();
     while (true) {
@@ -241,23 +275,28 @@ inline bool gpu_ipc_free(void* ptr) {
     auto it = a.live.find(ptr);
     if (it == a.live.end())
         return false;
+    gpu_ipc_release_locked(a, ptr);
     if (a.closed)
         return true;
     auto [s, cls] = it->second;
     gpu_ipc_release(a, s, static_cast<char*>(ptr) - a.slabs[s].base, cls);
     a.live.erase(it);
-    gpu_ipc_release_locked(a, ptr);
     return true;
 }
 
-/// Drop an arena block without reusing it (a receiver may still be reading it).
+/// Drop an arena block without reusing it (a receiver may still be reading it); this PE's
+/// waiting sends may now have to go another way (gpu_ipc_retry).
 inline bool gpu_ipc_forget(void* ptr) {
     auto& a = gpu_ipc_arena();
-    std::lock_guard<std::mutex> lock(a.mu);
-    if (a.closed)
-        return a.live.count(ptr) > 0;
-    gpu_ipc_release_locked(a, ptr);
-    return a.live.erase(ptr) > 0;
+    bool found;
+    {
+        std::lock_guard<std::mutex> lock(a.mu);
+        gpu_ipc_release_locked(a, ptr);
+        found = a.closed ? a.live.count(ptr) > 0 : a.live.erase(ptr) > 0;
+    }
+    if (found)
+        gpu_ipc_retry();
+    return found;
 }
 
 inline cudaIpcMemHandle_t gpu_ipc_handle(int slab) {
