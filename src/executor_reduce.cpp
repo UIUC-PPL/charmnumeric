@@ -15,6 +15,15 @@ static T device_dot_nc(const T* x, const T* y, int n) {
 }
 #endif
 
+/// Both dot paths read the operands as the node's dtype; the frontend promotes them first.
+template <int N>
+static void check_dot_dtype(PartitionImpl<N>* partition, int name, DType dt) {
+    auto it = partition->arrays.find(name);
+    if (it != partition->arrays.end() && it->second->dtype != dt)
+        CkAbort("REDUCE: operand %d has dtype %d, the dot is computed in dtype %d", name,
+                (int)it->second->dtype, (int)dt);
+}
+
 template <int N>
 void ArrayDAGExecutorND<N>::execute_reduce_node(DAGNode* node) {
     if constexpr (N != 1) {
@@ -35,6 +44,8 @@ void ArrayDAGExecutorND<N>::execute_reduce_node(DAGNode* node) {
         int result_name = reduce_root->result_name;
 
         DType dt = determine_dtype<1>(node, partition->arrays);
+        check_dot_dtype<1>(partition, lhs_name, dt);
+        check_dot_dtype<1>(partition, rhs_name, dt);
 
         DBG_PRINT("[1D Chare %d] execute_reduce_node: lhs=%d rhs=%d result=%d\n",
                   partition->index[0], lhs_name, rhs_name, result_name);

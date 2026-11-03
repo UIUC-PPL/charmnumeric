@@ -1090,6 +1090,10 @@ def _views_across_flush(n, fused):
         w2h, z2h = made(w2, z2)
         check("dot of large differently placed vectors", get(cnp.dot(w2, z2)),
               np.dot(w2h, z2h), rtol=1e-10)
+        w3 = big[5:].astype(np.float32) + 1.0
+        w3h = made(w3)
+        check("dot f32 . f64, differently placed", get(cnp.dot(w3, z2[2:])),
+              np.dot(w3h, z2h[2:]), rtol=1e-5)
     t = data((9, 11, 13), seed=3)
     th = made(t)
     u = t[1:, 2:, :-3] + 1.0
