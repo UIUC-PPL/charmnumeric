@@ -754,6 +754,9 @@ class ArrayDAGExecutorND : public DAGExecutor {
     void execute_matmul_node(DAGNode* node);
     void execute_matmatmul_node(DAGNode* node);
     void execute_reduce_node(DAGNode* node);
+    void start_realigned_dot(DAGNode* node, int lhs_name, int rhs_name);
+    void finish_realigned_dot(PendingComm<N>& comm);
+    void post_dot_partial(DAGNode* node, char* contrib, int lhs_name);
     void on_dot_partial(int node_id, char* data, int64_t size);
     void finish_dot(int node_id);
     void execute_cross_set_region_node(DAGNode* node);

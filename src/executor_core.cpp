@@ -154,6 +154,42 @@ static void dispatch_send(PartitionImpl<N>* partition, DAGNode* node, const Remo
     });
 }
 
+/// REDUCE of operands with different layouts: rhs moves to lhs's tiles like an
+/// elementwise input, then finish_realigned_dot takes the dot per lhs tile.
+template <int N>
+void ArrayDAGExecutorND<N>::start_realigned_dot(DAGNode* node, int lhs_name, int rhs_name) {
+    if constexpr (N == 1) {
+        auto& meta = static_cast<ArrayDAGGroup*>(group)->array_meta;
+        auto ld = meta[lhs_name].template decomp<1>();
+        auto rd = meta[rhs_name].template decomp<1>();
+        int n = std::min(ld.global_shape[0], rd.global_shape[0]);
+        ArrayRegion<1> full({0}, {n}, {1});
+        ArrayRegion<1> r_out = ld.to_global(full);
+        std::vector<ArrayRegion<1>> r_in = {rd.to_global(full)};
+        std::vector<ArrayDecomp<1>> in_decomps = {rd};
+        auto idx = partition->nd_index();
+        auto sends = send_remote_inputs<1>(r_out, r_in, idx, ld, in_decomps);
+        for (auto& send : sends)
+            dispatch_send<1>(partition, node, send, rhs_name, idx);
+#ifdef USE_NVIDIA
+        if (!sends.empty())
+            partition->compute_after_others();
+#endif
+        auto li = local_inputs<1>(r_out, r_in, idx, ld, in_decomps);
+        auto pre_it = pending.find(node->id);
+        int pre_arrived = 0;
+        std::unordered_map<int, std::vector<RemoteBuffer<1>>> pre_buffers;
+        if (pre_it != pending.end()) {
+            pre_arrived = -(pre_it->second.expected_msgs);
+            pre_buffers = std::move(pre_it->second.remote_buffers);
+        }
+        int remaining = li.expected_msgs - pre_arrived;
+        pending[node->id] = {node, remaining, std::move(li.my_inputs), std::move(pre_buffers)};
+        if (remaining <= 0)
+            on_comm_done(node->id);
+    }
+}
+
 template <int N>
 static void dispatch_execute(DType dt, ArrayDAGGroup* group, DAGNode* node,
                              PartitionImpl<N>* partition, PendingComm<N>* comm) {
@@ -920,6 +956,13 @@ void ArrayDAGExecutorND<N>::on_comm_done(int node_id) {
 
     PendingComm<N>& comm = it->second;
     DAGNode* node = comm.node;
+    for (ASTNode* root : node->ast->roots)
+        if (static_cast<Opcode>(root->opcode) == Opcode::REDUCE) {
+            PendingComm<N> done = std::move(comm);
+            pending.erase(it);
+            finish_realigned_dot(done);
+            return;
+        }
 #ifdef USE_NVIDIA
     // packs queued since the node started (its halo sends) may read what it now writes
     partition->compute_after_others();
@@ -964,5 +1007,8 @@ template void ArrayDAGExecutorND<2>::execute_dag_node(DAGNode*);
 template void ArrayDAGExecutorND<3>::execute_dag_node(DAGNode*);
 
 template void ArrayDAGExecutorND<1>::on_comm_done(int);
+template void ArrayDAGExecutorND<1>::start_realigned_dot(DAGNode*, int, int);
+template void ArrayDAGExecutorND<2>::start_realigned_dot(DAGNode*, int, int);
+template void ArrayDAGExecutorND<3>::start_realigned_dot(DAGNode*, int, int);
 template void ArrayDAGExecutorND<2>::on_comm_done(int);
 template void ArrayDAGExecutorND<3>::on_comm_done(int);

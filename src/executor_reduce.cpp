@@ -49,6 +49,18 @@ void ArrayDAGExecutorND<N>::execute_reduce_node(DAGNode* node) {
         contrib.result_name = result_name;
         contrib.dtype_int = static_cast<int>(dt);
 
+        // operands laid out differently: move rhs to lhs's tiles first
+        {
+            auto& meta = static_cast<ArrayDAGGroup*>(group)->array_meta;
+            auto l = meta.find(lhs_name), r = meta.find(rhs_name);
+            if (l != meta.end() && r != meta.end() &&
+                (l->second.tile != r->second.tile || l->second.offset != r->second.offset ||
+                 l->second.global_shape != r->second.global_shape)) {
+                start_realigned_dot(node, lhs_name, rhs_name);
+                return;
+            }
+        }
+
         if (lhs_it != partition->arrays.end() && rhs_it != partition->arrays.end()) {
             int local_size =
                 std::min(lhs_it->second->local_size(), rhs_it->second->local_size());
@@ -89,6 +101,15 @@ void ArrayDAGExecutorND<N>::execute_reduce_node(DAGNode* node) {
         }
         // else: contrib.value is all zeros — contributes 0 to the reduction
 
+        post_dot_partial(node, reinterpret_cast<char*>(&contrib), lhs_name);
+    }
+}
+
+template <int N>
+void ArrayDAGExecutorND<N>::post_dot_partial(DAGNode* node, char* contrib_bytes, int lhs_name) {
+    if constexpr (N == 1) {
+        ReduceContrib contrib;
+        memcpy(&contrib, contrib_bytes, sizeof(contrib));
         // Partials go to chare 0 (not a Charm++ reduction: chares added by a later
         // DAG restart their reduction numbering, which mismatches the older ones).
         auto* dag_group = static_cast<ArrayDAGGroup*>(group);
@@ -113,6 +134,78 @@ void ArrayDAGExecutorND<N>::execute_reduce_node(DAGNode* node) {
                 .reduce_result(node->id, sizeof(contrib), reinterpret_cast<char*>(&contrib));
         }
         node_finished(node->id);
+    }
+}
+
+static void local_dot_into(DType dt, const char* a, const char* b, int64_t n, char* acc_bytes) {
+    cn_dispatch_blas(dt, [&](auto tag) {
+        using T = decltype(tag);
+        T acc;
+        memcpy(&acc, acc_bytes, sizeof(T));
+#ifdef USE_KOKKOS
+        const T* x = reinterpret_cast<const T*>(a);
+        const T* y = reinterpret_cast<const T*>(b);
+        acc += device_dot_nc<T>(x, y, (int)n);
+#else
+        acc += eigen_dot(const_cast<T*>(reinterpret_cast<const T*>(a)),
+                         const_cast<T*>(reinterpret_cast<const T*>(b)), (int)n);
+#endif
+        memcpy(acc_bytes, &acc, sizeof(T));
+    });
+}
+
+/// Misaligned operands: rhs pieces came to the lhs tiles (start_realigned_dot).
+template <int N>
+void ArrayDAGExecutorND<N>::finish_realigned_dot(PendingComm<N>& comm) {
+    if constexpr (N == 1) {
+        DAGNode* node = comm.node;
+        ASTNode* root = nullptr;
+        for (ASTNode* r : node->ast->roots)
+            if (static_cast<Opcode>(r->opcode) == Opcode::REDUCE)
+                root = r;
+        int lhs_name = root->operands[0]->result_name;
+        int rhs_name = root->operands[1]->result_name;
+        auto& meta = static_cast<ArrayDAGGroup*>(group)->array_meta;
+        auto ld = meta[lhs_name].decomp<1>(), rd = meta[rhs_name].decomp<1>();
+        auto idx = partition->nd_index();
+        DType dt = determine_dtype<1>(node, partition->arrays);
+
+        ReduceContrib contrib = {};
+        contrib.node_id = node->id;
+        contrib.result_name = root->result_name;
+        contrib.dtype_int = static_cast<int>(dt);
+
+        auto lhs_it = partition->arrays.find(lhs_name);
+        if (lhs_it != partition->arrays.end() && !comm.my_inputs.empty()) {
+            int esz = dtype_size(dt);
+            std::vector<std::pair<ArrayRegion<1>, const char*>> parts;
+            auto rhs_it = partition->arrays.find(rhs_name);
+            if (rhs_it != partition->arrays.end()) {
+                auto [local, ok] = intersect(comm.my_inputs[0], rd.chare_region_global(idx));
+                if (ok && local.size() > 0)
+                    parts.push_back(
+                        {local, static_cast<const char*>(rhs_it->second->device_data_ptr()) +
+                                    (int64_t)(local.start[0] -
+                                              rd.chare_start_global(0, idx[0])) * esz});
+            }
+            for (auto& rb : comm.remote_buffers[0])
+                parts.push_back({rb.region, rb.data});
+#ifdef USE_KOKKOS
+            Kokkos::fence("ct_realigned_dot");
+#else
+            lhs_it->second->copyToHost();
+            if (rhs_it != partition->arrays.end())
+                rhs_it->second->copyToHost();
+#endif
+            const char* lhs_base = static_cast<const char*>(lhs_it->second->device_data_ptr());
+            for (auto& [r, ptr] : parts) {
+                int64_t lo = (int64_t)r.start[0] - rd.offset[0] + ld.offset[0] -
+                             ld.chare_start_global(0, idx[0]);
+                local_dot_into(dt, lhs_base + lo * esz, ptr, r.size(), contrib.value);
+            }
+        }
+        comm.clear_remote_buffers();
+        post_dot_partial(node, reinterpret_cast<char*>(&contrib), lhs_name);
     }
 }
 
@@ -191,5 +284,11 @@ template void ArrayDAGExecutorND<1>::on_dot_partial(int, char*, int64_t);
 template void ArrayDAGExecutorND<2>::on_dot_partial(int, char*, int64_t);
 template void ArrayDAGExecutorND<3>::on_dot_partial(int, char*, int64_t);
 template void ArrayDAGExecutorND<1>::finish_dot(int);
+template void ArrayDAGExecutorND<1>::post_dot_partial(DAGNode*, char*, int);
+template void ArrayDAGExecutorND<2>::post_dot_partial(DAGNode*, char*, int);
+template void ArrayDAGExecutorND<3>::post_dot_partial(DAGNode*, char*, int);
+template void ArrayDAGExecutorND<1>::finish_realigned_dot(PendingComm<1>&);
+template void ArrayDAGExecutorND<2>::finish_realigned_dot(PendingComm<2>&);
+template void ArrayDAGExecutorND<3>::finish_realigned_dot(PendingComm<3>&);
 template void ArrayDAGExecutorND<2>::finish_dot(int);
 template void ArrayDAGExecutorND<3>::finish_dot(int);
