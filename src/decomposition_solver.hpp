@@ -54,9 +54,10 @@ inline int64_t tile_count(const std::array<int, 3>& shape, int ndims, int tile) 
 }
 
 // Elements on the busiest PE when an array of this shape (offset 0) is cut into
-// tiles placed by chare_home_pe(); past 4096 tiles, tiles per PE times a full tile.
+// tiles placed by chare_home_pe(); estimated as tiles per PE times a full tile when
+// !exact.
 inline int64_t busiest_pe_elems(const std::array<int, 3>& shape, int ndims, int tile,
-                                int num_pes) {
+                                int num_pes, bool exact) {
     std::array<int, 3> n = {1, 1, 1};
     int64_t count = 1, full = 1;
     for (int d = 0; d < ndims; ++d) {
@@ -64,7 +65,7 @@ inline int64_t busiest_pe_elems(const std::array<int, 3>& shape, int ndims, int 
         count *= n[d];
         full *= std::min(tile, std::max(1, shape[d]));
     }
-    if (count > 4096)
+    if (!exact)
         return (count + num_pes - 1) / num_pes * full;
     std::unordered_map<int, int64_t> load;
     int64_t busiest = 0;
@@ -83,7 +84,10 @@ inline int64_t busiest_pe_elems(const std::array<int, 3>& shape, int ndims, int 
 // Near-equal tiles: ceil(n / k) >= min_tile along some dimension, rounded up to a small
 // multiple, at most max_tiles of them; the one that minimizes the busiest PE's elements
 // (near-ties: more tiles) replaces the smallest power-of-two multiple of min_tile within
-// max_tiles when it unloads the busiest PE by 10%.
+// max_tiles when it unloads the busiest PE by 20%. Smaller gains do not pay for tiles
+// that cut the array's sub-blocks unevenly (a (7*365,160,240) array filled 365 rows
+// at a time: tile 320 instead of 256 balances the whole array 17% better, and its
+// slab writes 10% worse).
 inline int balanced_tile(const std::array<int, 3>& shape, int ndims, int64_t max_tiles,
                          int num_pes, int min_tile) {
     int smax = 1;
@@ -121,6 +125,8 @@ inline int balanced_tile(const std::array<int, 3>& shape, int ndims, int64_t max
             cands.insert((int)std::min<int64_t>(t, std::numeric_limits<int>::max()));
         }
     cands.insert((smax + align - 1) / align * align);
+    // one estimator for every candidate, and at most ~1M chare visits per shape
+    bool exact = max_tiles <= 4096 && (int64_t)cands.size() * max_tiles <= (1 << 20);
     int best = -1;
     int64_t best_load = 0, best_count = 0;
     for (auto it = cands.rbegin(); it != cands.rend(); ++it) {
@@ -128,7 +134,7 @@ inline int balanced_tile(const std::array<int, 3>& shape, int ndims, int64_t max
         int64_t count = tile_count(shape, ndims, t);
         if (count > max_tiles && best >= 0)
             continue;
-        int64_t load = busiest_pe_elems(shape, ndims, t, key.num_pes);
+        int64_t load = busiest_pe_elems(shape, ndims, t, key.num_pes, exact);
         if (best < 0 || load < best_load * 0.98 ||
             (load <= best_load * 1.02 && count > best_count)) {
             best = t;
@@ -136,7 +142,7 @@ inline int balanced_tile(const std::array<int, 3>& shape, int ndims, int64_t max
             best_count = count;
         }
     }
-    if (best_load >= 0.9 * busiest_pe_elems(shape, ndims, pow2, key.num_pes))
+    if (best_load >= 0.8 * busiest_pe_elems(shape, ndims, pow2, key.num_pes, exact))
         best = pow2;
     return cache[key] = best;
 }
