@@ -145,7 +145,8 @@ Bit-exact NumPy mirror of `src/creation_kernels.hpp` (Philox4x32-10, software lo
 | `PartitionImpl<N>` | 352 | Partition logic (Charm++-independent) |
 | — `FreeKey`/`FreeKeyHash` | 370/387 | Array reuse key (dtype+region+shape) |
 | — Key methods | | `init()`:567, `create()`:571, `run()`:572, `retire_array()`:428, `try_reuse()`:456, `allocate_or_reuse()`:502, `ensure_array()`:534, `process_get()`:582 |
-| `Partition1D/2D/3D` | 587-672 | Thin Charm++ chare wrappers around PartitionImpl |
+| `Partition1D/2D/3D` | — | Thin Charm++ chare wrappers around PartitionImpl |
+| `PartitionMap` | — | `CkArrayMap` group placing the partitions' chares by `chare_home_pe()` |
 
 ### `backend_internal.hpp` — Compute kernels & helpers (491 lines)
 | Symbol | Line | Description |
@@ -162,12 +163,14 @@ Bit-exact NumPy mirror of `src/creation_kernels.hpp` (Philox4x32-10, software lo
 | `cross_set_region_send<N_src,N_tgt,T>()` | 320 | Cross-dim SET_REGION |
 | `ReduceContrib` | 264 | 32-byte dot (REDUCE) contribution, sent to chare 0 |
 
-### `decomposition_solver.hpp` — Standalone decomposition solver (1716 lines)
+### `decomposition_solver.hpp` — Standalone decomposition solver (2027 lines)
 | Symbol | Line | Description |
 |--------|------|-------------|
-| `decomposition_solver::compute_decompositions()` | 95 | Charm-free decomposition solver used by the runtime and standalone tests |
-| `detail::for_each_node_topo()` | 59 | Topological DAG traversal helper for solver passes |
-| `collect_unionable_nonfixed_leaves()` | 515 | Union-find guard: only unions zero-shift, same-tile, non-fixed temp leaves |
+| `decomposition_solver::compute_decompositions()` | 150 | Charm-free decomposition solver used by the runtime and standalone tests |
+| `detail::balanced_tile()` | 69 | Near-equal tiles: ceil(n/k) along the largest dim rounded to 1024/32/16 (1-/2-/3-D, at most the min tile), k minimizing (tiles per PE) x (tile volume); near-ties prefer tiles >= `CT_MIN_TILE_*`, then more tiles; at most `odf * PEs` tiles |
+| `assign_class_tiles` (in `compute_decompositions`) | 370 | Tile classes: arrays joined by unit-stride elementwise/COPY/SET_REGION accesses and REDUCE operands share one tile — the heaviest array from an earlier DAG (or TRANSPOSE result) in the class, else the balanced tile of the class's largest extents capped by strided accesses; the offset DP then aligns them |
+| `detail::for_each_node_topo()` | 114 | Topological DAG traversal helper for solver passes |
+| `collect_unionable_nonfixed_leaves()` | 693 | Union-find guard: only unions zero-shift, same-tile, non-fixed temp leaves |
 
 ### `array_region.hpp` — N-D regions & decomposition (449+ lines)
 | Symbol | Line | Description |
@@ -175,7 +178,8 @@ Bit-exact NumPy mirror of `src/creation_kernels.hpp` (Philox4x32-10, software lo
 | `ArrayRegion<N>` | 22 | N-D region (start/stop/step per dim) — `size()`:110, `deserialize()`:121, `overlaps()`:136, `covers()`:158, `intersect()`:186 |
 | `ArrayDecomp<N>` | 294 | Tile decomposition — `default_decomp()`:303, `offset_decomp()`:312, `to_global/local()`:322/339, `num_chares()`:350, `chare_region_global/local()`:360/371 |
 | `MemRef<N,T>` | 407 | MLIR memref descriptor (allocated, aligned, offset, sizes, strides) |
-| `ChareIndex<N>` | 437 | N-D chare array index |
+| `ChareIndex<N>` | — | N-D chare array index |
+| `chare_home_pe()` | 454 | Home PE of a chare (`PartitionMap`): for 2^m PEs a GF(2)-linear map of the index bits, so aligned boxes (2x2, 4x4, 4x1, 2x2x2, ...) spread evenly; 1-D round robin |
 
 ### `opcodes.hpp` — Operation codes
 | Symbol | Line | Description |
@@ -233,7 +237,7 @@ Started from `set_proxies`, off the CCS-ready path: rank 0 of each process expor
 | File | Description |
 |------|-------------|
 | `server.cpp` | Main chare, creates ArrayDAGGroup |
-| `dag_group_runtime.cpp` | ArrayDAGGroup constructor, `compute_decompositions()`, set_proxies, receive_get_request, gather |
+| `dag_group_runtime.cpp` | ArrayDAGGroup constructor (partitions use `PartitionMap`), `compute_decompositions()` (`CNUM_DECOMP_LOG=1`: PE 0 prints each new array's tile and offset), set_proxies, receive_get_request, gather |
 | `dag_group_compile.cpp` | JIT compilation orchestration (one `jit_compile_batch` per DAG) |
 | `dag_group_receive.cpp` | DAG reception and dispatch |
 | `execute_node.cpp` | `execute_node_nd<N,T>()` — dispatches JIT kernels, handles MATMUL/REDUCE/TILE/DIAG |
@@ -241,7 +245,7 @@ Started from `set_proxies`, off the CCS-ready path: rank 0 of each process expor
 | `executor_core.cpp` | `execute_dag_node()`, remote input sends |
 | `executor_matmul.cpp` | Matrix-vector multiply execution |
 | `executor_matmatmul.cpp` | Matrix-matrix multiply (SUMMA) execution |
-| `executor_reduce.cpp` | Reduce node execution |
+| `executor_reduce.cpp` | REDUCE (1-D dot): local dot per chare, partials to chare 0. Operands with different layouts (tile, offset or shape): rhs first moves to lhs's tiles through the elementwise planner (`start_realigned_dot` in executor_core.cpp, `finish_realigned_dot`) |
 | `executor_reduction.cpp` | REDUCTION/BINCOUNT: per-chare partials (Kokkos on GPU) sent point-to-point to the output chares (`receive_reduce_partial`) |
 | `executor_reducer.cpp` | `determine_dtype<N>()` (dtype of a node from its AST or arrays) |
 | `executor_transfer.cpp` | Cross-partition data transfer |
@@ -263,15 +267,19 @@ Started from `set_proxies`, off the CCS-ready path: rank 0 of each process expor
 
 ## Standalone C++ Tests (`example/charmnumeric/tests/`)
 
-### `test_compute_decompositions.cpp` — Standalone decomposition coverage (416 lines)
+### `test_compute_decompositions.cpp` — Standalone decomposition coverage (566 lines)
 | Symbol | Line | Description |
 |--------|------|-------------|
-| `test_shifted_copy_uses_absolute_offset()` | 128 | Checks lifted absolute offset for a simple shifted copy |
-| `test_shifted_expression_temp_uses_absolute_representative()` | 177 | Verifies shifted RHS temp keeps absolute representative `150` |
-| `test_jacobi1d_temp_offset()` | 207 | 1D Jacobi temp regression: offset should be `1` |
-| `test_jacobi2d_temp_offset()` | 259 | 2D Jacobi temp regression: offset should be `(1,1)` |
-| `test_jacobi3d_temp_offset()` | 317 | 3D Jacobi temp regression: offset should be `(1,1,1)` |
-| `test_strided_copy_reduces_tile_and_sets_offset()` | 374 | Stride-2 access regression: tile reduction and absolute offset lifting |
+| `test_shifted_copy_uses_absolute_offset()` | 131 | Checks lifted absolute offset for a simple shifted copy |
+| `test_shifted_expression_temp_uses_absolute_representative()` | 180 | Verifies shifted RHS temp keeps absolute representative `150` |
+| `test_jacobi1d_temp_offset()` | 210 | 1D Jacobi temp regression: offset should be `1` |
+| `test_jacobi2d_temp_offset()` | 262 | 2D Jacobi temp regression: offset should be `(1,1)` |
+| `test_jacobi3d_temp_offset()` | 320 | 3D Jacobi temp regression: offset should be `(1,1,1)` |
+| `test_strided_copy_reduces_tile_and_sets_offset()` | 377 | Stride-2 access regression: tile reduction and absolute offset lifting |
+| `test_balanced_tiles()` | 453 | `balanced_tile` picks near-equal tiles (800^3 on 4 PEs -> 400, 8194^2 -> 2080) |
+| `test_chare_home_pe_balance()` | 465 | `chare_home_pe` spreads 2x2, 4x4, 4x1, 2x2x2, ... chare boxes evenly on 4 and 8 PEs |
+| `test_misaligned_after_flush_takes_source_tile()` | 491 | A result read through shifted views of an earlier DAG's array gets that array's tile and the view offset |
+| `test_reduce_operands_share_layout()` | 515 | A new REDUCE operand takes the other operand's tile and offset |
 
 ### `backend.ci` — Charm++ interface (86 lines)
 Module `charmnumeric` (depends on `charmtyles`). Mainchare `Main`. Group `ArrayDAGGroup : DAGGroup` with entries: `set_proxies()`, `proxies_ready()` [reduction], `receive_dag()`, `receive_get_request()`, `gather()`. Arrays `Partition1D/2D/3D` with entries: `run()`, `receive_data()` [nocopy/nocopydevice], `send_complete()`, `receive_ipc()`, `receive_staged()` (GPU), `comm_done()`, `reduce_result()`, `receive_reduce_partial()`, `receive_linalg()`, `receive_shape()`, `receive_sort_msg()` (Partition1D).
