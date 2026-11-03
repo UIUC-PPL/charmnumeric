@@ -465,6 +465,15 @@ void ArrayDAGGroup::receive_dag_now(int epoch, int size, char* serialized_dag) {
                         shape = input_it->second.global_shape;
                 }
                 array_meta[ast_node->result_name] = {nd, shape, {}, 0};
+            } else if (op == Opcode::SELECT) {
+                // one chare holds the m order statistics
+                int m = (int)ast_node->operands.size() - 1;
+                int tile = CT_MIN_TILE_1D;
+                while (tile < m)
+                    tile *= 2;
+                ArrayMetadata meta = {1, {m, 0, 0}, {0, 0, 0}, tile};
+                meta.decomp_final = true;
+                array_meta[ast_node->result_name] = meta;
             } else if (is_castscansort(op)) {
                 // Same shape as the input (pinned again after the solver).
                 auto input_it = array_meta.find(ast_node->operands[0]->result_name);
@@ -516,7 +525,8 @@ void ArrayDAGGroup::receive_dag_now(int epoch, int size, char* serialized_dag) {
     // SCAN/SORT/ARGSORT take the input's final decomposition (topo order, chains propagate).
     dag_group_for_each_node_topo(dag, [&](DAGNode* dag_node) {
         for (ASTNode* ast_node : dag_node->ast->roots) {
-            if (!is_castscansort(static_cast<Opcode>(ast_node->opcode)))
+            Opcode op = static_cast<Opcode>(ast_node->opcode);
+            if (!is_castscansort(op) || op == Opcode::SELECT)
                 continue;
             auto input_it = array_meta.find(ast_node->operands[0]->result_name);
             if (input_it == array_meta.end())
@@ -708,6 +718,7 @@ void ArrayDAGGroup::receive_dag_now(int epoch, int size, char* serialized_dag) {
 
     compile(dag);
 
+    std::vector<int> deletions = dag->deletions;
     bool first = true;
     for (int nd : active_ndims) {
         if (first) {
@@ -723,7 +734,10 @@ void ArrayDAGGroup::receive_dag_now(int epoch, int size, char* serialized_dag) {
 
     for (auto& [nd, pg] : partition_grid) {
         if (pg.grid[0] > 0 && active_ndims.find(nd) == active_ndims.end()) {
-            add_dag(nd, epoch, new DAG());
+            // the deleted arrays may live in this partition
+            DAG* empty = new DAG();
+            empty->deletions = deletions;
+            add_dag(nd, epoch, empty);
             DBG_PRINT("[PE %d] receive_dag epoch=%d: stored empty DAG for ndims=%d\n", CkMyPe(),
                       epoch, nd);
         }

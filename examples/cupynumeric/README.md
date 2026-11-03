@@ -204,7 +204,8 @@ All NumPy-exact, each with regression checks in `examples/ops`:
   `numpy_scalar * array`), and `add/subtract/multiply/divide` keep NumPy
   scalars typed (NEP 50) (`test_frontend.py numpy_interop`).
 - **New functions.** `allclose`/`isclose` (NumPy's formula, `equal_nan`; device
-  results), `quantile`/`percentile` (native sort, NumPy's index and
+  results), `quantile`/`percentile` (native selection of the needed order
+  statistics for 1-D / axis=None, else native sort; NumPy's index and
   interpolation rules for every method, `axis` None/int, `keepdims`, `out`),
   `true_divide`, `iinfo`/`finfo`, and `synchronize()` (backend barrier: a GET
   of the reserved name -1 answered once every chare of every partition has
@@ -272,8 +273,8 @@ programs do not observe:
    RESHAPE/BROADCAST (opcodes 140-141, `src/executor_shape.cpp`) and
    FoldedArray (`charmnumeric/folded.py`) for >3-D arrays. black_scholes_greeks,
    scan, quantiles, take_pairs use them.
-9. ~~sort/argsort~~ (native since the castscansort ops; a distributed sample
-   sort is still missing for scaling).
+9. ~~sort/argsort~~ (native; 1-D sorts are a distributed sample sort,
+   `src/executor_sort.cpp`).
 10. ~~astype (dtype conversion)~~ (fused CONVERT op; mixed dtypes are converted
     in-kernel with NumPy's promotion rules).
 11. **One example each:** ~~scan (cumsum/cumprod)~~ (native), ~~convolve~~ (native),
