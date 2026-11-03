@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 #ifdef USE_KOKKOS
 #include <KokkosBlas2_gemv.hpp>
@@ -39,12 +40,46 @@ static void region_copy_kernel(PartitionImpl<N>* partition, E* dst, const E* src
 }
 #endif
 
+template <int N>
+static bool region_copy_spans_overlap(const RegionCopyPlan<N>& p) {
+    int64_t dlo = p.dst0, dhi = p.dst0, slo = p.src0, shi = p.src0;
+    for (int d = 0; d < N; ++d) {
+        int64_t dx = (int64_t)(p.n[d] - 1) * p.dinc[d], sx = (int64_t)(p.n[d] - 1) * p.sinc[d];
+        (dx < 0 ? dlo : dhi) += dx;
+        (sx < 0 ? slo : shi) += sx;
+    }
+    return dlo <= shi && slo <= dhi;
+}
+
+/// `alias`: src and dst are the same buffer; overlapping copies then go through a packed
+/// temporary, since the elements are copied in no particular order.
 template <int N, typename E>
 static void region_copy_typed(PartitionImpl<N>* partition, E* dst, const E* src,
-                              const RegionCopyPlan<N>& p) {
+                              const RegionCopyPlan<N>& p, bool alias = false) {
     int64_t total = 1;
     for (int d = 0; d < N; ++d)
         total *= p.n[d];
+    if (alias && region_copy_spans_overlap(p)) {
+        RegionCopyPlan<N> in = p, out = p;
+        int64_t stride = 1;
+        for (int d = N - 1; d >= 0; --d) {
+            in.dinc[d] = out.sinc[d] = stride;
+            stride *= p.n[d];
+        }
+        in.dst0 = out.src0 = 0;
+#ifdef USE_KOKKOS
+        Kokkos::View<E*, DeviceSpace> tmp(
+            Kokkos::view_alloc(Kokkos::WithoutInitializing, "ct_copy_stage"), total);
+        region_copy_typed<N>(partition, tmp.data(), src, in);
+        region_copy_typed<N>(partition, dst, tmp.data(), out);
+        CT_COMPUTE_EXEC(partition).fence("ct_copy_stage");
+#else
+        std::vector<E> tmp(total);
+        region_copy_typed<N>(partition, tmp.data(), src, in);
+        region_copy_typed<N>(partition, dst, tmp.data(), out);
+#endif
+        return;
+    }
 #ifdef USE_KOKKOS
     if (total <= INT32_MAX)
         region_copy_kernel<N, E, uint32_t>(partition, dst, src, p, total);
@@ -74,23 +109,23 @@ static void region_copy_typed(PartitionImpl<N>* partition, E* dst, const E* src,
 
 template <int N>
 static void region_copy(PartitionImpl<N>* partition, int esz, char* dst, const char* src,
-                        const RegionCopyPlan<N>& p) {
+                        const RegionCopyPlan<N>& p, bool alias) {
     switch (esz) {
     case 1:
         return region_copy_typed<N>(partition, reinterpret_cast<uint8_t*>(dst),
-                                    reinterpret_cast<const uint8_t*>(src), p);
+                                    reinterpret_cast<const uint8_t*>(src), p, alias);
     case 2:
         return region_copy_typed<N>(partition, reinterpret_cast<uint16_t*>(dst),
-                                    reinterpret_cast<const uint16_t*>(src), p);
+                                    reinterpret_cast<const uint16_t*>(src), p, alias);
     case 4:
         return region_copy_typed<N>(partition, reinterpret_cast<uint32_t*>(dst),
-                                    reinterpret_cast<const uint32_t*>(src), p);
+                                    reinterpret_cast<const uint32_t*>(src), p, alias);
     case 8:
         return region_copy_typed<N>(partition, reinterpret_cast<uint64_t*>(dst),
-                                    reinterpret_cast<const uint64_t*>(src), p);
+                                    reinterpret_cast<const uint64_t*>(src), p, alias);
     case 16:
         return region_copy_typed<N>(partition, reinterpret_cast<CopyBytes16*>(dst),
-                                    reinterpret_cast<const CopyBytes16*>(src), p);
+                                    reinterpret_cast<const CopyBytes16*>(src), p, alias);
     default:
         CkAbort("region_copy: unsupported element size %d", esz);
     }
@@ -319,7 +354,8 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
             }
             if (!empty)
                 region_copy(partition, esz, static_cast<char*>(target->device_data_ptr()),
-                            static_cast<const char*>(source->device_data_ptr()), plan);
+                            static_cast<const char*>(source->device_data_ptr()), plan,
+                            source == target);
         }
         return node->result_name;
     }
