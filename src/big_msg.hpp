@@ -23,12 +23,13 @@ enum MsgKind : int {
 
 /// Largest payload sent as one message (CNUM_MSG_MAX_BYTES overrides it, for tests).
 int64_t ct_msg_max_bytes();
+/// Sequence number of this PE's next fragmented payload.
+int64_t ct_next_frag_seq();
 
 template <typename P>
 void ct_send_frags(P&& proxy, int kind, int node_id, const std::vector<int>& meta, int64_t size,
                    const char* data) {
-    static thread_local int64_t seq = 0;
-    ++seq;
+    int64_t seq = ct_next_frag_seq();
     int64_t lim = ct_msg_max_bytes();
     for (int64_t off = 0; off < size; off += lim) {
         int64_t n = std::min(lim, size - off);

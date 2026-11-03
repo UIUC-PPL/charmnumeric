@@ -123,13 +123,19 @@ static void deferred_send_cb(void* param, void* msg) {
             p->node_id, p->input_index, p->inp_name, N_target, p->region_data, p->byte_size,
             CkMyNode(), p->ipc_slab, p->ipc_offset, (int)sizeof(h),
             reinterpret_cast<const char*>(&h), cb);
-#ifdef USE_NVIDIA
     } else if (p->local && p->byte_size > ct_msg_max_bytes()) {
         // charmxi posts nocopydevice sizes as int: same process, so pass the pointer itself
         proxy_at<N_target>(p->target_proxy, p->target_ci).receive_ipc(
             p->node_id, p->input_index, p->inp_name, N_target, p->region_data, p->byte_size,
             CkMyNode(), -1, reinterpret_cast<int64_t>(p->send_buf), 0, nullptr, cb);
-#endif
+    } else if (p->byte_size > ct_msg_max_bytes()) {
+        // another process, no IPC block or pinned block: a pageable copy, in fragments
+        std::unique_ptr<char[]> host(new char[p->byte_size]);
+        hapiCheck(cudaMemcpy(host.get(), p->send_buf, p->byte_size, cudaMemcpyDeviceToHost));
+        ct_send_frags(proxy_at<N_target>(p->target_proxy, p->target_ci), MSG_STAGED, p->node_id,
+                      ct_data_meta(p->input_index, p->inp_name, N_target, p->region_data),
+                      p->byte_size, host.get());
+        p->partition->send_complete(p->send_id);
     } else {
         proxy_at<N_target>(p->target_proxy, p->target_ci).receive_data(
             p->node_id, p->input_index, p->inp_name, N_target, p->region_data, p->byte_size,

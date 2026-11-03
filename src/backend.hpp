@@ -9,7 +9,6 @@
 #include <mutex>
 #include <deque>
 #include <map>
-#include <memory>
 
 #include "array_region.hpp"
 #include "opcodes.hpp"
@@ -1100,8 +1099,9 @@ class PartitionImpl {
 
     int create(ArrayRegion<N>* region, int name, DType dtype, const ArrayDecomp<N>& decomp);
     void run();
+    /// owned: data is new[]-allocated and passes to this chare (host payloads only).
     void receive_data(int node_id, int input_index, int name, int ndims, int* region_data,
-                      int64_t size, char* data);
+                      int64_t size, char* data, bool owned = false);
 #ifdef USE_KOKKOS
     void receive_data(int& node_id, int& input_index, int& name, int& ndims, int*& region_data,
                       int64_t& size, char*& data, CkDeviceBufferPost* devicePost);
@@ -1125,6 +1125,7 @@ class PartitionImpl {
     void process_get(int epoch);
     struct FragBuf {
         std::unique_ptr<char[]> data;
+        int64_t total = 0;
         int64_t got = 0;
     };
     std::map<std::pair<int, int64_t>, FragBuf> frags; // (source PE, sequence number)
