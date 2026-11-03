@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdlib>
+#include <memory>
 #include <cstring>
 #include <functional>
 #include <mutex>
@@ -394,7 +395,8 @@ struct IndexState {
     DAGNode* node = nullptr;
     bool started = false;
     std::vector<std::vector<char>> stash;
-    int req_left = 0;  // holder: requests still expected
+    std::shared_ptr<void> ctx; // the node's decoded context (executor_indexing.cpp)
+    int64_t req_left = 0; // holder: requests still expected (GATHER/SCATTER: units)
     int val_left = 0;  // target: value lists still expected
     int seg_left = 0;  // EXPAND coordinator: segment lists still expected
     bool wait_offsets = false; // EXPAND driver: segment offsets not yet received
@@ -410,7 +412,8 @@ struct IndexState {
     std::vector<std::vector<char>> reqs;   // v holder: requests, served once all arrived
     // GATHER / SCATTER
     bool gx_target = false, gx_issued = false;
-    int lmsg_left = 0, rep_left = 0;           // target: L pieces / buckets, direct copies to come
+    int64_t lmsg_left = 0;                     // target: L elements / bucket units to come
+    int rep_left = 0;                          // target: direct copies to come
     int64_t rep_elems = 0;                     // target: elements of replies to come
     char* gx_lblk = nullptr;                   // target: L values of its b range (GATHER)
     char* gx_ent = nullptr;                    // target: entry pairs grouped by holder

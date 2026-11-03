@@ -1329,6 +1329,9 @@ void ArrayDAGExecutorND<N>::mask_progress(int node_id) {
 
 namespace {
 
+// Message kinds of one index node share receive_index_msg: IxKind 1-3 (EXPAND),
+// MxKind 10-15 (COMPRESS / MASK_SCATTER), GxKind 20-29; GX_FREE is handled
+// before any node state.
 enum GxKind : int32_t {
     GX_LPIECE = 20,
     GX_BUCKET = 21,
@@ -1355,7 +1358,11 @@ struct GxHdr {
     int64_t ipc_ptr, ipc_off; // payload in an IPC slab of the sender (same host)
     int32_t ipc_slab, pad;
     char ipc_handle[64];
+    int64_t units; // share of the receiver's expected total carried by this part
 };
+
+/// Requests and scatter buckets each count kGxUnits, split among their parts.
+constexpr int64_t kGxUnits = int64_t(1) << 30;
 
 #ifdef USE_KOKKOS
 #define CT_IX_ATOMIC_ADD(p, v) Kokkos::atomic_add((p), (v))
@@ -1769,6 +1776,18 @@ int64_t gx_chunk_bytes() {
         return e && atoll(e) > 0 ? atoll(e) : 64;
     }();
     return mb << 20;
+}
+
+/// Splits n items of `ibytes` into parts of at most gx_chunk_bytes(): f(first, count, units),
+/// with the units of all parts adding up to `total`.
+template <typename F>
+void gx_split(int64_t n, int64_t ibytes, int64_t total, F&& f) {
+    int64_t per = std::max<int64_t>(1, gx_chunk_bytes() / std::max<int64_t>(ibytes, 1));
+    int64_t parts = std::max<int64_t>(1, (n + per - 1) / per);
+    for (int64_t k = 0; k < parts; ++k) {
+        int64_t a = std::min(n, k * per);
+        f(a, std::min(n, a + per) - a, total / parts + (k == 0 ? total % parts : 0));
+    }
 }
 
 int64_t gx_fdiv(int64_t a, int64_t b) { return a >= 0 ? a / b : -((-a + b - 1) / b); }
@@ -2296,6 +2315,20 @@ int64_t gx_elems(const GxCtx& c, const GxHdr& h) {
     return e;
 }
 
+/// A request to another process: its entry pairs inline, in parts.
+template <int N>
+void gx_send_req(PartitionImpl<N>* p, ArrayDAGGroup* g, int nd, const int dest[3], int node_id,
+                 const GxHdr& h, char* pairs) {
+    gx_split(h.n, 2 * sizeof(int64_t), kGxUnits, [&](int64_t a, int64_t m, int64_t u) {
+        GxHdr q = h;
+        q.n = m;
+        q.ent_off = h.ent_off + a;
+        q.units = u;
+        gx_send(p, g, nd, dest, node_id, q, pairs + a * 2 * sizeof(int64_t),
+                m * 2 * sizeof(int64_t), GX_BORROW);
+    });
+}
+
 void gx_warn_dropped(int64_t n) {
     if (n > 0)
         CkPrintf("charmnumeric: warning: %lld out-of-bounds indices ignored\n", (long long)n);
@@ -2306,12 +2339,14 @@ void gx_warn_dropped(int64_t n) {
 template <int N>
 void ArrayDAGExecutorND<N>::gx_start(DAGNode* node) {
     auto* g = static_cast<ArrayDAGGroup*>(group);
-    GxCtx c = gx_ctx(node, g);
+    IndexState<N>& st = ix_state[node->id];
+    auto ctx = std::make_shared<GxCtx>(gx_ctx(node, g));
+    st.ctx = ctx;
+    const GxCtx& c = *ctx;
     const IxSpec& s = c.s;
     bool gather = s.opc == Opcode::GATHER;
     int me[3];
     self_index(partition->nd_index(), me);
-    IndexState<N>& st = ix_state[node->id];
     st.node = node;
     st.started = true;
     int64_t s0[2], s1[2], e0[3], e1[3], p0[3], p1[3];
@@ -2334,22 +2369,16 @@ void ArrayDAGExecutorND<N>::gx_start(DAGNode* node) {
             for (int d = 0; d < c.nB; ++d)
                 nb *= e1[s.npre + d] - e0[s.npre + d];
             st.gx_lblk = gx_alloc(nb * sizeof(int64_t));
-            for (const auto& lc : c.lch) {
-                int64_t k0[3], cnt[3];
-                view_block(s.L, c.L, lc.data(), k0, cnt);
-                bool meets = true;
-                for (int d = 0; d < c.nB; ++d)
-                    meets = meets && std::max(k0[d], e0[s.npre + d]) <
-                                         std::min(k0[d] + cnt[d], e1[s.npre + d]);
-                st.lmsg_left += meets;
-            }
+            st.lmsg_left = nb; // L elements to come
+
         }
         // Holder: one request from every result chare whose slice box meets ours.
         if (N == s.data.nd && gx_data_box(c, me, s0, s1))
             for (int64_t k = 0; k < c.O.num_chares(); ++k) {
                 int ci[3];
                 c.O.chare(k, ci);
-                st.req_left += gx_e_box(c, false, ci, e0, e1) && gx_piece(c, s0, s1, e0, e1, p0, p1);
+                st.req_left += (gx_e_box(c, false, ci, e0, e1) && gx_piece(c, s0, s1, e0, e1, p0, p1)) *
+                               kGxUnits;
             }
         // L chare: send every result chare the part of its b range held here.
         int64_t k0[3], cnt[3];
@@ -2369,25 +2398,33 @@ void ArrayDAGExecutorND<N>::gx_start(DAGNode* node) {
                 }
                 if (!meets)
                     continue;
-                int64_t n = 1;
-                for (int d = 0; d < c.nB; ++d)
-                    n *= h.box1[d] - h.box0[d];
-                h.n = n;
-                char* buf = gx_pack_L(partition, c, me, h.box0, h.box1);
-                gx_send(partition, g, s.ndE, ci, node->id, h, buf, n * sizeof(int64_t), GX_GIVE);
+                int64_t row = 1;
+                for (int d = 1; d < c.nB; ++d)
+                    row *= h.box1[d] - h.box0[d];
+                int64_t r0 = h.box0[0];
+                gx_split(h.box1[0] - r0, row * sizeof(int64_t), 0, [&](int64_t a, int64_t m, int64_t) {
+                    GxHdr q = h;
+                    q.box0[0] = r0 + a;
+                    q.box1[0] = r0 + a + m;
+                    q.n = q.units = m * row;
+                    char* buf = gx_pack_L(partition, c, me, q.box0, q.box1);
+                    gx_send(partition, g, s.ndE, ci, node->id, q, buf, q.n * sizeof(int64_t),
+                            GX_GIVE);
+                });
             }
     } else {
         // Destination: one bucket from every L chare, then one reply per v chare asked.
         if (N == s.data.nd && gx_data_box(c, me, s0, s1)) {
             st.gx_target = true;
-            st.lmsg_left = (int)c.lch.size();
+            st.lmsg_left = (int64_t)c.lch.size() * kGxUnits;
         }
         // v chare: one request from every destination whose slice box meets ours.
         if (s.V.name >= 0 && N == s.V.nd && gx_e_box(c, true, me, e0, e1))
             for (int64_t k = 0; k < c.D.num_chares(); ++k) {
                 int ci[3];
                 c.D.chare(k, ci);
-                st.req_left += gx_data_box(c, ci, s0, s1) && gx_piece(c, s0, s1, e0, e1, p0, p1);
+                st.req_left += (gx_data_box(c, ci, s0, s1) && gx_piece(c, s0, s1, e0, e1, p0, p1)) *
+                               kGxUnits;
             }
         // L chare: group the block's entries by destination chare and send the groups.
         int64_t k0[3], cnt[3];
@@ -2418,12 +2455,15 @@ void ArrayDAGExecutorND<N>::gx_start(DAGNode* node) {
                 if (!gx_data_box(c, ci, s0, s1))
                     continue;
                 int64_t b = gx_bucket_of(c, ci);
-                GxHdr h = {};
-                h.kind = GX_BUCKET;
-                h.n = hist[b];
-                gx_send(partition, g, s.data.nd, ci, node->id, h,
-                        reinterpret_cast<char*>(grouped + 2 * starts[b]),
-                        hist[b] * 2 * sizeof(int64_t), GX_COPY);
+                gx_split(hist[b], 2 * sizeof(int64_t), kGxUnits, [&](int64_t a, int64_t m, int64_t u) {
+                    GxHdr h = {};
+                    h.kind = GX_BUCKET;
+                    h.n = m;
+                    h.units = u;
+                    gx_send(partition, g, s.data.nd, ci, node->id, h,
+                            reinterpret_cast<char*>(grouped + 2 * (starts[b] + a)),
+                            m * 2 * sizeof(int64_t), GX_COPY);
+                });
             }
             if (grouped != ent)
                 gx_free(reinterpret_cast<char*>(grouped));
@@ -2441,7 +2481,8 @@ void ArrayDAGExecutorND<N>::gx_progress(int node_id) {
     if (!st.started)
         return;
     auto* g = static_cast<ArrayDAGGroup*>(group);
-    GxCtx c = gx_ctx(st.node, g);
+    std::shared_ptr<void> keep = st.ctx;
+    const GxCtx& c = *static_cast<const GxCtx*>(keep.get());
     const IxSpec& s = c.s;
     bool gather = s.opc == Opcode::GATHER;
     int me[3];
@@ -2462,17 +2503,17 @@ void ArrayDAGExecutorND<N>::gx_progress(int node_id) {
         switch (h.kind) {
         case GX_LPIECE:
             gx_place_L(partition, g, c, st, m, h, e0, e1);
-            --st.lmsg_left;
+            st.lmsg_left -= h.units;
             break;
         case GX_BUCKET:
             st.gx_msgs.push_back(std::move(m));
-            --st.lmsg_left;
+            st.lmsg_left -= h.units;
             break;
         case GX_REQ:
             dispatch_elem(s.dt, [&](auto tag) {
                 gx_serve<N, decltype(tag)>(partition, g, c, node_id, me, m, h);
             });
-            --st.req_left;
+            st.req_left -= h.units;
             break;
         case GX_VAL:
             st.rep_elems -= gx_elems(c, h);
@@ -2549,11 +2590,11 @@ void ArrayDAGExecutorND<N>::gx_progress(int node_id) {
                     h.ent_ptr = reinterpret_cast<int64_t>(pairs);
                     for (int q = 0; q < c.ns; ++q)
                         h.dco[q] = ostr[c.ek[q]];
+                    h.units = kGxUnits;
                     gx_send(partition, g, s.data.nd, ci, st.node->id, h, nullptr, 0, GX_BORROW);
                 } else {
                     st.rep_elems += gx_elems(c, h);
-                    gx_send(partition, g, s.data.nd, ci, st.node->id, h, pairs,
-                            hist[b] * 2 * sizeof(int64_t), GX_BORROW);
+                    gx_send_req(partition, g, s.data.nd, ci, st.node->id, h, pairs);
                 }
             }
         } else {
@@ -2685,11 +2726,11 @@ void ArrayDAGExecutorND<N>::gx_progress(int node_id) {
                         h.ent_ptr = reinterpret_cast<int64_t>(pairs);
                         for (int q = 0; q < c.ns; ++q)
                             h.dco[q] = dco[q];
+                        h.units = kGxUnits;
                         gx_send(partition, g, s.V.nd, ci, st.node->id, h, nullptr, 0, GX_BORROW);
                     } else {
                         st.rep_elems += gx_elems(c, h);
-                        gx_send(partition, g, s.V.nd, ci, st.node->id, h, pairs,
-                                hist[b] * 2 * sizeof(int64_t), GX_BORROW);
+                        gx_send_req(partition, g, s.V.nd, ci, st.node->id, h, pairs);
                     }
                 }
             }
@@ -2728,6 +2769,7 @@ void ArrayDAGExecutorND<N>::gx_progress(int node_id) {
 // flat positions, each repeated count times. The row counts go to the first x
 // chare, which answers with every row's output offset (row-major over the
 // view); the positions then move in runs to the result tiles, as for COMPRESS.
+// Limit: a block's positions are one device buffer (its whole output count).
 
 namespace {
 
@@ -2739,6 +2781,7 @@ struct ExScanFn {
     int64_t f0, fs0, fs1; // flat view position of block element (i0, i1, i2)
     int64_t* rowpos;
     int64_t* out;
+    int64_t* pre; // optional: every element's exclusive prefix
     CT_IX_FN void operator()(const int64_t i, int64_t& upd, const bool final) const {
         int64_t i2 = i % c2, r = i / c2, i1 = r % c1, i0 = r / c1;
         T v = x[xbase + i0 * xs0 + i1 * xs1 + i2 * xs2];
@@ -2752,6 +2795,8 @@ struct ExScanFn {
         if (final) {
             if (!WRITE && i2 == 0)
                 rowpos[r] = upd;
+            if (pre)
+                pre[i] = upd;
             if (WRITE) {
                 int64_t f = f0 + i0 * fs0 + i1 * fs1 + i2;
                 for (int64_t q = 0; q < k; ++q)
@@ -2762,13 +2807,44 @@ struct ExScanFn {
     }
 };
 
+/// Output position o of a repeat-count block: the element whose prefix range holds o.
+struct ExFillFn {
+    const int64_t* pre;
+    int64_t n, c1, c2, f0, fs0, fs1;
+    int64_t* out;
+    CT_IX_FN void operator()(const int64_t o) const {
+        int64_t lo = 0, hi = n;
+        while (hi - lo > 1) {
+            int64_t mid = (lo + hi) / 2;
+            if (pre[mid] <= o)
+                lo = mid;
+            else
+                hi = mid;
+        }
+        int64_t i2 = lo % c2, r = lo / c2;
+        out[o] = f0 + (r / c1) * fs0 + (r % c1) * fs1 + i2;
+    }
+};
+
+/// Total count and positions (in *cbuf, one buffer holding the block's whole output)
+/// of a block. Repeat counts fill the output in parallel from the per-element prefixes.
 template <int N, typename T, bool COUNT>
-int64_t ex_scan(PartitionImpl<N>* p, const ExScanFn<T, COUNT, false>& f, int64_t n, char** cbuf) {
+int64_t ex_scan(PartitionImpl<N>* p, ExScanFn<T, COUNT, false> f, int64_t n, char** cbuf) {
+    char* pre = COUNT ? mx_alloc(n * sizeof(int64_t)) : nullptr;
+    f.pre = reinterpret_cast<int64_t*>(pre);
     int64_t total = gx_scan(p, n, f);
     *cbuf = mx_alloc(total * sizeof(int64_t));
-    ExScanFn<T, COUNT, true> w{f.x,  f.xbase, f.xs0, f.xs1, f.xs2,   f.c1,
-                               f.c2, f.f0,    f.fs0, f.fs1, nullptr, reinterpret_cast<int64_t*>(*cbuf)};
-    gx_scan(p, n, w);
+    if (COUNT) {
+        gx_for(p, total,
+               ExFillFn{f.pre, n, f.c1, f.c2, f.f0, f.fs0, f.fs1, reinterpret_cast<int64_t*>(*cbuf)});
+        compute_fence(p);
+        free_buffer(pre);
+    } else {
+        ExScanFn<T, COUNT, true> w{f.x,  f.xbase, f.xs0, f.xs1, f.xs2,   f.c1,
+                                   f.c2, f.f0,    f.fs0, f.fs1, nullptr, reinterpret_cast<int64_t*>(*cbuf),
+                                   nullptr};
+        gx_scan(p, n, w);
+    }
     return total;
 }
 
@@ -2796,12 +2872,12 @@ void ex_scan_block(PartitionImpl<N>* p, ArrayDAGGroup* g, IndexState<N>& st, con
     if (s.mode == 1)
         total = ex_scan<N, T, true>(p,
                                     {x, xb.base, xb.str[0], xb.str[1], xb.str[2], xb.cnt[1],
-                                     xb.cnt[2], f0, vs[1] * vs[2], vs[2], rowpos, nullptr},
+                                     xb.cnt[2], f0, vs[1] * vs[2], vs[2], rowpos, nullptr, nullptr},
                                     xb.size(), &st.cbuf);
     else
         total = ex_scan<N, T, false>(p,
                                      {x, xb.base, xb.str[0], xb.str[1], xb.str[2], xb.cnt[1],
-                                      xb.cnt[2], f0, vs[1] * vs[2], vs[2], rowpos, nullptr},
+                                      xb.cnt[2], f0, vs[1] * vs[2], vs[2], rowpos, nullptr, nullptr},
                                      xb.size(), &st.cbuf);
 #ifdef USE_KOKKOS
     mx_to_host(p, reinterpret_cast<char*>(st.rowpos.data()), drow, nrows * sizeof(int64_t));
@@ -2840,11 +2916,13 @@ void ArrayDAGExecutorND<N>::execute_index_node(DAGNode* node) {
         return;
     }
     auto* g = static_cast<ArrayDAGGroup*>(group);
-    IxCtx c = make_ctx(node, g);
+    IndexState<N>& st = ix_state[node->id];
+    auto ctx = std::make_shared<IxCtx>(make_ctx(node, g));
+    st.ctx = ctx;
+    const IxCtx& c = *ctx;
     const IxSpec& s = c.s;
     int me[3];
     self_index(partition->nd_index(), me);
-    IndexState<N>& st = ix_state[node->id];
     st.node = node;
     st.started = true;
 
@@ -2906,7 +2984,8 @@ void ArrayDAGExecutorND<N>::index_progress(int node_id) {
         return;
     }
     auto* g = static_cast<ArrayDAGGroup*>(group);
-    IxCtx c = make_ctx(st.node, g);
+    std::shared_ptr<void> keep = st.ctx;
+    const IxCtx& c = *static_cast<const IxCtx*>(keep.get());
     std::vector<std::vector<char>> msgs;
     msgs.swap(st.stash);
     for (auto& m : msgs) {
