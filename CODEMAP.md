@@ -163,14 +163,14 @@ Bit-exact NumPy mirror of `src/creation_kernels.hpp` (Philox4x32-10, software lo
 | `cross_set_region_send<N_src,N_tgt,T>()` | 320 | Cross-dim SET_REGION |
 | `ReduceContrib` | 264 | 32-byte dot (REDUCE) contribution, sent to chare 0 |
 
-### `decomposition_solver.hpp` — Standalone decomposition solver (2076 lines)
+### `decomposition_solver.hpp` — Standalone decomposition solver (2094 lines)
 | Symbol | Line | Description |
 |--------|------|-------------|
-| `decomposition_solver::compute_decompositions()` | 181 | Charm-free decomposition solver used by the runtime and standalone tests |
-| `detail::balanced_tile()` | 87 | Near-equal tiles: ceil(n/k) >= `CT_MIN_TILE_*` along some dim rounded to 1024/32/16 (1-/2-/3-D, at most the min tile), at most `odf * PEs` tiles; the one minimizing the busiest PE's elements under `chare_home_pe` (`busiest_pe_elems()`) replaces the old smallest power-of-two multiple of `CT_MIN_TILE_*` when it unloads the busiest PE by 10% (never on 1 PE) |
-| `assign_class_tiles` (in `compute_decompositions`) | 401 | Tile classes: arrays joined by unit-stride elementwise/COPY/SET_REGION accesses and REDUCE operands share one tile (members under half the largest one's size keep their own) — the heaviest array from an earlier DAG (or TRANSPOSE result) in the class, else the balanced tile of the class's largest extents capped by strided accesses; the offset DP then aligns them |
-| `detail::for_each_node_topo()` | 145 | Topological DAG traversal helper for solver passes |
-| `collect_unionable_nonfixed_leaves()` | 741 | Union-find guard: only unions zero-shift, same-tile, non-fixed temp leaves |
+| `decomposition_solver::compute_decompositions()` | 191 | Charm-free decomposition solver used by the runtime and standalone tests; results do not depend on map iteration order (sorted names, node ids, class reps; anchor ties go to the lower name) |
+| `detail::balanced_tile()` | 91 | Near-equal tiles: ceil(n/k) >= `CT_MIN_TILE_*` along some dim rounded to 1024/32/16 (1-/2-/3-D, at most the min tile), at most `odf * PEs` tiles; the one minimizing the busiest PE's elements under `chare_home_pe` (`busiest_pe_elems()`) replaces the old smallest power-of-two multiple of `CT_MIN_TILE_*` only when it unloads the busiest PE by 20% (never on 1 PE); exact per-PE sums when at most ~1M chare visits, else tiles per PE x full tile, for every candidate alike |
+| `assign_class_tiles` (in `compute_decompositions`) | 411 | Tile classes: arrays joined by unit-stride elementwise/COPY/SET_REGION accesses and REDUCE operands share one tile (members under half the largest one's size keep their own) — the heaviest array from an earlier DAG (or TRANSPOSE result) in the class, else the balanced tile of the class's largest extents capped by strided accesses; the offset DP then aligns them |
+| `detail::for_each_node_topo()` | 151 | Topological DAG traversal helper for solver passes |
+| `collect_unionable_nonfixed_leaves()` | 758 | Union-find guard: only unions zero-shift, same-tile, non-fixed temp leaves |
 
 ### `array_region.hpp` — N-D regions & decomposition (449+ lines)
 | Symbol | Line | Description |
@@ -179,7 +179,7 @@ Bit-exact NumPy mirror of `src/creation_kernels.hpp` (Philox4x32-10, software lo
 | `ArrayDecomp<N>` | 294 | Tile decomposition — `default_decomp()`:303, `offset_decomp()`:312, `to_global/local()`:322/339, `num_chares()`:350, `chare_region_global/local()`:360/371 |
 | `MemRef<N,T>` | 407 | MLIR memref descriptor (allocated, aligned, offset, sizes, strides) |
 | `ChareIndex<N>` | — | N-D chare array index |
-| `chare_home_pe()` | 454 | Home PE of a chare (`PartitionMap`): for 2^m PEs a GF(2)-linear map of the index bits, so aligned boxes (2x2, 4x4, 4x1, 2x2x2, ...) spread evenly; 1-D round robin |
+| `chare_home_pe()` | 454 | Home PE of a chare (`PartitionMap`): for 2^m PEs a GF(2)-linear map of the index bits, so aligned boxes (2x2, 4x4, 4x1, 2x2x2, ...) spread evenly; other PE counts a linear map with strides coprime to the PE count; 1-D round robin |
 
 ### `opcodes.hpp` — Operation codes
 | Symbol | Line | Description |
@@ -242,10 +242,10 @@ Started from `set_proxies`, off the CCS-ready path: rank 0 of each process expor
 | `dag_group_receive.cpp` | DAG reception and dispatch |
 | `execute_node.cpp` | `execute_node_nd<N,T>()` — dispatches JIT kernels, handles MATMUL/REDUCE/TILE/DIAG |
 | `execute_node_regions.cpp` | Region extraction from AST |
-| `executor_core.cpp` | `execute_dag_node()`, remote input sends. Debug builds abort when an input/output buffer's decomposition differs from array_meta (`check_buffer_decomp`: receivers without the buffer plan from array_meta) or a planned send falls outside the sender's buffer (it would be dropped and the receiver would wait) |
+| `executor_core.cpp` | `execute_dag_node()`, remote input sends. Debug builds abort when an input/output buffer's decomposition (tile, shape, offset) differs from array_meta (`check_buffer_decomp`: receivers without the buffer plan from array_meta) or a planned send falls outside the sender's buffer (it would be dropped and the receiver would wait) |
 | `executor_matmul.cpp` | Matrix-vector multiply execution |
 | `executor_matmatmul.cpp` | Matrix-matrix multiply (SUMMA) execution |
-| `executor_reduce.cpp` | REDUCE (1-D dot): local dot per chare, partials to chare 0. Operands with different layouts (tile, offset or shape): rhs first moves to lhs's tiles through the elementwise planner (`start_realigned_dot` in executor_core.cpp, `finish_realigned_dot`) |
+| `executor_reduce.cpp` | REDUCE (1-D dot): local dot per chare, partials to chare 0. Operands with different layouts (tile, offset or shape): rhs first moves to lhs's tiles through the elementwise planner (`start_realigned_dot` in executor_core.cpp, `finish_realigned_dot`). Operands must have the node's dtype (the frontend promotes them); otherwise it aborts |
 | `executor_reduction.cpp` | REDUCTION/BINCOUNT: per-chare partials (Kokkos on GPU) sent point-to-point to the output chares (`receive_reduce_partial`) |
 | `executor_reducer.cpp` | `determine_dtype<N>()` (dtype of a node from its AST or arrays) |
 | `executor_transfer.cpp` | Cross-partition data transfer |
@@ -267,7 +267,7 @@ Started from `set_proxies`, off the CCS-ready path: rank 0 of each process expor
 
 ## Standalone C++ Tests (`example/charmnumeric/tests/`)
 
-### `test_compute_decompositions.cpp` — Standalone decomposition coverage (599 lines)
+### `test_compute_decompositions.cpp` — Standalone decomposition coverage (621 lines)
 | Symbol | Line | Description |
 |--------|------|-------------|
 | `test_shifted_copy_uses_absolute_offset()` | 131 | Checks lifted absolute offset for a simple shifted copy |
@@ -276,11 +276,11 @@ Started from `set_proxies`, off the CCS-ready path: rank 0 of each process expor
 | `test_jacobi2d_temp_offset()` | 262 | 2D Jacobi temp regression: offset should be `(1,1)` |
 | `test_jacobi3d_temp_offset()` | 320 | 3D Jacobi temp regression: offset should be `(1,1,1)` |
 | `test_strided_copy_reduces_tile_and_sets_offset()` | 377 | Stride-2 access regression: tile reduction and absolute offset lifting |
-| `test_balanced_tiles()` | 453 | `balanced_tile`: 800^3 on 4 PEs -> 400, 10000^2 -> 2528; powers of two kept where they balance as well, and on 1 PE |
-| `test_chare_home_pe_balance()` | 470 | `chare_home_pe` spreads 2x2, 4x4, 4x1, 2x2x2, ... chare boxes evenly on 4 and 8 PEs |
-| `test_misaligned_after_flush_takes_source_tile()` | 496 | A result read through shifted views of an earlier DAG's array gets that array's tile and the view offset |
-| `test_reduce_operands_share_layout()` | 520 | A new REDUCE operand takes the other operand's tile and offset |
-| `test_small_class_member_keeps_own_tile()` | 549 | A (160,365,240) array written into a slice of a (1120,365,240) one keeps its own tile |
+| `test_balanced_tiles()` | 453 | `balanced_tile`: 1100^3 on 4 PEs -> 560, 10000^2 -> 2528; powers of two kept unless 20% better (800^3, (2555,160,240)) and on 1 PE |
+| `test_chare_home_pe_balance()` | 475 | `chare_home_pe` spreads 2x2, 4x4, 4x1, 2x2x2, ... chare boxes evenly on 4 and 8 PEs, and thin boxes over all of 3, 6 or 12 PEs |
+| `test_misaligned_after_flush_takes_source_tile()` | 518 | A result read through shifted views of an earlier DAG's array gets that array's tile and the view offset |
+| `test_reduce_operands_share_layout()` | 542 | A new REDUCE operand takes the other operand's tile and offset |
+| `test_small_class_member_keeps_own_tile()` | 571 | A (160,365,240) array written into a slice of a (1120,365,240) one keeps its own tile |
 
 ### `backend.ci` — Charm++ interface (86 lines)
 Module `charmnumeric` (depends on `charmtyles`). Mainchare `Main`. Group `ArrayDAGGroup : DAGGroup` with entries: `set_proxies()`, `proxies_ready()` [reduction], `receive_dag()`, `receive_get_request()`, `gather()`. Arrays `Partition1D/2D/3D` with entries: `run()`, `receive_data()` [nocopy/nocopydevice], `send_complete()`, `receive_ipc()`, `receive_staged()` (GPU), `comm_done()`, `reduce_result()`, `receive_reduce_partial()`, `receive_linalg()`, `receive_shape()`, `receive_sort_msg()` (Partition1D).
