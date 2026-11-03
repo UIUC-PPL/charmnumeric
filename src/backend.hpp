@@ -1222,6 +1222,12 @@ inline void release_device_caches() {
     auto& pool = comm_pool();
     std::lock_guard<std::mutex> lock(pool.mu);
     comm_release_all(pool);
+#ifdef USE_NVIDIA
+    int dev = 0;
+    cudaMemPool_t mp;
+    if (cudaGetDevice(&dev) == cudaSuccess && cudaDeviceGetDefaultMemPool(&mp, dev) == cudaSuccess)
+        cudaMemPoolTrimTo(mp, 0);
+#endif
 }
 
 /// Frees the least recently freed large block or retired array of this PE.
