@@ -150,7 +150,11 @@ inline void for_each_node_topo(DAG* dag, Fn&& fn) {
     std::unordered_map<DAGNode*, int> remaining_parents;
     remaining_parents.reserve(dag->nodes.size());
 
-    for (auto& [id, node] : dag->nodes) {
+    // ascending node ids: every PE visits the nodes in the same order
+    std::vector<std::pair<int, DAGNode*>> by_id(dag->nodes.begin(), dag->nodes.end());
+    std::sort(by_id.begin(), by_id.end(),
+              [](auto const& a, auto const& b) { return a.first < b.first; });
+    for (auto& [id, node] : by_id) {
         remaining_parents[node] = node->num_parents;
         if (node->num_parents == 0)
             topo_queue.push(node);
@@ -454,7 +458,7 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                     elems *= std::max(1, m.global_shape[d]);
                 return elems;
             };
-            std::unordered_map<int, TileClass> classes;
+            std::map<int, TileClass> classes;
             for (auto& [name, meta] : array_meta) {
                 if (!parent.count(name))
                     continue;
@@ -476,7 +480,8 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                     for (int d = 0; d < meta.ndims; ++d)
                         c.envelope.global_shape[d] =
                             std::max(c.envelope.global_shape[d], meta.global_shape[d]);
-                    if (anchors.count(name) && elems > c.anchor_elems) {
+                    if (anchors.count(name) && (elems > c.anchor_elems ||
+                                                (elems == c.anchor_elems && name < c.anchor))) {
                         c.anchor = name;
                         c.anchor_elems = elems;
                     }
@@ -724,7 +729,13 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                 uf_rank[rx]++;
         };
 
+        // results below must not depend on the map's iteration order
+        std::vector<int> sorted_names;
         for (auto& [name, meta] : array_meta)
+            sorted_names.push_back(name);
+        std::sort(sorted_names.begin(), sorted_names.end());
+
+        for (int name : sorted_names)
             uf_make(name);
 
         std::unordered_set<int> source_arrays;
@@ -890,7 +901,8 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
         };
         std::unordered_map<int, ClassInfo> class_info;
 
-        for (auto& [name, meta] : array_meta) {
+        for (int name : sorted_names) {
+            auto& meta = array_meta[name];
             int rep = uf_find(name);
             auto it = class_info.find(rep);
             bool is_fixed = meta.decomp_final || source_arrays.count(name);
@@ -1139,11 +1151,11 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
         std::unordered_set<int> cyclic_components;
         int num_components = 0;
 
-        std::unordered_set<int> all_classes;
+        std::set<int> all_classes;
         for (auto& [name, _] : array_meta)
             all_classes.insert(uf_find(name));
 
-        std::unordered_map<int, int> comp_root;
+        std::map<int, int> comp_root;
 
         for (int cls : all_classes) {
             if (comp_id.count(cls))
@@ -1804,7 +1816,7 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                 std::array<int, 3> desired_anchor;
                 int64_t weight;
             };
-            std::unordered_map<int, std::vector<DesiredOffset>> all_desired;
+            std::map<int, std::vector<DesiredOffset>> all_desired;
 
             auto collect_fallback_producer =
                 [&](auto&& self, ASTNode* node, int out_name, int nd, int out_tile) -> void {

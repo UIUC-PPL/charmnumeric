@@ -110,7 +110,7 @@ ArrayDAGGroup::~ArrayDAGGroup() {
 void ArrayDAGGroup::compute_decompositions(DAG* dag) {
     // Solve over the arrays this DAG references only: array_meta keeps every array
     // ever created, and the others are all decomp_final (singleton classes).
-    std::unordered_map<int, ArrayMetadata> sub;
+    std::map<int, ArrayMetadata> sub; // ordered: every PE solves alike
     std::unordered_set<ASTNode*> seen;
     std::vector<ASTNode*> stack;
     for (auto& [id, node] : dag->nodes)
