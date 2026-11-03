@@ -49,6 +49,9 @@ PartitionImpl<N>::~PartitionImpl() {
             retired_bytes() -= arr->local_size() * arr->elem_size();
             delete arr;
         }
+#ifdef USE_NVIDIA
+    gpu_ipc_cancel(this); // sends waiting for an IPC block; their buffers are in pending_sends
+#endif
 #ifdef USE_KOKKOS
     Kokkos::fence("ct_partition_exit"); // packs and copies on the comm stream
     for (auto& [id, ptr] : pending_sends) {
