@@ -441,8 +441,14 @@ void scan_finish(PartitionImpl<N>* partition, CTArrayBase<N>* in, CTArrayBase<N>
     auto rb_it = comm.remote_buffers.find(0);
     if (rb_it != comm.remote_buffers.end() && !rb_it->second.empty()) {
         carry_buf = pooled_alloc(g.lines * (int64_t)sizeof(Tout));
+        // in source order along the axis: float carries do not depend on arrival order
+        auto& rbs = rb_it->second;
+        std::sort(rbs.begin(), rbs.end(),
+                  [axis](const RemoteBuffer<N>& x, const RemoteBuffer<N>& y) {
+                      return x.region.start[axis] < y.region.start[axis];
+                  });
         bool init = true;
-        for (auto& rb : rb_it->second) {
+        for (auto& rb : rbs) {
             fold_totals<N, Tout>(partition, reinterpret_cast<Tout*>(carry_buf),
                                  reinterpret_cast<const Tout*>(rb.data), g.lines, op, init);
             init = false;

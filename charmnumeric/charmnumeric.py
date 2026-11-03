@@ -854,8 +854,11 @@ def _scan(name, a, axis=None, dtype=None, out=None):
         # NumPy's accumulation dtype (int64/uint64 for bool and small ints)
         dtype = getattr(np, name)(np.zeros(1, a.dtype)).dtype
         odt = np.dtype(out.dtype) if _is_array_nd(out) else None
-        if odt is not None and dtype.kind in "iu" and odt.kind in "iu":
-            dtype = odt  # same result modulo 2**bits, no int64 temporary
+        if odt is not None:
+            # NumPy accumulates in promote_types(default, out.dtype); for two integer
+            # types out's dtype gives the same result modulo 2**bits
+            ints = dtype.kind in "iu" and odt.kind in "iu"
+            dtype = odt if ints else np.promote_types(dtype, odt)
     dtype = _normalize_dtype(dtype)
     if a.dtype != dtype and not (dtype in _SCAN_WIDE and a.dtype in _SCAN_NARROW):
         a = _astype(a, dtype)  # SCAN casts the narrow integer inputs itself
