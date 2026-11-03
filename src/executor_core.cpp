@@ -2,6 +2,7 @@
 #include "dispatch.hpp"
 
 #include <cstring>
+#include <string>
 #include <unordered_set>
 
 template <int N, typename T>
@@ -167,13 +168,20 @@ static void check_buffer_decomp(ArrayDAGGroup* group, int name, const ArrayDecom
     auto it = group->array_meta.find(name);
     if (it == group->array_meta.end())
         return;
-    bool same = it->second.tile == decomp.tile;
+    auto const& m = it->second;
+    bool same = m.tile == decomp.tile;
     for (int d = 0; d < N; ++d)
-        same &= it->second.offset[d] == decomp.offset[d];
-    if (!same)
-        CkAbort("array %d: buffer decomposition (tile %d, offset %d) != metadata (tile %d, "
-                "offset %d)", name, decomp.tile, decomp.offset[0], it->second.tile,
-                it->second.offset[0]);
+        same &= m.offset[d] == decomp.offset[d] && m.global_shape[d] == decomp.global_shape[d];
+    if (same)
+        return;
+    std::string got, want;
+    for (int d = 0; d < N; ++d) {
+        got += " " + std::to_string(decomp.global_shape[d]) + "@" +
+               std::to_string(decomp.offset[d]);
+        want += " " + std::to_string(m.global_shape[d]) + "@" + std::to_string(m.offset[d]);
+    }
+    CkAbort("array %d: buffer decomposition (tile %d, shape@offset%s) != metadata (tile %d, "
+            "shape@offset%s)", name, decomp.tile, got.c_str(), m.tile, want.c_str());
 #endif
 }
 
