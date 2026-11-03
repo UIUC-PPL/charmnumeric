@@ -458,7 +458,8 @@ void test_balanced_tiles() {
     expect_eq("4096^2 on 4 PEs", balanced_tile({4096, 4096, 0}, 2, 16, 4, 1024), 1024);
     expect_eq("4096^2 on 1 PE", balanced_tile({4096, 4096, 0}, 2, 4, 1, 1024), 2048);
     expect_eq("10000^2 on 4 PEs", balanced_tile({10000, 10000, 0}, 2, 16, 4, 1024), 2528);
-    expect_eq("1500^2 on 4 PEs", balanced_tile({1500, 1500, 0}, 2, 16, 4, 1024), 768);
+    expect_eq("1500^2 on 4 PEs", balanced_tile({1500, 1500, 0}, 2, 16, 4, 1024), 1024);
+    expect_eq("365x1x240 on 4 PEs", balanced_tile({365, 1, 240}, 3, 16, 4, 128), 128);
     expect_eq("small array", balanced_tile({300, 200, 0}, 2, 16, 4, 1024), 1024);
     // 192 would leave a 48-wide slab on one PE; the power of two is as good here
     expect_eq("160x365x240 on 4 PEs", balanced_tile({160, 365, 240}, 3, 16, 4, 128), 128);
@@ -544,6 +545,32 @@ void test_reduce_operands_share_layout() {
 
     delete dag;
 }
+
+void test_small_class_member_keeps_own_tile() {
+    std::cout << "=== test_small_class_member_keeps_own_tile ===" << std::endl;
+
+    constexpr int BIG = 1;
+    constexpr int SMALL = 2;
+    constexpr int SET = 3;
+
+    // SMALL is written into a slice of BIG: one tile class, but a tile sized for BIG
+    // would leave SMALL on one or two PEs.
+    MetaMap meta;
+    meta[BIG] = make_meta(3, {1120, 365, 240}, {0, 0, 0}, 0, false);
+    meta[SMALL] = make_meta(3, {160, 365, 240}, {0, 0, 0}, 0, false);
+    ASTNode* set = make_set_region(SET, make_leaf(BIG, 3),
+                                   make_region<3>({160, 0, 0}, {320, 365, 240}, {1, 1, 1}),
+                                   make_leaf(SMALL, 3), /*ndims=*/3);
+    DAG* dag = make_single_node_dag({set});
+
+    decomposition_solver::compute_decompositions(meta, dag, /*odf=*/4, /*num_pes=*/4);
+
+    expect_eq("SMALL.tile", meta.at(SMALL).tile,
+              decomposition_solver::detail::balanced_tile({160, 365, 240}, 3, 16, 4, 64));
+    expect_true("BIG has another tile", meta.at(BIG).tile != meta.at(SMALL).tile);
+
+    delete dag;
+}
 } // namespace
 
 int main() {
@@ -560,6 +587,7 @@ int main() {
         test_chare_home_pe_balance();
         test_misaligned_after_flush_takes_source_tile();
         test_reduce_operands_share_layout();
+        test_small_class_member_keeps_own_tile();
     } catch (const std::exception& ex) {
         std::cerr << "test_compute_decompositions failed: " << ex.what() << std::endl;
         return 1;

@@ -80,10 +80,10 @@ inline int64_t busiest_pe_elems(const std::array<int, 3>& shape, int ndims, int 
     return busiest;
 }
 
-// Near-equal tiles: ceil(n / k) along some dimension, rounded up to a small multiple,
-// at most max_tiles of them; the one that minimizes the busiest PE's elements (near-ties:
-// tiles of at least min_tile, then more tiles) replaces the smallest power-of-two
-// multiple of min_tile within max_tiles when it unloads the busiest PE by 10%.
+// Near-equal tiles: ceil(n / k) >= min_tile along some dimension, rounded up to a small
+// multiple, at most max_tiles of them; the one that minimizes the busiest PE's elements
+// (near-ties: more tiles) replaces the smallest power-of-two multiple of min_tile within
+// max_tiles when it unloads the busiest PE by 10%.
 inline int balanced_tile(const std::array<int, 3>& shape, int ndims, int64_t max_tiles,
                          int num_pes, int min_tile) {
     int smax = 1;
@@ -112,37 +112,27 @@ inline int balanced_tile(const std::array<int, 3>& shape, int ndims, int64_t max
         return cache[key] = pow2;
 
     int align = std::max(1, std::min(ndims == 1 ? 1024 : ndims == 2 ? 32 : 16, min_tile));
-    int floor_tile = std::max(1, (min_tile + 1) / 2);
     std::set<int> cands;
     for (int d = 0; d < ndims; ++d)
         for (int64_t k = 1; k <= std::min<int64_t>(std::max<int64_t>(1, max_tiles), 256); ++k) {
             int64_t t = ((std::max(1, shape[d]) + k - 1) / k + align - 1) / align * align;
-            if (t < floor_tile)
+            if (t < min_tile)
                 break;
             cands.insert((int)std::min<int64_t>(t, std::numeric_limits<int>::max()));
         }
     cands.insert((smax + align - 1) / align * align);
     int best = -1;
     int64_t best_load = 0, best_count = 0;
-    bool best_full = false;
     for (auto it = cands.rbegin(); it != cands.rend(); ++it) {
         int t = *it;
         int64_t count = tile_count(shape, ndims, t);
         if (count > max_tiles && best >= 0)
             continue;
         int64_t load = busiest_pe_elems(shape, ndims, t, key.num_pes);
-        bool full = t >= min_tile;
-        bool better;
-        if (best < 0 || load < best_load * 0.98)
-            better = true;
-        else if (load > best_load * 1.02)
-            better = false;
-        else
-            better = full != best_full ? full : count > best_count;
-        if (better) {
+        if (best < 0 || load < best_load * 0.98 ||
+            (load <= best_load * 1.02 && count > best_count)) {
             best = t;
             best_load = load;
-            best_full = full;
             best_count = count;
         }
     }
@@ -448,33 +438,51 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
             for (auto& [a, b] : unit_links)
                 unite(a, b);
 
+            // Members under half the largest one's size keep their own tile: a class
+            // tile sized for a big array would leave a small one on few PEs.
             struct TileClass {
-                std::vector<int> members;
+                std::vector<std::pair<int, int64_t>> members;
+                int64_t max_elems = 0;
                 int anchor = -1;
                 int64_t anchor_elems = -1;
                 int cap = std::numeric_limits<int>::max();
                 ArrayMetadata envelope{};
+            };
+            auto elems_of = [](const ArrayMetadata& m) {
+                int64_t elems = 1;
+                for (int d = 0; d < m.ndims; ++d)
+                    elems *= std::max(1, m.global_shape[d]);
+                return elems;
             };
             std::unordered_map<int, TileClass> classes;
             for (auto& [name, meta] : array_meta) {
                 if (!parent.count(name))
                     continue;
                 auto& c = classes[find(name)];
-                if (c.members.empty())
-                    c.envelope = meta;
-                c.members.push_back(name);
-                for (int d = 0; d < meta.ndims; ++d)
-                    c.envelope.global_shape[d] =
-                        std::max(c.envelope.global_shape[d], meta.global_shape[d]);
-                int64_t elems = 1;
-                for (int d = 0; d < meta.ndims; ++d)
-                    elems *= std::max(1, meta.global_shape[d]);
-                if (anchors.count(name) && elems > c.anchor_elems) {
-                    c.anchor = name;
-                    c.anchor_elems = elems;
+                int64_t elems = elems_of(meta);
+                c.members.push_back({name, elems});
+                c.max_elems = std::max(c.max_elems, elems);
+            }
+            for (auto& [rep, c] : classes) {
+                auto members = std::move(c.members);
+                c.members.clear();
+                for (auto [name, elems] : members) {
+                    if (2 * elems < c.max_elems)
+                        continue;
+                    auto& meta = array_meta[name];
+                    if (c.members.empty())
+                        c.envelope = meta;
+                    c.members.push_back({name, elems});
+                    for (int d = 0; d < meta.ndims; ++d)
+                        c.envelope.global_shape[d] =
+                            std::max(c.envelope.global_shape[d], meta.global_shape[d]);
+                    if (anchors.count(name) && elems > c.anchor_elems) {
+                        c.anchor = name;
+                        c.anchor_elems = elems;
+                    }
+                    if (auto cap = tile_cap.find(name); cap != tile_cap.end())
+                        c.cap = std::min(c.cap, cap->second);
                 }
-                if (auto cap = tile_cap.find(name); cap != tile_cap.end())
-                    c.cap = std::min(c.cap, cap->second);
             }
 
             bool changed = false;
@@ -488,7 +496,7 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                     auto& a = array_meta[c.anchor];
                     anchor_tiles = detail::tile_count(a.global_shape, a.ndims, a.tile);
                 }
-                for (int name : c.members) {
+                for (auto [name, elems] : c.members) {
                     auto& meta = array_meta[name];
                     if (c.anchor >= 0)
                         anchored.insert(name);
