@@ -499,6 +499,8 @@ class ArrayDAGGroup : public CBase_ArrayDAGGroup {
     void set_proxies(CkArrayID p1, CkArrayID p2, CkArrayID p3);
     // Reduction target: all PEs have proxies, register CCS handlers
     void proxies_ready();
+    // After the server is ready: BLAS handles and cached JIT kernels (see CODEMAP)
+    void prewarm();
 
     // Unified DAG handling — dispatches to all relevant partition types
     void receive_dag(int epoch, int size, char* serialized_dag);

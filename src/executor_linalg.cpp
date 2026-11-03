@@ -583,8 +583,31 @@ struct LaHandles {
     cublasHandle_t blas = nullptr;
 };
 
-static LaHandles& la_handles(cudaStream_t st) {
+static LaHandles& la_slot() {
     thread_local LaHandles h; // per PE
+    return h;
+}
+
+/// Creates the handles unless they exist; false (nothing kept) on failure.
+static bool la_try_create() {
+    LaHandles& h = la_slot();
+    if (h.solver != nullptr)
+        return true;
+    cusolverDnHandle_t solver = nullptr;
+    cublasHandle_t blas = nullptr;
+    if (cusolverDnCreate(&solver) != CUSOLVER_STATUS_SUCCESS)
+        return false;
+    if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS) {
+        cusolverDnDestroy(solver);
+        return false;
+    }
+    h.solver = solver;
+    h.blas = blas;
+    return true;
+}
+
+static LaHandles& la_handles(cudaStream_t st) {
+    LaHandles& h = la_slot();
     if (h.solver == nullptr) {
         CT_CUSOLVER_CHECK(cusolverDnCreate(&h.solver));
         CT_CUBLAS_CHECK(cublasCreate(&h.blas));
@@ -1215,3 +1238,28 @@ template void ArrayDAGExecutorND<3>::on_linalg_msg(int, char*, int64_t);
 template void PartitionImpl<1>::receive_linalg(int, int64_t, char*);
 template void PartitionImpl<2>::receive_linalg(int, int64_t, char*);
 template void PartitionImpl<3>::receive_linalg(int, int64_t, char*);
+
+#ifdef USE_NVIDIA
+double ct_prewarm_blas() {
+    double t0 = CkWallTimer();
+    bool la = la_try_create();
+    cublasHandle_t h = ct_try_cublas();
+    double t1 = CkWallTimer();
+    // a first GEMM initializes cuBLAS internals and loads its kernels
+    void* p = nullptr;
+    if (la && h && cublasSetStream(h, nullptr) == CUBLAS_STATUS_SUCCESS &&
+        cudaMalloc(&p, 12 * sizeof(double)) == cudaSuccess) {
+        cudaMemset(p, 0, 12 * sizeof(double));
+        auto* f = static_cast<float*>(p);
+        auto* d = static_cast<double*>(p);
+        const float f1 = 1, f0 = 0;
+        const double d1 = 1, d0 = 0;
+        cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, 2, 2, 2, &f1, f, 2, f + 4, 2, &f0, f + 8, 2);
+        cublasDgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, 2, 2, 2, &d1, d, 2, d + 4, 2, &d0, d + 8, 2);
+        cudaStreamSynchronize(nullptr);
+        cudaFree(p);
+    }
+    cudaGetLastError(); // a failure above must not show up in later error checks
+    return 1e3 * (t1 - t0);
+}
+#endif
