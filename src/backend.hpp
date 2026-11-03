@@ -791,8 +791,12 @@ class PartitionImpl {
         arr->dtype = dtype_of<T>();
 
 #ifdef USE_KOKKOS
-        if (zero)
+        if (zero) {
+#ifdef USE_NVIDIA
+            default_after_compute(); // the retired array's last kernels ran on the compute stream
+#endif
             Kokkos::deep_copy(arr->d_view, T(0));
+        }
 #ifdef USE_NVIDIA
         else
             compute_after_others(); // e.g. a pack of the retired array on the comm stream
