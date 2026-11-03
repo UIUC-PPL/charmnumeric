@@ -187,8 +187,8 @@ inline bool device_cache_room(int64_t cached) {
     return cached <= device_cache_floor() || device_free() >= device_reserve();
 }
 
-/// Evicts cached blocks and retired arrays, oldest first, until `bytes` and a margin
-/// fit in free device memory (defined below).
+/// Evicts cached blocks and retired arrays, oldest first, while the caches hold more than
+/// device_cache_floor() and `bytes` plus device_reserve() do not fit (defined below).
 inline void device_make_room(int64_t bytes);
 
 /// Frees the cached message buffers and this PE's retired arrays (defined below).
@@ -1262,18 +1262,18 @@ inline bool evict_oldest_cached() {
     return true;
 }
 
+/// Retired arrays and cached large blocks of this process.
+inline int64_t device_cached() {
+    auto& pool = comm_pool();
+    std::lock_guard<std::mutex> lock(pool.mu);
+    return retired_device_bytes() + pool.large_cached;
+}
+
 inline void device_make_room(int64_t bytes) {
 #ifdef USE_NVIDIA
-    int64_t cached = retired_device_bytes();
-    {
-        auto& pool = comm_pool();
-        std::lock_guard<std::mutex> lock(pool.mu);
-        cached += pool.large_cached;
-    }
-    if (cached <= device_cache_floor())
-        return; // a failed allocation still releases everything
-    int64_t need = bytes + device_total() / 32;
-    while (device_free() < need && evict_oldest_cached()) {
+    int64_t need = bytes + device_reserve();
+    while (device_cached() > device_cache_floor() && device_free() < need &&
+           evict_oldest_cached()) {
     }
 #else
     (void)bytes;
