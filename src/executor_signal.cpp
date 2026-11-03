@@ -828,6 +828,9 @@ inline int64_t bmm_msg_bytes() {
     return b;
 }
 
+/// Packed outgoing pieces are sent once they reach this many bytes.
+constexpr int64_t kBmmFlushBytes = int64_t(256) << 20;
+
 /// Source chare of view v that holds view index x along dim d, or -1.
 template <int N>
 int src_chare_at(const SrcView<N>& v, int d, int x) {
@@ -880,14 +883,22 @@ BmmPlan bmm_plan(const SigGeom<N>& s, const std::array<int, N>& olo,
         std::sort(c->begin(), c->end());
         c->erase(std::unique(c->begin(), c->end()), c->end());
     }
-    int64_t maxp = 1, rows = std::max(ohi[1] - olo[1], ohi[2] - olo[2]);
-    for (size_t j = 0; j + 1 < pl.pcut.size(); ++j)
-        maxp = std::max<int64_t>(maxp, pl.pcut[j + 1] - pl.pcut[j]);
-    const int64_t slice = rows * maxp * esize, cap = bmm_msg_bytes();
+    const int64_t cap = bmm_msg_bytes(), rows = std::max(ohi[1] - olo[1], ohi[2] - olo[2]);
+    // panels longer than one batch slice of `cap` allows are cut further
+    const int64_t kmax = std::max<int64_t>(1, cap / std::max<int64_t>(1, rows * esize));
+    std::vector<int> pc = {pl.pcut[0]};
+    int64_t maxp = 1;
+    for (size_t j = 0; j + 1 < pl.pcut.size(); ++j) {
+        int64_t len = pl.pcut[j + 1] - pl.pcut[j], np = (len + kmax - 1) / kmax;
+        for (int64_t t = 1; t <= np; ++t)
+            pc.push_back(pl.pcut[j] + (int)(len * t / np));
+        maxp = std::max(maxp, (len + np - 1) / np);
+    }
+    pl.pcut = pc;
+    const int64_t per = std::max<int64_t>(1, cap / (rows * maxp * esize)); // batches per chunk
     pl.qcut = {bc[0]};
     for (size_t j = 0; j + 1 < bc.size(); ++j) {
-        int64_t len = bc[j + 1] - bc[j];
-        int64_t nq = std::min(len, std::max<int64_t>(1, (len * slice + cap - 1) / cap));
+        int64_t len = bc[j + 1] - bc[j], nq = (len + per - 1) / per;
         for (int64_t q = 1; q <= nq; ++q)
             pl.qcut.push_back(bc[j] + (int)(len * q / nq));
     }
@@ -985,6 +996,28 @@ void send_bmm_input(PartitionImpl<N>* partition, int node_id, const SigGeom<N>& 
         char* buf;
     };
     std::vector<Msg> msgs;
+    int64_t packed = 0;
+    // send what is packed so far (bounds the packed but unsent bytes)
+    auto flush = [&] {
+        if (msgs.empty())
+            return;
+        compute_fence(partition);
+        for (Msg& m : msgs) {
+#ifndef NDEBUG
+            partition->comm_bytes_sent += m.bytes;
+#endif
+#ifdef USE_KOKKOS
+            device_pack_send<N, N>(partition, partition->thisProxy, m.target, node_id, i, v.name,
+                                   m.region_data, m.bytes, m.buf);
+#else
+            proxy_at<N>(partition->thisProxy, m.target)
+                .receive_data(node_id, i, v.name, N, m.region_data, m.bytes, m.buf);
+            free_buffer(m.buf);
+#endif
+        }
+        msgs.clear();
+        packed = 0;
+    };
     std::vector<BmmPiece<N>> pcs;
     std::array<size_t, N> t{};
     while (true) {
@@ -1026,6 +1059,9 @@ void send_bmm_input(PartitionImpl<N>* partition, int node_id, const SigGeom<N>& 
                         copy_box<N, T>(partition, reinterpret_cast<T*>(m.buf), 0, pstride,
                                        src_ptr, base, sstride, ext);
                         msgs.push_back(m);
+                        packed += m.bytes;
+                        if (packed >= kBmmFlushBytes)
+                            flush();
                     }
                 }
             }
@@ -1039,22 +1075,7 @@ void send_bmm_input(PartitionImpl<N>* partition, int node_id, const SigGeom<N>& 
         if (e < 0)
             break;
     }
-    if (msgs.empty())
-        return;
-    compute_fence(partition);
-    for (Msg& m : msgs) {
-#ifndef NDEBUG
-        partition->comm_bytes_sent += m.bytes;
-#endif
-#ifdef USE_KOKKOS
-        device_pack_send<N, N>(partition, partition->thisProxy, m.target, node_id, i, v.name,
-                               m.region_data, m.bytes, m.buf);
-#else
-        proxy_at<N>(partition->thisProxy, m.target)
-            .receive_data(node_id, i, v.name, N, m.region_data, m.bytes, m.buf);
-        free_buffer(m.buf);
-#endif
-    }
+    flush();
 }
 
 /// Accumulator of the naive product: unsigned for ints, so overflow wraps (as in NumPy).
@@ -1160,8 +1181,6 @@ void batched_gemm(PartitionImpl<N>* partition, int64_t bs, int64_t m, int64_t n,
         bool fits = std::max({bs, m, n, k}) <= INT_MAX;
         if (fits && k > 0 && cublas_layout(m, k, as[1], as[2], oa, lda) &&
             cublas_layout(k, n, bst[1], bst[2], ob, ldb)) {
-            // inputs may come from work on the default instance's stream
-            Kokkos::DefaultExecutionSpace().fence("ct_bmm inputs");
             cublasHandle_t h = ct_cublas();
             cublasSetStream(h, partition->compute_stream_raw);
             cublasStatus_t st = CublasBatched<T>::run(h, ob, oa, (int)n, (int)m, (int)k, b,
@@ -1458,6 +1477,11 @@ void ArrayDAGExecutorND<N>::execute_signal_node(DAGNode* node) {
             CkAbort("CONVOLVE/FLIP: operand dtype %d != result dtype %d",
                     (int)it->second->dtype, (int)dt);
     }
+#ifdef USE_NVIDIA
+    // inputs may come from work on other streams; GEMMs then run without host fences
+    if (s.op == Opcode::BATCHED_MATMUL)
+        partition->compute_after_others();
+#endif
     for (int i = 0; i < s.nin; ++i)
         with_sig_type(s.op, dt, [&](auto tag) {
             using T = decltype(tag);
@@ -1485,8 +1509,13 @@ void ArrayDAGExecutorND<N>::execute_signal_node(DAGNode* node) {
         ones[d] = 1;
     }
     // finish_conv / finish_flip write the whole tile
-    partition->ensure_array(ArrayRegion<N>(zeros, sizes, ones), s.out.global_shape,
-                            root->result_name, dt, s.out, false);
+    CTArrayBase<N>* res = partition->ensure_array(ArrayRegion<N>(zeros, sizes, ones),
+                                                  s.out.global_shape, root->result_name, dt,
+                                                  s.out, false);
+    for (int d = 0; d < N; ++d)
+        if (res->region.size(d) != sizes[d] || res->dtype != dt)
+            CkAbort("CONVOLVE/FLIP/BATCHED_MATMUL: result %d exists with another tile or dtype",
+                    root->result_name);
     const bool bmm = s.op == Opcode::BATCHED_MATMUL;
     int expected = 0;
     if constexpr (N == 3) {
