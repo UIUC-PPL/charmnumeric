@@ -109,8 +109,6 @@ void PartitionImpl<N>::receive_staged(int node_id, int input_index, int name, in
 template <int N>
 void PartitionImpl<N>::receive_data(int node_id, int input_index, int name, int ndims,
                                     int* region_data, int64_t size, char* data) {
-    PendingComm<N>& comm = executor->pending[node_id];
-
 #ifdef USE_KOKKOS
     // Payload is already in the buffer from the post entry.
     char* buf = data;
@@ -129,6 +127,11 @@ void PartitionImpl<N>::receive_data(int node_id, int input_index, int name, int 
     char* buf = new char[size];
     memcpy(buf, data, size);
 #endif
+    if (input_index >= kDsDataTag && input_index < kDsDataTag + kDsDataTags) {
+        executor->on_ds_data(node_id, input_index - kDsDataTag, region_data, buf, size);
+        return;
+    }
+    PendingComm<N>& comm = executor->pending[node_id];
 
     // Unpack region from region_data: [start0, stop0, step0, start1, stop1, step1, ...]
     std::array<int, N> start, stop, step;
