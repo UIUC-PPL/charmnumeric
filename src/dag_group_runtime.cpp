@@ -211,11 +211,16 @@ void ArrayDAGGroup::receive_get_request_now(int ndims, int epoch, int name, int 
     }
 }
 
+void ArrayDAGGroup::mem_report(int epoch) {
+    mem_stats_report(this, epoch);
+}
+
 void ArrayDAGGroup::barrier_arrive(int epoch) {
     if (--barrier_pending[epoch] != 0)
         return;
     barrier_pending.erase(epoch);
-    mem_stats_report(this, epoch);
+    if (mem_stats_on())
+        thisProxy.mem_report(epoch);
     char none = 0;
     Server<CProxy_ArrayDAGGroup>::send_reply(epoch, 1, &none); // CCS needs a non-empty reply
 }

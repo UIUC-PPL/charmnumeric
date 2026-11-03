@@ -37,13 +37,15 @@ void mem_tally(MemTally& t) {
 
 } // namespace
 
-void mem_stats_report(ArrayDAGGroup* g, int epoch) {
+bool mem_stats_on() {
     static const bool on = [] {
         const char* e = getenv("CNUM_MEM_STATS");
         return e != nullptr && *e != '\0' && *e != '0';
     }();
-    if (!on)
-        return;
+    return on;
+}
+
+void mem_stats_report(ArrayDAGGroup* g, int epoch) {
     MemTally t;
     mem_tally<1>(t);
     mem_tally<2>(t);
@@ -51,16 +53,25 @@ void mem_stats_report(ArrayDAGGroup* g, int epoch) {
     int64_t dags = g->stored_dags();
     struct mallinfo2 mi = mallinfo2();
     const double MB = 1 << 20;
-    double dev_used = 0, pool = 0, pinned = 0;
+    double dev_used = 0, pool = 0, large = 0, pinned = 0;
     int64_t ipc_slabs = 0, ipc_live = 0;
 #ifdef USE_KOKKOS
-    pool = comm_pool().cached / MB;
+    {
+        auto& cp = comm_pool();
+        std::lock_guard<std::mutex> lock(cp.mu);
+        pool = cp.cached / MB;
+        large = cp.large_cached / MB;
+    }
 #endif
 #ifdef USE_NVIDIA
     size_t fr = 0, tot = 0;
     cudaMemGetInfo(&fr, &tot);
     dev_used = (tot - fr) / MB;
-    pinned = pinned_pool().cached / MB;
+    {
+        auto& pp = pinned_pool();
+        std::lock_guard<std::mutex> lock(pp.mu);
+        pinned = pp.cached / MB;
+    }
     {
         auto& a = gpu_ipc_arena();
         std::lock_guard<std::mutex> lock(a.mu);
@@ -70,11 +81,11 @@ void mem_stats_report(ArrayDAGGroup* g, int epoch) {
     }
 #endif
     CkPrintf("[mem] pe %d epoch %d dev_used %.0f | live %lld %.0f/%.0f MB | free %lld in %lld "
-             "keys %.0f/%.0f MB | comm_pool %.0f pinned %.0f MB | ipc %lld slabs %.0f MB live | "
-             "states %lld sends %lld | dags %lld kernels %zu | heap %.0f MB\n",
+             "keys %.0f/%.0f MB | comm_pool %.0f+%.0f pinned %.0f MB | ipc %lld slabs %.0f MB "
+             "live | states %lld sends %lld | dags %lld kernels %zu | heap %.0f MB\n",
              CkMyPe(), epoch, dev_used, (long long)t.live, t.live_dev / MB, t.live_host / MB,
              (long long)t.freed, (long long)t.free_keys, t.free_dev / MB, t.free_host / MB, pool,
-             pinned, (long long)ipc_slabs, ipc_live / MB, (long long)t.states,
+             large, pinned, (long long)ipc_slabs, ipc_live / MB, (long long)t.states,
              (long long)t.sends, (long long)dags, g->compile_cache.size(),
              (mi.uordblks + mi.hblkhd) / MB);
 }

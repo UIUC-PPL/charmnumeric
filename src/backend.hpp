@@ -654,6 +654,8 @@ class ArrayDAGGroup : public CBase_ArrayDAGGroup {
     void proxies_ready();
     // After the server is ready: BLAS handles and cached JIT kernels (see CODEMAP)
     void prewarm();
+    // CNUM_MEM_STATS: this PE's report for a barrier
+    void mem_report(int epoch);
 #ifdef USE_KOKKOS
     // Which process pairs of a host can use CUDA IPC (gpu_comm.cpp)
     void ipc_probe_start();
@@ -1106,6 +1108,7 @@ std::vector<PartitionImpl<N>*>& local_partitions() {
 
 /// CNUM_MEM_STATS=1: one line of memory use per PE at each barrier (partition_get.cpp).
 void mem_stats_report(ArrayDAGGroup* g, int epoch);
+bool mem_stats_on();
 
 #ifdef USE_KOKKOS
 inline void release_device_caches() {
