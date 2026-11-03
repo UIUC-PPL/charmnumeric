@@ -23,9 +23,11 @@ ArrayDAGGroup::ArrayDAGGroup() {
     ++kokkos_users;
 #endif
     if (CkMyPe() == 0) {
-        partition_proxy_1 = CProxy_Partition1D::ckNew();
-        partition_proxy_2 = CProxy_Partition2D::ckNew();
-        partition_proxy_3 = CProxy_Partition3D::ckNew();
+        CkArrayOptions opts;
+        opts.setMap(CProxy_PartitionMap::ckNew());
+        partition_proxy_1 = CProxy_Partition1D::ckNew(opts);
+        partition_proxy_2 = CProxy_Partition2D::ckNew(opts);
+        partition_proxy_3 = CProxy_Partition3D::ckNew(opts);
         thisProxy.set_proxies(partition_proxy_1, partition_proxy_2, partition_proxy_3);
     }
 }

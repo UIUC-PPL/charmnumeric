@@ -447,6 +447,45 @@ class ChareIndex {
     }
 };
 
+// Home PE of a chare. Power-of-two PE counts: a GF(2)-linear map of the index bits
+// (low bits of the last dimension, reversed bits of the one before, a mix for the
+// first of three), so aligned boxes such as 2x2, 4x4, 4x1 or 2x2x2 chares from the
+// origin spread evenly. Other counts: a skewed round-robin.
+inline int chare_home_pe(int ndims, const int* idx, int num_pes) {
+    if (num_pes <= 1)
+        return 0;
+    if (ndims == 1)
+        return idx[0] % num_pes;
+    if ((num_pes & (num_pes - 1)) != 0) {
+        int64_t v = 0;
+        for (int d = 0; d < ndims; ++d)
+            v = v * 2 + idx[d];
+        return (int)(v % num_pes);
+    }
+    int m = 0;
+    while ((1 << m) < num_pes)
+        ++m;
+    int mask = num_pes - 1;
+    auto apply = [&](const int* cols, int v) {
+        int r = 0;
+        for (int b = 0; b < m; ++b)
+            if ((v >> b) & 1)
+                r ^= cols[b];
+        return r;
+    };
+    int rev[31], mix[31];
+    for (int b = 0; b < m; ++b) {
+        rev[b] = 1 << (m - 1 - b);
+        mix[b] = 1 << ((b + m / 2) % m);
+    }
+    static const int mix2[] = {3, 1}, mix3[] = {3, 4, 1}, mix4[] = {7, 13, 4, 5};
+    const int* first = m == 1 ? rev : m == 2 ? mix2 : m == 3 ? mix3 : m == 4 ? mix4 : mix;
+    int last = idx[ndims - 1] & mask;
+    if (ndims == 2)
+        return apply(rev, idx[0] & mask) ^ last;
+    return apply(first, idx[0] & mask) ^ apply(rev, idx[1] & mask) ^ last;
+}
+
 template <int N>
 struct ChareIndexHash {
     std::size_t operator()(ChareIndex<N> const& ci) const {

@@ -462,6 +462,32 @@ void test_balanced_tiles() {
     expect_eq("small array", balanced_tile({300, 200, 0}, 2, 16, 4, 1024), 1024);
 }
 
+void test_chare_home_pe_balance() {
+    std::cout << "=== test_chare_home_pe_balance ===" << std::endl;
+    std::vector<std::array<int, 3>> boxes = {{2, 2, 0}, {4, 4, 0}, {4, 1, 0}, {1, 4, 0},
+                                             {2, 4, 0}, {2, 2, 2}, {4, 4, 4}, {2, 1, 2},
+                                             {2, 2, 1}, {1, 2, 2}};
+    for (int pes : {4, 8}) {
+        for (auto box : boxes) {
+            int nd = box[2] == 0 ? 2 : 3;
+            int n = box[0] * box[1] * (nd == 3 ? box[2] : 1);
+            if (n < pes)
+                continue;
+            std::vector<int> load(pes, 0);
+            for (int i = 0; i < box[0]; ++i)
+                for (int j = 0; j < box[1]; ++j)
+                    for (int k = 0; k < (nd == 3 ? box[2] : 1); ++k) {
+                        int idx[3] = {i, j, k};
+                        load[chare_home_pe(nd, idx, pes)]++;
+                    }
+            std::ostringstream label;
+            label << "box " << box[0] << "x" << box[1] << "x" << box[2] << " on " << pes;
+            expect_eq(label.str(), *std::max_element(load.begin(), load.end()),
+                      (n + pes - 1) / pes);
+        }
+    }
+}
+
 void test_misaligned_after_flush_takes_source_tile() {
     std::cout << "=== test_misaligned_after_flush_takes_source_tile ===" << std::endl;
 
@@ -527,6 +553,7 @@ int main() {
         test_strided_copy_reduces_tile_and_sets_offset();
         test_transpose_result_aligned_to_source_tiles();
         test_balanced_tiles();
+        test_chare_home_pe_balance();
         test_misaligned_after_flush_takes_source_tile();
         test_reduce_operands_share_layout();
     } catch (const std::exception& ex) {

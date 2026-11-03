@@ -586,6 +586,16 @@ struct DsState;
 /// of every partition has finished all earlier epochs.
 constexpr int kBarrierName = -1;
 
+/// Places the partitions' chares (chare_home_pe) instead of Charm++'s index hash.
+class PartitionMap : public CBase_PartitionMap {
+  public:
+    PartitionMap() {}
+    PartitionMap(CkMigrateMessage* m) : CBase_PartitionMap(m) {}
+    int procNum(int, const CkArrayIndex& idx) override {
+        return chare_home_pe(idx.dimension, idx.data(), CkNumPes());
+    }
+};
+
 class ArrayDAGGroup : public CBase_ArrayDAGGroup {
   public:
     // Per-ndims partition state: current chare grid and proxy.
