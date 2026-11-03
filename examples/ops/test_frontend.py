@@ -1100,6 +1100,45 @@ def _views_across_flush(n, fused):
           (uh * th[:-1, :-2, 3:]).sum(axis=2), rtol=1e-12)
 
 
+@case
+def kept_results_beside_shifted_set_region():
+    # Named results of a fused kernel that also writes a shifted region, read again later
+    with deadline(300):
+        for fused in (0, 1):
+            with max_fused_ops(fused):
+                _kept_results(45, fused)
+
+
+def _kept_results(n, fused):
+    g = data((n + 2, n + 2), seed=5)
+    gh = made(g)
+    avg = g[1:-1, 1:-1] + g[:-2, 1:-1]
+    work = 0.5 * avg
+    g[1:-1, 1:-1] = work
+    avgh = gh[1:-1, 1:-1] + gh[:-2, 1:-1]
+    workh = 0.5 * avgh
+    gh[1:-1, 1:-1] = workh
+    later = avg + work[::-1, :] + g[2:, 1:-1]
+    check(f"kept avg (fused={fused})", get(avg), avgh, rtol=1e-12)
+    check(f"kept work (fused={fused})", get(work), workh, rtol=1e-12)
+    check(f"later (fused={fused})", get(later), avgh + workh[::-1, :] + gh[2:, 1:-1],
+          rtol=1e-12)
+    t = g[1:-1, :] * 2.0
+    g[1:-1, 1:-1] = t[:, 1:-1] + 1.0
+    th = gh[1:-1, :] * 2.0
+    gh[1:-1, 1:-1] = th[:, 1:-1] + 1.0
+    check(f"wider kept t (fused={fused})", get(t), th, rtol=1e-12)
+    check(f"g after (fused={fused})", get(g), gh, rtol=1e-12)
+    v = data((7 * n + 3,), seed=6)
+    vh = made(v)
+    w = v[2:] - v[:-2]
+    v[1:-1] = w * 0.5
+    wh = vh[2:] - vh[:-2]
+    vh[1:-1] = wh * 0.5
+    u = w + v[1:-1]
+    check(f"1-D kept w (fused={fused})", get(u), wh + vh[1:-1], rtol=1e-12)
+
+
 def main():
     global iface
     iface = connect()
