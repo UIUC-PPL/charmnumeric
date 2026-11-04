@@ -593,6 +593,32 @@ void test_small_class_member_keeps_own_tile() {
 
     delete dag;
 }
+
+void test_fused_kept_results_share_layout() {
+    std::cout << "=== test_fused_kept_results_share_layout ===" << std::endl;
+
+    constexpr int X = 1;
+    constexpr int S = 2;
+    constexpr int T = 3;
+
+    // one kernel keeps S = X[0:500] + X[1:501] and T = X[2:502] + X[2:502]
+    MetaMap meta;
+    meta[X] = make_meta(1, 512, 0, 64, /*final=*/true);
+    meta[S] = make_meta(1, 500, 0, 0, false);
+    meta[T] = make_meta(1, 500, 0, 0, false);
+    ASTNode* s = make_add(S, make_leaf(X), make_region<1>({0}, {500}, {1}), make_leaf(X),
+                          make_region<1>({1}, {501}, {1}));
+    ASTNode* t = make_add(T, make_leaf(X), make_region<1>({2}, {502}, {1}), make_leaf(X),
+                          make_region<1>({2}, {502}, {1}));
+    DAG* dag = make_single_node_dag({s, t});
+
+    decomposition_solver::compute_decompositions(meta, dag, /*odf=*/4, /*num_pes=*/1);
+
+    expect_eq("T.tile", meta.at(T).tile, meta.at(S).tile);
+    expect_offset("T.offset", meta.at(T).offset, meta.at(S).offset);
+
+    delete dag;
+}
 } // namespace
 
 int main() {
@@ -610,6 +636,7 @@ int main() {
         test_misaligned_after_flush_takes_source_tile();
         test_reduce_operands_share_layout();
         test_small_class_member_keeps_own_tile();
+        test_fused_kept_results_share_layout();
     } catch (const std::exception& ex) {
         std::cerr << "test_compute_decompositions failed: " << ex.what() << std::endl;
         return 1;

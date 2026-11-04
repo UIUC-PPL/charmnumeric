@@ -2029,6 +2029,44 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                 meta_it->second.offset = zero_offset;
         }
 
+        // A fused elementwise kernel writes all its kept results in the chare
+        // layout of one of them (fused_output_decomp_name), so they share it.
+        detail::for_each_node_topo(dag, [&](DAGNode* dag_node) {
+            std::vector<ArrayMetadata*> outs;
+            ArrayMetadata* ref = nullptr;
+            for (ASTNode* root : dag_node->ast->roots) {
+                auto opc = static_cast<Opcode>(root->opcode);
+                if (opc == Opcode::SET_REGION)
+                    return;
+                if (opc == Opcode::NOOP || opc == Opcode::CREATE || root->is_temp)
+                    continue;
+                if (!is_elementwise(opc) && opc != Opcode::COPY)
+                    return;
+                auto it = array_meta.find(root->result_name);
+                if (it == array_meta.end())
+                    continue;
+                ArrayMetadata* m = &it->second;
+                if (!outs.empty() && (m->ndims != outs[0]->ndims ||
+                                      m->global_shape != outs[0]->global_shape))
+                    return;
+                outs.push_back(m);
+                if (m->decomp_final || matmul_arrays.count(root->result_name))
+                    if (ref == nullptr)
+                        ref = m;
+            }
+            if (outs.size() < 2)
+                return;
+            if (ref == nullptr)
+                ref = outs[0];
+            for (ArrayMetadata* m : outs) {
+                if (m == ref || m->decomp_final)
+                    continue;
+                m->tile = ref->tile;
+                m->offset = ref->offset;
+            }
+        });
+        align_transpose_results();
+
         // The executor allocates a fused kernel's other kept results at the
         // shifted set_region shape, so place them to match.
         detail::for_each_node_topo(dag, [&](DAGNode* dag_node) {
