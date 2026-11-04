@@ -612,9 +612,8 @@ inline void cross_matmul_send_result_3d_to_1d(PartitionImpl<3>* partition, DAGNo
 #ifndef USE_KOKKOS
     T* send_buf = new T[result_rows];
     memcpy(send_buf, result_data, byte_size);
-    proxy_at<1>(proxy_1d, target_ci)
-        .receive_data(node->id, /*input_index=*/0, result_name, 1, region_data, byte_size,
-                      reinterpret_cast<char*>(send_buf));
+    ct_send_data(proxy_at<1>(proxy_1d, target_ci), node->id, /*input_index=*/0, result_name, 1,
+                 region_data, byte_size, reinterpret_cast<char*>(send_buf));
     delete[] send_buf;
 #else
     T* send_buf = static_cast<T*>(comm_alloc(byte_size));
@@ -647,9 +646,8 @@ inline void cross_matmul_send_result_2d_to_1d(PartitionImpl<2>* partition, DAGNo
 #ifndef USE_KOKKOS
     T* send_buf = new T[result_rows];
     memcpy(send_buf, result_data, byte_size);
-    proxy_at<1>(proxy_1d, target_ci)
-        .receive_data(node->id, /*input_index=*/0, result_name, 1, region_data, byte_size,
-                      reinterpret_cast<char*>(send_buf));
+    ct_send_data(proxy_at<1>(proxy_1d, target_ci), node->id, /*input_index=*/0, result_name, 1,
+                 region_data, byte_size, reinterpret_cast<char*>(send_buf));
     delete[] send_buf;
 #else
     T* send_buf = static_cast<T*>(comm_alloc(byte_size));
@@ -889,9 +887,8 @@ inline void cross_set_region_send(PartitionImpl<N_src>* partition, DAGNode* node
             }
         }
 
-        proxy_at<N_tgt>(target_proxy, ci)
-            .receive_data(node->id, /*input_index=*/0, source_name, N_tgt, region_data, byte_size,
-                          reinterpret_cast<char*>(send_buf));
+        ct_send_data(proxy_at<N_tgt>(target_proxy, ci), node->id, /*input_index=*/0, source_name,
+                     N_tgt, region_data, byte_size, reinterpret_cast<char*>(send_buf));
         delete[] send_buf;
 #else
         T* send_buf = static_cast<T*>(comm_alloc(byte_size));

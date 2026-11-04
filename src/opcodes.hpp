@@ -89,7 +89,9 @@ enum class Opcode {
     LEFT_SHIFT = 168,
     RIGHT_SHIFT = 169, // arithmetic for signed ints
     // 170-179: batched matmul (executor_signal.cpp).
-    BATCHED_MATMUL = 170 // (a, b, dims of a: batch m k, dims of b: batch n k, shape[3])
+    BATCHED_MATMUL = 170, // (a, b, dims of a: batch m k, dims of b: batch n k, shape[3])
+    // 190-199: executor_sort.cpp.
+    SELECT = 190 // operands (x, k...): 1-D, x sorted (NaNs last) at ranks k
 };
 
 /// Returns true for the ops handled by execute_signal_node.
@@ -198,12 +200,13 @@ inline bool is_ternary_elementwise(Opcode op) {
     }
 }
 
-/// Result has the input's shape.
+/// SCAN/SORT/ARGSORT (result has the input's shape) and SELECT.
 inline bool is_castscansort(Opcode op) {
     switch (op) {
     case Opcode::SCAN:
     case Opcode::SORT:
     case Opcode::ARGSORT:
+    case Opcode::SELECT:
         return true;
     default:
         return false;

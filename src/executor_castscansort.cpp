@@ -2,6 +2,12 @@
 // Before the Charm++ headers: their ALIGN_BYTES macro breaks cub/thrust.
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Sort.hpp>
+#ifdef USE_NVIDIA
+#include <cub/cub.cuh>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/permutation_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
+#endif
 #endif
 
 #include "backend_internal.hpp"
@@ -18,8 +24,9 @@
 #endif
 
 // SCAN / SORT / ARGSORT executors (opcodes 81-83). The result has the
-// input's decomposition (pinned in dag_group_receive.cpp).
-// SORT is not scalable: it gathers to the chare holding element 0.
+// input's decomposition (pinned in dag_group_receive.cpp). 1-D sorts of real
+// types and SELECT run in executor_sort.cpp; the other sorts gather to the
+// chare holding element 0.
 
 // Named namespace: these types are captured by device lambdas.
 namespace castscansort_detail {
@@ -190,82 +197,189 @@ void send_buffer(PartitionImpl<N>* partition, const std::array<int, N>& target, 
     device_pack_send<N, N>(partition, partition->thisProxy, ci, node_id, input_index, name,
                            region_data, bytes, buf);
 #else
-    proxy_at<N>(partition->thisProxy, ci)
-        .receive_data(node_id, input_index, name, N, region_data, bytes, buf);
+    ct_send_data(proxy_at<N>(partition->thisProxy, ci), node_id, input_index, name, N, region_data,
+                 bytes, buf);
     delete[] buf;
 #endif
 }
 
-// ---- SCAN ----
-
+/// Small message/scratch buffers: pooled device memory in GPU builds. Free only
+/// after the GPU is done with them (comm_free reuses them at once).
+inline char* pooled_alloc(int64_t bytes) {
 #ifdef USE_KOKKOS
-/// Device scan of one line (sum/product are commutative, join order is free).
-template <int N, typename T>
-struct LineScanFunctor {
-    using value_type = T;
-    const T* in;
-    T* out;
-    LineGeom<N> g;
-    ScanOp<T> op;
-    int64_t line;
+    return static_cast<char*>(comm_alloc(std::max<int64_t>(bytes, 8)));
+#else
+    return alloc_buffer(bytes);
+#endif
+}
 
-    KOKKOS_INLINE_FUNCTION void init(T& v) const { v = op.identity(); }
-    KOKKOS_INLINE_FUNCTION void join(T& dst, const T& src) const { dst = op.apply(dst, src); }
-    KOKKOS_INLINE_FUNCTION void operator()(const int64_t pos, T& update, const bool final) const {
-        int64_t i = g.phys(line, pos);
-        update = op.apply(update, op.input(in[i]));
-        if (final)
-            out[i] = update;
+inline void pooled_free(char* p) {
+#ifdef USE_KOKKOS
+    comm_free(p);
+#else
+    free_buffer(p);
+#endif
+}
+
+// ---- SCAN ----
+// Each chare sends its line totals to the later chares along the axis, then scans
+// its tile once with the folded carry. The input may be a narrower integer type
+// than the result (cast on the fly).
+
+template <typename Tout, typename Tin>
+struct ScanIn {
+    const Tin* in;
+    int64_t base, stride;
+    ScanOp<Tout> op;
+    const Tout* carry;
+
+    CSS_FN Tout operator()(int64_t pos) const {
+        Tout x = op.input(cn_cast<Tout>(in[base + pos * stride]));
+        if (carry != nullptr && pos == 0)
+            x = op.apply(*carry, x);
+        return x;
     }
 };
-#endif
 
-/// out = inclusive scan of in along g.axis, per line (no carry yet).
-template <int N, typename T>
-void scan_tile(PartitionImpl<N>* partition, const T* in, T* out, const LineGeom<N>& g,
-               ScanOp<T> op) {
+template <typename T>
+struct ScanBin {
+    ScanOp<T> op;
+    CSS_FN T operator()(const T& a, const T& b) const { return op.apply(a, b); }
+};
+
+struct Strided {
+    int64_t s;
+    CSS_FN int64_t operator()(int64_t i) const { return i * s; }
+};
+
+/// totals[l] = op-fold of line l (one thread per line).
+template <int N, typename Tout, typename Tin>
+void totals_per_thread(PartitionImpl<N>* partition, const Tin* in, Tout* totals,
+                       const LineGeom<N>& g, ScanOp<Tout> op) {
+    int64_t astride = g.strides[g.axis];
 #ifdef USE_KOKKOS
-    if (g.lines >= g.len) {
-        // Many short lines: one thread per line.
-        Kokkos::parallel_for(
-            CT_COMPUTE_POLICY(partition, g.lines), KOKKOS_LAMBDA(int64_t l) {
-                T acc = op.identity();
-                for (int64_t p = 0; p < g.len; ++p) {
-                    int64_t i = g.phys(l, p);
-                    acc = op.apply(acc, op.input(in[i]));
-                    out[i] = acc;
-                }
-            });
-    } else {
-        // Few long lines: a device scan per line.
-        for (int64_t l = 0; l < g.lines; ++l)
-            Kokkos::parallel_scan("ct_scan_line", CT_COMPUTE_POLICY(partition, g.len),
-                                  LineScanFunctor<N, T>{in, out, g, op, l});
-    }
+    Kokkos::parallel_for(
+        CT_COMPUTE_POLICY(partition, g.lines), KOKKOS_LAMBDA(int64_t l) {
+            ScanIn<Tout, Tin> f{in, g.phys(l, 0), astride, op, nullptr};
+            Tout acc = op.identity();
+            for (int64_t p = 0; p < g.len; ++p)
+                acc = op.apply(acc, f(p));
+            totals[l] = acc;
+        });
 #else
     (void)partition;
     for (int64_t l = 0; l < g.lines; ++l) {
-        T acc = op.identity();
+        ScanIn<Tout, Tin> f{in, g.phys(l, 0), astride, op, nullptr};
+        Tout acc = op.identity();
+        for (int64_t p = 0; p < g.len; ++p)
+            acc = op.apply(acc, f(p));
+        totals[l] = acc;
+    }
+#endif
+}
+
+/// out = carry (op) inclusive scan of cast(in), per line (one thread per line).
+template <int N, typename Tout, typename Tin>
+void scan_per_thread(PartitionImpl<N>* partition, const Tin* in, Tout* out, const Tout* carry,
+                     const LineGeom<N>& g, ScanOp<Tout> op) {
+    int64_t astride = g.strides[g.axis];
+#ifdef USE_KOKKOS
+    Kokkos::parallel_for(
+        CT_COMPUTE_POLICY(partition, g.lines), KOKKOS_LAMBDA(int64_t l) {
+            int64_t base = g.phys(l, 0);
+            ScanIn<Tout, Tin> f{in, base, astride, op, nullptr};
+            Tout acc = carry ? carry[l] : op.identity();
+            for (int64_t p = 0; p < g.len; ++p) {
+                acc = op.apply(acc, f(p));
+                out[base + p * astride] = acc;
+            }
+        });
+#else
+    (void)partition;
+    for (int64_t l = 0; l < g.lines; ++l) {
+        int64_t base = g.phys(l, 0);
+        ScanIn<Tout, Tin> f{in, base, astride, op, nullptr};
+        Tout acc = carry ? carry[l] : op.identity();
         for (int64_t p = 0; p < g.len; ++p) {
-            int64_t i = g.phys(l, p);
-            acc = op.apply(acc, op.input(in[i]));
-            out[i] = acc;
+            acc = op.apply(acc, f(p));
+            out[base + p * astride] = acc;
         }
     }
 #endif
 }
 
-template <int N, typename T>
-void pack_line_totals(PartitionImpl<N>* partition, const T* out, T* buf, const LineGeom<N>& g) {
-#ifdef USE_KOKKOS
-    Kokkos::parallel_for(
-        CT_COMPUTE_POLICY(partition, g.lines),
-        KOKKOS_LAMBDA(int64_t l) { buf[l] = out[g.phys(l, g.len - 1)]; });
-#else
-    (void)partition;
-    for (int64_t l = 0; l < g.lines; ++l)
-        buf[l] = out[g.phys(l, g.len - 1)];
+#ifdef USE_NVIDIA
+/// Few long lines: one CUB reduction / single-pass scan per line.
+template <int N, typename Tout, typename Tin>
+void lines_cub(PartitionImpl<N>* partition, const Tin* in, Tout* out, Tout* totals,
+               const Tout* carry, const LineGeom<N>& g, ScanOp<Tout> op) {
+    cudaStream_t st = partition->compute_stream_raw;
+    int64_t astride = g.strides[g.axis];
+    int len = (int)g.len;
+    ScanBin<Tout> bin{op};
+    auto it_of = [&](int64_t l) {
+        return thrust::make_transform_iterator(
+            thrust::counting_iterator<int64_t>(0),
+            ScanIn<Tout, Tin>{in, g.phys(l, 0), astride, op, carry ? carry + l : nullptr});
+    };
+    size_t tb = 0;
+    if (totals)
+        hapiCheck(cub::DeviceReduce::Reduce(nullptr, tb, it_of(0), totals, len, bin,
+                                            op.identity(), st));
+    else if (astride == 1)
+        hapiCheck(cub::DeviceScan::InclusiveScan(nullptr, tb, it_of(0), out, bin, len, st));
+    else
+        hapiCheck(cub::DeviceScan::InclusiveScan(
+            nullptr, tb, it_of(0),
+            thrust::make_permutation_iterator(
+                out, thrust::make_transform_iterator(thrust::counting_iterator<int64_t>(0),
+                                                     Strided{astride})),
+            bin, len, st));
+    char* tmp = pooled_alloc((int64_t)tb);
+    for (int64_t l = 0; l < g.lines; ++l) {
+        if (totals) {
+            hapiCheck(cub::DeviceReduce::Reduce(tmp, tb, it_of(l), totals + l, len, bin,
+                                                op.identity(), st));
+        } else {
+            Tout* o = out + g.phys(l, 0);
+            if (astride == 1)
+                hapiCheck(cub::DeviceScan::InclusiveScan(tmp, tb, it_of(l), o, bin, len, st));
+            else
+                hapiCheck(cub::DeviceScan::InclusiveScan(
+                    tmp, tb, it_of(l),
+                    thrust::make_permutation_iterator(
+                        o, thrust::make_transform_iterator(thrust::counting_iterator<int64_t>(0),
+                                                           Strided{astride})),
+                    bin, len, st));
+        }
+    }
+    compute_fence(partition);
+    pooled_free(tmp);
+}
 #endif
+
+template <int N, typename Tout, typename Tin>
+void line_totals(PartitionImpl<N>* partition, const Tin* in, Tout* totals, const LineGeom<N>& g,
+                 ScanOp<Tout> op) {
+#ifdef USE_NVIDIA
+    if (g.lines < g.len) {
+        lines_cub<N, Tout, Tin>(partition, in, nullptr, totals, nullptr, g, op);
+        return;
+    }
+#endif
+    totals_per_thread<N, Tout, Tin>(partition, in, totals, g, op);
+}
+
+template <int N, typename Tout, typename Tin>
+void scan_lines(PartitionImpl<N>* partition, const Tin* in, Tout* out, const Tout* carry,
+                const LineGeom<N>& g, ScanOp<Tout> op) {
+#ifdef USE_NVIDIA
+    if (g.lines < g.len) {
+        lines_cub<N, Tout, Tin>(partition, in, out, nullptr, carry, g, op);
+        return;
+    }
+#endif
+    scan_per_thread<N, Tout, Tin>(partition, in, out, carry, g, op);
 }
 
 /// carry[l] = op(carry[l] or identity, totals[l]).
@@ -284,49 +398,29 @@ void fold_totals(PartitionImpl<N>* partition, T* carry, const T* totals, int64_t
 #endif
 }
 
-template <int N, typename T>
-void apply_carry(PartitionImpl<N>* partition, T* out, const T* carry, const LineGeom<N>& g,
-                 ScanOp<T> op) {
-    int64_t total = g.lines * g.len;
-#ifdef USE_KOKKOS
-    Kokkos::parallel_for(
-        CT_COMPUTE_POLICY(partition, total), KOKKOS_LAMBDA(int64_t k) {
-            int64_t l = k / g.len;
-            int64_t i = g.phys(l, k % g.len);
-            out[i] = op.apply(carry[l], out[i]);
-        });
-#else
-    (void)partition;
-    for (int64_t k = 0; k < total; ++k) {
-        int64_t l = k / g.len;
-        int64_t i = g.phys(l, k % g.len);
-        out[i] = op.apply(carry[l], out[i]);
-    }
-#endif
-}
-
-/// Local scan + send line totals to later chares. Returns messages to expect.
-template <int N, typename T>
+/// Send line totals to later chares. Returns messages to expect.
+template <int N, typename Tout, typename Tin>
 int scan_execute(PartitionImpl<N>* partition, DAGNode* node, int out_name, CTArrayBase<N>* in,
-                 CTArrayBase<N>* out, int axis, int kind) {
+                 int axis, int kind) {
     LineGeom<N> g = tile_geom<N>(in, axis);
-    ScanOp<T> op{kind};
-    T* out_ptr = static_cast<T*>(out->device_data_ptr());
-    scan_tile<N, T>(partition, static_cast<const T*>(in->device_data_ptr()), out_ptr, g, op);
-
+    ScanOp<Tout> op{kind};
     const ArrayDecomp<N>& dec = in->decomp;
     auto me = partition->nd_index();
     int first = dec.offset[axis] / dec.tile;
     int last = (dec.offset[axis] + dec.global_shape[axis] - 1) / dec.tile;
     int n_targets = last - me[axis];
     if (n_targets > 0) {
-        int64_t bytes = g.lines * (int64_t)sizeof(T);
+        int64_t bytes = g.lines * (int64_t)sizeof(Tout);
+        char* totals = pooled_alloc(bytes);
+        line_totals<N, Tout, Tin>(partition, static_cast<const Tin*>(in->device_data_ptr()),
+                                  reinterpret_cast<Tout*>(totals), g, op);
         std::vector<char*> bufs(n_targets);
         for (int t = 0; t < n_targets; ++t) {
-            bufs[t] = alloc_buffer(bytes);
-            pack_line_totals<N, T>(partition, out_ptr, reinterpret_cast<T*>(bufs[t]), g);
+            bufs[t] = pooled_alloc(bytes);
+            copy_bytes<N>(partition, bufs[t], totals, bytes);
         }
         compute_fence(partition);
+        pooled_free(totals);
         ArrayRegion<N> my_region = chare_array_region<N>(dec, me);
         for (int t = 0; t < n_targets; ++t) {
             auto target = me;
@@ -337,26 +431,64 @@ int scan_execute(PartitionImpl<N>* partition, DAGNode* node, int out_name, CTArr
     return me[axis] - first;
 }
 
-/// Fold received totals into a carry and apply it.
-template <int N, typename T>
-void scan_finish(PartitionImpl<N>* partition, CTArrayBase<N>* out, int axis, int kind,
-                 PendingComm<N>& comm) {
+/// Fold the received totals into a carry and scan the tile with it.
+template <int N, typename Tout, typename Tin>
+void scan_finish(PartitionImpl<N>* partition, CTArrayBase<N>* in, CTArrayBase<N>* out, int axis,
+                 int kind, PendingComm<N>& comm) {
+    LineGeom<N> g = tile_geom<N>(in, axis);
+    ScanOp<Tout> op{kind};
+    char* carry_buf = nullptr;
     auto rb_it = comm.remote_buffers.find(0);
-    if (rb_it == comm.remote_buffers.end() || rb_it->second.empty())
-        return;
-    LineGeom<N> g = tile_geom<N>(out, axis);
-    ScanOp<T> op{kind};
-    char* carry_buf = alloc_buffer(g.lines * (int64_t)sizeof(T));
-    T* carry = reinterpret_cast<T*>(carry_buf);
-    bool init = true;
-    for (auto& rb : rb_it->second) {
-        fold_totals<N, T>(partition, carry, reinterpret_cast<const T*>(rb.data), g.lines, op,
-                          init);
-        init = false;
+    if (rb_it != comm.remote_buffers.end() && !rb_it->second.empty()) {
+        carry_buf = pooled_alloc(g.lines * (int64_t)sizeof(Tout));
+        // in source order along the axis: float carries do not depend on arrival order
+        auto& rbs = rb_it->second;
+        std::sort(rbs.begin(), rbs.end(),
+                  [axis](const RemoteBuffer<N>& x, const RemoteBuffer<N>& y) {
+                      return x.region.start[axis] < y.region.start[axis];
+                  });
+        bool init = true;
+        for (auto& rb : rbs) {
+            fold_totals<N, Tout>(partition, reinterpret_cast<Tout*>(carry_buf),
+                                 reinterpret_cast<const Tout*>(rb.data), g.lines, op, init);
+            init = false;
+        }
     }
-    apply_carry<N, T>(partition, static_cast<T*>(out->device_data_ptr()), carry, g, op);
-    compute_fence(partition);
-    free_buffer(carry_buf);
+    scan_lines<N, Tout, Tin>(partition, static_cast<const Tin*>(in->device_data_ptr()),
+                             static_cast<Tout*>(out->device_data_ptr()),
+                             reinterpret_cast<const Tout*>(carry_buf), g, op);
+    if (carry_buf) {
+        compute_fence(partition);
+        pooled_free(carry_buf);
+    }
+}
+
+/// f(Tout{}, Tin{}) for the supported (result, input) dtype pairs: equal, or an
+/// integer/bool input narrower than an int64/uint64 result.
+template <typename F>
+void scan_dispatch(DType out_dt, DType in_dt, F&& f) {
+    if (out_dt == in_dt) {
+        cn_dispatch(out_dt, [&](auto t) { f(t, t); });
+        return;
+    }
+    auto inner = [&](auto o) {
+        switch (in_dt) {
+        case DType::BOOL: f(o, bool{}); return;
+        case DType::INT8: f(o, int8_t{}); return;
+        case DType::INT16: f(o, int16_t{}); return;
+        case DType::INT32: f(o, int32_t{}); return;
+        case DType::UINT8: f(o, uint8_t{}); return;
+        case DType::UINT16: f(o, uint16_t{}); return;
+        case DType::UINT32: f(o, uint32_t{}); return;
+        default: CkAbort("SCAN: input dtype %d for result dtype %d", (int)in_dt, (int)out_dt);
+        }
+    };
+    if (out_dt == DType::INT64)
+        inner(int64_t{});
+    else if (out_dt == DType::UINT64)
+        inner(uint64_t{});
+    else
+        CkAbort("SCAN: result dtype %d != input dtype %d", (int)out_dt, (int)in_dt);
 }
 
 // ---- SORT / ARGSORT ----
@@ -508,10 +640,21 @@ void sort_root(PartitionImpl<N>* partition, int node_id, int out_name, CTArrayBa
 
 using namespace castscansort_detail;
 
+bool ds_handles(ASTNode* root, DType dt, int ndims);
+template <int N>
+bool ds_axis_whole(CTArrayBase<N>* in, int axis);
+template <int N>
+void ds_axis_local(PartitionImpl<N>* p, CTArrayBase<N>* in, CTArrayBase<N>* out, int axis,
+                   bool arg);
+
 template <int N>
 void ArrayDAGExecutorND<N>::execute_castscansort_node(DAGNode* node) {
     ASTNode* root = castscansort_root(node);
     Opcode op = static_cast<Opcode>(root->opcode);
+    if (op != Opcode::SCAN && ds_handles(root, root->operands[0]->dtype, N)) {
+        execute_ds_node(node);
+        return;
+    }
     int in_name = root->operands[0]->result_name;
     int out_name = root->result_name;
 
@@ -522,20 +665,22 @@ void ArrayDAGExecutorND<N>::execute_castscansort_node(DAGNode* node) {
         return;
     }
     CTArrayBase<N>* in = in_it->second;
-    if (op == Opcode::SCAN && root->dtype != in->dtype)
-        CkAbort("SCAN: result dtype %d != input dtype %d", (int)root->dtype, (int)in->dtype);
-    DType out_dt = op == Opcode::ARGSORT ? DType::INT64 : in->dtype;
-    CTArrayBase<N>* out =
-        partition->ensure_array(in->region, in->global_shape, out_name, out_dt, in->decomp);
+    DType out_dt = op == Opcode::ARGSORT ? DType::INT64
+                   : op == Opcode::SCAN  ? root->dtype
+                                         : in->dtype;
+    CTArrayBase<N>* out = partition->ensure_array(in->region, in->global_shape, out_name, out_dt,
+                                                  in->decomp, false);
 
     int expected = 0;
     if (op == Opcode::SCAN) {
         int axis = scalar_param(root, 1, 0);
         int kind = scalar_param(root, 2, 0);
-        cn_dispatch(in->dtype, [&](auto tag) {
-            using T = decltype(tag);
-            expected = scan_execute<N, T>(partition, node, out_name, in, out, axis, kind);
+        scan_dispatch(out_dt, in->dtype, [&](auto to, auto ti) {
+            expected = scan_execute<N, decltype(to), decltype(ti)>(partition, node, out_name, in,
+                                                                   axis, kind);
         });
+    } else if (ds_axis_whole<N>(in, scalar_param(root, 1, 0))) {
+        ds_axis_local<N>(partition, in, out, scalar_param(root, 1, 0), op == Opcode::ARGSORT);
     } else if (op == Opcode::SORT || op == Opcode::ARGSORT) {
         const ArrayDecomp<N>& dec = in->decomp;
         auto me = partition->nd_index();
@@ -581,14 +726,15 @@ void ArrayDAGExecutorND<N>::finish_castscansort_node(PendingComm<N>& comm) {
     int axis = scalar_param(root, 1, 0);
     if (op == Opcode::SCAN) {
         int kind = scalar_param(root, 2, 0);
-        cn_dispatch(out->dtype, [&](auto tag) {
-            using T = decltype(tag);
-            scan_finish<N, T>(partition, out, axis, kind, comm);
+        scan_dispatch(out->dtype, in->dtype, [&](auto to, auto ti) {
+            scan_finish<N, decltype(to), decltype(ti)>(partition, in, out, axis, kind, comm);
         });
         return;
     }
 
     // SORT / ARGSORT
+    if (ds_axis_whole<N>(in, axis))
+        return;
     const ArrayDecomp<N>& dec = in->decomp;
     auto me = partition->nd_index();
     bool is_root = true;

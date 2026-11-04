@@ -160,6 +160,18 @@ static MemRef<N, T> make_output_memref(CTArrayBase<N>* arr) {
     return desc;
 }
 
+/// Copies each SET_REGION result buffer into its target, then pools the buffer: the
+/// frontend never reads a set_region result, and pooling it now lets the next one reuse it.
+template <int N, typename T>
+static void finish_set_regions(DAGNode* node, PartitionImpl<N>* partition) {
+    for (ASTNode* root : node->ast->roots)
+        if (static_cast<Opcode>(root->opcode) == Opcode::SET_REGION)
+            partition->executor->ast_visitor(root, dtype_of<T>());
+    for (ASTNode* root : node->ast->roots)
+        if (static_cast<Opcode>(root->opcode) == Opcode::SET_REGION)
+            partition->retire_array(root->result_name);
+}
+
 template <int N, typename T>
 void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, PendingComm<N>* comm) {
     auto nd_idx = partition->nd_index();
@@ -1387,9 +1399,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
         );
         // Scalar/broadcast-only RHS gives a 1-element result; write it to the target region.
         if (n_inputs == 0)
-            for (ASTNode* root : node->ast->roots)
-                if (static_cast<Opcode>(root->opcode) == Opcode::SET_REGION)
-                    partition->executor->ast_visitor(root, dtype_of<T>());
+            finish_set_regions<N, T>(node, partition);
         return;
     }
 
@@ -1601,10 +1611,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
         }
     }
 
-    // Handle SET_REGION side-effects
-    for (ASTNode* root : node->ast->roots)
-        if (static_cast<Opcode>(root->opcode) == Opcode::SET_REGION)
-            partition->executor->ast_visitor(root, dtype_of<T>());
+    finish_set_regions<N, T>(node, partition);
 }
 
 #define CN_INST_EXECUTE_NODE(T)                                                                    \

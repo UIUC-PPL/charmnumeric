@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <iostream>
@@ -99,7 +100,9 @@ ArrayRegion<N>* make_region(std::array<int, N> start, std::array<int, N> stop,
 DAG* make_single_node_dag(std::vector<ASTNode*> roots) {
     auto* ast = new AST(std::move(roots));
     auto* node = new DAGNode(0, ast);
-    auto* dag = new DAG({node});
+    auto* dag = new DAG();
+    dag->roots.push_back(node);
+    dag->nodes[0] = node;
     dag->num_nodes = 1;
     return dag;
 }
@@ -446,6 +449,150 @@ void test_transpose_result_aligned_to_source_tiles() {
     delete dag;
 }
 
+
+void test_balanced_tiles() {
+    std::cout << "=== test_balanced_tiles ===" << std::endl;
+    using decomposition_solver::detail::balanced_tile;
+    // 19% less on the busiest PE: not worth leaving the power of two
+    expect_eq("800^3 on 4 PEs", balanced_tile({800, 800, 800}, 3, 16, 4, 128), 512);
+    expect_eq("2555x160x240 on 4 PEs", balanced_tile({2555, 160, 240}, 3, 16, 4, 128), 256);
+    expect_eq("1100^3 on 4 PEs", balanced_tile({1100, 1100, 1100}, 3, 16, 4, 128), 560);
+    expect_eq("800^3 on 1 PE", balanced_tile({800, 800, 800}, 3, 4, 1, 128), 1024);
+    expect_eq("4096^2 on 4 PEs", balanced_tile({4096, 4096, 0}, 2, 16, 4, 1024), 1024);
+    expect_eq("4096^2 on 1 PE", balanced_tile({4096, 4096, 0}, 2, 4, 1, 1024), 2048);
+    expect_eq("10000^2 on 4 PEs", balanced_tile({10000, 10000, 0}, 2, 16, 4, 1024), 2528);
+    expect_eq("1500^2 on 4 PEs", balanced_tile({1500, 1500, 0}, 2, 16, 4, 1024), 1024);
+    expect_eq("365x1x240 on 4 PEs", balanced_tile({365, 1, 240}, 3, 16, 4, 128), 128);
+    expect_eq("small array", balanced_tile({300, 200, 0}, 2, 16, 4, 1024), 1024);
+    // 192 would leave a 48-wide slab on one PE; the power of two is as good here
+    expect_eq("160x365x240 on 4 PEs", balanced_tile({160, 365, 240}, 3, 16, 4, 128), 128);
+    expect_eq("14016000 on 4 PEs", balanced_tile({14016000, 0, 0}, 1, 16, 4, 1 << 20),
+              1 << 20);
+    expect_eq("3000000 on 4 PEs", balanced_tile({3000000, 0, 0}, 1, 16, 4, 1 << 20),
+              1 << 20);
+}
+
+void test_chare_home_pe_balance() {
+    std::cout << "=== test_chare_home_pe_balance ===" << std::endl;
+    std::vector<std::array<int, 3>> boxes = {{2, 2, 0}, {4, 4, 0}, {4, 1, 0}, {1, 4, 0},
+                                             {2, 4, 0}, {2, 2, 2}, {4, 4, 4}, {2, 1, 2},
+                                             {2, 2, 1}, {1, 2, 2}};
+    // other PE counts: no PE left idle by a thin grid
+    for (int pes : {3, 6, 12}) {
+        for (std::array<int, 3> box : {std::array<int, 3>{pes, 1, 0}, {1, pes, 0},
+                                       {pes, 1, 1}, {1, pes, 1}, {1, 1, pes}}) {
+            int nd = box[2] == 0 ? 2 : 3;
+            std::vector<int> load(pes, 0);
+            for (int i = 0; i < box[0]; ++i)
+                for (int j = 0; j < box[1]; ++j)
+                    for (int k = 0; k < (nd == 3 ? box[2] : 1); ++k) {
+                        int idx[3] = {i, j, k};
+                        load[chare_home_pe(nd, idx, pes)]++;
+                    }
+            std::ostringstream label;
+            label << "thin box " << box[0] << "x" << box[1] << "x" << box[2] << " on " << pes;
+            expect_eq(label.str(), *std::max_element(load.begin(), load.end()), 1);
+        }
+    }
+    for (int pes : {4, 8}) {
+        for (auto box : boxes) {
+            int nd = box[2] == 0 ? 2 : 3;
+            int n = box[0] * box[1] * (nd == 3 ? box[2] : 1);
+            if (n < pes)
+                continue;
+            std::vector<int> load(pes, 0);
+            for (int i = 0; i < box[0]; ++i)
+                for (int j = 0; j < box[1]; ++j)
+                    for (int k = 0; k < (nd == 3 ? box[2] : 1); ++k) {
+                        int idx[3] = {i, j, k};
+                        load[chare_home_pe(nd, idx, pes)]++;
+                    }
+            std::ostringstream label;
+            label << "box " << box[0] << "x" << box[1] << "x" << box[2] << " on " << pes;
+            expect_eq(label.str(), *std::max_element(load.begin(), load.end()),
+                      (n + pes - 1) / pes);
+        }
+    }
+}
+
+void test_misaligned_after_flush_takes_source_tile() {
+    std::cout << "=== test_misaligned_after_flush_takes_source_tile ===" << std::endl;
+
+    constexpr int G = 1;
+    constexpr int W = 2;
+
+    // grid from an earlier DAG (8194^2, tile 2080); W = grid[1:-1, 1:-1] + grid[0:-2, 1:-1]
+    MetaMap meta;
+    meta[G] = make_meta(2, {8194, 8194, 0}, {0, 0, 0}, 2080, /*final=*/true);
+    meta[W] = make_meta(2, {8192, 8192, 0}, {0, 0, 0}, 0, false);
+    ASTNode* w = make_add(W, make_leaf(G, 2), make_region<2>({1, 1}, {8193, 8193}, {1, 1}),
+                          make_leaf(G, 2), make_region<2>({0, 1}, {8192, 8193}, {1, 1}),
+                          /*is_temp=*/false, /*ndims=*/2);
+    DAG* dag = make_single_node_dag({w});
+
+    decomposition_solver::compute_decompositions(meta, dag, /*odf=*/4, /*num_pes=*/4);
+
+    expect_eq("W.tile", meta.at(W).tile, 2080);
+    expect_eq("W.offset[1]", meta.at(W).offset[1], 1);
+    expect_true("W.offset[0] in {0, 1}", meta.at(W).offset[0] == 0 || meta.at(W).offset[0] == 1);
+
+    delete dag;
+}
+
+void test_reduce_operands_share_layout() {
+    std::cout << "=== test_reduce_operands_share_layout ===" << std::endl;
+
+    constexpr int A = 1;
+    constexpr int C = 2;
+    constexpr int X = 3;
+    constexpr int R = 4;
+
+    MetaMap meta;
+    meta[A] = make_meta(1, 500, /*offset0=*/5, /*tile=*/64, /*final=*/true);
+    meta[C] = make_meta(1, 500, 0, 64, true);
+    meta[X] = make_meta(1, 500, 0, 0, false);
+    meta[R] = make_meta(1, 1, 0, 0, false);
+    ASTNode* x = make_copy(X, make_leaf(C), nullptr);
+    auto* r = new ASTNode(R, static_cast<int>(Opcode::REDUCE), false, false, 0.0, 1);
+    r->add_operand(make_leaf(X));
+    r->operand_regions.push_back(nullptr);
+    r->add_operand(make_leaf(A));
+    r->operand_regions.push_back(nullptr);
+    DAG* dag = make_single_node_dag({x, r});
+
+    decomposition_solver::compute_decompositions(meta, dag, /*odf=*/4, /*num_pes=*/1);
+
+    expect_eq("X.tile", meta.at(X).tile, 64);
+    expect_eq("X.offset[0]", meta.at(X).offset[0], 5);
+
+    delete dag;
+}
+
+void test_small_class_member_keeps_own_tile() {
+    std::cout << "=== test_small_class_member_keeps_own_tile ===" << std::endl;
+
+    constexpr int BIG = 1;
+    constexpr int SMALL = 2;
+    constexpr int SET = 3;
+
+    // SMALL is written into a slice of BIG: one tile class, but a tile sized for BIG
+    // would leave SMALL on one or two PEs.
+    MetaMap meta;
+    meta[BIG] = make_meta(3, {1120, 365, 240}, {0, 0, 0}, 0, false);
+    meta[SMALL] = make_meta(3, {160, 365, 240}, {0, 0, 0}, 0, false);
+    ASTNode* set = make_set_region(SET, make_leaf(BIG, 3),
+                                   make_region<3>({160, 0, 0}, {320, 365, 240}, {1, 1, 1}),
+                                   make_leaf(SMALL, 3), /*ndims=*/3);
+    DAG* dag = make_single_node_dag({set});
+
+    decomposition_solver::compute_decompositions(meta, dag, /*odf=*/4, /*num_pes=*/4);
+
+    expect_eq("SMALL.tile", meta.at(SMALL).tile,
+              decomposition_solver::detail::balanced_tile({160, 365, 240}, 3, 16, 4, 64));
+    expect_true("BIG has another tile", meta.at(BIG).tile != meta.at(SMALL).tile);
+
+    delete dag;
+}
 } // namespace
 
 int main() {
@@ -458,6 +605,11 @@ int main() {
         test_jacobi3d_temp_offset();
         test_strided_copy_reduces_tile_and_sets_offset();
         test_transpose_result_aligned_to_source_tiles();
+        test_balanced_tiles();
+        test_chare_home_pe_balance();
+        test_misaligned_after_flush_takes_source_tile();
+        test_reduce_operands_share_layout();
+        test_small_class_member_keeps_own_tile();
     } catch (const std::exception& ex) {
         std::cerr << "test_compute_decompositions failed: " << ex.what() << std::endl;
         return 1;

@@ -866,11 +866,14 @@ static void send_reduce_msg(ArrayDAGGroup* dag_group, const ChareIndex<M>& ci, i
                             std::vector<char>& buf) {
     int64_t bytes = static_cast<int64_t>(buf.size());
     if constexpr (M == 1)
-        proxy_at<1>(dag_group->partition_proxy_1, ci).receive_reduce_partial(node_id, bytes, buf.data());
+        ct_send_bytes(proxy_at<1>(dag_group->partition_proxy_1, ci), MSG_REDUCE_PARTIAL, node_id,
+                      bytes, buf.data());
     else if constexpr (M == 2)
-        proxy_at<2>(dag_group->partition_proxy_2, ci).receive_reduce_partial(node_id, bytes, buf.data());
+        ct_send_bytes(proxy_at<2>(dag_group->partition_proxy_2, ci), MSG_REDUCE_PARTIAL, node_id,
+                      bytes, buf.data());
     else
-        proxy_at<3>(dag_group->partition_proxy_3, ci).receive_reduce_partial(node_id, bytes, buf.data());
+        ct_send_bytes(proxy_at<3>(dag_group->partition_proxy_3, ci), MSG_REDUCE_PARTIAL, node_id,
+                      bytes, buf.data());
 }
 
 /// Split a partial over output box [start, stop) by the output decomposition

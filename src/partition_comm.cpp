@@ -2,6 +2,7 @@
 #include "dispatch.hpp"
 
 #include <cstring>
+#include <cstdlib>
 
 #ifdef USE_KOKKOS
 static std::vector<int> recv_key(int node_id, int input_index, int name, int ndims,
@@ -30,6 +31,9 @@ void PartitionImpl<N>::send_complete(int send_id) {
         comm_free(it->second);
         pending_sends.erase(it);
     }
+#ifdef USE_NVIDIA
+    gpu_ipc_retry();
+#endif
 }
 
 #ifdef USE_NVIDIA
@@ -72,10 +76,14 @@ void PartitionImpl<N>::receive_ipc(int node_id, int input_index, int name, int n
                                    int* region_data, int64_t size, int src_node, int slab,
                                    int64_t offset, const char* handle, const CkCallback& done) {
 #ifdef USE_NVIDIA
-    char* base = gpu_ipc_peer_slab(src_node, slab, handle);
-    if (!base)
-        return;
-    char* src = base + offset;
+    // slab < 0: a sender in this process passed its device pointer as the offset
+    char* src = reinterpret_cast<char*>(offset);
+    if (slab >= 0) {
+        char* base = gpu_ipc_peer_slab(src_node, slab, handle);
+        if (!base)
+            return;
+        src = base + offset;
+    }
     auto* p = comm_recv_param(this, node_id, input_index, name, ndims, region_data, size);
     p->done = done;
     hapiCheck(cudaMemcpyAsync(p->buf, src, size, cudaMemcpyDeviceToDevice, comm_stream_raw));
@@ -108,9 +116,7 @@ void PartitionImpl<N>::receive_staged(int node_id, int input_index, int name, in
 
 template <int N>
 void PartitionImpl<N>::receive_data(int node_id, int input_index, int name, int ndims,
-                                    int* region_data, int64_t size, char* data) {
-    PendingComm<N>& comm = executor->pending[node_id];
-
+                                    int* region_data, int64_t size, char* data, bool owned) {
 #ifdef USE_KOKKOS
     // Payload is already in the buffer from the post entry.
     char* buf = data;
@@ -125,10 +131,25 @@ void PartitionImpl<N>::receive_data(int node_id, int input_index, int name, int 
         if (it->second.empty())
             posted_recv_bufs.erase(it);
     }
+    (void)owned;
+    // before any other tag test: other tag ranges must stay below LA_DEV_INPUT (1 << 24)
+    static_assert(LA_DEV_INPUT == (1 << 24), "LINALG device chunk tags start at 1 << 24");
+    if (input_index >= LA_DEV_INPUT) {
+        executor->on_linalg_device(node_id, input_index - LA_DEV_INPUT, region_data, buf);
+        return;
+    }
 #else
-    char* buf = new char[size];
-    memcpy(buf, data, size);
+    char* buf = data;
+    if (!owned) {
+        buf = new char[size];
+        memcpy(buf, data, size);
+    }
 #endif
+    if (input_index >= kDsDataTag && input_index < kDsDataTag + kDsDataTags) {
+        executor->on_ds_data(node_id, input_index - kDsDataTag, region_data, buf, size);
+        return;
+    }
+    PendingComm<N>& comm = executor->pending[node_id];
 
     // Unpack region from region_data: [start0, stop0, step0, start1, stop1, step1, ...]
     std::array<int, N> start, stop, step;
@@ -147,7 +168,10 @@ void PartitionImpl<N>::receive_data(int node_id, int input_index, int name, int 
 
     if (comm.incremental) {
         // Incremental mode: compute with this panel immediately
-        executor->on_matmatmul_receive(node_id, input_index);
+        if constexpr (N == 3)
+            executor->on_signal_receive(node_id, input_index);
+        else
+            executor->on_matmatmul_receive(node_id, input_index);
     }
 
     if (comm.expected_msgs > 0) {
@@ -169,6 +193,69 @@ void PartitionImpl<N>::reduce_result(int node_id, int64_t size, char* data) {
     if constexpr (N == 1)
         executor->on_dot_partial(node_id, data, size);
 }
+
+int64_t ct_msg_max_bytes() {
+    static const int64_t limit = [] {
+        int64_t v = int64_t(1) << 30;
+        if (const char* e = getenv("CNUM_MSG_MAX_BYTES")) {
+            char* end = nullptr;
+            long long x = strtoll(e, &end, 10);
+            if (end != e && *end == '\0' && x > 0)
+                v = std::min<int64_t>(x, v);
+        }
+        return v;
+    }();
+    return limit;
+}
+
+int64_t ct_next_frag_seq() {
+    static thread_local int64_t seq = 0; // SMP: one per PE thread, keyed with the PE
+    return ++seq;
+}
+
+template <int N>
+void PartitionImpl<N>::receive_frag(int node_id, int kind, int src, int64_t seq, int nmeta,
+                                    int* meta, int64_t total, int64_t offset, int64_t size,
+                                    char* data) {
+    auto key = std::make_pair(src, seq);
+    FragBuf& f = frags[key];
+    if (!f.data) {
+        f.data.reset(new char[total]);
+        f.total = total;
+    } else if (f.total != total) {
+        CkAbort("receive_frag: fragments of PE %d's payload %lld disagree on its size", src,
+                (long long)seq);
+    }
+    memcpy(f.data.get() + offset, data, size);
+    f.got += size;
+    if (f.got < total)
+        return;
+    std::unique_ptr<char[]> buf = std::move(f.data);
+    frags.erase(key);
+    char* b = buf.get();
+    switch (kind) {
+#ifdef USE_KOKKOS
+    case MSG_STAGED: receive_staged(node_id, meta[0], meta[1], meta[2], meta + 3, total, b); break;
+#else
+    case MSG_DATA:
+        receive_data(node_id, meta[0], meta[1], meta[2], meta + 3, total, buf.release(), true);
+        break;
+#endif
+    case MSG_REDUCE_PARTIAL: receive_reduce_partial(node_id, total, b); break;
+    case MSG_LINALG: receive_linalg(node_id, total, b); break;
+    case MSG_INDEX: receive_index_msg(node_id, total, b); break;
+    case MSG_SHAPE: receive_shape(node_id, total, b); break;
+    case MSG_UPLOAD_TILE: receive_upload_tile(node_id, meta[0], total, b); break;
+    default: CkAbort("receive_frag: unexpected message kind %d", kind);
+    }
+}
+
+template void PartitionImpl<1>::receive_frag(int, int, int, int64_t, int, int*, int64_t, int64_t,
+                                             int64_t, char*);
+template void PartitionImpl<2>::receive_frag(int, int, int, int64_t, int, int*, int64_t, int64_t,
+                                             int64_t, char*);
+template void PartitionImpl<3>::receive_frag(int, int, int, int64_t, int, int*, int64_t, int64_t,
+                                             int64_t, char*);
 
 #ifdef USE_KOKKOS
 template void PartitionImpl<1>::receive_data(int&, int&, int&, int&, int*&, int64_t&, char*&,
@@ -194,9 +281,12 @@ template void PartitionImpl<2>::send_complete(int);
 template void PartitionImpl<3>::send_complete(int);
 #endif
 
-template void PartitionImpl<1>::receive_data(int, int, int, int, int*, int64_t, char*);
-template void PartitionImpl<2>::receive_data(int, int, int, int, int*, int64_t, char*);
-template void PartitionImpl<3>::receive_data(int, int, int, int, int*, int64_t, char*);
+template void PartitionImpl<1>::receive_data(int, int, int, int, int*, int64_t, char*,
+                                             bool);
+template void PartitionImpl<2>::receive_data(int, int, int, int, int*, int64_t, char*,
+                                             bool);
+template void PartitionImpl<3>::receive_data(int, int, int, int, int*, int64_t, char*,
+                                             bool);
 
 template void PartitionImpl<1>::comm_done(int);
 template void PartitionImpl<2>::comm_done(int);

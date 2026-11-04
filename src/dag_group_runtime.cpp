@@ -23,9 +23,11 @@ ArrayDAGGroup::ArrayDAGGroup() {
     ++kokkos_users;
 #endif
     if (CkMyPe() == 0) {
-        partition_proxy_1 = CProxy_Partition1D::ckNew();
-        partition_proxy_2 = CProxy_Partition2D::ckNew();
-        partition_proxy_3 = CProxy_Partition3D::ckNew();
+        CkArrayOptions opts;
+        opts.setMap(CProxy_PartitionMap::ckNew());
+        partition_proxy_1 = CProxy_Partition1D::ckNew(opts);
+        partition_proxy_2 = CProxy_Partition2D::ckNew(opts);
+        partition_proxy_3 = CProxy_Partition3D::ckNew(opts);
         thisProxy.set_proxies(partition_proxy_1, partition_proxy_2, partition_proxy_3);
     }
 }
@@ -108,7 +110,7 @@ ArrayDAGGroup::~ArrayDAGGroup() {
 void ArrayDAGGroup::compute_decompositions(DAG* dag) {
     // Solve over the arrays this DAG references only: array_meta keeps every array
     // ever created, and the others are all decomp_final (singleton classes).
-    std::unordered_map<int, ArrayMetadata> sub;
+    std::map<int, ArrayMetadata> sub; // ordered: every PE solves alike
     std::unordered_set<ASTNode*> seen;
     std::vector<ASTNode*> stack;
     for (auto& [id, node] : dag->nodes)
@@ -127,25 +129,29 @@ void ArrayDAGGroup::compute_decompositions(DAG* dag) {
         for (ASTNode* op : n->operands)
             stack.push_back(op);
     }
+    static const bool log = getenv("CNUM_DECOMP_LOG") != nullptr && CkMyPe() == 0;
+    std::unordered_set<int> was_final;
+    for (auto& [name, meta] : sub)
+        if (log && meta.decomp_final)
+            was_final.insert(name);
     decomposition_solver::compute_decompositions(sub, dag, odf, CkNumPes());
     for (auto& [name, meta] : sub)
         array_meta[name] = meta;
 
-    DBG_PRINT("[PE %d] compute_decompositions: assigned tiles and offsets for %d arrays\n",
-              CkMyPe(), (int)sub.size());
-    for (auto& [name, meta] : sub) {
-        DBG_PRINT("  array %d: ndims=%d shape=(%d,%d,%d) tile=%d offset=(%d,%d,%d)\n", name,
-                  meta.ndims, meta.global_shape[0], meta.global_shape[1],
-                  meta.global_shape[2], meta.tile, meta.offset[0], meta.offset[1],
-                  meta.offset[2]);
-    }
+    if (!log)
+        return;
+    for (auto& [name, meta] : sub)
+        if (!was_final.count(name))
+            CkPrintf("decomp: array %d shape (%d,%d,%d) tile %d offset (%d,%d,%d)\n", name,
+                     meta.global_shape[0], meta.global_shape[1], meta.global_shape[2],
+                     meta.tile, meta.offset[0], meta.offset[1], meta.offset[2]);
 }
 
-void ArrayDAGGroup::receive_get_request(int ndims, int epoch, int name, int size, int dtype) {
+void ArrayDAGGroup::receive_get_request(int ndims, int epoch, int name, int64_t size, int dtype) {
     epoch_arrived(epoch, [=] { receive_get_request_now(ndims, epoch, name, size, dtype); });
 }
 
-void ArrayDAGGroup::receive_get_request_now(int ndims, int epoch, int name, int size,
+void ArrayDAGGroup::receive_get_request_now(int ndims, int epoch, int name, int64_t size,
                                             int dtype) {
     if (name == kBarrierName) {
         int64_t chares = 0;
@@ -185,7 +191,7 @@ void ArrayDAGGroup::receive_get_request_now(int ndims, int epoch, int name, int 
     // Only PE 0 allocates the gather buffer for assembly
     // size is element count; convert to bytes using the wire dtype
     int elem_size = dtype_size(static_cast<DType>(dtype));
-    int64_t byte_size = (int64_t)size * elem_size;
+    int64_t byte_size = size * elem_size;
     if (CkMyPe() == 0) {
         gather_buffers[epoch] = new char[byte_size];
         gather_total[epoch] = byte_size;
@@ -201,10 +207,10 @@ void ArrayDAGGroup::receive_get_request_now(int ndims, int epoch, int name, int 
             }
             gather_early.erase(early_it);
             if (gather_counts[epoch] >= gather_total[epoch]) {
-                Server<CProxy_ArrayDAGGroup>::send_reply(epoch, byte_size, gather_buffers[epoch]);
+                Server<CProxy_ArrayDAGGroup>::send_fetch_reply(epoch, byte_size,
+                                                               gather_buffers[epoch]);
                 gather_counts.erase(epoch);
                 gather_total.erase(epoch);
-                delete[] gather_buffers[epoch];
                 gather_buffers.erase(epoch);
             }
         }
@@ -238,10 +244,10 @@ void ArrayDAGGroup::gather(int epoch, int name, int64_t offset, int64_t size, ch
     memcpy(gather_buffers[epoch] + offset, data, size);
     gather_counts[epoch] += size;
     if (gather_counts[epoch] >= gather_total[epoch]) {
-        Server<CProxy_ArrayDAGGroup>::send_reply(epoch, gather_total[epoch], gather_buffers[epoch]);
+        Server<CProxy_ArrayDAGGroup>::send_fetch_reply(epoch, gather_total[epoch],
+                                                       gather_buffers[epoch]);
         gather_counts.erase(epoch);
         gather_total.erase(epoch);
-        delete[] gather_buffers[epoch];
         gather_buffers.erase(epoch);
     }
 }

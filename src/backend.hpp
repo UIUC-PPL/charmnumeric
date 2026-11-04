@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdlib>
+#include <memory>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -115,6 +116,12 @@ inline int matmul_drop_dim(ASTNode* root, int idx) {
     return drop_dim_3d(*r, want_rows, want_cols);
 }
 
+/// Order of the frees into the caches (least recently freed is evicted first).
+inline std::atomic<uint64_t>& cache_clock() {
+    static std::atomic<uint64_t> c{0};
+    return c;
+}
+
 #ifdef USE_KOKKOS
 #include <Kokkos_Core.hpp>
 using DeviceSpace = Kokkos::DefaultExecutionSpace::memory_space;
@@ -131,9 +138,7 @@ inline std::atomic<int>& gpu_sharers() {
     return n;
 }
 
-/// Share of device memory a cache of this process may hold: `env` MB if set, else
-/// 1/`div` of the device split among the processes that share it.
-inline int64_t device_budget(const char* env, int div) {
+inline int64_t device_total() {
     static const int64_t total = [] {
         size_t fr = 0, tot = 0;
 #ifdef USE_NVIDIA
@@ -141,10 +146,50 @@ inline int64_t device_budget(const char* env, int div) {
 #endif
         return tot ? static_cast<int64_t>(tot) : int64_t(8) << 30;
     }();
+    return total;
+}
+
+/// Share of device memory a cache of this process may hold: `env` MB if set, else
+/// 1/`div` of the device split among the processes that share it.
+inline int64_t device_budget(const char* env, int div) {
     if (const char* v = std::getenv(env))
         return std::atoll(v) << 20;
-    return total / div / std::max(1, gpu_sharers().load(std::memory_order_relaxed));
+    return device_total() / div / std::max(1, gpu_sharers().load(std::memory_order_relaxed));
 }
+
+inline int64_t device_free() {
+#ifdef USE_NVIDIA
+    size_t fr = 0, tot = 0;
+    if (cudaMemGetInfo(&fr, &tot) == cudaSuccess)
+        return static_cast<int64_t>(fr);
+#endif
+    return std::numeric_limits<int64_t>::max();
+}
+
+/// Caches keep a freed block only while this much of the device stays free
+/// (CNUM_DEVICE_RESERVE_MB, default 1/4 of the device).
+inline int64_t device_reserve() {
+    static const int64_t r = [] {
+        const char* v = std::getenv("CNUM_DEVICE_RESERVE_MB");
+        return v ? std::atoll(v) << 20 : device_total() / 4;
+    }();
+    return r;
+}
+
+/// Bytes a cache may always hold: 1/8 of the device per sharing process.
+inline int64_t device_cache_floor() {
+    return device_total() / 8 / std::max(1, gpu_sharers().load(std::memory_order_relaxed));
+}
+
+/// Whether a cache holding `cached` bytes may keep another block: always up to
+/// device_cache_floor(), beyond that while device_reserve() stays free.
+inline bool device_cache_room(int64_t cached) {
+    return cached <= device_cache_floor() || device_free() >= device_reserve();
+}
+
+/// Evicts cached blocks and retired arrays, oldest first, while the caches hold more than
+/// device_cache_floor() and `bytes` plus device_reserve() do not fit (defined below).
+inline void device_make_room(int64_t bytes);
 
 /// Frees the cached message buffers and this PE's retired arrays (defined below).
 inline void release_device_caches();
@@ -178,10 +223,10 @@ inline void* device_malloc(int64_t bytes) {
 /// freed after their last GPU use (send_complete, compute-done callbacks). Larger blocks
 /// are cached by size in 2 MB steps: cudaMalloc of hundreds of MB gets slower the more
 /// such blocks a process has freed. Small and large blocks have separate budgets
-/// (CNUM_COMM_CACHE_MB, default 1/16 of the device; CNUM_DEVICE_CACHE_MB, default 1/8),
-/// split among the processes on the GPU; the least recently freed large blocks are evicted
-/// first. The IPC slabs (gpu_comm.hpp) are separate: in-flight messages, capped by
-/// CNUM_GPU_IPC_MB.
+/// (CNUM_COMM_CACHE_MB, default 1/16 of the device; CNUM_DEVICE_CACHE_MB, default 1/2),
+/// split among the processes on the GPU. A large block is kept only while device_reserve()
+/// stays free, and the least recently freed ones are evicted first. The IPC slabs
+/// (gpu_comm.hpp) are separate: in-flight messages, capped by CNUM_GPU_IPC_MB.
 struct CommPool {
     static constexpr int kMinClass = 8, kMaxClass = 26; // 256 B .. 64 MB
     static constexpr int64_t kLargeStep = int64_t(2) << 20;
@@ -195,7 +240,6 @@ struct CommPool {
     std::unordered_map<void*, int64_t> live_large; // block -> bytes
     std::multimap<int64_t, FreeBlock> free_large;
     int64_t large_cached = 0;
-    uint64_t clock = 0;
     std::mutex mu; // shared by the PEs of a process (SMP)
 };
 
@@ -218,22 +262,30 @@ inline void comm_release_all(CommPool& pool) {
     pool.cached = 0;
 }
 
+/// The least recently freed large block, or end(); the caller holds pool.mu.
+inline std::multimap<int64_t, CommPool::FreeBlock>::iterator comm_oldest_large(CommPool& pool) {
+    auto oldest = pool.free_large.begin();
+    for (auto it = pool.free_large.begin(); it != pool.free_large.end(); ++it)
+        if (it->second.stamp < oldest->second.stamp)
+            oldest = it;
+    return oldest;
+}
+
+inline void comm_evict_large(CommPool& pool, std::multimap<int64_t, CommPool::FreeBlock>::iterator it) {
+    Kokkos::kokkos_free<DeviceSpace>(it->second.ptr);
+    pool.large_cached -= it->first;
+    pool.free_large.erase(it);
+}
+
 inline void comm_free_large(CommPool& pool, void* ptr, int64_t bytes) {
-    int64_t limit = device_budget("CNUM_DEVICE_CACHE_MB", 8);
-    if (bytes > limit) {
+    int64_t limit = device_budget("CNUM_DEVICE_CACHE_MB", 2);
+    if (bytes > limit || !device_cache_room(pool.large_cached + bytes)) {
         Kokkos::kokkos_free<DeviceSpace>(ptr);
         return;
     }
-    while (pool.large_cached + bytes > limit) {
-        auto oldest = pool.free_large.begin();
-        for (auto it = pool.free_large.begin(); it != pool.free_large.end(); ++it)
-            if (it->second.stamp < oldest->second.stamp)
-                oldest = it;
-        Kokkos::kokkos_free<DeviceSpace>(oldest->second.ptr);
-        pool.large_cached -= oldest->first;
-        pool.free_large.erase(oldest);
-    }
-    pool.free_large.emplace(bytes, CommPool::FreeBlock{ptr, ++pool.clock});
+    while (pool.large_cached + bytes > limit)
+        comm_evict_large(pool, comm_oldest_large(pool));
+    pool.free_large.emplace(bytes, CommPool::FreeBlock{ptr, ++cache_clock()});
     pool.large_cached += bytes;
 }
 
@@ -266,6 +318,8 @@ inline void* comm_alloc(int64_t bytes) {
             return ptr;
         }
     }
+    if (large)
+        device_make_room(bytes);
     void* ptr = device_malloc(bytes); // not under pool.mu: a failure releases the pool
     std::lock_guard<std::mutex> lock(pool.mu);
     if (large)
@@ -324,6 +378,7 @@ class CTArrayBase {
     int global_size; // total elements across all dimensions
     bool owner;
     DType dtype;
+    uint64_t retired_at = 0; // cache_clock() when it entered a free list
 
     virtual ~CTArrayBase() = default;
     int64_t local_size() const { return region.size(); }
@@ -519,6 +574,16 @@ struct DotState {
     bool started = false;
 };
 
+/// receive_data input_index of LINALG device chunks: LA_DEV_INPUT + chunk kind.
+constexpr int LA_DEV_INPUT = 1 << 24;
+
+/// A LINALG device chunk: rows [r0, r1) x cols [c0, c1) of an operand or result.
+struct LaDevChunk {
+    int kind, r0, r1, c0, c1;
+    char* buf;
+};
+struct LaDevRoot;
+
 /// LINALG state on one result chare; early messages wait in `stash`.
 template <int N>
 struct LinalgState {
@@ -529,28 +594,25 @@ struct LinalgState {
     bool computed = false;
     std::vector<std::vector<char>> stash;
     std::vector<std::vector<char>> inputs; // gathered operand blocks (root)
+    std::vector<LaDevChunk> dev_stash;     // device chunks that arrived before the node
+    LaDevRoot* dev = nullptr;              // root's device operands (executor_linalg.cpp)
     ArrayRegion<N> mine;
     int64_t in_covered = 0, in_expected = 0;
     int64_t out_covered = 0, out_expected = 0;
 };
 
-/// GATHER/SCATTER/EXPAND state per chare; early messages wait in `stash`.
+/// Index op state per chare; early messages wait in `stash`.
 template <int N>
 struct IndexState {
     DAGNode* node = nullptr;
     bool started = false;
     std::vector<std::vector<char>> stash;
-    bool holder = false, flushed = false;
-    int req_left = 0;  // holder: request lists still expected
+    std::shared_ptr<void> ctx; // the node's decoded context (executor_indexing.cpp)
+    int64_t req_left = 0; // holder: requests still expected (GATHER/SCATTER: units)
     int val_left = 0;  // target: value lists still expected
     int seg_left = 0;  // EXPAND coordinator: segment lists still expected
     bool wait_offsets = false; // EXPAND driver: segment offsets not yet received
-    std::unordered_map<int64_t, std::vector<int64_t>> outgoing; // holder: value lists per target
-    std::vector<int64_t> updates; // target: received entries
-    int upd_width = 0;
     std::vector<std::vector<char>> segs; // coordinator: received segment lists
-    std::vector<int64_t> counts, seg_start; // EXPAND driver: element counts, row starts
-    int64_t row = 1;
     // COMPRESS / MASK_SCATTER
     bool mx_pending = false; // this chare holds a block of x that is not done yet
     bool mx_scanned = false;
@@ -560,6 +622,15 @@ struct IndexState {
     char* cbuf = nullptr;                  // compacted values (device memory in GPU builds)
     int64_t out_covered = 0, out_expected = 0;
     std::vector<std::vector<char>> reqs;   // v holder: requests, served once all arrived
+    // GATHER / SCATTER
+    bool gx_target = false, gx_issued = false;
+    int64_t lmsg_left = 0;                     // target: L elements / bucket units to come
+    int rep_left = 0;                          // target: direct copies to come
+    int64_t rep_elems = 0;                     // target: elements of replies to come
+    char* gx_lblk = nullptr;                   // target: L values of its b range (GATHER)
+    char* gx_ent = nullptr;                    // target: entry pairs grouped by holder
+    std::vector<std::vector<char>> gx_msgs;    // SCATTER target: received buckets
+    std::vector<std::vector<char>> gx_late;    // SCATTER target: values written after serving
 };
 
 /// RESHAPE/BROADCAST state per result chare; early messages wait in `stash`.
@@ -576,9 +647,23 @@ struct ShapeState {
 
 // ---- ArrayDAGGroup ----
 
+/// receive_data input_index base of the distributed sort's data messages (executor_sort.cpp).
+constexpr int kDsDataTag = 1 << 20, kDsDataTags = 1 << 16;
+struct DsState;
+
 /// GET of this array name: a barrier, answered (with no data) once every chare
 /// of every partition has finished all earlier epochs.
 constexpr int kBarrierName = -1;
+
+/// Places the partitions' chares (chare_home_pe) instead of Charm++'s index hash.
+class PartitionMap : public CBase_PartitionMap {
+  public:
+    PartitionMap() {}
+    PartitionMap(CkMigrateMessage* m) : CBase_PartitionMap(m) {}
+    int procNum(int, const CkArrayIndex& idx) override {
+        return chare_home_pe(idx.dimension, idx.data(), CkNumPes());
+    }
+};
 
 class ArrayDAGGroup : public CBase_ArrayDAGGroup {
   public:
@@ -671,9 +756,9 @@ class ArrayDAGGroup : public CBase_ArrayDAGGroup {
 
     // Unified DAG handling — dispatches to all relevant partition types
     void receive_dag(int epoch, int size, char* serialized_dag);
-    void receive_get_request(int ndims, int epoch, int name, int size, int dtype = 0);
+    void receive_get_request(int ndims, int epoch, int name, int64_t size, int dtype = 0);
     void receive_dag_now(int epoch, int size, char* serialized_dag);
-    void receive_get_request_now(int ndims, int epoch, int name, int size, int dtype);
+    void receive_get_request_now(int ndims, int epoch, int name, int64_t size, int dtype);
     // Broadcasts from PE 0 may arrive out of order (e.g. a small GET overtaking a large
     // DAG); epochs are processed in client order, later ones wait here.
     int next_epoch = 0;
@@ -726,6 +811,7 @@ class ArrayDAGExecutorND : public DAGExecutor {
     std::unordered_map<int, LinalgState<N>> la_state;
     std::unordered_map<int, IndexState<N>> ix_state;
     std::unordered_map<int, ShapeState<N>> shape_state;
+    std::unordered_map<int, std::shared_ptr<DsState>> ds_state;
     std::unordered_map<int, std::pair<DAGNode*, int>> upload_wait; // node -> tiles still fetched
 
     ArrayDAGExecutorND(ArrayDAGGroup* group_, PartitionImpl<N>* partition_)
@@ -737,6 +823,9 @@ class ArrayDAGExecutorND : public DAGExecutor {
     void execute_matmul_node(DAGNode* node);
     void execute_matmatmul_node(DAGNode* node);
     void execute_reduce_node(DAGNode* node);
+    void start_realigned_dot(DAGNode* node, int lhs_name, int rhs_name);
+    void finish_realigned_dot(PendingComm<N>& comm);
+    void post_dot_partial(DAGNode* node, char* contrib, int lhs_name);
     void on_dot_partial(int node_id, char* data, int64_t size);
     void finish_dot(int node_id);
     void execute_cross_set_region_node(DAGNode* node);
@@ -747,6 +836,7 @@ class ArrayDAGExecutorND : public DAGExecutor {
     void on_reduce_final(int node_id);
     void execute_linalg_node(DAGNode* node);
     void on_linalg_msg(int node_id, char* data, int64_t size);
+    void on_linalg_device(int node_id, int kind, const int* region, char* buf);
     void execute_creation_node(DAGNode* node);
     void on_upload_tile(int node_id, int name, char* data, int64_t size);
     void finish_creation_node(int node_id);
@@ -755,13 +845,23 @@ class ArrayDAGExecutorND : public DAGExecutor {
     void on_shape_msg(int node_id, char* data, int64_t size);
     void execute_castscansort_node(DAGNode* node);
     void finish_castscansort_node(PendingComm<N>& comm);
+    void execute_ds_node(DAGNode* node);
+    void ds_progress_start(int node_id);
+    void on_ds_msg(int node_id, char* data, int64_t size);
+    void on_ds_data(int node_id, int phase, const int* region_data, char* buf, int64_t size);
+    void ds_take_piece(int node_id, int phase, int src, int64_t start, int64_t count, char* buf);
+    void ds_sort_progress(int node_id);
+    void ds_select_msg(int node_id, char* data, int64_t size);
     void execute_signal_node(DAGNode* node);
     void finish_signal_node(PendingComm<N>& comm);
+    void on_signal_receive(int node_id, int input_index);
     void execute_index_node(DAGNode* node);
     void on_index_msg(int node_id, char* data, int64_t size);
     void index_progress(int node_id);
     void execute_mask_node(DAGNode* node);
     void mask_progress(int node_id);
+    void gx_start(DAGNode* node);
+    void gx_progress(int node_id);
     void on_comm_done(int node_id);
     void on_matmatmul_receive(int node_id, int input_index);
     void on_matmul_partial(int node_id, RemoteBuffer<N>& partial_buf);
@@ -786,11 +886,11 @@ class PartitionImpl {
     int64_t comm_bytes_sent = 0; // cumulative communication volume (bytes) sent from this chare
 #endif
 
-    // Free list for array reuse: retired arrays keyed by exact buffer metadata.
-    // A buffer is only reusable when dtype, shape, and decomposition match.
+    // Free list for array reuse: retired arrays keyed by dtype and local size; a reused
+    // array takes the new region, shape and decomposition.
 #ifdef USE_NVIDIA
-    // Bounded by retired bytes per PE: freeing the surplus costs a cudaFree (a device sync)
-    // and a later cudaMalloc per array.
+    // Bounded by retired bytes per process and by free device memory: freeing the surplus
+    // costs a cudaFree (a device sync) and a later cudaMalloc per array.
     static constexpr int FREE_LIST_MAX = 64; // max entries per key
 #else
     static constexpr int FREE_LIST_MAX = 4; // max entries per key
@@ -798,10 +898,10 @@ class PartitionImpl {
     static std::atomic<int64_t>& retired_bytes() {
         return retired_device_bytes();
     }
-    /// 1/8 of the device, split among the processes on it (CNUM_FREE_LIST_MB).
+    /// 1/2 of the device, split among the processes on it (CNUM_FREE_LIST_MB).
     static int64_t retired_limit() {
 #ifdef USE_NVIDIA
-        return device_budget("CNUM_FREE_LIST_MB", 8);
+        return device_budget("CNUM_FREE_LIST_MB", 2);
 #else
         return std::numeric_limits<int64_t>::max();
 #endif
@@ -809,58 +909,27 @@ class PartitionImpl {
 
     struct FreeKey {
         DType dtype;
-        std::array<int, N> local_shape;
-        std::array<int, N> global_shape;
-        std::array<int, N> decomp_offset;
-        std::array<int, N> decomp_global_shape;
-        int decomp_tile;
-
-        bool operator==(const FreeKey& o) const {
-            return dtype == o.dtype &&
-                   local_shape == o.local_shape &&
-                   global_shape == o.global_shape &&
-                   decomp_offset == o.decomp_offset &&
-                   decomp_global_shape == o.decomp_global_shape &&
-                   decomp_tile == o.decomp_tile;
-        }
+        int64_t size;
+        bool operator==(const FreeKey& o) const { return dtype == o.dtype && size == o.size; }
     };
     struct FreeKeyHash {
-        static inline void hash_combine(std::size_t& seed, std::size_t value) {
-            seed ^= value + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-        }
-
-        static inline void hash_int_array(std::size_t& seed, const std::array<int, N>& values) {
-            for (int value : values)
-                hash_combine(seed, std::hash<int>()(value));
-        }
-
         std::size_t operator()(const FreeKey& k) const {
-            std::size_t seed = std::hash<int>()(static_cast<int>(k.dtype));
-            hash_int_array(seed, k.local_shape);
-            hash_int_array(seed, k.global_shape);
-            hash_int_array(seed, k.decomp_offset);
-            hash_int_array(seed, k.decomp_global_shape);
-            hash_combine(seed, std::hash<int>()(k.decomp_tile));
-            return seed;
+            return std::hash<int64_t>()(k.size) * 31 + static_cast<int>(k.dtype);
         }
     };
     std::unordered_map<FreeKey, std::vector<CTArrayBase<N>*>, FreeKeyHash> free_arrays;
 
-    static FreeKey make_free_key(DType dtype,
-                                 const ArrayRegion<N>& region,
-                                 const std::array<int, N>& global_shape,
-                                 const ArrayDecomp<N>& decomp) {
-        std::array<int, N> local_shape{};
-        for (int d = 0; d < N; ++d)
-            local_shape[d] = region.size(d);
-        return FreeKey{
-            dtype,
-            local_shape,
-            global_shape,
-            decomp.offset,
-            decomp.global_shape,
-            decomp.tile,
-        };
+    static bool device_has_room(int64_t cached) {
+#ifdef USE_NVIDIA
+        return device_cache_room(cached);
+#else
+        (void)cached;
+        return true;
+#endif
+    }
+
+    static FreeKey make_free_key(DType dtype, const ArrayRegion<N>& region) {
+        return FreeKey{dtype, region.size()};
     }
 
     /// Move an array from `arrays` into the free list (or delete it if the
@@ -874,12 +943,12 @@ class PartitionImpl {
         }
         CTArrayBase<N>* arr = it->second;
         arrays.erase(it);
-        FreeKey key = make_free_key(arr->dtype, arr->region, arr->global_shape, arr->decomp);
-        auto& bucket = free_arrays[key];
+        auto& bucket = free_arrays[make_free_key(arr->dtype, arr->region)];
         int64_t bytes = arr->local_size() * arr->elem_size();
         if (static_cast<int>(bucket.size()) < FREE_LIST_MAX &&
-            retired_bytes() + bytes <= retired_limit()) {
+            retired_bytes() + bytes <= retired_limit() && device_has_room(retired_bytes() + bytes)) {
             arr->drop_host();
+            arr->retired_at = ++cache_clock();
             bucket.push_back(arr);
             retired_bytes() += bytes;
             DBG_PRINT("[PE %d] Partition<%d> retire_array name=%d: moved to freelist "
@@ -905,14 +974,35 @@ class PartitionImpl {
         free_arrays.clear();
     }
 
+    /// cache_clock() of this chare's least recently retired array (max if none).
+    uint64_t oldest_retired() const {
+        uint64_t s = std::numeric_limits<uint64_t>::max();
+        for (auto& [key, bucket] : free_arrays)
+            if (!bucket.empty())
+                s = std::min(s, bucket.front()->retired_at);
+        return s;
+    }
+
+    void evict_oldest_retired() {
+        uint64_t s = oldest_retired();
+        for (auto it = free_arrays.begin(); it != free_arrays.end(); ++it) {
+            auto& bucket = it->second;
+            if (bucket.empty() || bucket.front()->retired_at != s)
+                continue;
+            CTArrayBase<N>* arr = bucket.front();
+            bucket.erase(bucket.begin());
+            retired_bytes() -= arr->local_size() * arr->elem_size();
+            delete arr;
+            if (bucket.empty())
+                free_arrays.erase(it);
+            return;
+        }
+    }
+
     /// Try to pop a reusable buffer from the free list.
     /// Returns nullptr if none available.
-    CTArrayBase<N>* try_reuse(DType dtype,
-                              const ArrayRegion<N>& region,
-                              const std::array<int, N>& global_shape,
-                              const ArrayDecomp<N>& decomp) {
-        FreeKey key = make_free_key(dtype, region, global_shape, decomp);
-        auto it = free_arrays.find(key);
+    CTArrayBase<N>* try_reuse(DType dtype, const ArrayRegion<N>& region) {
+        auto it = free_arrays.find(make_free_key(dtype, region));
         if (it == free_arrays.end() || it->second.empty())
             return nullptr;
         CTArrayBase<N>* arr = it->second.back();
@@ -953,11 +1043,12 @@ class PartitionImpl {
                                          int name,
                                          const ArrayDecomp<N>& decomp,
                                          bool zero = true) {
-        CTArrayBase<N>* reused = try_reuse(dtype_of<T>(), region, global_shape, decomp);
+        CTArrayBase<N>* reused = try_reuse(dtype_of<T>(), region);
         if (reused == nullptr) {
             Array<N, T>* arr;
 #ifdef USE_NVIDIA
             // zero-filled on the compute stream below, not by a blocking Kokkos init
+            device_make_room(region.size() * (int64_t)sizeof(T));
             try {
                 arr = new Array<N, T>(region, global_shape, name, decomp, false);
             } catch (const std::exception&) {
@@ -1084,8 +1175,9 @@ class PartitionImpl {
 
     int create(ArrayRegion<N>* region, int name, DType dtype, const ArrayDecomp<N>& decomp);
     void run();
+    /// owned: data is new[]-allocated and passes to this chare (host payloads only).
     void receive_data(int node_id, int input_index, int name, int ndims, int* region_data,
-                      int64_t size, char* data);
+                      int64_t size, char* data, bool owned = false);
 #ifdef USE_KOKKOS
     void receive_data(int& node_id, int& input_index, int& name, int& ndims, int*& region_data,
                       int64_t& size, char*& data, CkDeviceBufferPost* devicePost);
@@ -1103,7 +1195,16 @@ class PartitionImpl {
     void receive_index_msg(int node_id, int64_t size, char* data);
     void receive_shape(int node_id, int64_t size, char* data);
     void receive_upload_tile(int node_id, int name, int64_t size, char* data);
+    void receive_frag(int node_id, int kind, int src, int64_t seq, int nmeta, int* meta,
+                      int64_t total, int64_t offset, int64_t size, char* data);
+    void receive_sort_msg(int node_id, int64_t size, char* data);
     void process_get(int epoch);
+    struct FragBuf {
+        std::unique_ptr<char[]> data;
+        int64_t total = 0;
+        int64_t got = 0;
+    };
+    std::map<std::pair<int, int64_t>, FragBuf> frags; // (source PE, sequence number)
 };
 
 /// This PE's chares of each rank (CNUM_MEM_STATS reports).
@@ -1129,6 +1230,59 @@ inline void release_device_caches() {
     auto& pool = comm_pool();
     std::lock_guard<std::mutex> lock(pool.mu);
     comm_release_all(pool);
+#ifdef USE_NVIDIA
+    int dev = 0;
+    cudaMemPool_t mp;
+    if (cudaGetDevice(&dev) == cudaSuccess && cudaDeviceGetDefaultMemPool(&mp, dev) == cudaSuccess)
+        cudaMemPoolTrimTo(mp, 0);
+#endif
+}
+
+/// Frees the least recently freed large block or retired array of this PE.
+inline bool evict_oldest_cached() {
+    uint64_t best = std::numeric_limits<uint64_t>::max();
+    std::function<void()> evict;
+    auto scan = [&](auto& parts) {
+        for (auto* p : parts) {
+            uint64_t s = p->oldest_retired();
+            if (s < best) {
+                best = s;
+                evict = [p] { p->evict_oldest_retired(); };
+            }
+        }
+    };
+    scan(local_partitions<1>());
+    scan(local_partitions<2>());
+    scan(local_partitions<3>());
+    auto& pool = comm_pool();
+    std::lock_guard<std::mutex> lock(pool.mu);
+    auto it = comm_oldest_large(pool);
+    if (it != pool.free_large.end() && it->second.stamp < best) {
+        comm_evict_large(pool, it);
+        return true;
+    }
+    if (!evict)
+        return false;
+    evict();
+    return true;
+}
+
+/// Retired arrays and cached large blocks of this process.
+inline int64_t device_cached() {
+    auto& pool = comm_pool();
+    std::lock_guard<std::mutex> lock(pool.mu);
+    return retired_device_bytes() + pool.large_cached;
+}
+
+inline void device_make_room(int64_t bytes) {
+#ifdef USE_NVIDIA
+    int64_t need = bytes + device_reserve();
+    while (device_cached() > device_cache_floor() && device_free() < need &&
+           evict_oldest_cached()) {
+    }
+#else
+    (void)bytes;
+#endif
 }
 #endif
 
@@ -1191,6 +1345,13 @@ class Partition1D : public CBase_Partition1D {
     void receive_upload_tile(int node_id, int name, int64_t size, char* data) {
         impl.receive_upload_tile(node_id, name, size, data);
     }
+    void receive_frag(int node_id, int kind, int src, int64_t seq, int nmeta, int* meta,
+                      int64_t total, int64_t offset, int64_t size, char* data) {
+        impl.receive_frag(node_id, kind, src, seq, nmeta, meta, total, offset, size, data);
+    }
+    void receive_sort_msg(int node_id, int64_t size, char* data) {
+        impl.receive_sort_msg(node_id, size, data);
+    }
 };
 
 class Partition2D : public CBase_Partition2D {
@@ -1250,6 +1411,10 @@ class Partition2D : public CBase_Partition2D {
     void receive_upload_tile(int node_id, int name, int64_t size, char* data) {
         impl.receive_upload_tile(node_id, name, size, data);
     }
+    void receive_frag(int node_id, int kind, int src, int64_t seq, int nmeta, int* meta,
+                      int64_t total, int64_t offset, int64_t size, char* data) {
+        impl.receive_frag(node_id, kind, src, seq, nmeta, meta, total, offset, size, data);
+    }
 };
 
 class Partition3D : public CBase_Partition3D {
@@ -1308,5 +1473,9 @@ class Partition3D : public CBase_Partition3D {
     }
     void receive_upload_tile(int node_id, int name, int64_t size, char* data) {
         impl.receive_upload_tile(node_id, name, size, data);
+    }
+    void receive_frag(int node_id, int kind, int src, int64_t seq, int nmeta, int* meta,
+                      int64_t total, int64_t offset, int64_t size, char* data) {
+        impl.receive_frag(node_id, kind, src, seq, nmeta, meta, total, offset, size, data);
     }
 };

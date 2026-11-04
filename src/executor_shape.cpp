@@ -110,11 +110,11 @@ void send_to(ArrayDAGGroup* g, const std::array<int, 3>& c, int node_id, std::ve
         ci.idx[k] = c[k];
     int64_t bytes = static_cast<int64_t>(buf.size());
     if constexpr (M == 1)
-        proxy_at<1>(g->partition_proxy_1, ci).receive_shape(node_id, bytes, buf.data());
+        ct_send_bytes(proxy_at<1>(g->partition_proxy_1, ci), MSG_SHAPE, node_id, bytes, buf.data());
     else if constexpr (M == 2)
-        proxy_at<2>(g->partition_proxy_2, ci).receive_shape(node_id, bytes, buf.data());
+        ct_send_bytes(proxy_at<2>(g->partition_proxy_2, ci), MSG_SHAPE, node_id, bytes, buf.data());
     else
-        proxy_at<3>(g->partition_proxy_3, ci).receive_shape(node_id, bytes, buf.data());
+        ct_send_bytes(proxy_at<3>(g->partition_proxy_3, ci), MSG_SHAPE, node_id, bytes, buf.data());
 }
 
 /// This chare's part of the source view: view indices [lo, hi) per dim, and
