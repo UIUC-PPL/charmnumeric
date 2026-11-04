@@ -3062,6 +3062,24 @@ void lu_bcast(PartitionImpl<2>* p, ArrayDAGGroup* g, int node_id, const LaSpec& 
     }
 }
 
+/// Small sends: one host message per worker (no device message latency).
+void lu_bcast_host(PartitionImpl<2>* p, ArrayDAGGroup* g, int node_id, LaLu* L, int kind, int id,
+                   const char* src, int64_t bytes) {
+    LaMsgHeader h = {};
+    h.kind = 3;
+    h.operand = kind;
+    h.start[0] = id;
+    h.start[2] = static_cast<int>(bytes / 8);
+    h.size[0] = static_cast<int>(bytes / 8);
+    h.count = bytes;
+    std::vector<char> msg(sizeof(h) + bytes);
+    memcpy(msg.data(), &h, sizeof(h));
+    lu_to_host(p, msg.data() + sizeof(h), src, bytes);
+    for (int w = 0; w < L->Q; ++w)
+        if (w != L->me)
+            la_send_to<2>(g, ChareIndex<2>{{L->wci[w][0], L->wci[w][1]}}, node_id, msg);
+}
+
 template <int N>
 void lu_blob_recv(PartitionImpl<N>* p, LaLu* L, const LaDevChunk& c) {
     LaLuBlob& b = L->blobs[{c.kind, c.r0}];
@@ -3190,7 +3208,10 @@ void lu_bsolve(PartitionImpl<2>* p, ArrayDAGGroup* g, int node_id, const LaSpec&
     int64_t bytes = (wj * L->nrhs * sizeof(T) + 7) / 8 * 8;
     char* st = lu_alloc(p, bytes);
     lu_copy2d(p, st, wj * sizeof(T), Bj, ldb * sizeof(T), wj * sizeof(T), L->nrhs);
-    lu_bcast(p, g, node_id, s, L, fwd ? LU_Y : LU_Z, j, st, bytes);
+    if (bytes <= (int64_t(1) << 20))
+        lu_bcast_host(p, g, node_id, L, fwd ? LU_Y : LU_Z, j, st, bytes);
+    else
+        lu_bcast(p, g, node_id, s, L, fwd ? LU_Y : LU_Z, j, st, bytes);
     lu_release(p, st);
 }
 
@@ -3600,8 +3621,8 @@ static bool la_lu_progress(PartitionImpl<N>* p, ArrayDAGGroup* g, int node_id, c
             ++st.lu->pokes_got;
             continue;
         }
-        char* b = new char[std::max<int64_t>(h.count, 16)];
-        memcpy(b, msg.data() + sizeof(h), h.count);
+        char* b = lu_msg_alloc(h.count);
+        lu_to_dev(p, b, msg.data() + sizeof(h), h.count);
         st.dev_stash.push_back({h.operand, h.start[0], h.start[1], h.start[2], h.size[0], b});
     }
     st.stash.clear();
