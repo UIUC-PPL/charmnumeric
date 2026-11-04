@@ -82,7 +82,8 @@ inline void comm_free_after(cudaStream_t stream, void* p) {
 
 /// Row-major C[m x n] = A[m x k] * B[k x n] + beta * C, leading dims lda/ldb/ldc.
 /// Under USE_KOKKOS all pointers are device pointers. Under USE_NVIDIA it is queued on `exec`
-/// (after the default instance's work): cuBLAS for float and complex types, KokkosBlas else.
+/// (after the default instance's work, which is then ordered after it): cuBLAS for float and
+/// complex types, KokkosBlas else.
 template <typename T>
 inline void local_gemm(const T* a, int lda, const T* b, int ldb, T* c, int ldc, int m, int n,
                        int k, T beta
@@ -127,6 +128,7 @@ inline void local_gemm(const T* a, int lda, const T* b, int ldb, T* c, int ldc, 
                              reinterpret_cast<cuDoubleComplex*>(c), ldc);
         if (st != CUBLAS_STATUS_SUCCESS)
             CkAbort("cuBLAS gemm failed (%d)", (int)st);
+        ct_stream_after(Kokkos::DefaultExecutionSpace().cuda_stream(), stream);
         return;
     }
 #endif
@@ -138,6 +140,8 @@ inline void local_gemm(const T* a, int lda, const T* b, int ldb, T* c, int ldc, 
 #ifdef USE_NVIDIA
     // integer types: no cuBLAS GEMM (cublasGemmEx takes only int8 inputs)
     KokkosBlas::gemm(exec, "N", "N", T(1), d_A, d_B, beta, d_C);
+    // readers on the default instance (KokkosBlas, reductions) see C without a host wait
+    ct_stream_after(Kokkos::DefaultExecutionSpace().cuda_stream(), stream);
 #else
     KokkosBlas::gemm("N", "N", T(1), d_A, d_B, beta, d_C);
 #endif
