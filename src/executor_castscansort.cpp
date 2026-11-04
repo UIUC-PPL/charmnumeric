@@ -197,8 +197,8 @@ void send_buffer(PartitionImpl<N>* partition, const std::array<int, N>& target, 
     device_pack_send<N, N>(partition, partition->thisProxy, ci, node_id, input_index, name,
                            region_data, bytes, buf);
 #else
-    proxy_at<N>(partition->thisProxy, ci)
-        .receive_data(node_id, input_index, name, N, region_data, bytes, buf);
+    ct_send_data(proxy_at<N>(partition->thisProxy, ci), node_id, input_index, name, N, region_data,
+                 bytes, buf);
     delete[] buf;
 #endif
 }

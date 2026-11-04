@@ -1,6 +1,7 @@
 #pragma once
 
 #include "backend.hpp"
+#include "big_msg.hpp"
 #include "jit_api.hpp"
 
 #include <limits>
@@ -81,6 +82,7 @@ struct DeferredSendParam {
     int ipc_slab;
     int64_t ipc_offset;
     void* host_buf = nullptr; // pinned copy of send_buf (another host)
+    bool local = true;        // target in this process
 
     /// Same-dimension send constructor: target_proxy defaults to partition's own proxy.
     DeferredSendParam(PartitionImpl<N_sender>* p)
@@ -104,9 +106,14 @@ static void deferred_send_cb(void* param, void* msg) {
                   proxy_at<N_sender>(p->partition->thisProxy, self_ci));
     cb.setRefnum(static_cast<CMK_REFNUM_TYPE>(p->send_id));
     if (p->host_buf) {
-        proxy_at<N_target>(p->target_proxy, p->target_ci).receive_staged(
-            p->node_id, p->input_index, p->inp_name, N_target, p->region_data, p->byte_size,
-            static_cast<char*>(p->host_buf));
+        auto target = proxy_at<N_target>(p->target_proxy, p->target_ci);
+        if (p->byte_size > ct_msg_max_bytes())
+            ct_send_frags(target, MSG_STAGED, p->node_id,
+                          ct_data_meta(p->input_index, p->inp_name, N_target, p->region_data),
+                          p->byte_size, static_cast<const char*>(p->host_buf));
+        else
+            target.receive_staged(p->node_id, p->input_index, p->inp_name, N_target,
+                                  p->region_data, p->byte_size, static_cast<char*>(p->host_buf));
         pinned_free(p->host_buf);
         p->partition->send_complete(p->send_id);
     } else if (p->ipc_buf) {
@@ -116,6 +123,19 @@ static void deferred_send_cb(void* param, void* msg) {
             p->node_id, p->input_index, p->inp_name, N_target, p->region_data, p->byte_size,
             CkMyNode(), p->ipc_slab, p->ipc_offset, (int)sizeof(h),
             reinterpret_cast<const char*>(&h), cb);
+    } else if (p->local && p->byte_size > ct_msg_max_bytes()) {
+        // charmxi posts nocopydevice sizes as int: same process, so pass the pointer itself
+        proxy_at<N_target>(p->target_proxy, p->target_ci).receive_ipc(
+            p->node_id, p->input_index, p->inp_name, N_target, p->region_data, p->byte_size,
+            CkMyNode(), -1, reinterpret_cast<int64_t>(p->send_buf), 0, nullptr, cb);
+    } else if (p->byte_size > ct_msg_max_bytes()) {
+        // another process, no IPC block or pinned block: a pageable copy, in fragments
+        std::unique_ptr<char[]> host(new char[p->byte_size]);
+        hapiCheck(cudaMemcpy(host.get(), p->send_buf, p->byte_size, cudaMemcpyDeviceToHost));
+        ct_send_frags(proxy_at<N_target>(p->target_proxy, p->target_ci), MSG_STAGED, p->node_id,
+                      ct_data_meta(p->input_index, p->inp_name, N_target, p->region_data),
+                      p->byte_size, host.get());
+        p->partition->send_complete(p->send_id);
     } else {
         proxy_at<N_target>(p->target_proxy, p->target_ci).receive_data(
             p->node_id, p->input_index, p->inp_name, N_target, p->region_data, p->byte_size,
@@ -184,6 +204,7 @@ static void device_pack_send(PartitionImpl<N_sender>* partition,
     // partitions do not migrate: lastKnown is the target's PE
     int target_pe = target.ckLocalBranch()->lastKnown(target.ckGetIndex());
     if (CmiNodeOf(target_pe) != CkMyNode()) {
+        ds->local = false;
         if (gpu_ipc_peer(target_pe)) {
             int slab;
             int64_t offset;

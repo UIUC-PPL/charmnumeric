@@ -759,7 +759,7 @@ void send_piece(PartitionImpl<1>* p, int chare, int node_id, int phase, int src,
     device_pack_send<1, 1>(p, p->thisProxy, ci, node_id, kDsDataTag + phase, 0, region_data,
                            bytes, buf);
 #else
-    p->thisProxy[chare].receive_data(node_id, kDsDataTag + phase, 0, 1, region_data, bytes, buf);
+    ct_send_data(p->thisProxy[chare], node_id, kDsDataTag + phase, 0, 1, region_data, bytes, buf);
     delete[] buf;
 #endif
 }

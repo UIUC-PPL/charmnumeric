@@ -9,7 +9,6 @@
 #include <mutex>
 #include <deque>
 #include <map>
-#include <memory>
 
 #include "array_region.hpp"
 #include "opcodes.hpp"
@@ -689,9 +688,9 @@ class ArrayDAGGroup : public CBase_ArrayDAGGroup {
 
     // Unified DAG handling — dispatches to all relevant partition types
     void receive_dag(int epoch, int size, char* serialized_dag);
-    void receive_get_request(int ndims, int epoch, int name, int size, int dtype = 0);
+    void receive_get_request(int ndims, int epoch, int name, int64_t size, int dtype = 0);
     void receive_dag_now(int epoch, int size, char* serialized_dag);
-    void receive_get_request_now(int ndims, int epoch, int name, int size, int dtype);
+    void receive_get_request_now(int ndims, int epoch, int name, int64_t size, int dtype);
     // Broadcasts from PE 0 may arrive out of order (e.g. a small GET overtaking a large
     // DAG); epochs are processed in client order, later ones wait here.
     int next_epoch = 0;
@@ -1113,8 +1112,9 @@ class PartitionImpl {
 
     int create(ArrayRegion<N>* region, int name, DType dtype, const ArrayDecomp<N>& decomp);
     void run();
+    /// owned: data is new[]-allocated and passes to this chare (host payloads only).
     void receive_data(int node_id, int input_index, int name, int ndims, int* region_data,
-                      int64_t size, char* data);
+                      int64_t size, char* data, bool owned = false);
 #ifdef USE_KOKKOS
     void receive_data(int& node_id, int& input_index, int& name, int& ndims, int*& region_data,
                       int64_t& size, char*& data, CkDeviceBufferPost* devicePost);
@@ -1132,8 +1132,16 @@ class PartitionImpl {
     void receive_index_msg(int node_id, int64_t size, char* data);
     void receive_shape(int node_id, int64_t size, char* data);
     void receive_upload_tile(int node_id, int name, int64_t size, char* data);
+    void receive_frag(int node_id, int kind, int src, int64_t seq, int nmeta, int* meta,
+                      int64_t total, int64_t offset, int64_t size, char* data);
     void receive_sort_msg(int node_id, int64_t size, char* data);
     void process_get(int epoch);
+    struct FragBuf {
+        std::unique_ptr<char[]> data;
+        int64_t total = 0;
+        int64_t got = 0;
+    };
+    std::map<std::pair<int, int64_t>, FragBuf> frags; // (source PE, sequence number)
 };
 
 /// This PE's chares of each rank (CNUM_MEM_STATS reports).
@@ -1221,6 +1229,10 @@ class Partition1D : public CBase_Partition1D {
     void receive_upload_tile(int node_id, int name, int64_t size, char* data) {
         impl.receive_upload_tile(node_id, name, size, data);
     }
+    void receive_frag(int node_id, int kind, int src, int64_t seq, int nmeta, int* meta,
+                      int64_t total, int64_t offset, int64_t size, char* data) {
+        impl.receive_frag(node_id, kind, src, seq, nmeta, meta, total, offset, size, data);
+    }
     void receive_sort_msg(int node_id, int64_t size, char* data) {
         impl.receive_sort_msg(node_id, size, data);
     }
@@ -1283,6 +1295,10 @@ class Partition2D : public CBase_Partition2D {
     void receive_upload_tile(int node_id, int name, int64_t size, char* data) {
         impl.receive_upload_tile(node_id, name, size, data);
     }
+    void receive_frag(int node_id, int kind, int src, int64_t seq, int nmeta, int* meta,
+                      int64_t total, int64_t offset, int64_t size, char* data) {
+        impl.receive_frag(node_id, kind, src, seq, nmeta, meta, total, offset, size, data);
+    }
 };
 
 class Partition3D : public CBase_Partition3D {
@@ -1341,5 +1357,9 @@ class Partition3D : public CBase_Partition3D {
     }
     void receive_upload_tile(int node_id, int name, int64_t size, char* data) {
         impl.receive_upload_tile(node_id, name, size, data);
+    }
+    void receive_frag(int node_id, int kind, int src, int64_t seq, int nmeta, int* meta,
+                      int64_t total, int64_t offset, int64_t size, char* data) {
+        impl.receive_frag(node_id, kind, src, seq, nmeta, meta, total, offset, size, data);
     }
 };
