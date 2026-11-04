@@ -161,6 +161,10 @@ void PartitionImpl<N>::receive_data(int node_id, int input_index, int name, int 
     ArrayRegion<N> region(start, stop, step);
 
     comm.remote_buffers[input_index].push_back({buf, region, size});
+    if (input_index == RED_FINAL_INPUT) {
+        executor->on_reduce_final(node_id);
+        return;
+    }
 
     if (comm.incremental) {
         // Incremental mode: compute with this panel immediately

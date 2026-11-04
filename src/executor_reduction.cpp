@@ -350,6 +350,44 @@ static T red_finalize(int op, const RedAcc<A>& a, int64_t extent, int ddof) {
     }
 }
 
+/// Ops whose result red_finalize computes without the host-only branches (NORM2, VAR, STD).
+static bool red_device_finalizable(int op) {
+    return op != RED_NORM2 && op != RED_VAR && op != RED_STD;
+}
+
+/// out[p] = red_finalize(part[p]) on the device, for red_device_finalizable ops.
+template <typename A, typename T>
+struct RedFinalFunctor {
+    const RedAcc<A>* part;
+    T* out;
+    int op;
+    int64_t extent;
+
+    CT_RED_FN void operator()(const int64_t p) const {
+        const RedAcc<A>& a = part[p];
+        switch (op) {
+        case RED_ARGMAX:
+        case RED_ARGMIN:
+            out[p] = cn_cast<T>(a.idx);
+            break;
+        case RED_ALL:
+            out[p] = cn_cast<T>(cn_cast<int64_t>(a.v) == extent ? 1 : 0);
+            break;
+        case RED_ANY:
+            out[p] = cn_cast<T>(cn_nonzero(a.v) ? 1 : 0);
+            break;
+        case RED_MEAN:
+            if constexpr (cn_is_complex_v<A>)
+                out[p] = cn_cast<T>(a.v / A(static_cast<double>(extent)));
+            else
+                out[p] = cn_cast<T>(cn_to_double(a.v) / static_cast<double>(extent));
+            break;
+        default:
+            out[p] = cn_cast<T>(a.v);
+        }
+    }
+};
+
 /// Geometry of one chare's block of a (possibly strided) view: which elements
 /// of the local tile it covers and where they sit in the view.
 struct RedGeom {
@@ -672,6 +710,155 @@ int reduction_result_meta(ASTNode* root,
     return s.out_nd;
 }
 
+/// Every input block holds the whole reduced extent of its outputs (each reduced axis of
+/// the view lies in one tile), so input chares finalize their outputs on the device and
+/// send the values as device messages. Depends only on the spec and the metadata, so all
+/// chares agree.
+static bool red_final_on_device(ArrayDAGGroup* dag_group, const RedSpec& s) {
+#ifdef USE_NVIDIA
+    if (s.opc != Opcode::REDUCTION || !red_device_finalizable(s.op))
+        return false;
+    int all = (1 << s.in_nd) - 1;
+    if ((s.red_mask & all) == all)
+        return false;
+    auto it = dag_group->array_meta.find(s.in_name);
+    if (it == dag_group->array_meta.end() || it->second.tile <= 0)
+        return false;
+    const auto& m = it->second;
+    for (int d = 0; d < s.in_nd; ++d) {
+        if (!((s.red_mask >> d) & 1) || s.view_shape[d] <= 0)
+            continue;
+        int start = 0, step = 1;
+        if (s.in_region != nullptr && !s.in_region->is_global) {
+            if (s.in_nd == 1) {
+                auto* r = static_cast<ArrayRegion<1>*>(s.in_region);
+                start = r->start[d], step = r->step[d];
+            } else if (s.in_nd == 2) {
+                auto* r = static_cast<ArrayRegion<2>*>(s.in_region);
+                start = r->start[d], step = r->step[d];
+            } else {
+                auto* r = static_cast<ArrayRegion<3>*>(s.in_region);
+                start = r->start[d], step = r->step[d];
+            }
+        }
+        int64_t lo = start + m.offset[d], hi = lo + (int64_t)(s.view_shape[d] - 1) * step;
+        if (lo / m.tile != hi / m.tile)
+            return false;
+    }
+    return true;
+#else
+    (void)dag_group;
+    (void)s;
+    return false;
+#endif
+}
+
+#ifdef USE_NVIDIA
+template <int M>
+static typename PartitionTraits<M>::ProxyType& partition_proxy(ArrayDAGGroup* g) {
+    if constexpr (M == 1)
+        return g->partition_proxy_1;
+    else if constexpr (M == 2)
+        return g->partition_proxy_2;
+    else
+        return g->partition_proxy_3;
+}
+
+/// Copies the elements of box r from src (laid out as box sb) to dst (laid out as box db),
+/// on `stream`; all boxes dense.
+template <int M>
+static void copy_subbox(char* dst, const ArrayRegion<M>& db, const char* src,
+                        const ArrayRegion<M>& sb, const ArrayRegion<M>& r, int64_t esz,
+                        cudaStream_t stream) {
+    int64_t dw = M > 1 ? db.size(M - 1) : 1, sw = M > 1 ? sb.size(M - 1) : 1;
+    int64_t dplane = M > 2 ? db.size(1) * dw : 0, splane = M > 2 ? sb.size(1) * sw : 0;
+    int n0 = M > 2 ? r.size(0) : 1;
+    for (int i = 0; i < n0; ++i) {
+        int64_t doff = 0, soff = 0;
+        for (int d = 0; d < M; ++d) {
+            int64_t ds = M == 1 ? 1 : (d == M - 1 ? 1 : (d == M - 2 ? dw : dplane));
+            int64_t ss = M == 1 ? 1 : (d == M - 1 ? 1 : (d == M - 2 ? sw : splane));
+            int64_t c = r.start[d] + (M > 2 && d == 0 ? i : 0);
+            doff += (c - db.start[d]) * ds;
+            soff += (c - sb.start[d]) * ss;
+        }
+        if constexpr (M == 1)
+            hapiCheck(cudaMemcpyAsync(dst + doff * esz, src + soff * esz, r.size(0) * esz,
+                                      cudaMemcpyDeviceToDevice, stream));
+        else
+            hapiCheck(cudaMemcpy2DAsync(dst + doff * esz, dw * esz, src + soff * esz, sw * esz,
+                                        r.size(M - 1) * esz, r.size(M - 2),
+                                        cudaMemcpyDeviceToDevice, stream));
+    }
+}
+
+/// Finalizes the accumulators of output box [start, stop) on the device and sends each
+/// piece to its owner as a device message (RED_FINAL_INPUT).
+template <int N, int M, typename A, typename T>
+static void send_final_pieces(PartitionImpl<N>* partition, ArrayDAGGroup* dag_group, int node_id,
+                              const RedSpec& s, const std::array<int, 3>& start,
+                              const std::array<int, 3>& stop, const RedAcc<A>* part, int64_t P) {
+    T* vals = static_cast<T*>(comm_alloc(P * sizeof(T)));
+    Kokkos::parallel_for("ct_reduce_final", CT_COMPUTE_POLICY(partition, P),
+                         RedFinalFunctor<A, T>{part, vals, s.op, s.extent});
+    ArrayDecomp<M> out_decomp = dag_group->array_meta[s.out_name].template decomp<M>();
+    std::array<int, M> bs{}, be{}, one{};
+    for (int d = 0; d < M; ++d) {
+        bs[d] = start[d];
+        be[d] = stop[d];
+        one[d] = 1;
+    }
+    ArrayRegion<M> box(bs, be, one);
+    std::vector<std::pair<ChareIndex<M>, ArrayRegion<M>>> pieces;
+    for (auto& [ci, pg] : decompose(out_decomp.to_global(box), out_decomp)) {
+        ArrayRegion<M> piece = out_decomp.to_local(pg);
+        if (piece.size() > 0)
+            pieces.push_back({ci, piece});
+    }
+    std::vector<T*> bufs;
+    for (auto& [ci, piece] : pieces) {
+        if (pieces.size() == 1 && piece.size() == P) {
+            bufs.push_back(vals);
+            vals = nullptr;
+            break;
+        }
+        T* buf = static_cast<T*>(comm_alloc(piece.size() * sizeof(T)));
+        copy_subbox<M>(reinterpret_cast<char*>(buf), piece, reinterpret_cast<const char*>(vals),
+                       box, piece, sizeof(T), partition->compute_stream_raw);
+        bufs.push_back(buf);
+    }
+    comm_free_after(partition->compute_stream_raw, vals);
+    partition->join_streams(); // the sends start on the comm stream
+    for (size_t k = 0; k < pieces.size(); ++k) {
+        const ArrayRegion<M>& piece = pieces[k].second;
+        int region_data[M * 3];
+        for (int d = 0; d < M; ++d) {
+            region_data[3 * d] = piece.start[d];
+            region_data[3 * d + 1] = piece.stop[d];
+            region_data[3 * d + 2] = 1;
+        }
+        device_pack_send<N, M>(partition, partition_proxy<M>(dag_group), pieces[k].first, node_id,
+                               RED_FINAL_INPUT, s.out_name, region_data,
+                               piece.size() * (int64_t)sizeof(T), bufs[k]);
+    }
+}
+
+template <int N, typename A>
+static void send_final(PartitionImpl<N>* partition, ArrayDAGGroup* dag_group, int node_id,
+                       const RedSpec& s, const std::array<int, 3>& start,
+                       const std::array<int, 3>& stop, const RedAcc<A>* part, int64_t P) {
+    cn_dispatch(s.out_dt, [&](auto tag) {
+        using T = decltype(tag);
+        if (s.out_nd == 1)
+            send_final_pieces<N, 1, A, T>(partition, dag_group, node_id, s, start, stop, part, P);
+        else if (s.out_nd == 2)
+            send_final_pieces<N, 2, A, T>(partition, dag_group, node_id, s, start, stop, part, P);
+        else
+            send_final_pieces<N, 3, A, T>(partition, dag_group, node_id, s, start, stop, part, P);
+    });
+}
+#endif
+
 // ---- Send side ----
 
 template <int M>
@@ -859,7 +1046,8 @@ static void reduce_block_and_send(PartitionImpl<N>* partition, ArrayDAGGroup* da
         if (!((s.red_mask >> d) & 1))
             P *= g.bn[d];
 
-    std::vector<RedAcc<A>> part(P);
+    const bool final_on_device = red_final_on_device(dag_group, s);
+    std::vector<RedAcc<A>> part(final_on_device ? 0 : P);
 #ifdef USE_KOKKOS
     using AccView = Kokkos::View<RedAcc<A>*, DeviceSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
     AccView d_part(static_cast<RedAcc<A>*>(comm_alloc(P * sizeof(RedAcc<A>))), P);
@@ -882,6 +1070,14 @@ static void reduce_block_and_send(PartitionImpl<N>* partition, ArrayDAGGroup* da
     } else {
         Kokkos::parallel_for("ct_reduce_axis", CT_COMPUTE_POLICY(partition, P), f);
     }
+#ifdef USE_NVIDIA
+    if (final_on_device) {
+        send_final<N, A>(partition, dag_group, node_id, s, start, stop, d_part.data(), P);
+        comm_free_after(partition->compute_stream_raw, tmp);
+        comm_free_after(partition->compute_stream_raw, d_part.data());
+        return;
+    }
+#endif
     Kokkos::View<RedAcc<A>*, HostSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>> h_part(part.data(), P);
 #ifdef USE_NVIDIA
     Kokkos::deep_copy(partition->compute_exec, h_part, d_part);
@@ -1243,10 +1439,33 @@ static bool reduction_progress(PartitionImpl<N>* partition, ArrayDAGGroup* dag_g
         std::vector<double>().swap(st.weights);
     }
     if (st.receiving && st.covered >= st.expected) {
-        with_acc(s.acc, [&](auto tag) { write_result_dispatch<N, decltype(tag)>(partition, st, s); });
+        if (!st.device)
+            with_acc(s.acc, [&](auto tag) { write_result_dispatch<N, decltype(tag)>(partition, st, s); });
         st.receiving = false;
     }
     return !st.sending && !st.receiving;
+}
+
+/// Copies the finalized pieces received so far into this chare's part of the result.
+template <int N, typename Pending>
+static void drain_final(PartitionImpl<N>* partition, Pending& pending, int node_id,
+                        ReductionState<N>& st, const RedSpec& s) {
+#ifdef USE_NVIDIA
+    auto pit = pending.find(node_id);
+    if (pit == pending.end())
+        return;
+    char* out = static_cast<char*>(partition->arrays[s.out_name]->device_data_ptr());
+    int64_t esz = dtype_size(s.out_dt);
+    for (auto& rb : pit->second.remote_buffers[RED_FINAL_INPUT]) {
+        copy_subbox<N>(out, st.mine, rb.data, rb.region, rb.region, esz,
+                       partition->compute_stream_raw);
+        st.covered += rb.region.size() * s.extent;
+        comm_free_after(partition->compute_stream_raw, rb.data);
+    }
+    pending.erase(pit);
+#else
+    (void)partition, (void)pending, (void)node_id, (void)st, (void)s;
+#endif
 }
 
 static RedSpec spec_of(DAGNode* node, ArrayDAGGroup* dag_group) {
@@ -1331,12 +1550,16 @@ void ArrayDAGExecutorND<N>::execute_reduction_node(DAGNode* node) {
             st.receiving = true;
             st.mine = mine;
             st.expected = mine.size() * s.extent;
-            with_acc(s.acc, [&](auto tag) {
-                using A = decltype(tag);
-                st.acc.assign(mine.size() * sizeof(RedAcc<A>), 0);
-                for (int64_t i = 0; i < mine.size(); ++i)
-                    red_init<A>(s.op, reinterpret_cast<RedAcc<A>*>(st.acc.data())[i]);
-            });
+            st.device = red_final_on_device(dag_group, s);
+            if (st.device)
+                drain_final<N>(partition, pending, node->id, st, s);
+            else
+                with_acc(s.acc, [&](auto tag) {
+                    using A = decltype(tag);
+                    st.acc.assign(mine.size() * sizeof(RedAcc<A>), 0);
+                    for (int64_t i = 0; i < mine.size(); ++i)
+                        red_init<A>(s.op, reinterpret_cast<RedAcc<A>*>(st.acc.data())[i]);
+                });
         }
     }
 
@@ -1361,6 +1584,20 @@ void ArrayDAGExecutorND<N>::on_reduce_partial(int node_id, char* data, int64_t s
 }
 
 template <int N>
+void ArrayDAGExecutorND<N>::on_reduce_final(int node_id) {
+    auto it = red_state.find(node_id);
+    if (it == red_state.end() || !it->second.started || !it->second.receiving)
+        return; // drained when the node starts
+    auto* dag_group = static_cast<ArrayDAGGroup*>(group);
+    RedSpec s = spec_of(it->second.node, dag_group);
+    drain_final<N>(partition, pending, node_id, it->second, s);
+    if (reduction_progress<N>(partition, dag_group, node_id, it->second, s)) {
+        red_state.erase(it);
+        node_finished(node_id);
+    }
+}
+
+template <int N>
 void PartitionImpl<N>::receive_reduce_partial(int node_id, int64_t size, char* data) {
     executor->on_reduce_partial(node_id, data, size);
 }
@@ -1372,6 +1609,10 @@ template void ArrayDAGExecutorND<3>::execute_reduction_node(DAGNode*);
 template void ArrayDAGExecutorND<1>::on_reduce_partial(int, char*, int64_t);
 template void ArrayDAGExecutorND<2>::on_reduce_partial(int, char*, int64_t);
 template void ArrayDAGExecutorND<3>::on_reduce_partial(int, char*, int64_t);
+
+template void ArrayDAGExecutorND<1>::on_reduce_final(int);
+template void ArrayDAGExecutorND<2>::on_reduce_final(int);
+template void ArrayDAGExecutorND<3>::on_reduce_final(int);
 
 template void PartitionImpl<1>::receive_reduce_partial(int, int64_t, char*);
 template void PartitionImpl<2>::receive_reduce_partial(int, int64_t, char*);
