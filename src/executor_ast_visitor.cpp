@@ -1,12 +1,135 @@
 #include "backend_internal.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
+#include <vector>
 
 #ifdef USE_KOKKOS
 #include <KokkosBlas2_gemv.hpp>
 #include <KokkosBlas3_gemm.hpp>
 #endif
+
+/// Strided N-D box copy in elements: dst[dst0 + sum c*dinc] = src[src0 + sum c*sinc], 0 <= c < n.
+template <int N>
+struct RegionCopyPlan {
+    int n[N];
+    int64_t dst0, src0, dinc[N], sinc[N];
+};
+
+struct alignas(16) CopyBytes16 {
+    uint64_t lo, hi;
+};
+
+#ifdef USE_KOKKOS
+template <int N, typename E, typename I>
+static void region_copy_kernel(PartitionImpl<N>* partition, E* dst, const E* src,
+                               const RegionCopyPlan<N>& p, int64_t total) {
+    Kokkos::parallel_for(
+        CT_COMPUTE_POLICY(partition, total), KOKKOS_LAMBDA(int64_t i) {
+            I flat = static_cast<I>(i);
+            int64_t di = p.dst0, si = p.src0;
+            for (int d = N - 1; d >= 0; --d) {
+                I c = flat % static_cast<I>(p.n[d]);
+                flat /= static_cast<I>(p.n[d]);
+                di += c * p.dinc[d];
+                si += c * p.sinc[d];
+            }
+            dst[di] = src[si];
+        });
+}
+#endif
+
+template <int N>
+static bool region_copy_spans_overlap(const RegionCopyPlan<N>& p) {
+    int64_t dlo = p.dst0, dhi = p.dst0, slo = p.src0, shi = p.src0;
+    for (int d = 0; d < N; ++d) {
+        int64_t dx = (int64_t)(p.n[d] - 1) * p.dinc[d], sx = (int64_t)(p.n[d] - 1) * p.sinc[d];
+        (dx < 0 ? dlo : dhi) += dx;
+        (sx < 0 ? slo : shi) += sx;
+    }
+    return dlo <= shi && slo <= dhi;
+}
+
+/// `alias`: src and dst are the same buffer; overlapping copies then go through a packed
+/// temporary, since the elements are copied in no particular order.
+template <int N, typename E>
+static void region_copy_typed(PartitionImpl<N>* partition, E* dst, const E* src,
+                              const RegionCopyPlan<N>& p, bool alias = false) {
+    int64_t total = 1;
+    for (int d = 0; d < N; ++d)
+        total *= p.n[d];
+    if (alias && region_copy_spans_overlap(p)) {
+        RegionCopyPlan<N> in = p, out = p;
+        int64_t stride = 1;
+        for (int d = N - 1; d >= 0; --d) {
+            in.dinc[d] = out.sinc[d] = stride;
+            stride *= p.n[d];
+        }
+        in.dst0 = out.src0 = 0;
+#ifdef USE_KOKKOS
+        Kokkos::View<E*, DeviceSpace> tmp(
+            Kokkos::view_alloc(Kokkos::WithoutInitializing, "ct_copy_stage"), total);
+        region_copy_typed<N>(partition, tmp.data(), src, in);
+        region_copy_typed<N>(partition, dst, tmp.data(), out);
+        CT_COMPUTE_EXEC(partition).fence("ct_copy_stage");
+#else
+        std::vector<E> tmp(total);
+        region_copy_typed<N>(partition, tmp.data(), src, in);
+        region_copy_typed<N>(partition, dst, tmp.data(), out);
+#endif
+        return;
+    }
+#ifdef USE_KOKKOS
+    if (total <= INT32_MAX)
+        region_copy_kernel<N, E, uint32_t>(partition, dst, src, p, total);
+    else
+        region_copy_kernel<N, E, uint64_t>(partition, dst, src, p, total);
+#else
+    (void)partition;
+    int64_t rows = total / p.n[N - 1];
+    bool contiguous = p.dinc[N - 1] == 1 && p.sinc[N - 1] == 1;
+    for (int64_t r = 0; r < rows; ++r) {
+        int64_t di = p.dst0, si = p.src0, rem = r;
+        for (int d = N - 2; d >= 0; --d) {
+            int64_t c = rem % p.n[d];
+            rem /= p.n[d];
+            di += c * p.dinc[d];
+            si += c * p.sinc[d];
+        }
+        if (contiguous) {
+            memmove(dst + di, src + si, p.n[N - 1] * sizeof(E));
+        } else {
+            for (int c = 0; c < p.n[N - 1]; ++c)
+                dst[di + c * p.dinc[N - 1]] = src[si + c * p.sinc[N - 1]];
+        }
+    }
+#endif
+}
+
+template <int N>
+static void region_copy(PartitionImpl<N>* partition, int esz, char* dst, const char* src,
+                        const RegionCopyPlan<N>& p, bool alias) {
+    switch (esz) {
+    case 1:
+        return region_copy_typed<N>(partition, reinterpret_cast<uint8_t*>(dst),
+                                    reinterpret_cast<const uint8_t*>(src), p, alias);
+    case 2:
+        return region_copy_typed<N>(partition, reinterpret_cast<uint16_t*>(dst),
+                                    reinterpret_cast<const uint16_t*>(src), p, alias);
+    case 4:
+        return region_copy_typed<N>(partition, reinterpret_cast<uint32_t*>(dst),
+                                    reinterpret_cast<const uint32_t*>(src), p, alias);
+    case 8:
+        return region_copy_typed<N>(partition, reinterpret_cast<uint64_t*>(dst),
+                                    reinterpret_cast<const uint64_t*>(src), p, alias);
+    case 16:
+        return region_copy_typed<N>(partition, reinterpret_cast<CopyBytes16*>(dst),
+                                    reinterpret_cast<const CopyBytes16*>(src), p, alias);
+    default:
+        CkAbort("region_copy: unsupported element size %d", esz);
+    }
+}
 
 template <int N>
 int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
@@ -186,120 +309,53 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
             src_strides[N - 1] = 1;
             for (int d = N - 2; d >= 0; --d)
                 src_strides[d] = src_strides[d + 1] * source->region.size(d + 1);
-
             auto src_chare = source->decomp.chare_region_global(nd_idx);
 
-#ifdef USE_KOKKOS
-            // Device-side element copy
-            char* tgt_device = static_cast<char*>(target->device_data_ptr());
-            char* src_device = static_cast<char*>(source->device_data_ptr());
-
-            int64_t overlap_total = overlap.size();
-            int ol_start[N], ol_step[N], tgt_s[N], src_s[N], ol_sizes[N], tgt_cs_arr2[N];
-            int g_reg_s[N], reg_step[N], src_chare_s[N], src_reg_s[N], src_reg_step[N],
-                src_region_sizes[N];
-            for (int d = 0; d < N; d++) {
-                ol_start[d] = overlap.start[d];
-                ol_step[d] = overlap.step[d];
-                tgt_s[d] = tgt_strides[d];
-                src_s[d] = src_strides[d];
-                ol_sizes[d] = overlap.size(d);
-                tgt_cs_arr2[d] = tgt_chare.start[d];
-                g_reg_s[d] = g_reg_start[d];
-                reg_step[d] = region->step[d];
-                src_chare_s[d] = src_chare.start[d];
-                src_reg_s[d] = source_region_global.start[d];
-                src_reg_step[d] = source_region_global.step[d];
-                src_region_sizes[d] = source->region.size(d);
-            }
-
-            Kokkos::parallel_for(
-                CT_COMPUTE_POLICY(partition, overlap_total), KOKKOS_LAMBDA(int flat_idx) {
-                    int remaining = flat_idx;
-                    int dst_flat = 0, src_flat = 0;
-                    bool src_valid = true;
-                    for (int d = N - 1; d >= 0; --d) {
-                        int coord_d = remaining % ol_sizes[d];
-                        remaining /= ol_sizes[d];
-                        int global_d = ol_start[d] + coord_d * ol_step[d];
-                        dst_flat += (global_d - tgt_cs_arr2[d]) * tgt_s[d];
-                        if (source_is_result_buffer) {
-                            // A size-1 result buffer (scalar RHS) broadcasts.
-                            int src_local = src_region_sizes[d] == 1
-                                                ? 0
-                                                : (global_d - ol_start[d]) / ol_step[d];
-                            if (src_local < 0 || src_local >= src_region_sizes[d]) {
-                                src_valid = false;
-                                break;
-                            }
-                            src_flat += src_local * src_s[d];
-                        } else {
-                            int logical_idx = (global_d - g_reg_s[d]) / reg_step[d];
-                            int src_global = src_reg_s[d] + logical_idx * src_reg_step[d];
-                            int src_local = src_global - src_chare_s[d];
-                            if (src_local < 0 || src_local >= src_region_sizes[d]) {
-                                src_valid = false;
-                                break;
-                            }
-                            src_flat += src_local * src_s[d];
-                        }
-                    }
-                    if (src_valid) {
-                        char* dst = tgt_device + dst_flat * esz;
-                        char* src = src_device + src_flat * esz;
-                        for (int b = 0; b < esz; b++)
-                            dst[b] = src[b];
-                    }
-                });
-#else
-            // Host-side odometer over the overlap region
-            char* tgt_data = static_cast<char*>(target->data_ptr());
-            char* src_data = static_cast<char*>(source->data_ptr());
-            std::array<int, N> idx;
-            for (int d = 0; d < N; ++d)
-                idx[d] = overlap.start[d];
-            while (true) {
-                int dst_flat = 0, src_flat = 0;
-                bool src_valid = true;
-                for (int d = 0; d < N; ++d) {
-                    dst_flat += (idx[d] - tgt_chare.start[d]) * tgt_strides[d];
-                    if (source_is_result_buffer) {
-                        // A size-1 result buffer (scalar RHS) broadcasts.
-                        int src_local = source->region.size(d) == 1
-                                            ? 0
-                                            : (idx[d] - overlap.start[d]) / overlap.step[d];
-                        if (src_local < 0 || src_local >= source->region.size(d)) {
-                            src_valid = false;
-                            break;
-                        }
-                        src_flat += src_local * src_strides[d];
-                    } else {
-                        int logical_idx = (idx[d] - g_reg_start[d]) / region->step[d];
-                        int src_global = source_region_global.start[d] +
-                                         logical_idx * source_region_global.step[d];
-                        int src_local = src_global - src_chare.start[d];
-                        if (src_local < 0 || src_local >= source->region.size(d)) {
-                            src_valid = false;
-                            break;
-                        }
-                        src_flat += src_local * src_strides[d];
+            // Both offsets are affine in the overlap lattice coordinates; cells whose
+            // source lies outside this chare's tile are clipped per dim.
+            RegionCopyPlan<N> plan;
+            plan.dst0 = plan.src0 = 0;
+            bool empty = false;
+            for (int d = 0; d < N; ++d) {
+                int64_t lo = 0, hi = overlap.size(d), a, b;
+                if (source_is_result_buffer) {
+                    bool bcast = source->region.size(d) == 1;
+                    a = 0;
+                    b = bcast ? 0 : 1;
+                    if (!bcast)
+                        hi = std::min<int64_t>(hi, source->region.size(d));
+                } else {
+                    int64_t l0 = (overlap.start[d] - g_reg_start[d]) / region->step[d];
+                    int64_t k = overlap.step[d] / region->step[d];
+                    a = source_region_global.start[d] + l0 * source_region_global.step[d] -
+                        src_chare.start[d];
+                    b = k * source_region_global.step[d];
+                    int64_t n = source->region.size(d);
+                    if (b > 0) {
+                        lo = std::max<int64_t>(lo, a >= 0 ? 0 : (-a + b - 1) / b);
+                        hi = std::min<int64_t>(hi, a >= n ? 0 : (n - a + b - 1) / b);
+                    } else if (b < 0) {
+                        lo = std::max<int64_t>(lo, a < n ? 0 : (a - n) / -b + 1);
+                        hi = std::min<int64_t>(hi, a < 0 ? 0 : a / -b + 1);
+                    } else if (a < 0 || a >= n) {
+                        hi = 0;
                     }
                 }
-                if (src_valid)
-                    memcpy(tgt_data + dst_flat * esz, src_data + src_flat * esz, esz);
-
-                int d = N - 1;
-                while (d >= 0) {
-                    idx[d] += overlap.step[d];
-                    if (idx[d] < overlap.stop[d])
-                        break;
-                    idx[d] = overlap.start[d];
-                    --d;
-                }
-                if (d < 0)
+                if (lo >= hi) {
+                    empty = true;
                     break;
+                }
+                plan.n[d] = (int)(hi - lo);
+                plan.dinc[d] = (int64_t)overlap.step[d] * tgt_strides[d];
+                plan.sinc[d] = b * src_strides[d];
+                plan.dst0 += ((int64_t)overlap.start[d] - tgt_chare.start[d]) * tgt_strides[d] +
+                             lo * plan.dinc[d];
+                plan.src0 += a * src_strides[d] + lo * plan.sinc[d];
             }
-#endif
+            if (!empty)
+                region_copy(partition, esz, static_cast<char*>(target->device_data_ptr()),
+                            static_cast<const char*>(source->device_data_ptr()), plan,
+                            source == target);
         }
         return node->result_name;
     }
