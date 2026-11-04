@@ -145,6 +145,10 @@ void PartitionImpl<N>::receive_data(int node_id, int input_index, int name, int 
         memcpy(buf, data, size);
     }
 #endif
+    if (input_index == SHAPE_DEV_INPUT) {
+        executor->on_shape_payload(node_id, region_data, buf);
+        return;
+    }
     if (input_index >= kDsDataTag && input_index < kDsDataTag + kDsDataTags) {
         executor->on_ds_data(node_id, input_index - kDsDataTag, region_data, buf, size);
         return;
