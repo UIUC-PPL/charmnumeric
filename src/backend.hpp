@@ -852,6 +852,9 @@ class ArrayDAGExecutorND : public DAGExecutor {
     void ds_take_piece(int node_id, int phase, int src, int64_t start, int64_t count, char* buf);
     void ds_sort_progress(int node_id);
     void ds_select_msg(int node_id, char* data, int64_t size);
+    void execute_ax_node(DAGNode* node, int in_name, int out_name, int axis, bool arg);
+    void ax_take_piece(int node_id, int phase, int src, char* buf, int64_t bytes);
+    void ax_progress(int node_id);
     void execute_signal_node(DAGNode* node);
     void finish_signal_node(PendingComm<N>& comm);
     void on_signal_receive(int node_id, int input_index);
@@ -1408,6 +1411,9 @@ class Partition2D : public CBase_Partition2D {
     void receive_shape(int node_id, int64_t size, char* data) {
         impl.receive_shape(node_id, size, data);
     }
+    void receive_sort_msg(int node_id, int64_t size, char* data) {
+        impl.receive_sort_msg(node_id, size, data);
+    }
     void receive_upload_tile(int node_id, int name, int64_t size, char* data) {
         impl.receive_upload_tile(node_id, name, size, data);
     }
@@ -1470,6 +1476,9 @@ class Partition3D : public CBase_Partition3D {
     }
     void receive_shape(int node_id, int64_t size, char* data) {
         impl.receive_shape(node_id, size, data);
+    }
+    void receive_sort_msg(int node_id, int64_t size, char* data) {
+        impl.receive_sort_msg(node_id, size, data);
     }
     void receive_upload_tile(int node_id, int name, int64_t size, char* data) {
         impl.receive_upload_tile(node_id, name, size, data);

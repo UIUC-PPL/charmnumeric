@@ -20,8 +20,10 @@
 // selection); see execute_ds_node. Elements are ordered by (radix key, array index),
 // so the order is stable and every split is exact.
 
-#ifdef USE_NVIDIA
+#if defined(USE_NVIDIA)
 #define DS_FN __host__ __device__ inline
+#elif defined(USE_KOKKOS)
+#define DS_FN KOKKOS_INLINE_FUNCTION
 #else
 #define DS_FN inline
 #endif
@@ -199,13 +201,13 @@ DS_FN int group_of(K k, int W, int depth, const K* grp, int G) {
     return -1;
 }
 
-DS_FN uint64_t mix64(uint64_t x) {
-    x += 0x9e3779b97f4a7c15ull;
 /// Byte offset of n keys stored after n int64 values (16-byte keys stay aligned).
 DS_FN int64_t keys_after(int64_t n) {
     return (8 * n + 15) / 16 * 16;
 }
 
+DS_FN uint64_t mix64(uint64_t x) {
+    x += 0x9e3779b97f4a7c15ull;
     x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
     x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
     return x ^ (x >> 31);
@@ -349,10 +351,14 @@ inline void ds_free(void* p) {
 }
 
 #ifdef USE_NVIDIA
-inline cudaStream_t ds_stream(PartitionImpl<1>* p) { return p->compute_stream_raw; }
+template <int N>
+cudaStream_t ds_stream(PartitionImpl<N>* p) {
+    return p->compute_stream_raw;
+}
 #endif
 
-inline void ds_copy(PartitionImpl<1>* p, void* dst, const void* src, int64_t bytes) {
+template <int N>
+void ds_copy(PartitionImpl<N>* p, void* dst, const void* src, int64_t bytes) {
     if (bytes <= 0)
         return;
 #ifdef USE_NVIDIA
@@ -364,7 +370,8 @@ inline void ds_copy(PartitionImpl<1>* p, void* dst, const void* src, int64_t byt
 }
 
 /// Host -> device (host -> host in CPU builds).
-inline void ds_to_dev(PartitionImpl<1>* p, void* dst, const void* src, int64_t bytes) {
+template <int N>
+void ds_to_dev(PartitionImpl<N>* p, void* dst, const void* src, int64_t bytes) {
     if (bytes <= 0)
         return;
 #if defined(USE_NVIDIA)
@@ -382,21 +389,33 @@ inline void ds_to_dev(PartitionImpl<1>* p, void* dst, const void* src, int64_t b
 #endif
 }
 
-inline void ds_to_host(PartitionImpl<1>* p, void* dst, const void* src, int64_t bytes) {
+/// Device -> host (host -> host in CPU builds).
+template <int N>
+void ds_to_host(PartitionImpl<N>* p, void* dst, const void* src, int64_t bytes) {
     if (bytes <= 0)
         return;
-#ifdef USE_NVIDIA
+#if defined(USE_NVIDIA)
     hapiCheck(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, ds_stream(p)));
     hapiCheck(cudaStreamSynchronize(ds_stream(p)));
+#elif defined(USE_KOKKOS)
+    (void)p;
+    using U = Kokkos::MemoryTraits<Kokkos::Unmanaged>;
+    Kokkos::deep_copy(Kokkos::View<char*, HostSpace, U>(static_cast<char*>(dst), bytes),
+                      Kokkos::View<const char*, DeviceSpace, U>(static_cast<const char*>(src),
+                                                                bytes));
 #else
     (void)p;
     std::memcpy(dst, src, bytes);
 #endif
 }
 
-inline void ds_fence(PartitionImpl<1>* p) {
-#ifdef USE_NVIDIA
+template <int N>
+void ds_fence(PartitionImpl<N>* p) {
+#if defined(USE_NVIDIA)
     hapiCheck(cudaStreamSynchronize(ds_stream(p)));
+#elif defined(USE_KOKKOS)
+    (void)p;
+    Kokkos::fence();
 #else
     (void)p;
 #endif
@@ -727,11 +746,34 @@ bool ds_sort_local(PartitionImpl<1>* p, K* k, K* ka, int64_t* g, int64_t* ga, in
 #endif
 }
 
+/// Row-major tile viewed as `lines` lines of length `len` along `axis`.
+struct AxisGeom {
+    int64_t sizes[3], strides[3];
+    int nd, axis;
+    int64_t len, lines;
+
+    DS_FN int64_t phys(int64_t l, int64_t p) const {
+        int64_t idx = p * strides[axis];
+        for (int d = nd - 1; d >= 0; --d) {
+            if (d == axis)
+                continue;
+            idx += (l % sizes[d]) * strides[d];
+            l /= sizes[d];
+        }
+        return idx;
+    }
+};
+
+/// Lines [0, lines) x [0, len) of a packed block (axis last).
+inline AxisGeom block_geom(int64_t lines, int64_t len) {
+    return AxisGeom{{lines, len, 1}, {len, 1, 1}, 2, 1, len, lines};
+}
+
 } // namespace ds_detail
 
 using namespace ds_detail;
 
-/// Per-node state of one chare (N = 1 partitions only).
+/// Per-node state of one chare: 1-D sorts and SELECT, and N-D axis sorts (ax_*).
 struct DsState {
     struct Piece {
         int phase = 0, src = 0;
@@ -779,6 +821,14 @@ struct DsState {
     std::vector<int64_t> uranks, resid;
     std::vector<uint64_t> prefix;
     std::vector<char> host_in; // non-NVIDIA Kokkos builds: host copy of the tile
+
+    // N-D axis sort: rank / P / pstart are this chare's place among the tiles along the axis
+    std::vector<int64_t> lst;            // P + 1: the lines each of them sorts whole
+    std::vector<std::array<int, 3>> grp; // their chare indices
+    AxisGeom tg{};                       // this tile's lines along the axis
+    char* lines = nullptr;               // this chare's lines (whole), being assembled
+    int64_t esize = 0;
+    int need1 = 0, got1 = 0, need2 = 0, got2 = 0;
 };
 
 namespace ds_detail {
@@ -1288,45 +1338,33 @@ std::vector<typename Key<T>::K> select_compact(PartitionImpl<1>* p, DsState& s, 
 }
 
 // ------------------------------------------------------------------ axis sorts
+// A tile holding whole lines sorts them locally. Otherwise the tiles along the axis
+// trade data so that each sorts a share of their lines whole, then send the results
+// back: every element crosses the network at most twice, with no splitter rounds.
 
-/// Row-major tile viewed as `lines` lines of length `len` along `axis`.
-struct AxisGeom {
-    int64_t sizes[3], strides[3];
-    int nd, axis;
-    int64_t len, lines;
-
-    DS_FN int64_t phys(int64_t l, int64_t p) const {
-        int64_t idx = p * strides[axis];
-        for (int d = nd - 1; d >= 0; --d) {
-            if (d == axis)
-                continue;
-            idx += (l % sizes[d]) * strides[d];
-            l /= sizes[d];
-        }
-        return idx;
-    }
-};
+constexpr int64_t kAxisBatch = int64_t(1) << 25; // elements per segmented sort
 
 #ifdef USE_NVIDIA
 template <typename T>
-__global__ void ax_gather_kernel(const T* in, AxisGeom g, bool canon, typename Key<T>::K* k,
-                                 int64_t* v) {
+__global__ void ax_gather_kernel(const T* in, AxisGeom g, int64_t l0, int n, bool canon,
+                                 typename Key<T>::K* k, int64_t* v) {
     int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= g.lines * g.len)
+    if (i >= n)
         return;
-    int64_t l = i / g.len, p = i % g.len;
+    int64_t l = l0 + i / g.len, p = i % g.len;
     k[i] = Key<T>::enc(in[g.phys(l, p)], canon);
-    v[i] = p;
+    if (v)
+        v[i] = p;
 }
 
 template <typename T>
 __global__ void ax_scatter_kernel(const typename Key<T>::K* k, const int64_t* v, AxisGeom g,
-                                  bool arg, void* out) {
+                                  int64_t l0, int n, void* out) {
     int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= g.lines * g.len)
+    if (i >= n)
         return;
-    int64_t o = g.phys(i / g.len, i % g.len);
-    if (arg)
+    int64_t o = g.phys(l0 + i / g.len, i % g.len);
+    if (v)
         static_cast<int64_t*>(out)[o] = v[i];
     else
         static_cast<T*>(out)[o] = Key<T>::dec(k[i]);
@@ -1338,38 +1376,9 @@ struct SegOff {
 };
 #endif
 
-/// SORT/ARGSORT along `axis` of a tile that holds whole lines (no communication).
-template <int N, typename T>
-void ds_sort_axis_local(PartitionImpl<N>* p, const T* in, void* out, AxisGeom g, bool arg) {
+template <typename T>
+void ds_sort_axis_host(const T* in, void* out, const AxisGeom& g, bool arg) {
     using K = typename Key<T>::K;
-    int64_t total = g.lines * g.len;
-    if (total == 0)
-        return;
-#ifdef USE_NVIDIA
-    cudaStream_t st = p->compute_stream_raw;
-    char* kb = ds_alloc(2 * total * sizeof(K));
-    char* vb = ds_alloc(2 * total * sizeof(int64_t));
-    K* k = reinterpret_cast<K*>(kb);
-    int64_t* v = reinterpret_cast<int64_t*>(vb);
-    ax_gather_kernel<T><<<grid_for(total), 256, 0, st>>>(in, g, arg, k, v);
-    DS_LAUNCHED();
-    thrust::counting_iterator<int64_t> seg(0);
-    auto b0 = thrust::make_transform_iterator(seg, SegOff{g.len, 0});
-    auto b1 = thrust::make_transform_iterator(seg, SegOff{g.len, 1});
-    size_t tb = 0;
-    hapiCheck(cub::DeviceSegmentedSort::StableSortPairs(nullptr, tb, k, k + total, v, v + total,
-                                                        (int)total, (int)g.lines, b0, b1, st));
-    char* tmp = ds_alloc((int64_t)tb);
-    hapiCheck(cub::DeviceSegmentedSort::StableSortPairs(tmp, tb, k, k + total, v, v + total,
-                                                        (int)total, (int)g.lines, b0, b1, st));
-    ax_scatter_kernel<T><<<grid_for(total), 256, 0, st>>>(k + total, v + total, g, arg, out);
-    DS_LAUNCHED();
-    hapiCheck(cudaStreamSynchronize(st));
-    ds_free(tmp);
-    ds_free(kb);
-    ds_free(vb);
-#else
-    (void)p;
     std::vector<std::pair<K, int64_t>> line(g.len);
     for (int64_t l = 0; l < g.lines; ++l) {
         for (int64_t q = 0; q < g.len; ++q)
@@ -1383,21 +1392,207 @@ void ds_sort_axis_local(PartitionImpl<N>* p, const T* in, void* out, AxisGeom g,
                 static_cast<T*>(out)[o] = Key<T>::dec(line[q].first);
         }
     }
+}
+
+/// SORT/ARGSORT of every line of a block that holds them whole (ARGSORT: stable).
+template <int N, typename T>
+void ds_sort_axis_local(PartitionImpl<N>* p, const T* in, void* out, AxisGeom g, bool arg) {
+    if (g.lines * g.len == 0)
+        return;
+#if defined(USE_NVIDIA)
+    using K = typename Key<T>::K;
+    cudaStream_t st = p->compute_stream_raw;
+    int64_t bl = std::max<int64_t>(1, std::min<int64_t>(g.lines, kAxisBatch / g.len));
+    int64_t cap = bl * g.len;
+    char* kb = ds_alloc(2 * cap * sizeof(K));
+    char* vb = arg ? ds_alloc(2 * cap * sizeof(int64_t)) : nullptr;
+    K* k = reinterpret_cast<K*>(kb);
+    int64_t* v = reinterpret_cast<int64_t*>(vb);
+    char* tmp = nullptr;
+    size_t tcap = 0;
+    thrust::counting_iterator<int64_t> seg(0);
+    auto b0 = thrust::make_transform_iterator(seg, SegOff{g.len, 0});
+    auto b1 = thrust::make_transform_iterator(seg, SegOff{g.len, 1});
+    for (int64_t l0 = 0; l0 < g.lines; l0 += bl) {
+        int nl = (int)std::min(bl, g.lines - l0), n = (int)(nl * g.len);
+        ax_gather_kernel<T><<<grid_for(n), 256, 0, st>>>(in, g, l0, n, arg, k, v);
+        DS_LAUNCHED();
+        size_t tb = 0;
+        auto run = [&](void* t) {
+            return arg ? cub::DeviceSegmentedSort::StableSortPairs(t, tb, k, k + cap, v, v + cap,
+                                                                   n, nl, b0, b1, st)
+                       : cub::DeviceSegmentedSort::SortKeys(t, tb, k, k + cap, n, nl, b0, b1, st);
+        };
+        hapiCheck(run(nullptr));
+        if (tb > tcap) {
+            ds_free(tmp);
+            tmp = ds_alloc((int64_t)tb);
+            tcap = tb;
+        }
+        hapiCheck(run(tmp));
+        ax_scatter_kernel<T><<<grid_for(n), 256, 0, st>>>(k + cap, arg ? v + cap : nullptr, g, l0,
+                                                          n, out);
+        DS_LAUNCHED();
+    }
+    hapiCheck(cudaStreamSynchronize(st));
+    ds_free(tmp);
+    ds_free(kb);
+    ds_free(vb);
+#elif defined(USE_KOKKOS)
+    int64_t total = g.lines * g.len, osize = arg ? 8 : (int64_t)sizeof(T);
+    std::vector<T> hin(total);
+    std::vector<char> hout(total * osize);
+    ds_to_host(p, hin.data(), in, total * (int64_t)sizeof(T));
+    ds_sort_axis_host<T>(hin.data(), hout.data(), g, arg);
+    ds_to_dev(p, out, hout.data(), total * osize);
+#else
+    (void)p;
+    ds_sort_axis_host<T>(in, out, g, arg);
+#endif
+}
+
+struct alignas(16) Bytes16 {
+    uint64_t a, b;
+};
+
+/// f(E{}) for a type of `esize` bytes (the exchange only moves elements).
+template <typename F>
+void by_size(int64_t esize, F&& f) {
+    switch (esize) {
+    case 1: f(uint8_t{}); return;
+    case 2: f(uint16_t{}); return;
+    case 4: f(uint32_t{}); return;
+    case 8: f(uint64_t{}); return;
+    case 16: f(Bytes16{}); return;
+    default: CkAbort("axis sort: element size %lld", (long long)esize);
+    }
+}
+
+/// lines[(l - l0) * ld + off + q] <-> tile[g.phys(l, q)] for l in [l0, l1), q < g.len.
+template <int N, typename E>
+void ax_tile_xfer(PartitionImpl<N>* p, E* tile, AxisGeom g, int64_t l0, int64_t l1, E* lines,
+                  int64_t ld, int64_t off, bool to_tile) {
+    int64_t n = (l1 - l0) * g.len;
+    if (n <= 0)
+        return;
+#ifdef USE_KOKKOS
+    Kokkos::parallel_for(
+        CT_COMPUTE_POLICY(p, n), KOKKOS_LAMBDA(int64_t i) {
+            int64_t l = l0 + i / g.len, q = i % g.len;
+            int64_t a = g.phys(l, q), b = (l - l0) * ld + off + q;
+            if (to_tile)
+                tile[a] = lines[b];
+            else
+                lines[b] = tile[a];
+        });
+#else
+    (void)p;
+    for (int64_t i = 0; i < n; ++i) {
+        int64_t l = l0 + i / g.len, q = i % g.len;
+        int64_t a = g.phys(l, q), b = (l - l0) * ld + off + q;
+        if (to_tile)
+            tile[a] = lines[b];
+        else
+            lines[b] = tile[a];
+    }
+#endif
+}
+
+/// dst[r * dld + doff + q] = src[r * sld + soff + q] for r < rows, q < w.
+template <int N, typename E>
+void ax_copy2d(PartitionImpl<N>* p, const E* src, int64_t sld, int64_t soff, E* dst, int64_t dld,
+               int64_t doff, int64_t rows, int64_t w) {
+    int64_t n = rows * w;
+    if (n <= 0)
+        return;
+#ifdef USE_KOKKOS
+    Kokkos::parallel_for(
+        CT_COMPUTE_POLICY(p, n), KOKKOS_LAMBDA(int64_t i) {
+            int64_t r = i / w, q = i % w;
+            dst[r * dld + doff + q] = src[r * sld + soff + q];
+        });
+#else
+    (void)p;
+    for (int64_t r = 0; r < rows; ++r)
+        memcpy(dst + r * dld + doff, src + r * sld + soff, w * sizeof(E));
+#endif
+}
+
+template <int N>
+void ax_tile(PartitionImpl<N>* p, int64_t esize, void* tile, const AxisGeom& g, int64_t l0,
+             int64_t l1, void* lines, int64_t ld, int64_t off, bool to_tile) {
+    by_size(esize, [&](auto e) {
+        using E = decltype(e);
+        ax_tile_xfer<N, E>(p, static_cast<E*>(tile), g, l0, l1, static_cast<E*>(lines), ld, off,
+                           to_tile);
+    });
+}
+
+template <int N>
+void ax_copy(PartitionImpl<N>* p, int64_t esize, const void* src, int64_t sld, int64_t soff,
+             void* dst, int64_t dld, int64_t doff, int64_t rows, int64_t w) {
+    by_size(esize, [&](auto e) {
+        using E = decltype(e);
+        ax_copy2d<N, E>(p, static_cast<const E*>(src), sld, soff, static_cast<E*>(dst), dld, doff,
+                        rows, w);
+    });
+}
+
+template <int N>
+auto ax_proxy(PartitionImpl<N>* p, const std::array<int, 3>& c) {
+    ChareIndex<N> ci;
+    for (int d = 0; d < N; ++d)
+        ci.idx[d] = c[d];
+    return proxy_at<N>(p->thisProxy, ci);
+}
+
+template <int N>
+bool ax_on_pe(PartitionImpl<N>* p, const std::array<int, 3>& c) {
+    auto t = ax_proxy<N>(p, c);
+    return t.ckLocalBranch()->lastKnown(t.ckGetIndex()) == CkMyPe();
+}
+
+/// Hands `buf` (ownership) to chare c: by pointer on this PE, else as a data message.
+template <int N>
+void ax_send(PartitionImpl<N>* p, const std::array<int, 3>& c, int node_id, int phase, int src,
+             char* buf, int64_t bytes) {
+    auto t = ax_proxy<N>(p, c);
+    if (ax_on_pe<N>(p, c)) {
+        auto m = make_msg(Hdr{S_PIECE, src, phase, 0, 0, 0, bytes, reinterpret_cast<int64_t>(buf)});
+        t.receive_sort_msg(node_id, (int64_t)m.size(), m.data());
+        return;
+    }
+    int region_data[N * 3] = {};
+    region_data[0] = src;
+#ifdef USE_KOKKOS
+    ChareIndex<N> ci;
+    for (int d = 0; d < N; ++d)
+        ci.idx[d] = c[d];
+    device_pack_send<N, N>(p, p->thisProxy, ci, node_id, kDsDataTag + phase, 0, region_data,
+                           bytes, buf);
+#else
+    ct_send_data(t, node_id, kDsDataTag + phase, 0, N, region_data, bytes, buf);
+    delete[] buf;
 #endif
 }
 
 } // namespace ds_detail
 
-/// The tile holds whole lines along `axis`, so SORT/ARGSORT needs no communication.
 template <int N>
 bool ds_axis_whole(CTArrayBase<N>* in, int axis) {
-    const ArrayDecomp<N>& dec = in->decomp;
-    if (dec.offset[axis] / dec.tile != (dec.offset[axis] + dec.global_shape[axis] - 1) / dec.tile)
-        return false;
-#if defined(USE_KOKKOS) && !defined(USE_NVIDIA)
-    return false;
-#endif
-    return in->dtype != DType::COMPLEX64 && in->dtype != DType::COMPLEX128;
+    return in->decomp.num_chares(axis) == 1;
+}
+
+/// Small arrays split along the axis are sorted on one chare (sort_root).
+template <int N>
+bool ds_axis_gather(CTArrayBase<N>* in) {
+    static const int64_t limit = getenv("CNUM_SORT_GATHER_MAX")
+                                     ? atoll(getenv("CNUM_SORT_GATHER_MAX"))
+                                     : int64_t(1) << 16;
+    int64_t total = 1;
+    for (int d = 0; d < N; ++d)
+        total *= in->decomp.global_shape[d];
+    return total <= limit;
 }
 
 template <int N>
@@ -1416,18 +1611,180 @@ void ds_axis_local(PartitionImpl<N>* p, CTArrayBase<N>* in, CTArrayBase<N>* out,
     g.lines = in->local_size() / std::max<int64_t>(1, g.len);
     cn_dispatch(in->dtype, [&](auto tag) {
         using T = decltype(tag);
-        if constexpr (!cn_is_complex_v<T>)
-            ds_sort_axis_local<N, T>(p, static_cast<const T*>(in->device_data_ptr()),
-                                     out->device_data_ptr(), g, arg);
+        ds_sort_axis_local<N, T>(p, static_cast<const T*>(in->device_data_ptr()),
+                                 out->device_data_ptr(), g, arg);
     });
 }
 
 #define DS_AXIS_INST(N)                                                                            \
     template bool ds_axis_whole<N>(CTArrayBase<N>*, int);                                          \
+    template bool ds_axis_gather<N>(CTArrayBase<N>*);                                              \
     template void ds_axis_local<N>(PartitionImpl<N>*, CTArrayBase<N>*, CTArrayBase<N>*, int, bool);
 DS_AXIS_INST(1)
 DS_AXIS_INST(2)
 DS_AXIS_INST(3)
+
+template <int N>
+void ArrayDAGExecutorND<N>::execute_ax_node(DAGNode* node, int in_name, int out_name, int axis,
+                                            bool arg) {
+    if constexpr (N == 1) {
+        CkAbort("execute_ax_node: N-D partitions only");
+    } else {
+        DS_SCOPE(partition);
+        auto& slot = ds_state[node->id];
+        if (!slot)
+            slot = std::make_shared<DsState>();
+        auto keep = slot;
+        DsState& s = *keep;
+        CTArrayBase<N>* in = partition->arrays.at(in_name);
+        const ArrayDecomp<N>& dec = in->decomp;
+        auto me = partition->nd_index();
+        s.node = node;
+        s.op = arg ? Opcode::ARGSORT : Opcode::SORT;
+        s.arg = arg;
+        s.dt = in->dtype;
+        s.in_name = in_name;
+        s.out_name = out_name;
+        s.esize = in->elem_size();
+        int first = dec.offset[axis] / dec.tile, P = dec.num_chares(axis);
+        s.first = first;
+        s.P = P;
+        s.rank = me[axis] - first;
+        s.grp.assign(P, {0, 0, 0});
+        s.pstart.assign(P + 1, dec.global_shape[axis]);
+        for (int r = 0; r < P; ++r) {
+            for (int d = 0; d < N; ++d)
+                s.grp[r][d] = d == axis ? first + r : me[d];
+            s.pstart[r] = dec.chare_start_global(axis, first + r) - dec.offset[axis];
+        }
+        AxisGeom& g = s.tg;
+        g.nd = N;
+        g.axis = axis;
+        for (int d = 0; d < 3; ++d)
+            g.sizes[d] = d < N ? in->region.size(d) : 1;
+        g.strides[N - 1] = 1;
+        for (int d = N - 2; d >= 0; --d)
+            g.strides[d] = g.strides[d + 1] * g.sizes[d + 1];
+        g.len = g.sizes[axis];
+        g.lines = in->local_size() / g.len;
+        s.lst.resize(P + 1);
+        for (int r = 0; r <= P; ++r)
+            s.lst[r] = g.lines * r / P;
+        int64_t L = s.pstart[P], mine = s.lst[s.rank + 1] - s.lst[s.rank];
+        s.need1 = mine > 0 ? P - 1 : 0;
+        for (int r = 0; r < P; ++r)
+            s.need2 += r != s.rank && s.lst[r + 1] > s.lst[r];
+        if (mine > 0)
+            s.lines = ds_alloc(mine * L * s.esize);
+        char* ip = static_cast<char*>(in->device_data_ptr());
+        std::vector<std::pair<int, char*>> sends;
+        for (int r = 0; r < P; ++r) {
+            if (s.lst[r + 1] == s.lst[r])
+                continue;
+            if (r == s.rank) {
+                ax_tile(partition, s.esize, ip, g, s.lst[r], s.lst[r + 1], s.lines, L,
+                        s.pstart[r], false);
+                continue;
+            }
+            char* buf = ds_alloc((s.lst[r + 1] - s.lst[r]) * g.len * s.esize,
+                                 !ax_on_pe(partition, s.grp[r]));
+            ax_tile(partition, s.esize, ip, g, s.lst[r], s.lst[r + 1], buf, g.len, 0, false);
+            sends.push_back({r, buf});
+        }
+        ds_fence(partition);
+        for (auto& sb : sends)
+            ax_send(partition, s.grp[sb.first], node->id, 0, s.rank, sb.second,
+                    (s.lst[sb.first + 1] - s.lst[sb.first]) * g.len * s.esize);
+        s.started = true;
+        std::vector<DsState::Piece> early;
+        early.swap(s.early);
+        for (auto& pc : early)
+            ax_take_piece(node->id, pc.phase, pc.src, pc.buf, pc.count);
+        if (ds_state.count(node->id))
+            ax_progress(node->id);
+    }
+}
+
+template <int N>
+void ArrayDAGExecutorND<N>::ax_take_piece(int node_id, int phase, int src, char* buf,
+                                          int64_t bytes) {
+    if constexpr (N != 1) {
+        DS_SCOPE(partition);
+        auto& slot = ds_state[node_id];
+        if (!slot)
+            slot = std::make_shared<DsState>();
+        auto keep = slot;
+        DsState& s = *keep;
+        if (!s.started) {
+            s.early.push_back(DsState::Piece{phase, src, 0, bytes, buf});
+            return;
+        }
+        int me = s.rank;
+        if (phase == 0) {
+            int64_t w = s.pstart[src + 1] - s.pstart[src];
+            ax_copy(partition, s.esize, buf, w, 0, s.lines, s.pstart[s.P], s.pstart[src],
+                    s.lst[me + 1] - s.lst[me], w);
+            ++s.got1;
+        } else {
+            CTArrayBase<N>* out = partition->arrays.at(s.out_name);
+            ax_tile(partition, out->elem_size(), out->device_data_ptr(), s.tg, s.lst[src],
+                    s.lst[src + 1], buf, s.tg.len, 0, true);
+            ++s.got2;
+        }
+        ds_fence(partition);
+        ds_free(buf);
+        ax_progress(node_id);
+    }
+}
+
+template <int N>
+void ArrayDAGExecutorND<N>::ax_progress(int node_id) {
+    if constexpr (N != 1) {
+        DS_SCOPE(partition);
+        auto keep = ds_state.at(node_id);
+        DsState& s = *keep;
+        int me = s.rank, P = s.P;
+        int64_t L = s.pstart[P];
+        CTArrayBase<N>* out = partition->arrays.at(s.out_name);
+        if (!s.sorted && s.got1 == s.need1) {
+            s.sorted = true;
+            int64_t mine = s.lst[me + 1] - s.lst[me];
+            if (mine > 0) {
+                int64_t osize = out->elem_size();
+                char* res = ds_alloc(mine * L * osize);
+                cn_dispatch(s.dt, [&](auto tag) {
+                    using T = decltype(tag);
+                    ds_sort_axis_local<N, T>(partition, reinterpret_cast<const T*>(s.lines), res,
+                                             block_geom(mine, L), s.arg);
+                });
+                ds_free(s.lines);
+                s.lines = nullptr;
+                std::vector<std::pair<int, char*>> sends;
+                for (int r = 0; r < P; ++r) {
+                    int64_t w = s.pstart[r + 1] - s.pstart[r];
+                    if (r == me) {
+                        ax_tile(partition, osize, out->device_data_ptr(), s.tg, s.lst[me],
+                                s.lst[me + 1], res, L, s.pstart[me], true);
+                        continue;
+                    }
+                    char* buf = ds_alloc(mine * w * osize, !ax_on_pe(partition, s.grp[r]));
+                    ax_copy(partition, osize, res, L, s.pstart[r], buf, w, 0, mine, w);
+                    sends.push_back({r, buf});
+                }
+                ds_fence(partition);
+                ds_free(res);
+                for (auto& sb : sends)
+                    ax_send(partition, s.grp[sb.first], node_id, 1, me, sb.second,
+                            mine * (s.pstart[sb.first + 1] - s.pstart[sb.first]) * osize);
+            }
+        }
+        if (s.sorted && s.got2 == s.need2) {
+            ds_fence(partition);
+            ds_state.erase(node_id);
+            node_finished(node_id);
+        }
+    }
+}
 
 // ------------------------------------------------------------------ executor
 
@@ -1582,8 +1939,10 @@ void ArrayDAGExecutorND<N>::ds_progress_start(int node_id) {
 template <int N>
 void ArrayDAGExecutorND<N>::on_ds_data(int node_id, int phase, const int* region_data, char* buf,
                                        int64_t size) {
-    (void)size;
-    ds_take_piece(node_id, phase, region_data[0], region_data[1], region_data[2], buf);
+    if constexpr (N == 1)
+        ds_take_piece(node_id, phase, region_data[0], region_data[1], region_data[2], buf);
+    else
+        ax_take_piece(node_id, phase, region_data[0], buf, size);
 }
 
 template <int N>
@@ -1611,6 +1970,14 @@ void ArrayDAGExecutorND<N>::ds_take_piece(int node_id, int phase, int src, int64
 template <int N>
 void ArrayDAGExecutorND<N>::on_ds_msg(int node_id, char* data, int64_t size) {
     DS_SCOPE(partition);
+    if constexpr (N != 1) {
+        Hdr h;
+        memcpy(&h, data, sizeof(h));
+        if (h.kind != S_PIECE)
+            CkAbort("on_ds_msg: unexpected message %d on a %d-D partition", h.kind, N);
+        ax_take_piece(node_id, h.phase, h.src, reinterpret_cast<char*>(h.d), h.c);
+        return;
+    }
     auto& st = ds_state[node_id];
     if (!st)
         st = std::make_shared<DsState>();
@@ -1905,6 +2272,7 @@ void PartitionImpl<N>::receive_sort_msg(int node_id, int64_t size, char* data) {
     template void ArrayDAGExecutorND<N>::execute_ds_node(DAGNode*);                                \
     template void ArrayDAGExecutorND<N>::on_ds_msg(int, char*, int64_t);                           \
     template void ArrayDAGExecutorND<N>::on_ds_data(int, int, const int*, char*, int64_t);         \
+    template void ArrayDAGExecutorND<N>::execute_ax_node(DAGNode*, int, int, int, bool);           \
     template void PartitionImpl<N>::receive_sort_msg(int, int64_t, char*);
 DS_INST(1)
 DS_INST(2)
