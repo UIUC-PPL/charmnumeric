@@ -517,6 +517,16 @@ struct DotState {
     bool started = false;
 };
 
+/// receive_data input_index of LINALG device chunks: LA_DEV_INPUT + chunk kind.
+constexpr int LA_DEV_INPUT = 1 << 24;
+
+/// A LINALG device chunk: rows [r0, r1) x cols [c0, c1) of an operand or result.
+struct LaDevChunk {
+    int kind, r0, r1, c0, c1;
+    char* buf;
+};
+struct LaDevRoot;
+
 /// LINALG state on one result chare; early messages wait in `stash`.
 template <int N>
 struct LinalgState {
@@ -527,6 +537,8 @@ struct LinalgState {
     bool computed = false;
     std::vector<std::vector<char>> stash;
     std::vector<std::vector<char>> inputs; // gathered operand blocks (root)
+    std::vector<LaDevChunk> dev_stash;     // device chunks that arrived before the node
+    LaDevRoot* dev = nullptr;              // root's device operands (executor_linalg.cpp)
     ArrayRegion<N> mine;
     int64_t in_covered = 0, in_expected = 0;
     int64_t out_covered = 0, out_expected = 0;
@@ -753,6 +765,7 @@ class ArrayDAGExecutorND : public DAGExecutor {
     void on_reduce_partial(int node_id, char* data, int64_t size);
     void execute_linalg_node(DAGNode* node);
     void on_linalg_msg(int node_id, char* data, int64_t size);
+    void on_linalg_device(int node_id, int kind, const int* region, char* buf);
     void execute_creation_node(DAGNode* node);
     void on_upload_tile(int node_id, int name, char* data, int64_t size);
     void finish_creation_node(int node_id);
