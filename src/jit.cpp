@@ -1400,8 +1400,9 @@ std::unique_ptr<mlir::ExecutionEngine> MLIRJitCompiler::generateNVIDIAHost() {
         llvm::errs() << "generateNVIDIAHost: GPU lowering failed\n";
         return nullptr;
     }
-    // Embed cubins instead of PTX, so loading does not run the driver's JIT. A failure
-    // keeps the PTX (mgpuModuleLoadJIT then reports it).
+    // Embed cubins instead of PTX, so loading does not run the driver's JIT. A kernel
+    // ptxas rejects fails the compile instead of aborting at load.
+    bool assembled = true;
     module->walk([&](mlir::gpu::BinaryOp bin) {
         llvm::SmallVector<mlir::Attribute> objects;
         for (mlir::Attribute a : bin.getObjectsAttr()) {
@@ -1411,16 +1412,23 @@ std::unique_ptr<mlir::ExecutionEngine> MLIRJitCompiler::generateNVIDIAHost() {
             if (auto props = obj ? obj.getProperties() : nullptr)
                 if (auto o = mlir::dyn_cast_or_null<mlir::IntegerAttr>(props.get("O")))
                     opt = o.getInt();
-            if (obj && obj.getFormat() == mlir::gpu::CompilationTarget::Assembly &&
-                cnPtxToCubin(obj.getObject().getValue(), opt, cubin, log) == CUDA_SUCCESS)
+            if (obj && obj.getFormat() == mlir::gpu::CompilationTarget::Assembly) {
+                if (cnPtxToCubin(obj.getObject().getValue(), opt, cubin, log) != CUDA_SUCCESS) {
+                    llvm::errs() << "generateNVIDIAHost: ptxas failed: " << log << "\n";
+                    assembled = false;
+                    continue;
+                }
                 a = mlir::gpu::ObjectAttr::get(&context, obj.getTarget(),
                                                mlir::gpu::CompilationTarget::Binary,
                                                mlir::StringAttr::get(&context, cubin),
                                                obj.getProperties(), obj.getKernels());
+            }
             objects.push_back(a);
         }
         bin.setObjectsAttr(mlir::ArrayAttr::get(&context, objects));
     });
+    if (!assembled)
+        return nullptr;
     jitMark("cubin");
 
     llvm::InitializeNativeTarget();
@@ -2761,8 +2769,16 @@ void* compileKernel(void* ast, const std::string& path, void** moduleHandleOut) 
 
 #if defined(USE_NVIDIA)
     auto engine = node_jit.generateNVIDIAHost();
-    if (!engine)
-        return nullptr;
+    if (!engine) {
+        MLIRJitCompiler unfused;
+        unfused.fuseLoops = false;
+        unfused.buildFromAST(ast);
+        unfused.optimizeAndFuse();
+        engine = unfused.generateNVIDIAHost();
+        if (!engine)
+            return nullptr;
+        llvm::errs() << "JIT: fused kernel failed to compile; running it as one kernel per op\n";
+    }
     if (!node_jit.loadCPU(engine, "fused_kernel", &moduleHandle, &funcPtr))
         return nullptr;
 #elif defined(USE_AMD)
