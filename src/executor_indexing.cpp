@@ -1858,6 +1858,49 @@ void gx_tile(const IxLayout& l, const int ci[3], int64_t lo[3], int64_t tstr[3])
     }
 }
 
+/// The chares of a layout in a box (all of them at first), iterated like
+/// IxLayout::num_chares / chare: loops over the chares meeting a box skip the others.
+struct GxBox {
+    const IxLayout* l;
+    int lo[3] = {0, 0, 0}, hi[3] = {1, 1, 1};
+
+    explicit GxBox(const IxLayout& lay) : l(&lay) {
+        for (int d = 0; d < l->nd; ++d) {
+            lo[d] = l->c0[d];
+            hi[d] = l->c1[d];
+        }
+    }
+    /// Keeps the chares along dim d holding a coordinate a + s * t for some s in [s0, s1).
+    GxBox& narrow(int d, int64_t a, int64_t t, int64_t s0, int64_t s1) {
+        if (d >= l->nd)
+            return *this;
+        if (s1 <= s0) {
+            hi[d] = lo[d];
+            return *this;
+        }
+        int64_t x0 = a + s0 * t, x1 = a + (s1 - 1) * t;
+        if (x0 > x1)
+            std::swap(x0, x1);
+        lo[d] = (int)std::max<int64_t>(lo[d], gx_fdiv(x0 + l->off[d], l->tile));
+        hi[d] = (int)std::min<int64_t>(hi[d], gx_fdiv(x1 + l->off[d], l->tile) + 1);
+        return *this;
+    }
+    int64_t num() const {
+        int64_t n = 1;
+        for (int d = 0; d < l->nd; ++d)
+            n *= std::max(0, hi[d] - lo[d]);
+        return n;
+    }
+    void chare(int64_t k, int ci[3]) const {
+        ci[0] = ci[1] = ci[2] = 0;
+        for (int d = l->nd - 1; d >= 0; --d) {
+            int n = hi[d] - lo[d];
+            ci[d] = lo[d] + (int)(k % n);
+            k /= n;
+        }
+    }
+};
+
 struct GxCtx {
     IxSpec s;
     IxLayout D, L, V, O; // data root, index array, values (SCATTER), result (GATHER)
@@ -2412,19 +2455,26 @@ void ArrayDAGExecutorND<N>::gx_start(DAGNode* node) {
 
         }
         // Holder: one request from every result chare whose slice box meets ours.
-        if (N == s.data.nd && gx_data_box(c, me, s0, s1))
-            for (int64_t k = 0; k < c.O.num_chares(); ++k) {
+        if (N == s.data.nd && gx_data_box(c, me, s0, s1)) {
+            GxBox bx(c.O);
+            for (int k = 0; k < c.ns; ++k)
+                bx.narrow(c.ek[k], s0[k], 1, 0, s1[k] - s0[k]);
+            for (int64_t k = 0; k < bx.num(); ++k) {
                 int ci[3];
-                c.O.chare(k, ci);
+                bx.chare(k, ci);
                 st.req_left += (gx_e_box(c, false, ci, e0, e1) && gx_piece(c, s0, s1, e0, e1, p0, p1)) *
                                kGxUnits;
             }
+        }
         // L chare: send every result chare the part of its b range held here.
         int64_t k0[3], cnt[3];
-        if (N == s.L.nd && view_block(s.L, c.L, me, k0, cnt))
-            for (int64_t k = 0; k < c.O.num_chares(); ++k) {
+        if (N == s.L.nd && view_block(s.L, c.L, me, k0, cnt)) {
+            GxBox bx(c.O);
+            for (int d = 0; d < c.nB; ++d)
+                bx.narrow(s.npre + d, k0[d], 1, 0, cnt[d]);
+            for (int64_t k = 0; k < bx.num(); ++k) {
                 int ci[3];
-                c.O.chare(k, ci);
+                bx.chare(k, ci);
                 if (!gx_e_box(c, false, ci, e0, e1))
                     continue;
                 GxHdr h = {};
@@ -2451,6 +2501,7 @@ void ArrayDAGExecutorND<N>::gx_start(DAGNode* node) {
                             GX_GIVE);
                 });
             }
+        }
     } else {
         // Destination: one bucket from every L chare, then one reply per v chare asked.
         if (N == s.data.nd && gx_data_box(c, me, s0, s1)) {
@@ -2458,13 +2509,17 @@ void ArrayDAGExecutorND<N>::gx_start(DAGNode* node) {
             st.lmsg_left = (int64_t)c.lch.size() * kGxUnits;
         }
         // v chare: one request from every destination whose slice box meets ours.
-        if (s.V.name >= 0 && N == s.V.nd && gx_e_box(c, true, me, e0, e1))
-            for (int64_t k = 0; k < c.D.num_chares(); ++k) {
+        if (s.V.name >= 0 && N == s.V.nd && gx_e_box(c, true, me, e0, e1)) {
+            GxBox bx(c.D);
+            for (int k = 0; k < c.ns; ++k)
+                bx.narrow(c.g.rk[k], c.g.ak[k], c.tk[k], e0[c.ek[k]], e1[c.ek[k]]);
+            for (int64_t k = 0; k < bx.num(); ++k) {
                 int ci[3];
-                c.D.chare(k, ci);
+                bx.chare(k, ci);
                 st.req_left += (gx_data_box(c, ci, s0, s1) && gx_piece(c, s0, s1, e0, e1, p0, p1)) *
                                kGxUnits;
             }
+        }
         // L chare: group the block's entries by destination chare and send the groups.
         int64_t k0[3], cnt[3];
         if (N == s.L.nd && view_block(s.L, c.L, me, k0, cnt)) {
@@ -2488,9 +2543,12 @@ void ArrayDAGExecutorND<N>::gx_start(DAGNode* node) {
             std::vector<int64_t> hist = gx_hist(partition, n, c.nbk, kf), starts;
             gx_warn_dropped(hist[c.nbk]);
             int64_t* grouped = gx_group(partition, n, key, ent, hist, starts);
-            for (int64_t k = 0; k < c.D.num_chares(); ++k) {
+            GxBox bx(c.D);
+            for (int k = 0; k < c.ns; ++k)
+                bx.narrow(c.g.rk[k], c.g.ak[k], c.tk[k], 0, s.E[c.ek[k]]);
+            for (int64_t k = 0; k < bx.num(); ++k) {
                 int ci[3];
-                c.D.chare(k, ci);
+                bx.chare(k, ci);
                 if (!gx_data_box(c, ci, s0, s1))
                     continue;
                 int64_t b = gx_bucket_of(c, ci);
@@ -2608,9 +2666,12 @@ void ArrayDAGExecutorND<N>::gx_progress(int node_id) {
                            GxSetFn<T>{static_cast<T*>(out->device_data_ptr()), T{}});
                 });
             }
-            for (int64_t k = 0; k < c.D.num_chares(); ++k) {
+            GxBox bx(c.D);
+            for (int k = 0; k < c.ns; ++k)
+                bx.narrow(c.g.rk[k], c.g.ak[k], c.tk[k], e0[c.ek[k]], e1[c.ek[k]]);
+            for (int64_t k = 0; k < bx.num(); ++k) {
                 int ci[3];
-                c.D.chare(k, ci);
+                bx.chare(k, ci);
                 if (!gx_data_box(c, ci, s0, s1) || !gx_piece(c, s0, s1, e0, e1, p0, p1))
                     continue;
                 int64_t b = gx_bucket_of(c, ci);
@@ -2737,9 +2798,12 @@ void ArrayDAGExecutorND<N>::gx_progress(int node_id) {
                     gx_free(partition, reinterpret_cast<char*>(kept));
                 gx_free(partition, reinterpret_cast<char*>(key));
                 st.gx_ent = reinterpret_cast<char*>(grouped);
-                for (int64_t k = 0; k < c.V.num_chares(); ++k) {
+                GxBox bx(c.V);
+                for (int k = 0; k < c.ns; ++k)
+                    bx.narrow(c.ek[k], v.start[c.ek[k]], v.step[c.ek[k]], s0[k], s1[k]);
+                for (int64_t k = 0; k < bx.num(); ++k) {
                     int ci[3];
-                    c.V.chare(k, ci);
+                    bx.chare(k, ci);
                     if (!gx_e_box(c, true, ci, e0, e1) || !gx_piece(c, s0, s1, e0, e1, p0, p1))
                         continue;
                     int64_t b = 0;
