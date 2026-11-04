@@ -9,6 +9,7 @@
 #include "dispatch.hpp"
 
 #include <algorithm>
+#include <climits>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -709,7 +710,7 @@ bool ds_sort_local(PartitionImpl<1>* p, K* k, K* ka, int64_t* g, int64_t* ga, in
     cub::DoubleBuffer<K> dk(k, ka);
     cub::DoubleBuffer<int64_t> dv(g, ga);
     size_t tb = 0;
-    int nn = (int)n;
+    int64_t nn = n;
     if (g)
         hapiCheck(cub::DeviceRadixSort::SortPairs(nullptr, tb, dk, dv, nn, 0, 8 * sizeof(K),
                                                   ds_stream(p)));
@@ -871,7 +872,9 @@ void send_piece(PartitionImpl<1>* p, int chare, int node_id, int phase, int src,
         send_ctrl(p, chare, node_id, make_msg(h));
         return;
     }
-    int region_data[3] = {src, (int)start, (int)count};
+    // phase 0 pieces start at 0 and carry their count; phase 1 pieces carry their start
+    int64_t v = phase == 0 ? count : start;
+    int region_data[3] = {src, (int)(uint32_t)v, (int)(v >> 32)};
 #ifdef USE_KOKKOS
     ChareIndex<1> ci;
     ci.idx[0] = chare;
@@ -1072,9 +1075,9 @@ void sort_partition(PartitionImpl<1>* p, DsState& s, const T* in, int64_t n,
         DS_LAUNCHED();
         cub::DoubleBuffer<unsigned> kb(bid, bid2), vb(idx, idx2);
         size_t tb = 0;
-        hapiCheck(cub::DeviceRadixSort::SortPairs(nullptr, tb, kb, vb, (int)n, 0, bits, st));
+        hapiCheck(cub::DeviceRadixSort::SortPairs(nullptr, tb, kb, vb, n, 0, bits, st));
         char* tmp = ds_alloc((int64_t)tb);
-        hapiCheck(cub::DeviceRadixSort::SortPairs(tmp, tb, kb, vb, (int)n, 0, bits, st));
+        hapiCheck(cub::DeviceRadixSort::SortPairs(tmp, tb, kb, vb, n, 0, bits, st));
         std::vector<unsigned> hc(P);
         ds_to_host(p, hc.data(), dcnt, P * sizeof(unsigned));
         std::vector<int64_t> hb(P);
@@ -1413,8 +1416,11 @@ void ds_sort_axis_local(PartitionImpl<N>* p, const T* in, void* out, AxisGeom g,
     thrust::counting_iterator<int64_t> seg(0);
     auto b0 = thrust::make_transform_iterator(seg, SegOff{g.len, 0});
     auto b1 = thrust::make_transform_iterator(seg, SegOff{g.len, 1});
+    if (cap > INT_MAX)
+        CkAbort("axis sort: a line of %lld elements exceeds the segmented sort's int range",
+                (long long)g.len);
     for (int64_t l0 = 0; l0 < g.lines; l0 += bl) {
-        int nl = (int)std::min(bl, g.lines - l0), n = (int)(nl * g.len);
+        int nl = (int)std::min(bl, g.lines - l0), n = (int)(nl * g.len); // <= cap
         ax_gather_kernel<T><<<grid_for(n), 256, 0, st>>>(in, g, l0, n, arg, k, v);
         DS_LAUNCHED();
         size_t tb = 0;
@@ -1939,9 +1945,17 @@ void ArrayDAGExecutorND<N>::ds_progress_start(int node_id) {
 template <int N>
 void ArrayDAGExecutorND<N>::on_ds_data(int node_id, int phase, const int* region_data, char* buf,
                                        int64_t size) {
-    if constexpr (N == 1)
-        ds_take_piece(node_id, phase, region_data[0], region_data[1], region_data[2], buf);
-    else
+    if constexpr (N == 1) {
+        int64_t v = (int64_t)(uint32_t)region_data[1] | ((int64_t)region_data[2] << 32);
+        if (phase == 0) {
+            ds_take_piece(node_id, phase, region_data[0], 0, v, buf);
+        } else {
+            // phase 1 follows this chare's own start, so its output array exists
+            DsState& s = *ds_state.at(node_id);
+            ds_take_piece(node_id, phase, region_data[0], v,
+                          size / partition->arrays.at(s.out_name)->elem_size(), buf);
+        }
+    } else
         ax_take_piece(node_id, phase, region_data[0], buf, size);
 }
 

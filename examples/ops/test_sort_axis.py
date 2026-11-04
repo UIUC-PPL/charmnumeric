@@ -138,7 +138,7 @@ def main(chk):
     same("sort signed zeros/NaNs axis=0", cnp.sort(cnp.asarray(z), axis=0), np.sort(z, axis=0))
 
     # complex 1-D (distributed sample sort) and complex N-D axis=None
-    for n in (7, 262_145, 1_000_003):
+    for n in (7, 262_145, 1_000_003, 3_000_001):  # 3e6: several chares on GPU builds too
         for dt in CPLX:
             h = make((n,), dt, rng, n > 10)
             both(f"{np.dtype(dt).name} 1-D n={n}", cnp.asarray(h), h, 0)
