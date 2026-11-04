@@ -597,6 +597,16 @@ struct DsState;
 /// of every partition has finished all earlier epochs.
 constexpr int kBarrierName = -1;
 
+/// Places the partitions' chares (chare_home_pe) instead of Charm++'s index hash.
+class PartitionMap : public CBase_PartitionMap {
+  public:
+    PartitionMap() {}
+    PartitionMap(CkMigrateMessage* m) : CBase_PartitionMap(m) {}
+    int procNum(int, const CkArrayIndex& idx) override {
+        return chare_home_pe(idx.dimension, idx.data(), CkNumPes());
+    }
+};
+
 class ArrayDAGGroup : public CBase_ArrayDAGGroup {
   public:
     // Per-ndims partition state: current chare grid and proxy.
@@ -755,6 +765,9 @@ class ArrayDAGExecutorND : public DAGExecutor {
     void execute_matmul_node(DAGNode* node);
     void execute_matmatmul_node(DAGNode* node);
     void execute_reduce_node(DAGNode* node);
+    void start_realigned_dot(DAGNode* node, int lhs_name, int rhs_name);
+    void finish_realigned_dot(PendingComm<N>& comm);
+    void post_dot_partial(DAGNode* node, char* contrib, int lhs_name);
     void on_dot_partial(int node_id, char* data, int64_t size);
     void finish_dot(int node_id);
     void execute_cross_set_region_node(DAGNode* node);
