@@ -2067,12 +2067,12 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
         });
         align_transpose_results();
 
-        // The executor allocates a fused kernel's other kept results at the
-        // shifted set_region shape, so place them to match.
+        // The executor allocates a fused kernel's other kept results in the
+        // set_region's chare layout, so place them to match.
         detail::for_each_node_topo(dag, [&](DAGNode* dag_node) {
             for (ASTNode* root : dag_node->ast->roots) {
                 if (static_cast<Opcode>(root->opcode) != Opcode::SET_REGION ||
-                    root->operands.empty() || root->region == nullptr || root->region->is_global)
+                    root->operands.empty())
                     continue;
                 auto target_it = array_meta.find(root->operands[0]->result_name);
                 if (target_it == array_meta.end())
@@ -2082,12 +2082,10 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                 auto start = extract_region_start(root->region, nd);
                 auto step = extract_region_step(root->region, nd);
                 auto stop = extract_region_stop(root->region, nd, target.global_shape);
-                bool shifted = false, unit = true;
-                for (int d = 0; d < nd; ++d) {
-                    shifted |= start[d] != 0;
+                bool unit = true;
+                for (int d = 0; d < nd; ++d)
                     unit &= step[d] == 1;
-                }
-                if (!shifted || !unit)
+                if (!unit)
                     continue;
                 for (ASTNode* other : dag_node->ast->roots) {
                     if (other == root || other->is_temp ||
@@ -2098,9 +2096,11 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                         it->second.ndims != nd)
                         continue;
                     // zero-offset results are routed from tile 0 by their executors
-                    assert(!matmul_arrays.count(other->result_name));
-                    if (matmul_arrays.count(other->result_name))
+                    if (matmul_arrays.count(other->result_name)) {
+                        for (int d = 0; d < nd; ++d)
+                            assert(target.offset[d] + start[d] == 0);
                         continue;
+                    }
                     bool same_shape = true;
                     for (int d = 0; d < nd; ++d)
                         same_shape &= it->second.global_shape[d] == stop[d] - start[d];

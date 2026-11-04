@@ -619,6 +619,32 @@ void test_fused_kept_results_share_layout() {
 
     delete dag;
 }
+
+void test_set_region_kept_result_takes_target_layout() {
+    std::cout << "=== test_set_region_kept_result_takes_target_layout ===" << std::endl;
+
+    constexpr int X = 1;
+    constexpr int U = 2;
+    constexpr int T = 3;
+    constexpr int SET = 4;
+
+    // one kernel keeps T = X[2:502] + X[2:502] and writes U[0:500] = T
+    MetaMap meta;
+    meta[X] = make_meta(1, 512, 0, 64, /*final=*/true);
+    meta[U] = make_meta(1, 500, 0, 64, /*final=*/true);
+    meta[T] = make_meta(1, 500, 0, 0, false);
+    ASTNode* t = make_add(T, make_leaf(X), make_region<1>({2}, {502}, {1}), make_leaf(X),
+                          make_region<1>({2}, {502}, {1}));
+    ASTNode* set = make_set_region(SET, make_leaf(U), make_region<1>({0}, {500}, {1}), t);
+    DAG* dag = make_single_node_dag({t, set});
+
+    decomposition_solver::compute_decompositions(meta, dag, /*odf=*/4, /*num_pes=*/1);
+
+    expect_eq("T.tile", meta.at(T).tile, 64);
+    expect_offset("T.offset", meta.at(T).offset, {0, 0, 0});
+
+    delete dag;
+}
 } // namespace
 
 int main() {
@@ -637,6 +663,7 @@ int main() {
         test_reduce_operands_share_layout();
         test_small_class_member_keeps_own_tile();
         test_fused_kept_results_share_layout();
+        test_set_region_kept_result_takes_target_layout();
     } catch (const std::exception& ex) {
         std::cerr << "test_compute_decompositions failed: " << ex.what() << std::endl;
         return 1;
