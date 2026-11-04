@@ -4,6 +4,7 @@
 #include "dispatch.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <type_traits>
 
 #ifdef USE_KOKKOS
@@ -37,15 +38,35 @@ inline cublasHandle_t ct_cublas() {
 /// failures are skipped. Returns the ms spent creating the handles.
 double ct_prewarm_blas();
 
-/// Orders `stream` after the work queued so far on the Kokkos default instance, without a
-/// host wait.
-inline void ct_after_default(cudaStream_t stream) {
+/// Orders `stream` after the work queued so far on `producer`, without a host wait.
+inline void ct_stream_after(cudaStream_t stream, cudaStream_t producer) {
     thread_local cudaEvent_t ev = nullptr;
     if (ev == nullptr && cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess)
         CkAbort("cudaEventCreate failed");
-    if (cudaEventRecord(ev, Kokkos::DefaultExecutionSpace().cuda_stream()) != cudaSuccess ||
-        cudaStreamWaitEvent(stream, ev, 0) != cudaSuccess)
-        CkAbort("ordering after the default instance failed");
+    if (cudaEventRecord(ev, producer) != cudaSuccess || cudaStreamWaitEvent(stream, ev, 0) != cudaSuccess)
+        CkAbort("ordering two streams failed");
+}
+
+/// Orders `stream` after the work queued so far on the Kokkos default instance, without a
+/// host wait.
+inline void ct_after_default(cudaStream_t stream) {
+    ct_stream_after(stream, Kokkos::DefaultExecutionSpace().cuda_stream());
+}
+
+struct CtHostTask {
+    std::function<void()> fn;
+};
+
+inline void ct_host_task_cb(void* t, void*) {
+    auto* task = static_cast<CtHostTask*>(t);
+    task->fn();
+    delete task;
+}
+
+/// Runs `fn` on this PE once the work queued so far on `stream` has run.
+inline void ct_after_stream(cudaStream_t stream, std::function<void()> fn) {
+    CkCallback cb(ct_host_task_cb, new CtHostTask{std::move(fn)});
+    hapiAddCallback(stream, &cb);
 }
 
 inline void comm_free_cb(void* p, void*) { comm_free(p); }
@@ -564,13 +585,81 @@ inline char* alloc_buffer(int64_t bytes) {
 #endif
 }
 
-/// Waits for the device, like the cudaFree it replaces, before the block can be reused.
+/// Waits for the whole device before the block can be reused (sort_root); others use
+/// free_buffer(partition, buf).
 inline void free_buffer(char* buf) {
 #ifdef USE_KOKKOS
     Kokkos::fence("ct_free_buffer");
     comm_free(buf);
 #else
     delete[] buf;
+#endif
+}
+
+/// Frees an alloc_buffer() block once the chare's work queued so far has run: its compute
+/// stream, ordered after its comm stream and the default instance. No host wait.
+template <int N>
+void free_buffer(PartitionImpl<N>* partition, char* buf) {
+#if defined(USE_NVIDIA)
+    partition->compute_after_others();
+    comm_free_after(partition->compute_stream_raw, buf);
+#elif defined(USE_KOKKOS)
+    (void)partition;
+    Kokkos::fence("ct_free_buffer");
+    comm_free(buf);
+#else
+    (void)partition;
+    delete[] buf;
+#endif
+}
+
+#ifdef USE_KOKKOS
+/// Frees a comm_alloc block once the work queued so far on the compute stream has run (the
+/// caller used it only there).
+template <int N>
+void free_after_compute(PartitionImpl<N>* partition, void* p) {
+#ifdef USE_NVIDIA
+    comm_free_after(partition->compute_stream_raw, p);
+#else
+    (void)partition;
+    Kokkos::fence("ct_free_after_compute");
+    comm_free(p);
+#endif
+}
+
+/// Device copy of `h` (a comm_alloc block, queued on the compute stream; `h` may go away on
+/// return); free it with free_after_compute.
+template <int N>
+int64_t* upload_words(PartitionImpl<N>* partition, const std::vector<int64_t>& h) {
+    int64_t bytes = std::max<int64_t>((int64_t)h.size() * (int64_t)sizeof(int64_t), 8);
+    auto* d = static_cast<int64_t*>(comm_alloc(bytes));
+#ifdef USE_NVIDIA
+    // a pageable source is staged before cudaMemcpyAsync returns
+    if (!h.empty())
+        hapiCheck(cudaMemcpyAsync(d, h.data(), h.size() * sizeof(int64_t), cudaMemcpyHostToDevice,
+                                  partition->compute_stream_raw));
+#else
+    (void)partition;
+    Kokkos::deep_copy(
+        Kokkos::View<int64_t*, DeviceSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>(d, h.size()),
+        Kokkos::View<const int64_t*, HostSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>(
+            h.data(), h.size()));
+#endif
+    return d;
+}
+#endif
+
+/// Orders the comm stream (packed sends, device_pack_send) after the work queued so far on
+/// the compute stream, without a host wait.
+template <int N>
+void comm_after_compute(PartitionImpl<N>* partition) {
+#if defined(USE_NVIDIA)
+    ct_stream_after(partition->comm_stream_raw, partition->compute_stream_raw);
+#elif defined(USE_KOKKOS)
+    (void)partition;
+    Kokkos::fence("ct_comm_after_compute");
+#else
+    (void)partition;
 #endif
 }
 
