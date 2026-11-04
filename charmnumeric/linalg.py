@@ -5,7 +5,10 @@ operands are gathered to one chare, factored there (Eigen on CPU, cuSOLVER/cuBLA
 NVIDIA), and scattered back. On NVIDIA the operands stay in device memory (CUDA IPC
 between processes), so the operands and result must fit on one GPU. ``tssvd`` of a
 matrix whose columns lie in one tile column needs no gather: the chares sum their
-Gram matrices.
+Gram matrices. ``solve``, ``inv``, ``det`` and ``slogdet`` of matrices with at least
+``CNUM_LA_LU_MIN`` (server env, default 2048) rows use a distributed partial-pivoted LU
+instead: row panels are dealt cyclically to one worker per PE (``CNUM_LA_LU_NB`` rows,
+default 512 on NVIDIA, 128 on CPU), so each worker holds about 1/P of the matrix.
 
 Deviations from NumPy:
 
