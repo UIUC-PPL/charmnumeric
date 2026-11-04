@@ -618,7 +618,7 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                 // also needs x and weights laid out identically.
                 if (is_reduction_op(op) || op == Opcode::LINALG || is_shape_op(op) ||
                     is_signal_op(op) || op == Opcode::GATHER || op == Opcode::EXPAND ||
-                    op == Opcode::COMPRESS) {
+                    op == Opcode::COMPRESS || op == Opcode::TILE || op == Opcode::DIAG) {
                     matmul_arrays.insert(ast_node->result_name);
                     if (op == Opcode::BINCOUNT)
                         for (ASTNode* operand : ast_node->operands)
@@ -1807,6 +1807,10 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                     auto it = array_meta.find(other->result_name);
                     if (it == array_meta.end() || it->second.decomp_final ||
                         it->second.ndims != nd)
+                        continue;
+                    // zero-offset results are routed from tile 0 by their executors
+                    assert(!matmul_arrays.count(other->result_name));
+                    if (matmul_arrays.count(other->result_name))
                         continue;
                     bool same_shape = true;
                     for (int d = 0; d < nd; ++d)
