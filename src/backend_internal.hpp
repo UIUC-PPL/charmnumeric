@@ -81,22 +81,25 @@ inline void comm_free_after(cudaStream_t stream, void* p) {
 #endif
 
 /// Row-major C[m x n] = A[m x k] * B[k x n] + beta * C, leading dims lda/ldb/ldc.
-/// Under USE_KOKKOS all pointers are device pointers; float/double use cuBLAS on `stream`.
+/// Under USE_KOKKOS all pointers are device pointers. Under USE_NVIDIA it is queued on `exec`
+/// (after the default instance's work): cuBLAS for float and complex types, KokkosBlas else.
 template <typename T>
 inline void local_gemm(const T* a, int lda, const T* b, int ldb, T* c, int ldc, int m, int n,
                        int k, T beta
 #ifdef USE_NVIDIA
                        ,
-                       cudaStream_t stream
+                       const Kokkos::Cuda& exec
 #endif
 ) {
     if (m <= 0 || n <= 0)
         return;
 #ifdef USE_KOKKOS
 #ifdef USE_NVIDIA
-    if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double>) {
-        // inputs may come from work on the default instance's stream: order, don't wait
-        ct_after_default(stream);
+    cudaStream_t stream = exec.cuda_stream();
+    // inputs may come from work on the default instance's stream: order, don't wait
+    ct_after_default(stream);
+    if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double> ||
+                  std::is_same_v<T, cn_c64> || std::is_same_v<T, cn_c128>) {
         // column-major view of the row-major product: C^T = B^T * A^T
         cublasHandle_t h = ct_cublas();
         cublasSetStream(h, stream);
@@ -105,9 +108,23 @@ inline void local_gemm(const T* a, int lda, const T* b, int ldb, T* c, int ldc, 
         if constexpr (std::is_same_v<T, float>)
             st = cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &one, b, ldb, a, lda, &beta, c,
                              ldc);
-        else
+        else if constexpr (std::is_same_v<T, double>)
             st = cublasDgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &one, b, ldb, a, lda, &beta, c,
                              ldc);
+        else if constexpr (std::is_same_v<T, cn_c64>)
+            st = cublasCgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k,
+                             reinterpret_cast<const cuComplex*>(&one),
+                             reinterpret_cast<const cuComplex*>(b), ldb,
+                             reinterpret_cast<const cuComplex*>(a), lda,
+                             reinterpret_cast<const cuComplex*>(&beta),
+                             reinterpret_cast<cuComplex*>(c), ldc);
+        else
+            st = cublasZgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k,
+                             reinterpret_cast<const cuDoubleComplex*>(&one),
+                             reinterpret_cast<const cuDoubleComplex*>(b), ldb,
+                             reinterpret_cast<const cuDoubleComplex*>(a), lda,
+                             reinterpret_cast<const cuDoubleComplex*>(&beta),
+                             reinterpret_cast<cuDoubleComplex*>(c), ldc);
         if (st != CUBLAS_STATUS_SUCCESS)
             CkAbort("cuBLAS gemm failed (%d)", (int)st);
         return;
@@ -119,12 +136,10 @@ inline void local_gemm(const T* a, int lda, const T* b, int ldb, T* c, int ldc, 
     SMat d_B(const_cast<T*>(b), Kokkos::LayoutStride(k, ldb, n, 1));
     SMat d_C(c, Kokkos::LayoutStride(m, ldc, n, 1));
 #ifdef USE_NVIDIA
-    // KokkosBlas runs on the default instance, which is not ordered with `stream`
-    cudaStreamSynchronize(stream);
-#endif
+    // integer types: no cuBLAS GEMM (cublasGemmEx takes only int8 inputs)
+    KokkosBlas::gemm(exec, "N", "N", T(1), d_A, d_B, beta, d_C);
+#else
     KokkosBlas::gemm("N", "N", T(1), d_A, d_B, beta, d_C);
-#ifdef USE_NVIDIA
-    Kokkos::DefaultExecutionSpace().fence("ct_gemm result");
 #endif
 #else
     using RMat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
@@ -374,7 +389,7 @@ inline void panel_gemm_accumulate(T* a_data, int a_rows, int a_k_size, int a_col
                                   int c_row, int c_col
 #ifdef USE_NVIDIA
                                   ,
-                                  cudaStream_t stream
+                                  const Kokkos::Cuda& exec
 #endif
 ) {
     (void)c_rows;
@@ -383,7 +398,7 @@ inline void panel_gemm_accumulate(T* a_data, int a_rows, int a_k_size, int a_col
                   c_data + (int64_t)c_row * c_cols + c_col, c_cols, a_rows, b_cols, k_size, T(1)
 #ifdef USE_NVIDIA
                   ,
-                  stream
+                  exec
 #endif
     );
 }

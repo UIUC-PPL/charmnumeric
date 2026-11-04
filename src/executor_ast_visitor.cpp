@@ -528,35 +528,22 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
             }
 
 #ifdef USE_KOKKOS
-            // Perform matmatmul on device using KokkosBlas::gemm
-            auto kokkos_gemm = [&](auto dummy) {
-                using VT = decltype(dummy);
-                Kokkos::View<VT**, Kokkos::LayoutRight, DeviceSpace,
-                             Kokkos::MemoryTraits<Kokkos::Unmanaged>>
-                    d_a(static_cast<VT*>(a_base->device_data_ptr()), a_local_rows, a_local_cols);
-                auto d_a_sub = Kokkos::subview(d_a,
-                                               Kokkos::make_pair(a_row_offset, a_row_offset + sub_rows),
-                                               Kokkos::make_pair(a_col_offset, a_col_offset + k_size));
-                Kokkos::View<VT**, Kokkos::LayoutRight, DeviceSpace,
-                             Kokkos::MemoryTraits<Kokkos::Unmanaged>>
-                    d_b(static_cast<VT*>(b_base->device_data_ptr()), b_local_rows, b_local_cols);
-                auto d_b_sub = Kokkos::subview(d_b,
-                                               Kokkos::make_pair(b_row_offset, b_row_offset + k_size),
-                                               Kokkos::make_pair(b_col_offset, b_col_offset + sub_cols));
-                Kokkos::View<VT**, Kokkos::LayoutRight, DeviceSpace,
-                             Kokkos::MemoryTraits<Kokkos::Unmanaged>>
-                    d_c(static_cast<VT*>(partition->arrays[result_name]->device_data_ptr()), sub_rows,
-                        sub_cols);
+            // C += A_sub * B_sub on the device (cuBLAS / KokkosBlas on the compute stream)
+            cn_dispatch_blas(dtype, [&](auto tag) {
+                using VT = decltype(tag);
+                const VT* a = static_cast<const VT*>(a_base->device_data_ptr()) +
+                              (int64_t)a_row_offset * a_local_cols + a_col_offset;
+                const VT* b = static_cast<const VT*>(b_base->device_data_ptr()) +
+                              (int64_t)b_row_offset * b_local_cols + b_col_offset;
+                VT* c = static_cast<VT*>(partition->arrays[result_name]->device_data_ptr());
+                local_gemm<VT>(a, a_local_cols, b, b_local_cols, c, sub_cols, sub_rows, sub_cols,
+                               k_size, VT(1)
 #ifdef USE_NVIDIA
-                // default instance is not ordered with the chare's compute stream
-                cudaStreamSynchronize(partition->compute_stream_raw);
+                               ,
+                               partition->compute_exec
 #endif
-                KokkosBlas::gemm("N", "N", VT(1), d_a_sub, d_b_sub, VT(1), d_c);
-#ifdef USE_NVIDIA
-                Kokkos::DefaultExecutionSpace().fence("ct_gemm result");
-#endif
-            };
-            cn_dispatch_blas(dtype, kokkos_gemm);
+                );
+            });
 #else
             a_base->copyToHost();
             b_base->copyToHost();
