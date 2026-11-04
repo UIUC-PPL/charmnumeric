@@ -273,8 +273,8 @@ programs do not observe:
    RESHAPE/BROADCAST (opcodes 140-141, `src/executor_shape.cpp`) and
    FoldedArray (`charmnumeric/folded.py`) for >3-D arrays. black_scholes_greeks,
    scan, quantiles, take_pairs use them.
-9. ~~sort/argsort~~ (native; 1-D sorts are a distributed sample sort,
-   `src/executor_sort.cpp`).
+9. ~~sort/argsort~~ (native and distributed, `src/executor_sort.cpp`: 1-D sample
+   sort; N-D sorts redistribute whole lines among the tiles along the axis).
 10. ~~astype (dtype conversion)~~ (fused CONVERT op; mixed dtypes are converted
     in-kernel with NumPy's promotion rules).
 11. **One example each:** ~~scan (cumsum/cumprod)~~ (native), ~~convolve~~ (native),
