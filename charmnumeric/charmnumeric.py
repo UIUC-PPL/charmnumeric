@@ -877,6 +877,9 @@ def _scan(name, a, axis=None, dtype=None, out=None):
     return result
 
 
+_SORT_LONG_LINE, _SORT_FEW_LINES = 1 << 22, 16
+
+
 def _sort(a, axis=-1, kind=None, order=None, arg=False):
     """sort / argsort along one axis (stable, NaNs last: valid for every NumPy kind)."""
     if order is not None:
@@ -892,6 +895,20 @@ def _sort(a, axis=-1, kind=None, order=None, arg=False):
         from .folded import along_last_dims
 
         return along_last_dims(a, axis, lambda b, ax: _sort(b, ax, kind, order, arg))
+    n = int(a.shape[axis]) if a.ndims else 1
+    lines = int(a.size) // n if n else 0
+    if a.ndims > 1 and n >= _SORT_LONG_LINE and lines <= _SORT_FEW_LINES:
+        # few long lines: one distributed 1-D sort per line keeps every tile busy
+        if lines == 1:
+            return _reshape(_sort(_reshape(a, (n,)), 0, kind, order, arg), tuple(a.shape))
+        out = create_array(tuple(a.shape), dtype=np.dtype(np.int64) if arg else a.dtype)
+        rest = [m for d, m in enumerate(a.shape) if d != axis]
+        for idx in np.ndindex(*rest):
+            key = list(idx)
+            key.insert(axis, slice(None))
+            key = tuple(key)
+            out[key] = _sort(_reshape(a[key], (n,)), 0, kind, order, arg)
+        return out
     src = _materialize(a)
     return nonfusible_op(
         src,
