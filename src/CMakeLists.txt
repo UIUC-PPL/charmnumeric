@@ -152,6 +152,7 @@ set(BACKEND_EXECUTOR_SOURCES
     executor_ast_visitor.cpp
     executor_creation.cpp
     executor_castscansort.cpp
+    executor_sort.cpp
     executor_linalg.cpp
     executor_signal.cpp
     executor_indexing.cpp
