@@ -416,6 +416,9 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
                                static_cast<VT*>(result_base->device_data_ptr()));
             };
             cn_dispatch_blas(dtype, kokkos_gemv);
+#ifdef USE_NVIDIA
+            partition->join_streams();
+#endif
 #else
             // Perform matmul on host using Eigen gemv
             mat_base->copyToHost();

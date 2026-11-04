@@ -36,6 +36,27 @@ inline cublasHandle_t ct_cublas() {
 /// Creates this PE's cuBLAS/cuSOLVER handles and runs a first GEMM (all lazy otherwise);
 /// failures are skipped. Returns the ms spent creating the handles.
 double ct_prewarm_blas();
+
+/// Orders `stream` after the work queued so far on the Kokkos default instance, without a
+/// host wait.
+inline void ct_after_default(cudaStream_t stream) {
+    thread_local cudaEvent_t ev = nullptr;
+    if (ev == nullptr && cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess)
+        CkAbort("cudaEventCreate failed");
+    if (cudaEventRecord(ev, Kokkos::DefaultExecutionSpace().cuda_stream()) != cudaSuccess ||
+        cudaStreamWaitEvent(stream, ev, 0) != cudaSuccess)
+        CkAbort("ordering after the default instance failed");
+}
+
+inline void comm_free_cb(void* p, void*) { comm_free(p); }
+
+/// Returns a comm_alloc buffer to the pool once the work queued on `stream` has run.
+inline void comm_free_after(cudaStream_t stream, void* p) {
+    if (p == nullptr)
+        return;
+    CkCallback cb(comm_free_cb, p);
+    hapiAddCallback(stream, &cb);
+}
 #endif
 
 /// Row-major C[m x n] = A[m x k] * B[k x n] + beta * C, leading dims lda/ldb/ldc.
@@ -54,14 +75,7 @@ inline void local_gemm(const T* a, int lda, const T* b, int ldb, T* c, int ldc, 
 #ifdef USE_NVIDIA
     if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double>) {
         // inputs may come from work on the default instance's stream: order, don't wait
-        thread_local cudaEvent_t inputs_ready = nullptr;
-        if (inputs_ready == nullptr &&
-            cudaEventCreateWithFlags(&inputs_ready, cudaEventDisableTiming) != cudaSuccess)
-            CkAbort("cudaEventCreate failed");
-        if (cudaEventRecord(inputs_ready, Kokkos::DefaultExecutionSpace().cuda_stream()) !=
-                cudaSuccess ||
-            cudaStreamWaitEvent(stream, inputs_ready, 0) != cudaSuccess)
-            CkAbort("ct_gemm: ordering after the default instance failed");
+        ct_after_default(stream);
         // column-major view of the row-major product: C^T = B^T * A^T
         cublasHandle_t h = ct_cublas();
         cublasSetStream(h, stream);
@@ -119,10 +133,18 @@ inline T* concat_vector_pieces(Buffers& buffers, int& vec_len) {
     int64_t off = 0;
     for (auto& rb : buffers) {
         int64_t len = rb.byte_size / sizeof(T);
+#ifdef USE_NVIDIA
+        // on the default instance; readers order themselves after it
+        hapiCheck(cudaMemcpyAsync(out + off, rb.data, rb.byte_size, cudaMemcpyDeviceToDevice,
+                                  Kokkos::DefaultExecutionSpace().cuda_stream()));
+#else
         Kokkos::deep_copy(U(out + off, len), U(reinterpret_cast<T*>(rb.data), len));
+#endif
         off += len;
     }
+#ifndef USE_NVIDIA
     Kokkos::fence("ct_concat_vector");
+#endif
 #else
     T* out = new T[vec_len];
     int64_t off = 0;
@@ -138,7 +160,9 @@ template <typename T>
 inline void free_vector_pieces(T* p) {
     if (p == nullptr)
         return;
-#ifdef USE_KOKKOS
+#ifdef USE_NVIDIA
+    comm_free_after(Kokkos::DefaultExecutionSpace().cuda_stream(), p);
+#elif defined(USE_KOKKOS)
     comm_free(p);
 #else
     delete[] p;
@@ -213,23 +237,63 @@ struct GemvRowFunctor {
     }
 };
 
-/// Row-major res[rows] = mat[rows x cols] * vec (device pointers, row stride ld), on `exec`.
+/// Item i: column chunk i % chunks of row i / chunks, as GemvChunkFunctor, but the vector
+/// lanes read consecutive columns (coalesced).
+template <typename T, typename Exec>
+struct GemvLaneFunctor {
+    using member_type = typename Kokkos::TeamPolicy<Exec>::member_type;
+    const T* mat;
+    int64_t ld;
+    int rows, cols, chunks, chunk_len;
+    const T* vec;
+    double* tmp;
+    T* res;
+
+    KOKKOS_INLINE_FUNCTION void operator()(const member_type& m) const {
+        Kokkos::parallel_for(Kokkos::TeamThreadRange(m, m.team_size()), [&](int t) {
+            int64_t i = (int64_t)m.league_rank() * m.team_size() + t;
+            if (i >= (int64_t)rows * chunks)
+                return;
+            int r = (int)(i / chunks), c0 = (int)(i % chunks) * chunk_len;
+            int c1 = c0 + chunk_len < cols ? c0 + chunk_len : cols;
+            const T* row = mat + r * ld;
+            double s = 0.0;
+            Kokkos::parallel_reduce(
+                Kokkos::ThreadVectorRange(m, c0, c1),
+                [&](int c, double& acc) {
+                    acc += static_cast<double>(row[c]) * static_cast<double>(vec[c]);
+                },
+                s);
+            Kokkos::single(Kokkos::PerThread(m), [&]() {
+                if (chunks == 1)
+                    res[r] = static_cast<T>(s);
+                else
+                    tmp[i] = s;
+            });
+        });
+    }
+};
+
+/// Row-major res[rows] = mat[rows x cols] * vec (device pointers, row stride ld), queued on
+/// `exec` after the default instance's work; under USE_NVIDIA callers order the readers of
+/// `res` after `exec`.
 template <typename T, typename Exec>
 inline void local_gemv(const Exec& exec, const T* mat, int ld, int rows, int cols, const T* vec,
                        T* res) {
     if (rows <= 0)
         return;
+#ifdef USE_NVIDIA
+    ct_after_default(exec.cuda_stream());
+#else
+    Kokkos::DefaultExecutionSpace().fence("ct_gemv inputs");
+#endif
     if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double>) {
-        // inputs may come from the default instance's stream; callers send the result
-        // from other streams right after, so finish before returning
-        Kokkos::DefaultExecutionSpace().fence("ct_gemv inputs");
 #ifdef USE_NVIDIA
         if (rows >= 2048 && cols >= 256) {
             constexpr int team = 8, lanes = 32;
             Kokkos::parallel_for("ct_gemv_rows",
                                  Kokkos::TeamPolicy<Exec>(exec, (rows + team - 1) / team, team, lanes),
                                  GemvRowFunctor<T, Exec>{mat, ld, rows, cols, vec, res});
-            exec.fence("ct_gemv");
             return;
         }
 #endif
@@ -237,17 +301,32 @@ inline void local_gemv(const Exec& exec, const T* mat, int ld, int rows, int col
             {std::max<int64_t>(1, 65536 / rows), (cols + 255) / 256, 1024});
         chunks = std::max(chunks, 1);
         int chunk_len = (cols + chunks - 1) / chunks;
-        Kokkos::View<double*, DeviceSpace> tmp;
-        if (chunks > 1)
-            tmp = Kokkos::View<double*, DeviceSpace>(
-                Kokkos::view_alloc(Kokkos::WithoutInitializing, "ct_gemv"), (int64_t)rows * chunks);
-        Kokkos::parallel_for("ct_gemv", Kokkos::RangePolicy<Exec>(exec, 0, rows * chunks),
-                             GemvChunkFunctor<T>{mat, ld, cols, chunks, chunk_len, vec,
-                                                 tmp.data(), res});
+        double* tmp = chunks > 1
+                          ? static_cast<double*>(comm_alloc((int64_t)rows * chunks * sizeof(double)))
+                          : nullptr;
+#ifdef USE_NVIDIA
+        if (cols >= 256) {
+            constexpr int team = 8, lanes = 32;
+            int64_t items = (int64_t)rows * chunks;
+            Kokkos::parallel_for(
+                "ct_gemv_lanes",
+                Kokkos::TeamPolicy<Exec>(exec, (int)((items + team - 1) / team), team, lanes),
+                GemvLaneFunctor<T, Exec>{mat, ld, rows, cols, chunks, chunk_len, vec, tmp, res});
+        } else
+#endif
+            Kokkos::parallel_for("ct_gemv", Kokkos::RangePolicy<Exec>(exec, 0, rows * chunks),
+                                 GemvChunkFunctor<T>{mat, ld, cols, chunks, chunk_len, vec, tmp,
+                                                     res});
         if (chunks > 1)
             Kokkos::parallel_for("ct_gemv_join", Kokkos::RangePolicy<Exec>(exec, 0, rows),
-                                 GemvJoinFunctor<T>{tmp.data(), chunks, res});
+                                 GemvJoinFunctor<T>{tmp, chunks, res});
+#ifdef USE_NVIDIA
+        comm_free_after(exec.cuda_stream(), tmp);
+#else
         exec.fence("ct_gemv");
+        if (tmp)
+            comm_free(tmp);
+#endif
     } else {
         Kokkos::View<T**, Kokkos::LayoutStride, DeviceSpace,
                      Kokkos::MemoryTraits<Kokkos::Unmanaged>>
@@ -255,9 +334,10 @@ inline void local_gemv(const Exec& exec, const T* mat, int ld, int rows, int col
         Kokkos::View<T*, DeviceSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>> d_vec(
             const_cast<T*>(vec), cols);
         Kokkos::View<T*, DeviceSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>> d_res(res, rows);
-        Kokkos::DefaultExecutionSpace().fence("ct_gemv inputs");
         KokkosBlas::gemv(exec, "N", T(1), d_mat, d_vec, T(0), d_res);
+#ifndef USE_NVIDIA
         exec.fence("ct_gemv");
+#endif
     }
 }
 #endif
