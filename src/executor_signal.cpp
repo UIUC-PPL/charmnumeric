@@ -6,7 +6,10 @@
 #include <climits>
 #include <cmath>
 #include <complex>
+#include <deque>
 #include <map>
+#include <tuple>
+#include <unordered_map>
 #include <type_traits>
 #include <vector>
 
@@ -15,8 +18,9 @@
 #endif
 
 // CONVOLVE / FLIP (opcodes 150-151), BATCHED_MATMUL (170). Each result chare
-// gathers one box per source view, then computes locally (direct sum, overlap-save
-// FFT, batched GEMM; cuFFT/cuBLAS on NVIDIA). The result has any decomposition.
+// gathers one box per source view (CONVOLVE's filter: once per PE), then computes
+// locally (direct sum, overlap-save FFT, batched GEMM; cuFFT/cuBLAS on NVIDIA). The
+// result has any decomposition.
 
 #ifdef USE_KOKKOS
 #define CT_SIG_FN KOKKOS_INLINE_FUNCTION
@@ -436,55 +440,6 @@ void fftn(std::vector<cplx>& a, const int64_t* L) {
     }
 }
 
-/// FFT convolution on the host: out = (w conv v)[f - 1 + j], j < len. Both real
-/// inputs share one complex transform (w + i v).
-template <int N, typename T>
-void fft_conv(T* out, const T* w, const T* v, const int64_t* len, const int64_t* f) {
-    int64_t L[N], Ls[N], wext[N];
-    int64_t total = 1;
-    for (int d = 0; d < N; ++d) {
-        wext[d] = len[d] + f[d] - 1;
-        L[d] = fft_size(wext[d]);
-        total *= L[d];
-    }
-    row_major_strides<N>(L, Ls);
-    auto offset = [&](const int64_t* ext, int64_t k, int64_t shift) {
-        int64_t li = 0;
-        for (int d = N - 1; d >= 0; --d) {
-            li += (k % ext[d] + shift * (f[d] - 1)) * Ls[d];
-            k /= ext[d];
-        }
-        return li;
-    };
-    std::vector<cplx> Z(total), P(total);
-    int64_t nw = 1, nv = 1, no = 1;
-    for (int d = 0; d < N; ++d) {
-        nw *= wext[d];
-        nv *= f[d];
-        no *= len[d];
-    }
-    for (int64_t k = 0; k < nw; ++k)
-        Z[offset(wext, k, 0)].real(static_cast<double>(w[k]));
-    for (int64_t k = 0; k < nv; ++k)
-        Z[offset(f, k, 0)].imag(static_cast<double>(v[k]));
-    fftn<N>(Z, L);
-    // W(k) = (Z(k) + conj Z(-k)) / 2, V(k) = (Z(k) - conj Z(-k)) / 2i; P = conj(W V) / total
-    // (conjugated so the inverse is a forward transform).
-    for (int64_t k = 0; k < total; ++k) {
-        int64_t rem = k, kn = 0;
-        for (int d = N - 1; d >= 0; --d) {
-            int64_t c = rem % L[d];
-            rem /= L[d];
-            kn += ((L[d] - c) % L[d]) * Ls[d];
-        }
-        cplx zc = std::conj(Z[kn]);
-        cplx W = 0.5 * (Z[k] + zc), V = cplx(0.0, -0.5) * (Z[k] - zc);
-        P[k] = std::conj(W * V) / double(total);
-    }
-    fftn<N>(P, L);
-    for (int64_t k = 0; k < no; ++k)
-        out[k] = static_cast<T>(P[offset(len, k, 1)].real());
-}
 #endif
 
 #ifdef USE_NVIDIA
@@ -514,73 +469,6 @@ struct CufftTypes<double> {
     static cufftResult inv(cufftHandle p, C* i, double* o) { return cufftExecZ2D(p, i, o); }
 };
 
-/// a[k] *= b[k] * scale (complex).
-template <int N, typename T, typename C>
-void spectrum_mul(PartitionImpl<N>* partition, C* a, const C* b, int64_t n, T scale) {
-    Kokkos::parallel_for(
-        CT_COMPUTE_POLICY(partition, n), KOKKOS_LAMBDA(int64_t k) {
-            T re = a[k].x * b[k].x - a[k].y * b[k].y;
-            T im = a[k].x * b[k].y + a[k].y * b[k].x;
-            a[k].x = re * scale;
-            a[k].y = im * scale;
-        });
-}
-
-/// out = (w conv v)[f - 1 + j], j < len; w, v are device buffers.
-template <int N, typename T>
-void fft_conv_gpu(PartitionImpl<N>* partition, T* out, const T* w, const T* v,
-                  const int64_t* len, const int64_t* f) {
-    using CT = CufftTypes<T>;
-    using C = typename CT::C;
-    int64_t L[N], Ls[N], wext[N], ws[N], fs[N];
-    int64_t total = 1;
-    for (int d = 0; d < N; ++d) {
-        wext[d] = len[d] + f[d] - 1;
-        L[d] = fft_size(wext[d]);
-        total *= L[d];
-    }
-    row_major_strides<N>(L, Ls);
-    row_major_strides<N>(wext, ws);
-    row_major_strides<N>(f, fs);
-    int64_t ctotal = total / L[N - 1] * (L[N - 1] / 2 + 1);
-
-    T* wp = reinterpret_cast<T*>(alloc_buffer(total * sizeof(T)));
-    T* vp = reinterpret_cast<T*>(alloc_buffer(total * sizeof(T)));
-    C* wf = reinterpret_cast<C*>(alloc_buffer(ctotal * sizeof(C)));
-    C* vf = reinterpret_cast<C*>(alloc_buffer(ctotal * sizeof(C)));
-    fill_zero<N, T>(partition, wp, total);
-    fill_zero<N, T>(partition, vp, total);
-    copy_box<N, T>(partition, wp, 0, Ls, w, 0, ws, wext);
-    copy_box<N, T>(partition, vp, 0, Ls, v, 0, fs, f);
-
-    int dims[N];
-    for (int d = 0; d < N; ++d)
-        dims[d] = static_cast<int>(L[d]);
-    cufftHandle fwd, inv;
-    CT_CUFFT_CHECK(cufftPlanMany(&fwd, N, dims, nullptr, 1, 0, nullptr, 1, 0, CT::r2c, 1));
-    CT_CUFFT_CHECK(cufftPlanMany(&inv, N, dims, nullptr, 1, 0, nullptr, 1, 0, CT::c2r, 1));
-    CT_CUFFT_CHECK(cufftSetStream(fwd, partition->compute_stream_raw));
-    CT_CUFFT_CHECK(cufftSetStream(inv, partition->compute_stream_raw));
-    CT_CUFFT_CHECK(CT::fwd(fwd, wp, wf));
-    CT_CUFFT_CHECK(CT::fwd(fwd, vp, vf));
-    spectrum_mul<N, T, C>(partition, wf, vf, ctotal, T(1) / T(total));
-    CT_CUFFT_CHECK(CT::inv(inv, wf, wp));
-
-    int64_t base = 0;
-    for (int d = 0; d < N; ++d)
-        base += (f[d] - 1) * Ls[d];
-    int64_t os[N];
-    row_major_strides<N>(len, os);
-    copy_box<N, T>(partition, out, 0, os, wp, base, Ls, len);
-    ct_after_stream(partition->compute_stream_raw, [fwd, inv] {
-        cufftDestroy(fwd);
-        cufftDestroy(inv);
-    });
-    free_buffer(partition, reinterpret_cast<char*>(wp));
-    free_buffer(partition, reinterpret_cast<char*>(vp));
-    free_buffer(partition, reinterpret_cast<char*>(wf));
-    free_buffer(partition, reinterpret_cast<char*>(vf));
-}
 #endif
 
 // ---- send side ----
@@ -747,51 +635,6 @@ void finish_flip(PartitionImpl<N>* partition, const SigGeom<N>& s, PendingComm<N
     copy_box<N, T>(partition, out, 0, stride, box, base, sstride, len);
     free_buffer(partition, reinterpret_cast<char*>(box));
 }
-
-template <int N, typename T>
-void finish_conv(PartitionImpl<N>* partition, const SigGeom<N>& s, PendingComm<N>& comm, T* out,
-                 const std::array<int, N>& olo, const std::array<int, N>& ohi) {
-    int64_t len[N], wlo[N], wext[N], f[N], zero[N] = {};
-    for (int d = 0; d < N; ++d) {
-        len[d] = ohi[d] - olo[d];
-        f[d] = s.in[1].vsize[d];
-        wlo[d] = olo[d] + s.shift[d] - (f[d] - 1);
-        wext[d] = len[d] + f[d] - 1;
-    }
-    T* w = assemble<N, T>(partition, comm, 0, wlo, wext);
-    T* v = assemble<N, T>(partition, comm, 1, zero, f);
-    if (s.method == CONV_FFT && std::is_floating_point<T>::value) {
-#ifdef USE_NVIDIA
-        if constexpr (std::is_floating_point<T>::value)
-            fft_conv_gpu<N, T>(partition, out, w, v, len, f);
-#elif defined(USE_KOKKOS)
-        // Host FFT on a staged copy.
-        int64_t nw = 1, nv = 1, no = 1;
-        for (int d = 0; d < N; ++d) {
-            nw *= wext[d];
-            nv *= f[d];
-            no *= len[d];
-        }
-        compute_fence(partition);
-        std::vector<T> hw(nw), hv(nv), ho(no);
-        using U = Kokkos::MemoryTraits<Kokkos::Unmanaged>;
-        Kokkos::deep_copy(Kokkos::View<T*, HostSpace, U>(hw.data(), nw),
-                          Kokkos::View<T*, DeviceSpace, U>(w, nw));
-        Kokkos::deep_copy(Kokkos::View<T*, HostSpace, U>(hv.data(), nv),
-                          Kokkos::View<T*, DeviceSpace, U>(v, nv));
-        fft_conv<N, T>(ho.data(), hw.data(), hv.data(), len, f);
-        Kokkos::deep_copy(Kokkos::View<T*, DeviceSpace, U>(out, no),
-                          Kokkos::View<T*, HostSpace, U>(ho.data(), no));
-#else
-        fft_conv<N, T>(out, w, v, len, f);
-#endif
-    } else {
-        direct_conv<N, T>(partition, out, w, v, len, f);
-    }
-    free_buffer(partition, reinterpret_cast<char*>(w));
-    free_buffer(partition, reinterpret_cast<char*>(v));
-}
-
 
 // ---- BATCHED_MATMUL ----
 // Result chare R (range [olo, ohi): batch, m, n) computes C[t] = sum over panels P of
@@ -1456,6 +1299,622 @@ int bmm_start(PartitionImpl<N>* partition, int node_id, const SigGeom<N>& s, int
     return total;
 }
 
+// ---- CONVOLVE: one filter copy per PE, overlap-save FFT blocks ----
+//
+// The filter goes only to the first result chare of each PE (row-major order). That chare
+// prepares what every result chare of its PE reads: the dense filter (direct method), or
+// its spectrum at the node's FFT block size, as soon as the filter is in, and then tells
+// the others.
+// FFTs run over blocks of at most kConvBlockMax[N] per dim (overlap-save), batched, with
+// cuFFT plans cached per shape.
+
+/// Result chares of a CONVOLVE node by PE: the leader (first) of each and this PE's count.
+template <int N>
+struct ConvPeers {
+    std::vector<std::array<int, N>> leader; // by PE; leader[pe][0] < 0: none
+    int local = 0;                          // result chares on this PE
+};
+
+/// Depends only on the result decomposition and the PE count, which make the key: node ids
+/// restart when the frontend resets.
+template <int N>
+const ConvPeers<N>& conv_peers(const SigGeom<N>& s) {
+    using Key = std::tuple<std::array<int, N>, std::array<int, N>, int, int>;
+    thread_local std::deque<std::pair<Key, ConvPeers<N>>> cache;
+    const Key key{s.out.offset, s.out.global_shape, s.out.tile, CkNumPes()};
+    for (auto& [k, p] : cache)
+        if (k == key)
+            return p;
+    if (cache.size() >= 8)
+        cache.pop_front();
+    cache.emplace_back(key, ConvPeers<N>{});
+    ConvPeers<N>& p = cache.back().second;
+    std::array<int, N> none;
+    none.fill(-1);
+    p.leader.assign(CkNumPes(), none);
+    std::array<int, N> first, last, ci;
+    for (int d = 0; d < N; ++d)
+        chare_span<N>(s.out, d, first[d], last[d]);
+    ci = first;
+    while (true) {
+        int pe = chare_home_pe(N, ci.data(), CkNumPes());
+        if (p.leader[pe][0] < 0)
+            p.leader[pe] = ci;
+        p.local += pe == CkMyPe();
+        int d = N - 1;
+        for (; d >= 0; --d) {
+            if (++ci[d] <= last[d])
+                break;
+            ci[d] = first[d];
+        }
+        if (d < 0)
+            break;
+    }
+    return p;
+}
+
+template <int N>
+bool conv_is_leader(const ConvPeers<N>& p, const std::array<int, N>& me) {
+    return p.leader[CkMyPe()] == me;
+}
+
+/// FFT blocks of a CONVOLVE node, the same on every chare: L (FFT extents) and B (outputs
+/// per block, L >= B + f - 1).
+template <int N>
+struct ConvBlocks {
+    int64_t f[N], L[N], B[N];
+    int64_t lvol = 1, lc = 1; // real and half-spectrum (R2C) volumes of a block
+};
+
+constexpr int64_t kConvBlockMax[3] = {int64_t(1) << 22, 2048, 256};
+constexpr int64_t kConvChunkBytes = int64_t(256) << 20;
+
+/// Largest FFT block extent per dim: kConvBlockMax, or CNUM_CONV_BLOCK (testing).
+inline int64_t conv_block_max(int ndims) {
+    static const int64_t over = [] {
+        const char* e = getenv("CNUM_CONV_BLOCK");
+        return e ? atoll(e) : 0;
+    }();
+    return over > 0 ? over : kConvBlockMax[ndims - 1];
+}
+
+/// The node's FFT blocks, the same on every chare. Blocks hold outputs of at least f per dim
+/// (or about f / 4 if a block would pass kConvChunkBytes); false if even those do, and the
+/// node then runs the direct method.
+template <int N>
+bool conv_blocks(const SigGeom<N>& s, int64_t esz, ConvBlocks<N>& cb) {
+    for (int tier = 0; tier < 2; ++tier) {
+        cb = ConvBlocks<N>{};
+        for (int d = 0; d < N; ++d) {
+            int64_t f = s.in[1].vsize[d];
+            int64_t t = std::min<int64_t>(s.out.tile, s.out.global_shape[d]); // longest tile
+            int64_t lmax = std::max(conv_block_max(N), tier == 0 ? 2 * f - 1 : f + (f + 3) / 4);
+            if (t + f - 1 <= lmax) {
+                cb.B[d] = t;
+            } else {
+                int64_t nb = (t + (lmax - f + 1) - 1) / (lmax - f + 1);
+                cb.B[d] = (t + nb - 1) / nb;
+            }
+            cb.f[d] = f;
+            cb.L[d] = fft_size(cb.B[d] + f - 1);
+            cb.lvol *= cb.L[d];
+            cb.lc *= d == N - 1 ? cb.L[d] / 2 + 1 : cb.L[d];
+        }
+        if (cb.lvol * esz <= kConvChunkBytes)
+            return true;
+    }
+    return false;
+}
+
+/// FFT method for this node (else direct), and its blocks.
+template <int N, typename T>
+bool conv_fft(const SigGeom<N>& s, ConvBlocks<N>& cb) {
+    return s.method == CONV_FFT && std::is_floating_point<T>::value &&
+           conv_blocks<N>(s, sizeof(T), cb);
+}
+
+/// N-D extents padded to 3-D (leading 1s).
+template <int N>
+std::array<int64_t, 3> pad3(const int64_t* a) {
+    std::array<int64_t, 3> r = {1, 1, 1};
+    for (int d = 0; d < N; ++d)
+        r[3 - N + d] = a[d];
+    return r;
+}
+
+/// Block g of the grid nb (row-major), its block coordinates.
+CT_SIG_FN void block_coords(int64_t g, const int64_t* nb, int64_t* b) {
+    b[2] = g % nb[2];
+    b[1] = (g / nb[2]) % nb[1];
+    b[0] = g / (nb[2] * nb[1]);
+}
+
+/// xb[q] = the window w (extents ext) at block first + q, zero past its end.
+template <typename T>
+struct ConvGather {
+    T* xb;
+    const T* w;
+    int64_t L[3], B[3], ext[3], nb[3], first;
+
+    CT_SIG_FN void operator()(int64_t idx) const {
+        const int64_t lvol = L[0] * L[1] * L[2], r = idx % lvol;
+        int64_t b[3];
+        block_coords(first + idx / lvol, nb, b);
+        const int64_t t0 = b[0] * B[0] + r / (L[1] * L[2]), t1 = b[1] * B[1] + (r / L[2]) % L[1],
+                      t2 = b[2] * B[2] + r % L[2];
+        xb[idx] = (t0 < ext[0] && t1 < ext[1] && t2 < ext[2])
+                      ? w[(t0 * ext[1] + t1) * ext[2] + t2]
+                      : T(0);
+    }
+};
+
+/// out at block first + q = yb[q] from offset f - 1, clipped to len.
+template <typename T>
+struct ConvScatter {
+    T* out;
+    const T* yb;
+    int64_t L[3], B[3], f[3], len[3], nb[3], first;
+
+    CT_SIG_FN void operator()(int64_t idx) const {
+        const int64_t bvol = B[0] * B[1] * B[2], r = idx % bvol, q = idx / bvol;
+        int64_t b[3];
+        block_coords(first + q, nb, b);
+        const int64_t j0 = r / (B[1] * B[2]), j1 = (r / B[2]) % B[1], j2 = r % B[2];
+        const int64_t o0 = b[0] * B[0] + j0, o1 = b[1] * B[1] + j1, o2 = b[2] * B[2] + j2;
+        if (o0 >= len[0] || o1 >= len[1] || o2 >= len[2])
+            return;
+        out[(o0 * len[1] + o1) * len[2] + o2] =
+            yb[q * L[0] * L[1] * L[2] + ((j0 + f[0] - 1) * L[1] + j1 + f[1] - 1) * L[2] + j2 +
+               f[2] - 1];
+    }
+};
+
+#ifdef USE_NVIDIA
+/// x[k] *= v[k % lc] * scale (complex), for a batch of half spectra.
+template <typename T, typename C>
+struct ConvSpecMul {
+    C* x;
+    const C* v;
+    int64_t lc;
+    T scale;
+
+    CT_SIG_FN void operator()(int64_t k) const {
+        const C b = v[k % lc];
+        const C a = x[k];
+        x[k].x = (a.x * b.x - a.y * b.y) * scale;
+        x[k].y = (a.x * b.y + a.y * b.x) * scale;
+    }
+};
+
+struct FftPlan {
+    cufftHandle h;
+    size_t work;
+    uint64_t used;
+};
+
+/// A cuFFT plan for `batch` dense row-major transforms of extents n, made once per PE and
+/// shape (at most kMaxPlans kept). It has no work area: fft_run passes one per call, so
+/// chares on other streams can share the plan.
+template <int N>
+FftPlan& fft_plan(const int64_t* n, int64_t batch, cufftType type) {
+    constexpr size_t kMaxPlans = 16;
+    using Key = std::tuple<int, std::array<int64_t, 3>, int64_t, int>;
+    thread_local std::map<Key, FftPlan> plans;
+    thread_local uint64_t clock = 0;
+    Key key{N, pad3<N>(n), batch, (int)type};
+    auto it = plans.find(key);
+    if (it != plans.end()) {
+        it->second.used = ++clock;
+        return it->second;
+    }
+    if (plans.size() >= kMaxPlans) {
+        auto old = plans.begin();
+        for (auto j = plans.begin(); j != plans.end(); ++j)
+            if (j->second.used < old->second.used)
+                old = j;
+        cufftDestroy(old->second.h); // a rare eviction; may wait for the device
+        plans.erase(old);
+    }
+    FftPlan p{0, 0, ++clock};
+    long long dims[N];
+    for (int d = 0; d < N; ++d)
+        dims[d] = n[d];
+    CT_CUFFT_CHECK(cufftCreate(&p.h));
+    CT_CUFFT_CHECK(cufftSetAutoAllocation(p.h, 0));
+    CT_CUFFT_CHECK(cufftMakePlanMany64(p.h, N, dims, nullptr, 1, 0, nullptr, 1, 0, type, batch,
+                                       &p.work));
+    return plans.emplace(key, p).first->second;
+}
+
+/// Runs plan p on the chare's compute stream with a pooled work area.
+template <int N, typename F>
+void fft_run(PartitionImpl<N>* partition, FftPlan& p, F&& exec) {
+    cudaStream_t st = partition->compute_stream_raw;
+    void* wa = p.work ? comm_alloc((int64_t)p.work) : nullptr;
+    if (wa)
+        CT_CUFFT_CHECK(cufftSetWorkArea(p.h, wa));
+    CT_CUFFT_CHECK(cufftSetStream(p.h, st));
+    CT_CUFFT_CHECK(exec(p.h));
+    comm_free_after(st, wa);
+}
+
+/// Half spectrum of the filter v (dense, extents f) zero-padded to one block.
+template <int N, typename T>
+char* filter_spectrum(PartitionImpl<N>* partition, const T* v, const ConvBlocks<N>& cb) {
+    using CT = CufftTypes<T>;
+    using C = typename CT::C;
+    int64_t Ls[N], fs[N];
+    row_major_strides<N>(cb.L, Ls);
+    row_major_strides<N>(cb.f, fs);
+    T* vp = static_cast<T*>(comm_alloc(cb.lvol * (int64_t)sizeof(T)));
+    C* spec = static_cast<C*>(comm_alloc(cb.lc * (int64_t)sizeof(C)));
+    fill_zero<N, T>(partition, vp, cb.lvol);
+    copy_box<N, T>(partition, vp, 0, Ls, v, 0, fs, cb.f);
+    fft_run(partition, fft_plan<N>(cb.L, 1, CT::r2c),
+            [&](cufftHandle h) { return CT::fwd(h, vp, spec); });
+    comm_free_after(partition->compute_stream_raw, vp);
+    return reinterpret_cast<char*>(spec);
+}
+
+/// out (extents len) = valid part of w (extents len + f - 1) convolved with the filter whose
+/// half spectrum is spec, block by block in batches.
+template <int N, typename T>
+void conv_fft_blocks(PartitionImpl<N>* partition, T* out, const T* w, const int64_t* len,
+                     const ConvBlocks<N>& cb, const char* spec, int local) {
+    using CT = CufftTypes<T>;
+    using C = typename CT::C;
+    int64_t ext[N], nb[N], nbt = 1;
+    for (int d = 0; d < N; ++d) {
+        ext[d] = len[d] + cb.f[d] - 1;
+        nb[d] = (len[d] + cb.B[d] - 1) / cb.B[d];
+        nbt *= nb[d];
+    }
+    // a PE's chares queue their batches without a host wait: they share the budget
+    static const int64_t budget = device_budget("CNUM_CONV_FFT_MB", 8);
+    const int64_t chunk = std::min(kConvChunkBytes, budget / 2 / std::max(1, local));
+    const int64_t q =
+        std::max<int64_t>(1, std::min<int64_t>(nbt, chunk / (cb.lvol * (int64_t)sizeof(T))));
+    T* xb = static_cast<T*>(comm_alloc(q * cb.lvol * (int64_t)sizeof(T)));
+    C* xf = static_cast<C*>(comm_alloc(q * cb.lc * (int64_t)sizeof(C)));
+    auto L3 = pad3<N>(cb.L), B3 = pad3<N>(cb.B), f3 = pad3<N>(cb.f), e3 = pad3<N>(ext),
+         n3 = pad3<N>(nb), len3 = pad3<N>(len);
+    int64_t bvol = B3[0] * B3[1] * B3[2];
+    for (int64_t first = 0; first < nbt; first += q) {
+        const int64_t k = std::min(q, nbt - first);
+        ConvGather<T> g{xb, w, {L3[0], L3[1], L3[2]}, {B3[0], B3[1], B3[2]},
+                        {e3[0], e3[1], e3[2]}, {n3[0], n3[1], n3[2]}, first};
+        Kokkos::parallel_for("ct_conv_gather", CT_COMPUTE_POLICY(partition, k * cb.lvol), g);
+        fft_run(partition, fft_plan<N>(cb.L, k, CT::r2c),
+                [&](cufftHandle h) { return CT::fwd(h, xb, xf); });
+        Kokkos::parallel_for("ct_conv_mul", CT_COMPUTE_POLICY(partition, k * cb.lc),
+                             ConvSpecMul<T, C>{xf, reinterpret_cast<const C*>(spec), cb.lc,
+                                               T(1) / T(cb.lvol)});
+        fft_run(partition, fft_plan<N>(cb.L, k, CT::c2r),
+                [&](cufftHandle h) { return CT::inv(h, xf, xb); });
+        ConvScatter<T> sc{out, xb, {L3[0], L3[1], L3[2]}, {B3[0], B3[1], B3[2]},
+                          {f3[0], f3[1], f3[2]}, {len3[0], len3[1], len3[2]},
+                          {n3[0], n3[1], n3[2]}, first};
+        Kokkos::parallel_for("ct_conv_scatter", CT_COMPUTE_POLICY(partition, k * bvol), sc);
+    }
+    comm_free_after(partition->compute_stream_raw, xb);
+    comm_free_after(partition->compute_stream_raw, xf);
+}
+#else
+/// Host spectrum of the filter v (dense, extents f) zero-padded to one block.
+template <int N, typename T>
+void filter_spectrum_host(const T* v, const ConvBlocks<N>& cb, std::vector<cplx>& spec) {
+    int64_t Ls[N], fs[N], n = 1;
+    row_major_strides<N>(cb.L, Ls);
+    row_major_strides<N>(cb.f, fs);
+    for (int d = 0; d < N; ++d)
+        n *= cb.f[d];
+    spec.assign(cb.lvol, cplx(0.0));
+    for (int64_t k = 0; k < n; ++k) {
+        int64_t li = 0;
+        for (int d = 0; d < N; ++d)
+            li += (k / fs[d] % cb.f[d]) * Ls[d];
+        spec[li] = cplx(static_cast<double>(v[k]), 0.0);
+    }
+    fftn<N>(spec, cb.L);
+}
+
+/// Host overlap-save: like conv_fft_blocks, one block at a time.
+template <int N, typename T>
+void conv_fft_blocks_host(T* out, const T* w, const int64_t* len, const ConvBlocks<N>& cb,
+                          const std::vector<cplx>& spec) {
+    int64_t ext[N], nb[N], nbt = 1;
+    for (int d = 0; d < N; ++d) {
+        ext[d] = len[d] + cb.f[d] - 1;
+        nb[d] = (len[d] + cb.B[d] - 1) / cb.B[d];
+        nbt *= nb[d];
+    }
+    auto L3 = pad3<N>(cb.L), B3 = pad3<N>(cb.B), f3 = pad3<N>(cb.f), e3 = pad3<N>(ext),
+         n3 = pad3<N>(nb), len3 = pad3<N>(len);
+    std::vector<cplx> z(cb.lvol);
+    std::vector<T> xb(cb.lvol);
+    for (int64_t g = 0; g < nbt; ++g) {
+        ConvGather<T> ga{xb.data(), w, {L3[0], L3[1], L3[2]}, {B3[0], B3[1], B3[2]},
+                         {e3[0], e3[1], e3[2]}, {n3[0], n3[1], n3[2]}, g};
+        for (int64_t i = 0; i < cb.lvol; ++i) {
+            ga(i);
+            z[i] = cplx(static_cast<double>(xb[i]), 0.0);
+        }
+        fftn<N>(z, cb.L);
+        // inverse as a forward transform of the conjugate
+        for (int64_t i = 0; i < cb.lvol; ++i)
+            z[i] = std::conj(z[i] * spec[i]) / double(cb.lvol);
+        fftn<N>(z, cb.L);
+        for (int64_t i = 0; i < cb.lvol; ++i)
+            xb[i] = static_cast<T>(z[i].real());
+        ConvScatter<T> sc{out, xb.data(), {L3[0], L3[1], L3[2]}, {B3[0], B3[1], B3[2]},
+                          {f3[0], f3[1], f3[2]}, {len3[0], len3[1], len3[2]},
+                          {n3[0], n3[1], n3[2]}, g};
+        for (int64_t i = 0; i < B3[0] * B3[1] * B3[2]; ++i)
+            sc(i);
+    }
+}
+#endif
+
+/// What the result chares of one PE share: the dense filter (direct) or its spectrum (FFT).
+struct ConvShared {
+    char* data = nullptr; // device memory under USE_KOKKOS, else host
+#ifndef USE_NVIDIA
+    std::vector<cplx> spec; // host FFT
+#endif
+    int refs = 0;
+#ifdef USE_NVIDIA
+    cudaEvent_t ready = nullptr;    // recorded on the leader's compute stream
+    std::vector<cudaEvent_t> done;  // recorded on the compute streams of released users
+#endif
+};
+
+inline std::unordered_map<int, ConvShared>& conv_shared() {
+    thread_local std::unordered_map<int, ConvShared> m;
+    return m;
+}
+
+/// Frees a buffer once the work queued so far on the chare's compute stream has run.
+template <int N>
+void sig_free_after_compute(PartitionImpl<N>* partition, char* p) {
+#if defined(USE_NVIDIA)
+    comm_free_after(partition->compute_stream_raw, p);
+#elif defined(USE_KOKKOS)
+    (void)partition;
+    Kokkos::fence("ct_conv_free");
+    comm_free(p);
+#else
+    (void)partition;
+    delete[] p;
+#endif
+}
+
+/// A result chare is done reading the shared entry of node_id.
+template <int N>
+void conv_release(PartitionImpl<N>* partition, int node_id) {
+    auto it = conv_shared().find(node_id);
+    ConvShared& sh = it->second;
+#ifdef USE_NVIDIA
+    cudaStream_t st = partition->compute_stream_raw;
+    if (--sh.refs > 0) {
+        cudaEvent_t ev;
+        hapiCheck(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+        hapiCheck(cudaEventRecord(ev, st));
+        sh.done.push_back(ev);
+        return;
+    }
+    for (cudaEvent_t ev : sh.done) {
+        hapiCheck(cudaStreamWaitEvent(st, ev, 0));
+        hapiCheck(cudaEventDestroy(ev));
+    }
+    if (sh.ready)
+        hapiCheck(cudaEventDestroy(sh.ready));
+#else
+    if (--sh.refs > 0)
+        return;
+#endif
+    if (sh.data)
+        sig_free_after_compute<N>(partition, sh.data);
+    conv_shared().erase(it);
+}
+
+/// Tells result chare ci (on this PE) that this PE's shared entry for node_id is ready.
+template <int N>
+void conv_notify(PartitionImpl<N>* partition, int node_id, const std::array<int, N>& ci) {
+    ChareIndex<N> target;
+    for (int d = 0; d < N; ++d)
+        target.idx[d] = ci[d];
+    auto proxy = proxy_at<N>(partition->thisProxy, target);
+    auto* local = proxy.ckLocal();
+    if (local == nullptr)
+        CkAbort("CONVOLVE: a result chare placed on PE %d is not there; the shared filter "
+                "relies on partitions staying where chare_home_pe puts them (no migration)",
+                CkMyPe());
+    PendingComm<N>& comm = local->impl.executor->pending[node_id];
+    if (comm.expected_msgs > 0) {
+        if (--comm.expected_msgs == 0)
+            proxy.comm_done(node_id);
+    } else {
+        --comm.expected_msgs;
+    }
+}
+
+/// Send this chare's block of the filter to the leader of every PE that holds result chares.
+template <int N, typename T>
+void send_filter(PartitionImpl<N>* partition, int node_id, const SigGeom<N>& s) {
+    const SrcView<N>& v = s.in[1];
+    auto it = partition->arrays.find(v.name);
+    if (it == partition->arrays.end() || it->second->local_size() == 0)
+        return;
+    CTArrayBase<N>* src = it->second;
+    auto me = partition->nd_index();
+    int64_t ext[N], tsize[N], lstride[N], sstride[N], pstride[N], base = 0, count = 1;
+    int region_data[N * 3];
+    for (int d = 0; d < N; ++d) {
+        int lo, hi;
+        if (!src_block_1d<N>(v, d, me[d], lo, hi))
+            return;
+        ext[d] = hi - lo;
+        count *= ext[d];
+        tsize[d] = src->region.size(d);
+        region_data[3 * d] = lo;
+        region_data[3 * d + 1] = hi;
+        region_data[3 * d + 2] = 1;
+    }
+    row_major_strides<N>(tsize, lstride);
+    row_major_strides<N>(ext, pstride);
+    for (int d = 0; d < N; ++d) {
+        sstride[d] = (int64_t)v.vstep[d] * lstride[d];
+        base += (int64_t)(v.vstart[d] + region_data[3 * d] * v.vstep[d] -
+                          v.dec.chare_start_global(d, me[d])) *
+                lstride[d];
+    }
+    const T* src_ptr = static_cast<const T*>(src->device_data_ptr());
+    const int64_t bytes = count * (int64_t)sizeof(T);
+    const ConvPeers<N>& peers = conv_peers<N>(s);
+    std::vector<std::pair<ChareIndex<N>, char*>> sends;
+    for (const auto& l : peers.leader) {
+        if (l[0] < 0)
+            continue;
+        ChareIndex<N> target;
+        for (int d = 0; d < N; ++d)
+            target.idx[d] = l[d];
+        char* buf = alloc_buffer(bytes);
+        copy_box<N, T>(partition, reinterpret_cast<T*>(buf), 0, pstride, src_ptr, base, sstride,
+                       ext);
+        sends.push_back({target, buf});
+    }
+#ifdef USE_NVIDIA
+    partition->join_streams(); // the sends start on the comm stream
+#elif defined(USE_KOKKOS)
+    Kokkos::fence("ct_conv_filter");
+#endif
+    for (auto& [target, buf] : sends) {
+#ifndef NDEBUG
+        partition->comm_bytes_sent += bytes;
+#endif
+#ifdef USE_KOKKOS
+        device_pack_send<N, N>(partition, partition->thisProxy, target, node_id, 1, v.name,
+                               region_data, bytes, buf);
+#else
+        ct_send_data(proxy_at<N>(partition->thisProxy, target), node_id, 1, v.name, N,
+                     region_data, bytes, buf);
+        delete[] buf;
+#endif
+    }
+}
+
+/// The PE's leader, once its filter pieces are in: builds the shared filter or spectrum
+/// and tells the PE's other result chares.
+template <int N, typename T>
+void conv_build_shared(PartitionImpl<N>* partition, int node_id, const SigGeom<N>& s,
+                       PendingComm<N>& comm) {
+    int64_t f[N], zero[N] = {};
+    for (int d = 0; d < N; ++d)
+        f[d] = s.in[1].vsize[d];
+    const ConvPeers<N>& peers = conv_peers<N>(s);
+    T* v = assemble<N, T>(partition, comm, 1, zero, f);
+    auto [sit, fresh] = conv_shared().try_emplace(node_id);
+    if (!fresh)
+        CkAbort("CONVOLVE: PE %d already has a shared filter for node %d", CkMyPe(), node_id);
+    ConvShared& sh = sit->second;
+    sh.refs = peers.local;
+    ConvBlocks<N> cb;
+    if (!conv_fft<N, T>(s, cb)) {
+        sh.data = reinterpret_cast<char*>(v);
+    } else {
+        if constexpr (std::is_floating_point<T>::value) {
+#if defined(USE_NVIDIA)
+            sh.data = filter_spectrum<N, T>(partition, v, cb);
+#elif defined(USE_KOKKOS)
+            int64_t nv = 1;
+            for (int d = 0; d < N; ++d)
+                nv *= f[d];
+            std::vector<T> hv(nv);
+            using U = Kokkos::MemoryTraits<Kokkos::Unmanaged>;
+            Kokkos::fence("ct_conv_filter");
+            Kokkos::deep_copy(Kokkos::View<T*, HostSpace, U>(hv.data(), nv),
+                              Kokkos::View<T*, DeviceSpace, U>(v, nv));
+            filter_spectrum_host<N, T>(hv.data(), cb, sh.spec);
+#else
+            filter_spectrum_host<N, T>(v, cb, sh.spec);
+#endif
+        }
+        sig_free_after_compute<N>(partition, reinterpret_cast<char*>(v));
+    }
+#ifdef USE_NVIDIA
+    hapiCheck(cudaEventCreateWithFlags(&sh.ready, cudaEventDisableTiming));
+    hapiCheck(cudaEventRecord(sh.ready, partition->compute_stream_raw));
+#endif
+    const auto me = partition->nd_index();
+    std::array<int, N> first, last, ci;
+    for (int d = 0; d < N; ++d)
+        chare_span<N>(s.out, d, first[d], last[d]);
+    ci = first;
+    while (true) {
+        if (ci != me && chare_home_pe(N, ci.data(), CkNumPes()) == CkMyPe())
+            conv_notify<N>(partition, node_id, ci);
+        int d = N - 1;
+        for (; d >= 0; --d) {
+            if (++ci[d] <= last[d])
+                break;
+            ci[d] = first[d];
+        }
+        if (d < 0)
+            break;
+    }
+}
+
+/// CONVOLVE on a result chare (range [olo, ohi)), once the PE's shared entry is built.
+template <int N, typename T>
+void finish_conv_shared(PartitionImpl<N>* partition, int node_id, const SigGeom<N>& s,
+                        PendingComm<N>& comm, T* out, const std::array<int, N>& olo,
+                        const std::array<int, N>& ohi) {
+    int64_t len[N], wlo[N], wext[N], f[N];
+    for (int d = 0; d < N; ++d) {
+        len[d] = ohi[d] - olo[d];
+        f[d] = s.in[1].vsize[d];
+        wlo[d] = olo[d] + s.shift[d] - (f[d] - 1);
+        wext[d] = len[d] + f[d] - 1;
+    }
+    ConvBlocks<N> cb;
+    const bool fft = conv_fft<N, T>(s, cb);
+    auto it = conv_shared().find(node_id);
+    if (it == conv_shared().end())
+        CkAbort("CONVOLVE: no shared filter for node %d on PE %d", node_id, CkMyPe());
+    ConvShared& sh = it->second;
+#ifdef USE_NVIDIA
+    hapiCheck(cudaStreamWaitEvent(partition->compute_stream_raw, sh.ready, 0));
+#endif
+    T* w = assemble<N, T>(partition, comm, 0, wlo, wext);
+    if (fft) {
+        if constexpr (std::is_floating_point<T>::value) {
+#if defined(USE_NVIDIA)
+            conv_fft_blocks<N, T>(partition, out, w, len, cb, sh.data, conv_peers<N>(s).local);
+#elif defined(USE_KOKKOS)
+            int64_t nw = 1, no = 1;
+            for (int d = 0; d < N; ++d) {
+                nw *= wext[d];
+                no *= len[d];
+            }
+            std::vector<T> hw(nw), ho(no);
+            using U = Kokkos::MemoryTraits<Kokkos::Unmanaged>;
+            Kokkos::fence("ct_conv_window");
+            Kokkos::deep_copy(Kokkos::View<T*, HostSpace, U>(hw.data(), nw),
+                              Kokkos::View<T*, DeviceSpace, U>(w, nw));
+            conv_fft_blocks_host<N, T>(ho.data(), hw.data(), len, cb, sh.spec);
+            Kokkos::deep_copy(Kokkos::View<T*, DeviceSpace, U>(out, no),
+                              Kokkos::View<T*, HostSpace, U>(ho.data(), no));
+#else
+            conv_fft_blocks_host<N, T>(out, w, len, cb, sh.spec);
+#endif
+        }
+    } else {
+        direct_conv<N, T>(partition, out, w, reinterpret_cast<const T*>(sh.data), len, f);
+    }
+    sig_free_after_compute<N>(partition, reinterpret_cast<char*>(w));
+    conv_release<N>(partition, node_id);
+}
+
 } // namespace signal_detail
 
 using namespace signal_detail;
@@ -1490,7 +1949,10 @@ void ArrayDAGExecutorND<N>::execute_signal_node(DAGNode* node) {
                     return;
                 }
             }
-            send_input<N, T>(partition, node->id, s, i);
+            if (s.op == Opcode::CONVOLVE && i == 1)
+                send_filter<N, T>(partition, node->id, s);
+            else
+                send_input<N, T>(partition, node->id, s, i);
         });
 
     // Receive side: chares holding part of the result.
@@ -1522,8 +1984,13 @@ void ArrayDAGExecutorND<N>::execute_signal_node(DAGNode* node) {
             expected = bmm_start<N>(partition, node->id, s, root->result_name, olo, ohi,
                                     dtype_size(dt));
     }
+    const bool conv = s.op == Opcode::CONVOLVE;
+    const bool leader = conv && conv_is_leader<N>(conv_peers<N>(s), me);
     for (int i = 0; i < s.nin && !bmm; ++i)
-        expected += expected_msgs<N>(s, i, olo, ohi);
+        if (!conv || i == 0 || leader)
+            expected += expected_msgs<N>(s, i, olo, ohi);
+    if (conv && !leader)
+        ++expected; // the PE's leader: shared entry ready
 
     DBG_PRINT("[PE %d] execute_signal_node<%d>: node=%d op=%d result=%d expected=%d\n",
               CkMyPe(), N, node->id, root->opcode, root->result_name, expected);
@@ -1555,8 +2022,27 @@ void ArrayDAGExecutorND<N>::execute_signal_node(DAGNode* node) {
             });
         }
     }
+    if (conv && leader) {
+        PendingComm<N>& comm = pending[node->id];
+        auto rb = comm.remote_buffers.find(1);
+        const int have = rb == comm.remote_buffers.end() ? 0 : (int)rb->second.size();
+        comm.conv_filter_left = std::max(0, expected_msgs<N>(s, 1, olo, ohi) - have);
+        if (comm.conv_filter_left == 0)
+            on_conv_filter(node->id);
+    }
     if (remaining <= 0)
         on_comm_done(node->id);
+}
+
+template <int N>
+void ArrayDAGExecutorND<N>::on_conv_filter(int node_id) {
+    PendingComm<N>& comm = pending.at(node_id);
+    ASTNode* root = signal_root(comm.node);
+    SigGeom<N> s;
+    make_geom<N>(static_cast<ArrayDAGGroup*>(group), root, s);
+    with_conv_dtype(root->dtype, [&](auto tag) {
+        conv_build_shared<N, decltype(tag)>(partition, node_id, s, comm);
+    });
 }
 
 template <int N>
@@ -1615,8 +2101,8 @@ void ArrayDAGExecutorND<N>::finish_signal_node(PendingComm<N>& comm) {
     else
         with_conv_dtype(out->dtype, [&](auto tag) {
             using T = decltype(tag);
-            finish_conv<N, T>(partition, s, comm, static_cast<T*>(out->device_data_ptr()), olo,
-                              ohi);
+            finish_conv_shared<N, T>(partition, comm.node->id, s, comm,
+                                     static_cast<T*>(out->device_data_ptr()), olo, ohi);
         });
 }
 
@@ -1626,6 +2112,9 @@ template void ArrayDAGExecutorND<3>::execute_signal_node(DAGNode*);
 template void ArrayDAGExecutorND<1>::on_signal_receive(int, int);
 template void ArrayDAGExecutorND<2>::on_signal_receive(int, int);
 template void ArrayDAGExecutorND<3>::on_signal_receive(int, int);
+template void ArrayDAGExecutorND<1>::on_conv_filter(int);
+template void ArrayDAGExecutorND<2>::on_conv_filter(int);
+template void ArrayDAGExecutorND<3>::on_conv_filter(int);
 template void ArrayDAGExecutorND<1>::finish_signal_node(PendingComm<1>&);
 template void ArrayDAGExecutorND<2>::finish_signal_node(PendingComm<2>&);
 template void ArrayDAGExecutorND<3>::finish_signal_node(PendingComm<3>&);

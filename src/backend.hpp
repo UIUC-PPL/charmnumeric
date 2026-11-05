@@ -520,6 +520,7 @@ struct PendingComm {
     std::vector<ArrayRegion<N>> my_inputs;
     std::unordered_map<int, std::vector<RemoteBuffer<N>>> remote_buffers;
     bool incremental = false; // When true, compute as panels arrive
+    int conv_filter_left = 0; // CONVOLVE leader: filter pieces still to arrive
 
     void clear_remote_buffers() {
 #ifdef USE_KOKKOS
@@ -551,7 +552,11 @@ struct ReductionState {
     DAGNode* node = nullptr;
     bool started = false;
     bool receiving = false; // owns part of the result
-    bool sending = false;   // BINCOUNT: waiting for weights moved onto x's layout
+    bool sending = false;   // BINCOUNT: the histogram waits for moved weights or its bin range
+    bool bin_moved = false;      // BINCOUNT: weights moved onto x's layout (weights)
+    bool bin_range_wait = false; // BINCOUNT: block's bin range on its way (MSG_BIN_RANGE)
+    bool bin_range = false;      // BINCOUNT: [bin_lo, bin_hi] known
+    int64_t bin_lo = 0, bin_hi = -1;
     std::vector<std::vector<char>> stash;
     ArrayRegion<N> mine;    // output elements owned by this chare (output array coords)
     std::vector<char> acc;  // one accumulator per element of `mine`
@@ -580,6 +585,9 @@ struct DotState {
 
 /// receive_data input_index of LINALG device chunks: LA_DEV_INPUT + chunk kind.
 constexpr int LA_DEV_INPUT = 1 << 24;
+
+/// receive_data input index of BINCOUNT pieces (a PE's histogram slice for an output chare).
+constexpr int BIN_DEV_INPUT = -1500;
 
 /// A LINALG device chunk: rows [r0, r1) x cols [c0, c1) of an operand or result.
 struct LaDevChunk {
@@ -864,6 +872,7 @@ class ArrayDAGExecutorND : public DAGExecutor {
     void execute_signal_node(DAGNode* node);
     void finish_signal_node(PendingComm<N>& comm);
     void on_signal_receive(int node_id, int input_index);
+    void on_conv_filter(int node_id);
     void execute_index_node(DAGNode* node);
     void on_index_msg(int node_id, char* data, int64_t size);
     void index_progress(int node_id);
