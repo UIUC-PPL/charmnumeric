@@ -693,7 +693,7 @@ class ArrayDAGGroup : public CBase_ArrayDAGGroup {
     std::unordered_map<int, int64_t> gather_counts; // bytes gathered so far
     std::unordered_map<int, int64_t> gather_total;  // total bytes expected
     struct GatherFragment {
-        int64_t offset;
+        std::vector<int64_t> meta;
         int64_t size;
         char* data; // owned copy (bytes)
     };
@@ -775,7 +775,7 @@ class ArrayDAGGroup : public CBase_ArrayDAGGroup {
     int next_epoch = 0;
     std::map<int, std::function<void()>> early_epochs;
     void epoch_arrived(int epoch, std::function<void()> run);
-    void gather(int epoch, int name, int64_t offset, int64_t size, char* data);
+    void gather(int epoch, int name, int nmeta, int64_t* meta, int64_t size, char* data);
     void barrier_arrive(int epoch);
 
     // Templated execute_node — dispatched by dtype at call site

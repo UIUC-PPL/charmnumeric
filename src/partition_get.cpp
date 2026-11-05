@@ -136,48 +136,31 @@ void PartitionImpl<N>::process_get(int epoch) {
 
     arrays[name]->copyToHost();
 
-    {
-        CTArrayBase<N>* arr = arrays[name];
-        int esz = arr->elem_size();
-
-        std::array<int64_t, N> global_strides;
-        global_strides[N - 1] = 1;
-        for (int d = N - 2; d >= 0; --d)
-            global_strides[d] = global_strides[d + 1] * (int64_t)arr->global_shape[d + 1];
-
-        std::array<int64_t, N> local_strides;
-        local_strides[N - 1] = 1;
-        for (int d = N - 2; d >= 0; --d)
-            local_strides[d] = local_strides[d + 1] * (int64_t)arr->region.size(d + 1);
-
-        int64_t inner_size = arr->region.size(N - 1);
-
-        std::array<int, N> idx = {};
-        while (true) {
-            int64_t global_offset = 0;
-            int64_t local_offset = 0;
-            for (int d = 0; d < N; ++d) {
-                global_offset += ((int64_t)global_region.start[d] + idx[d]) * global_strides[d];
-                local_offset += (int64_t)idx[d] * local_strides[d];
-            }
-            int64_t byte_offset = global_offset * esz;
-            int64_t byte_size = inner_size * esz;
-            char* src = static_cast<char*>(arr->data_ptr()) + local_offset * esz;
-            int64_t lim = ct_msg_max_bytes();
-            for (int64_t off = 0; off < byte_size; off += lim)
-                dag_proxy[0].gather(epoch, name, byte_offset + off,
-                                    std::min(lim, byte_size - off), src + off);
-
-            int d = N - 2;
-            while (d >= 0) {
-                if (++idx[d] < arr->region.size(d))
-                    break;
-                idx[d] = 0;
-                --d;
-            }
-            if (d < 0)
-                break;
+    // The tile is contiguous here (row-major over its region): send it in pieces of up to
+    // ct_msg_max_bytes() with its place in the result, not one message per row.
+    CTArrayBase<N>* arr = arrays[name];
+    int64_t esz = arr->elem_size();
+    int64_t gstride = esz, base = 0;
+    std::vector<int64_t> meta(4 + 2 * (N - 1));
+    meta[0] = N - 1;
+    meta[1] = arr->region.size(N - 1) * esz;
+    int64_t total = meta[1];
+    for (int d = N - 1; d >= 0; --d) {
+        base += (int64_t)global_region.start[d] * gstride;
+        if (d < N - 1) {
+            meta[4 + d] = arr->region.size(d);
+            meta[4 + (N - 1) + d] = gstride;
+            total *= arr->region.size(d);
         }
+        gstride *= arr->global_shape[d];
+    }
+    meta[3] = base;
+    const char* src = static_cast<const char*>(arr->data_ptr());
+    int64_t lim = ct_msg_max_bytes();
+    for (int64_t off = 0; off < total; off += lim) {
+        meta[2] = off;
+        dag_proxy[0].gather(epoch, name, (int)meta.size(), meta.data(), std::min(lim, total - off),
+                            src + off);
     }
 }
 
