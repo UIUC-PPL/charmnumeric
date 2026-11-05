@@ -227,7 +227,7 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
         }
 
         // Compute row-major strides for target
-        std::array<int, N> tgt_strides;
+        std::array<int64_t, N> tgt_strides;
         tgt_strides[N - 1] = 1;
         for (int d = N - 2; d >= 0; --d)
             tgt_strides[d] = tgt_strides[d + 1] * target->region.size(d + 1);
@@ -250,7 +250,8 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
                 memcpy(&bits1, scalar_buf + 8, 8);
 
                 int64_t overlap_total = overlap.size();
-                int ol_start[N], ol_step[N], tgt_s[N], ol_sizes[N], tgt_cs_arr[N];
+                int ol_start[N], ol_step[N], ol_sizes[N], tgt_cs_arr[N];
+                int64_t tgt_s[N];
                 for (int d = 0; d < N; d++) {
                     ol_start[d] = overlap.start[d];
                     ol_step[d] = overlap.step[d];
@@ -260,14 +261,13 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
                 }
 
                 Kokkos::parallel_for(
-                    CT_COMPUTE_POLICY(partition, overlap_total), KOKKOS_LAMBDA(int flat_idx) {
-                        int remaining = flat_idx;
-                        int flat = 0;
+                    CT_COMPUTE_POLICY(partition, overlap_total), KOKKOS_LAMBDA(int64_t flat_idx) {
+                        int64_t remaining = flat_idx;
+                        int64_t flat = 0;
                         for (int d = N - 1; d >= 0; --d) {
-                            int coord_d = remaining % ol_sizes[d];
-                            remaining /= ol_sizes[d];
+                            int coord_d = (int)ct_divmod(remaining, ol_sizes[d]);
                             int global_d = ol_start[d] + coord_d * ol_step[d];
-                            flat += (global_d - tgt_cs_arr[d]) * tgt_s[d];
+                            flat += (int64_t)(global_d - tgt_cs_arr[d]) * tgt_s[d];
                         }
                         char* dst = tgt_device + flat * esz;
                         int64_t bits[2] = {bits0, bits1};
@@ -282,7 +282,7 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
                 for (int d = 0; d < N; ++d)
                     idx[d] = overlap.start[d];
                 while (true) {
-                    int flat = 0;
+                    int64_t flat = 0;
                     for (int d = 0; d < N; ++d)
                         flat += (idx[d] - tgt_chare.start[d]) * tgt_strides[d];
                     memcpy(tgt_data + flat * esz, scalar_buf, esz);
@@ -305,7 +305,7 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
 
         if (has_overlap) {
             // Compute row-major strides for source
-            std::array<int, N> src_strides;
+            std::array<int64_t, N> src_strides;
             src_strides[N - 1] = 1;
             for (int d = N - 2; d >= 0; --d)
                 src_strides[d] = src_strides[d + 1] * source->region.size(d + 1);
@@ -364,81 +364,11 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
         // The ast_visitor should never be reached for REDUCE nodes.
         return node->result_name;
     }
-    case Opcode::MATMUL: {
-        if constexpr (N >= 2) {
-            // Local matmul in ast_visitor (no-comm path, e.g. single chare)
-            // This is reached when execute_matmul_node had total_expected == 0
-            int mat_name = node->operands[0]->result_name;
-            int vec_name = node->operands[1]->result_name;
-            int result_name = node->result_name;
-
-            auto mat_it = partition->arrays.find(mat_name);
-            auto vec_it = partition->arrays.find(vec_name);
-            if (mat_it == partition->arrays.end() || vec_it == partition->arrays.end()) {
-                DBG_PRINT("[Chare %d] MATMUL ast_visitor: missing operand arrays\n",
-                          partition->index[0]);
-                return result_name;
-            }
-
-            CTArrayBase<N>* mat_base = mat_it->second;
-            CTArrayBase<N>* vec_base = vec_it->second;
-            int local_rows = mat_base->region.size(0);
-            int local_cols = mat_base->region.size(1);
-            int vec_len = vec_base->local_size();
-
-            // Create result array if needed
-            if (partition->arrays.find(result_name) == partition->arrays.end()) {
-                std::array<int, N> out_start = {}, out_stop, out_step, out_gs;
-                out_stop.fill(1);
-                out_step.fill(1);
-                out_gs.fill(1);
-                out_stop[0] = local_rows;
-                out_gs[0] = mat_base->global_shape[0];
-                ArrayRegion<N> out_region(out_start, out_stop, out_step);
-                ArrayDecomp<N> out_decomp =
-                    static_cast<ArrayDAGGroup*>(group)->array_meta[result_name].template decomp<N>();
-                // Use dtype dispatch to create the correctly typed result array
-                partition->arrays[result_name] =
-                    partition->allocate_or_reuse(out_region, out_gs, result_name, dtype, out_decomp);
-            }
-
-            CTArrayBase<N>* result_base = partition->arrays[result_name];
-            int actual_cols = std::min(local_cols, vec_len);
-
-#ifdef USE_KOKKOS
-            // Perform matmul on device using KokkosBlas::gemv
-            auto kokkos_gemv = [&](auto dummy) {
-                using VT = decltype(dummy);
-                local_gemv<VT>(CT_COMPUTE_EXEC(partition),
-                               static_cast<VT*>(mat_base->device_data_ptr()), local_cols,
-                               local_rows, actual_cols,
-                               static_cast<VT*>(vec_base->device_data_ptr()),
-                               static_cast<VT*>(result_base->device_data_ptr()));
-            };
-            cn_dispatch_blas(dtype, kokkos_gemv);
-#ifdef USE_NVIDIA
-            partition->join_streams();
-#endif
-#else
-            // Perform matmul on host using Eigen gemv
-            mat_base->copyToHost();
-            vec_base->copyToHost();
-
-            cn_dispatch_blas(dtype, [&](auto tag) {
-                using VT = decltype(tag);
-                eigen_gemv(static_cast<VT*>(mat_base->data_ptr()), local_rows, local_cols,
-                           static_cast<VT*>(vec_base->data_ptr()), actual_cols,
-                           static_cast<VT*>(result_base->data_ptr()));
-            });
-#endif
-            DBG_PRINT("[Chare %d] MATMUL ast_visitor: %dx%d @ %d done\n", partition->index[0],
-                      local_rows, actual_cols, vec_len);
-            return result_name;
-        } else {
-            // N=1: MATMUL on 1D partition is handled via comm path, not ast_visitor
-            return node->result_name;
-        }
-    }
+    case Opcode::MATMUL:
+        // execute_dag_node sends every MATMUL node to execute_matmul_node, which finishes it
+        // through on_comm_done -> execute_node's comm path (MATMUL is never fused)
+        CkAbort("MATMUL node %d reached ast_visitor", node->result_name);
+        return node->result_name;
     case Opcode::MATMATMUL: {
         if constexpr (N == 2) {
             // Local matmatmul in ast_visitor (no-comm path, e.g. single chare)

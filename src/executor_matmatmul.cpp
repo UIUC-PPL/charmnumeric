@@ -12,14 +12,14 @@
 template <typename T, typename Policy>
 static void pack_3d_panel(const Policy& policy, T* panel_buf, const T* d_data, int ncols,
                           int dd_dim, int dd, int rd_dim, int rd_base, int cd_dim, int cd_base,
-                          int s0, int s1, int s2) {
+                          int64_t s0, int64_t s1, int64_t s2) {
     Kokkos::parallel_for(
-        policy, KOKKOS_LAMBDA(int i) {
-            int r = i / ncols;
-            int c = i % ncols;
+        policy, KOKKOS_LAMBDA(int64_t i) {
+            int64_t r = i;
+            int c = (int)ct_divmod(r, ncols);
             int idx3d[3];
             idx3d[dd_dim] = dd;
-            idx3d[rd_dim] = rd_base + r;
+            idx3d[rd_dim] = rd_base + (int)r;
             idx3d[cd_dim] = cd_base + c;
             panel_buf[i] = d_data[idx3d[0] * s0 + idx3d[1] * s1 + idx3d[2] * s2];
         });
@@ -54,20 +54,23 @@ static void cross_matmatmul_send_panel_2d(
     // Pack sub-block into contiguous send buffer
     T* send_buf = new T[send_count];
     for (int r = 0; r < sub_rows; r++)
-        memcpy(send_buf + r * sub_cols,
-               local_data + (row_offset + r) * local_cols + col_offset,
+        memcpy(send_buf + (int64_t)r * sub_cols,
+               local_data + (int64_t)(row_offset + r) * local_cols + col_offset,
                sub_cols * sizeof(T));
     ct_send_data(proxy_at<2>(proxy_2d, target_ci), node->id, input_index, arr_name, 2, region_data,
                  byte_size, reinterpret_cast<char*>(send_buf));
     delete[] send_buf;
 #else
     T* send_buf = static_cast<T*>(comm_alloc(byte_size));
-    T* src = local_data + row_offset * local_cols + col_offset;
-    int lc = local_cols;
+    T* src = local_data + (int64_t)row_offset * local_cols + col_offset;
+    int64_t lc = local_cols;
     int sc = sub_cols;
     Kokkos::parallel_for(
-        CT_COMM_POLICY(partition, send_count),
-        KOKKOS_LAMBDA(int64_t i) { send_buf[i] = src[(i / sc) * lc + i % sc]; });
+        CT_COMM_POLICY(partition, send_count), KOKKOS_LAMBDA(int64_t i) {
+            int64_t r = i;
+            int64_t c = ct_divmod(r, sc);
+            send_buf[i] = src[r * lc + c];
+        });
     device_pack_send<2>(partition, proxy_2d, target_ci, node->id, input_index, arr_name,
                         region_data, byte_size, send_buf);
 #endif
@@ -612,10 +615,10 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
 
                 auto send_3d_panel = [&](auto* dummy) {
                     using T = std::remove_pointer_t<decltype(dummy)>;
-                    int s0 = local_dims[1] * local_dims[2];
-                    int s1 = local_dims[2];
-                    int s2 = 1;
-                    int strides[3] = {s0, s1, s2};
+                    int64_t s0 = (int64_t)local_dims[1] * local_dims[2];
+                    int64_t s1 = local_dims[2];
+                    int64_t s2 = 1;
+                    int64_t strides[3] = {s0, s1, s2};
 
 #ifdef USE_KOKKOS
                     T* d_data = static_cast<T*>(op_it->second->device_data_ptr());
@@ -665,7 +668,7 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
                             idx3d[dd] = dd_local_offset;
                             idx3d[rd] = row_offset + r;
                             idx3d[cd] = col_offset + c;
-                            send_buf[r * sub_cols + c] =
+                            send_buf[(int64_t)r * sub_cols + c] =
                                 data[idx3d[0] * strides[0] + idx3d[1] * strides[1] + idx3d[2] * strides[2]];
                         }
                     }
@@ -693,8 +696,8 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
                             int64_t panel_bytes = panel_count * sizeof(T);
                             T* panel_buf = new T[panel_count];
                             for (int r = 0; r < send_rows; r++)
-                                memcpy(panel_buf + r * sub_cols,
-                                       send_buf + (send_row_off + r) * sub_cols,
+                                memcpy(panel_buf + (int64_t)r * sub_cols,
+                                       send_buf + (int64_t)(send_row_off + r) * sub_cols,
                                        sub_cols * sizeof(T));
 
 #ifndef NDEBUG
@@ -721,10 +724,10 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
 
                 auto send_3d_panel = [&](auto* dummy) {
                     using T = std::remove_pointer_t<decltype(dummy)>;
-                    int s0 = local_dims[1] * local_dims[2];
-                    int s1 = local_dims[2];
-                    int s2 = 1;
-                    int strides[3] = {s0, s1, s2};
+                    int64_t s0 = (int64_t)local_dims[1] * local_dims[2];
+                    int64_t s1 = local_dims[2];
+                    int64_t s2 = 1;
+                    int64_t strides[3] = {s0, s1, s2};
 
 #ifdef USE_KOKKOS
                     T* d_data = static_cast<T*>(op_it->second->device_data_ptr());
@@ -774,7 +777,7 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
                             idx3d[dd] = dd_local_offset;
                             idx3d[rd] = row_offset + r;
                             idx3d[cd] = col_offset + c;
-                            send_buf[r * sub_cols + c] =
+                            send_buf[(int64_t)r * sub_cols + c] =
                                 data[idx3d[0] * strides[0] + idx3d[1] * strides[1] + idx3d[2] * strides[2]];
                         }
                     }
@@ -803,8 +806,8 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
                             T* panel_buf = new T[panel_count];
                             for (int r = 0; r < sub_rows; r++)
                                 for (int c = 0; c < send_cols; c++)
-                                    panel_buf[r * send_cols + c] =
-                                        send_buf[r * sub_cols + (send_col_off + c)];
+                                    panel_buf[(int64_t)r * send_cols + c] =
+                                        send_buf[(int64_t)r * sub_cols + (send_col_off + c)];
 
 #ifndef NDEBUG
                             partition->comm_bytes_sent += panel_bytes;

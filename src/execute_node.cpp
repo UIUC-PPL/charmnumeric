@@ -220,11 +220,12 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                         int local_cols = mat->region.size(1);
 
                         // Extract slice regions if present
-                        int mat_rs = 0, mat_re = mat->global_shape[0];
+                        int mat_rs = 0, mat_re = mat->global_shape[0], mat_rst = 1;
                         int mat_cs = 0, mat_ce = mat->global_shape[1];
                         if (ast_node->operand_regions.size() >= 2) {
                             auto* mr = static_cast<ArrayRegion<2>*>(ast_node->operand_regions[0]);
                             mat_rs = mr->start[0]; mat_re = mr->stop[0];
+                            mat_rst = std::max(1, mr->step[0]);
                             mat_cs = mr->start[1]; mat_ce = mr->stop[1];
                         }
 
@@ -235,12 +236,16 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
 
                         // Compute row/col overlap with local tile
                         auto mat_chare = mat_decomp.chare_region_global(nd_idx);
-                        int row_lo = std::max(mat_chare.start[0], mat_rs);
-                        int row_hi = std::min(mat_chare.stop[0], mat_re);
+                        // selected rows mat_rs + k * mat_rst, k in [result_lo, result_hi)
+                        int result_lo, result_hi;
+                        stepped_rows(mat_rs, mat_re, mat_rst, mat_chare.start[0],
+                                     mat_chare.stop[0], result_lo, result_hi);
+                        int row_lo = mat_rs + result_lo * mat_rst;
                         int col_lo = std::max(mat_chare.start[1], mat_cs);
                         int col_hi = std::min(mat_chare.stop[1], mat_ce);
-                        int sub_rows = row_hi - row_lo;
+                        int sub_rows = result_hi - result_lo;
                         int sub_cols = col_hi - col_lo;
+                        int64_t row_ld = (int64_t)local_cols * mat_rst;
                         int row_offset = row_lo - mat_chare.start[0];
                         int col_offset = col_lo - mat_chare.start[1];
 
@@ -268,9 +273,16 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                             continue;
                         }
 
-                        int slice_rows = mat_re - mat_rs;
+                        // trans: res = mat^T @ vec, one partial per column of this block
+                        bool trans = matmul_trans(ast_node);
+                        int slice_rows = (mat_re - mat_rs + mat_rst - 1) / mat_rst;
+                        if (trans) {
+                            slice_rows = mat_ce - mat_cs;
+                            result_lo = col_lo - mat_cs;
+                            result_hi = col_hi - mat_cs;
+                        }
                         std::array<int, N> out_start = {}, out_stop, out_step, out_gs;
-                        out_stop[0] = sub_rows; out_step[0] = 1; out_gs[0] = slice_rows;
+                        out_stop[0] = result_hi - result_lo; out_step[0] = 1; out_gs[0] = slice_rows;
                         out_stop[1] = 1; out_step[1] = 1; out_gs[1] = 1;
                         ArrayRegion<N> out_region(out_start, out_stop, out_step);
                         ArrayDecomp<N> out_decomp = array_meta[result_name].decomp<N>();
@@ -279,17 +291,31 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
 
                         int actual_cols = std::min(sub_cols, vec_len);
 #ifdef USE_KOKKOS
-                        local_gemv<T>(CT_COMPUTE_EXEC(partition),
-                                      static_cast<T*>(mat->device_data_ptr()) +
-                                          (int64_t)row_offset * local_cols + col_offset,
-                                      local_cols, sub_rows, actual_cols, vec_data,
-                                      static_cast<T*>(result->device_data_ptr()));
+                        if (trans)
+                            local_gemv_t<T>(CT_COMPUTE_EXEC(partition),
+                                            static_cast<T*>(mat->device_data_ptr()) +
+                                                (int64_t)row_offset * local_cols + col_offset,
+                                            row_ld, std::min(sub_rows, vec_len), sub_cols,
+                                            vec_data, static_cast<T*>(result->device_data_ptr()));
+                        else
+                            local_gemv<T>(CT_COMPUTE_EXEC(partition),
+                                          static_cast<T*>(mat->device_data_ptr()) +
+                                              (int64_t)row_offset * local_cols + col_offset,
+                                          (int)row_ld, sub_rows, actual_cols, vec_data,
+                                          static_cast<T*>(result->device_data_ptr()));
                         CT_KOKKOS_FENCE();
 #else
-                        eigen_gemv_sub(static_cast<T*>(mat->data_ptr()), local_cols,
-                                       row_offset, col_offset,
-                                       sub_rows, actual_cols,
-                                       vec_data, static_cast<T*>(result->data_ptr()));
+                        if (trans)
+                            eigen_gemv_t_sub(static_cast<T*>(mat->data_ptr()) +
+                                                 (int64_t)row_offset * local_cols + col_offset,
+                                             row_ld, std::min(sub_rows, vec_len), sub_cols,
+                                             vec_data, static_cast<T*>(result->data_ptr()));
+                        else
+                            eigen_gemv_sub(static_cast<T*>(mat->data_ptr()) +
+                                               (int64_t)row_offset * local_cols,
+                                           (int)row_ld, 0, col_offset,
+                                           sub_rows, actual_cols,
+                                           vec_data, static_cast<T*>(result->data_ptr()));
 #endif
 #ifdef USE_NVIDIA
                         // the result is packed on the comm stream; the vector is freed
@@ -310,8 +336,6 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
 
 
                             // result_lo/hi in result-local space (0-based)
-                            int result_lo = row_lo - mat_rs;
-                            int result_hi = row_hi - mat_rs;
                             // Translate to global for chare index computation
                             auto res_meta = dag_group->array_meta.find(result_name);
                             int res_offset = (res_meta != dag_group->array_meta.end())
@@ -493,7 +517,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
 #endif
                             Kokkos::parallel_for(
                                 CT_COMPUTE_POLICY(partition, sub_rows),
-                                KOKKOS_LAMBDA(int i) {
+                                KOKKOS_LAMBDA(int64_t i) {
                                     T sum = T(0);
                                     for (int j = 0; j < actual_cols; j++) {
                                         if (dd == 0)
@@ -578,7 +602,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                                 slice_rows = mr->stop[rd] - mr->start[rd];
                             } else {
                                 auto* mr = static_cast<ArrayRegion<2>*>(ast_node->operand_regions[0]);
-                                slice_rows = mr->stop[0] - mr->start[0];
+                                slice_rows = matmul_trans(ast_node) ? mr->size(1) : mr->size(0);
                             }
                         } else {
                             // Fallback: use matrix global rows
@@ -713,14 +737,14 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                                     int lr_cap = local_rows, lc_cap = local_cols;
                                     Kokkos::parallel_for(
                                         CT_COMPUTE_POLICY(partition, rb_count),
-                                        KOKKOS_LAMBDA(int j) {
-                                            int row = rb_row_start + j;
-                                            int col = rb_col_start + j;
-                                            int local_r = row - rs_cap;
-                                            int local_c = col - cs_cap;
+                                        KOKKOS_LAMBDA(int64_t j) {
+                                            int64_t row = rb_row_start + j;
+                                            int64_t col = rb_col_start + j;
+                                            int64_t local_r = row - rs_cap;
+                                            int64_t local_c = col - cs_cap;
                                             if (local_r >= 0 && local_r < lr_cap &&
                                                 local_c >= 0 && local_c < lc_cap) {
-                                                out_device[local_r * lc_cap + local_c] =
+                                                out_device[(int64_t)local_r * lc_cap + local_c] =
                                                     received[j];
                                             }
                                         });
@@ -729,7 +753,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                         }
 #else
                         T* out_data = static_cast<T*>(partition->arrays[result_name]->data_ptr());
-                        std::memset(out_data, 0, local_rows * local_cols * sizeof(T));
+                        std::memset(out_data, 0, (size_t)local_rows * local_cols * sizeof(T));
 
                         if (comm) {
                             auto rb_it = comm->remote_buffers.find(0);
@@ -746,7 +770,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                                         int local_c = col - col_start;
                                         if (local_r >= 0 && local_r < local_rows &&
                                             local_c >= 0 && local_c < local_cols) {
-                                            out_data[local_r * local_cols + local_c] = received[j];
+                                            out_data[(int64_t)local_r * local_cols + local_c] = received[j];
                                         }
                                     }
                                 }
@@ -786,8 +810,8 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                                     int ms_cap = my_start, ls_cap = local_size;
                                     Kokkos::parallel_for(
                                         CT_COMPUTE_POLICY(partition, rb_count),
-                                        KOKKOS_LAMBDA(int j) {
-                                            int local_idx = (rb_start + j) - ms_cap;
+                                        KOKKOS_LAMBDA(int64_t j) {
+                                            int64_t local_idx = (rb_start + j) - ms_cap;
                                             if (local_idx >= 0 && local_idx < ls_cap)
                                                 out_device[local_idx] = received[j];
                                         });
@@ -883,7 +907,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                                     // For dims < delta: [0, 1) (prepended dim)
                                     // For dims >= delta: source chare's global range
                                     std::array<int, N> src_start, src_size;
-                                    int src_total_size = 1;
+                                    int64_t src_total_size = 1;
                                     for (int d = 0; d < N; ++d) {
                                         src_start[d] = rb.region.start[d];
                                         src_size[d] = rb.region.stop[d] - rb.region.start[d];
@@ -892,14 +916,14 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
 
                                     // For each output position in this chare's local region,
                                     // check if it maps (via mod) to this source's range
-                                    int total_out = 1;
+                                    int64_t total_out = 1;
                                     for (int d = 0; d < N; ++d)
                                         total_out *= local_sizes[d];
 
-                                    for (int flat = 0; flat < total_out; ++flat) {
+                                    for (int64_t flat = 0; flat < total_out; ++flat) {
                                         // Decompose flat index into N-dimensional local coords
                                         std::array<int, N> local_idx;
-                                        int rem = flat;
+                                        int64_t rem = flat;
                                         for (int d = N - 1; d >= 0; --d) {
                                             local_idx[d] = rem % local_sizes[d];
                                             rem /= local_sizes[d];
@@ -931,7 +955,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                                             continue;
 
                                         // Compute flat index into received buffer
-                                        int src_flat = 0;
+                                        int64_t src_flat = 0;
                                         for (int d = 0; d < N; ++d) {
                                             src_flat = src_flat * src_size[d] + src_local[d];
                                         }
@@ -956,7 +980,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                                         src_size_arr[d] = rb.region.stop[d] - rb.region.start[d];
                                     }
 
-                                    int total_out = 1;
+                                    int64_t total_out = 1;
                                     for (int d = 0; d < N; ++d)
                                         total_out *= local_sizes[d];
 
@@ -974,13 +998,11 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
 
                                     Kokkos::parallel_for(
                                         CT_COMPUTE_POLICY(partition, total_out),
-                                        KOKKOS_LAMBDA(int flat) {
+                                        KOKKOS_LAMBDA(int64_t flat) {
                                             int local_idx[N];
-                                            int r = flat;
-                                            for (int d = N - 1; d >= 0; --d) {
-                                                local_idx[d] = r % lsz[d];
-                                                r /= lsz[d];
-                                            }
+                                            int64_t r = flat;
+                                            for (int d = N - 1; d >= 0; --d)
+                                                local_idx[d] = (int)ct_divmod(r, lsz[d]);
 
                                             bool from_this_src = true;
                                             int src_local[N];
@@ -997,7 +1019,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                                             if (!from_this_src)
                                                 return;
 
-                                            int src_flat = 0;
+                                            int64_t src_flat = 0;
                                             for (int d = 0; d < N; ++d)
                                                 src_flat = src_flat * ssz[d] + src_local[d];
 
@@ -1051,7 +1073,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                         auto& my_inp = comm->my_inputs[0];
 
                         // Compute row-major strides for target
-                        std::array<int, N> tgt_strides;
+                        std::array<int64_t, N> tgt_strides;
                         tgt_strides[N - 1] = 1;
                         for (int d = N - 2; d >= 0; --d)
                             tgt_strides[d] = tgt_strides[d + 1] * target->region.size(d + 1);
@@ -1086,7 +1108,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                                     continue;
 
                                 // Compute row-major strides for remote buffer (densely packed)
-                                std::array<int, N> rb_strides;
+                                std::array<int64_t, N> rb_strides;
                                 rb_strides[N - 1] = 1;
                                 for (int d = N - 2; d >= 0; --d)
                                     rb_strides[d] = rb_strides[d + 1] * rb.region.size(d + 1);
@@ -1097,7 +1119,8 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                                 T* rb_device = reinterpret_cast<T*>(rb.data);
                                 int64_t overlap_total = overlap.size();
 
-                                int cs_arr[N], tgt_s[N], rb_s[N];
+                                int cs_arr[N];
+                                int64_t tgt_s[N], rb_s[N];
                                 int ol_start[N], ol_sizes[N], ol_step[N], rb_in_dst_start[N],
                                     rb_in_dst_step[N];
                                 for (int d = 0; d < N; d++) {
@@ -1113,12 +1136,11 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
 
                                 Kokkos::parallel_for(
                                     CT_COMPUTE_POLICY(partition, overlap_total),
-                                    KOKKOS_LAMBDA(int flat_idx) {
-                                        int remaining = flat_idx;
-                                        int dst_flat = 0, rb_flat = 0;
+                                    KOKKOS_LAMBDA(int64_t flat_idx) {
+                                        int64_t remaining = flat_idx;
+                                        int64_t dst_flat = 0, rb_flat = 0;
                                         for (int d = N - 1; d >= 0; --d) {
-                                            int coord_d = remaining % ol_sizes[d];
-                                            remaining /= ol_sizes[d];
+                                            int coord_d = (int)ct_divmod(remaining, ol_sizes[d]);
                                             int global_d = ol_start[d] + coord_d * ol_step[d];
                                             dst_flat += (global_d - cs_arr[d]) * tgt_s[d];
                                             int rb_logical =
@@ -1133,7 +1155,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                                 for (int d = 0; d < N; ++d)
                                     idx[d] = overlap.start[d];
                                 while (true) {
-                                    int dst_flat = 0, rb_flat = 0;
+                                    int64_t dst_flat = 0, rb_flat = 0;
                                     for (int d = 0; d < N; ++d) {
                                         dst_flat += (idx[d] - cs_tgt[d]) * tgt_strides[d];
                                         int rb_logical =
@@ -1168,7 +1190,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                                 auto src_it = partition->arrays.find(source_name);
                                 if (src_it != partition->arrays.end()) {
                                     // Compute row-major strides for source
-                                    std::array<int, N> src_strides;
+                                    std::array<int64_t, N> src_strides;
                                     src_strides[N - 1] = 1;
                                     for (int d = N - 2; d >= 0; --d)
                                         src_strides[d] =
@@ -1181,7 +1203,8 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                                         static_cast<T*>(src_it->second->device_data_ptr());
                                     int64_t loc_total = loc_overlap.size();
 
-                                    int cs_tgt_arr[N], cs_src_arr[N], tgt_s[N], src_s[N];
+                                    int cs_tgt_arr[N], cs_src_arr[N];
+                                    int64_t tgt_s[N], src_s[N];
                                     int lo_start[N], lo_sizes[N], lo_step[N];
                                     int local_inp_start[N], local_inp_step[N];
                                     int local_in_dst_start[N], local_in_dst_step[N];
@@ -1201,12 +1224,11 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
 
                                     Kokkos::parallel_for(
                                         CT_COMPUTE_POLICY(partition, loc_total),
-                                        KOKKOS_LAMBDA(int flat_idx) {
-                                            int remaining = flat_idx;
-                                            int dst_flat = 0, src_flat = 0;
+                                        KOKKOS_LAMBDA(int64_t flat_idx) {
+                                            int64_t remaining = flat_idx;
+                                            int64_t dst_flat = 0, src_flat = 0;
                                             for (int d = N - 1; d >= 0; --d) {
-                                                int coord_d = remaining % lo_sizes[d];
-                                                remaining /= lo_sizes[d];
+                                                int coord_d = (int)ct_divmod(remaining, lo_sizes[d]);
                                                 int global_d = lo_start[d] + coord_d * lo_step[d];
                                                 dst_flat += (global_d - cs_tgt_arr[d]) * tgt_s[d];
                                                 int logical_idx =
@@ -1225,7 +1247,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                                     for (int d = 0; d < N; ++d)
                                         idx[d] = loc_overlap.start[d];
                                     while (true) {
-                                        int dst_flat = 0, src_flat = 0;
+                                        int64_t dst_flat = 0, src_flat = 0;
                                         for (int d = 0; d < N; ++d) {
                                             dst_flat += (idx[d] - cs_tgt[d]) * tgt_strides[d];
                                             int logical_idx =
@@ -1455,7 +1477,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
             auto [local_part, has_local] = intersect(my_inp, r_chare_inp);
             if (has_local) {
                 {
-                    std::array<int, N> arr_strides;
+                    std::array<int64_t, N> arr_strides;
                     arr_strides[N - 1] = 1;
                     for (int d = N - 2; d >= 0; --d)
                         arr_strides[d] = arr_strides[d + 1] * arr->region.size(d + 1);

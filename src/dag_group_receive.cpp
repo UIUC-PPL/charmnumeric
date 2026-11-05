@@ -349,7 +349,7 @@ void ArrayDAGGroup::receive_dag_now(int epoch, int size, char* serialized_dag) {
                         } else {
                             auto* mr =
                                 static_cast<ArrayRegion<2>*>(ast_node->operand_regions[0]);
-                            mat_rows = mr->stop[0] - mr->start[0];
+                            mat_rows = matmul_trans(ast_node) ? mr->size(1) : mr->size(0);
                         }
                     }
                     array_meta[ast_node->result_name] = {1, {mat_rows, 0, 0}, {}, 0};

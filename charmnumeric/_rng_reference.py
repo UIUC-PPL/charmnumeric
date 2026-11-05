@@ -238,11 +238,12 @@ def iota_values(words, shape, dtype):
             line[0] = b0
         if line.size > 1:
             line[1] = b1
-    elif mode == 1:  # LINSPACE in float64
-        start, stop, step, delta = (_as_double(w) for w in (v0, v1, v2, v3))
-        y = i.astype(np.float64)
+    elif mode == 1:  # LINSPACE in float64, or float32 (flags & 4)
+        ct = np.float32 if flags & 4 else np.float64
+        start, stop, step, delta = (ct(_as_double(w)) for w in (v0, v1, v2, v3))
+        y = i.astype(ct)
         if div > 0:
-            y = (y / float(div)) * delta if (flags & 2) else y * step
+            y = (y / ct(div)) * delta if (flags & 2) else y * step
         else:
             y = y * delta
         y = y + start

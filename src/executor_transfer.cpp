@@ -283,7 +283,7 @@ static void diag_send(PartitionImpl<N_src>* partition, DAGNode* node, int source
             T* src_device = static_cast<T*>(src->device_data_ptr()) + r.first_local;
             Kokkos::parallel_for(
                 CT_COMM_POLICY(partition, r.count),
-                KOKKOS_LAMBDA(int j) { send_buf[j] = src_device[j]; });
+                KOKKOS_LAMBDA(int64_t j) { send_buf[j] = src_device[j]; });
             device_pack_send<1, 2>(partition, dag_group->partition_proxy_2, r.target_ci,
                                    node->id, 0, source_name, region_data, byte_size, send_buf);
 #else
@@ -358,13 +358,13 @@ static void diag_send(PartitionImpl<N_src>* partition, DAGNode* node, int source
             int fvi_cap = r.first_vec_idx;
             Kokkos::parallel_for(
                 CT_COMM_POLICY(partition, r.count),
-                KOKKOS_LAMBDA(int j) {
-                    int vec_idx = fvi_cap + j;
-                    int row = (ko_cap >= 0) ? vec_idx : vec_idx - ko_cap;
-                    int col = (ko_cap >= 0) ? vec_idx + ko_cap : vec_idx;
-                    int local_row = row - rs_cap;
-                    int local_col = col - cs_cap;
-                    send_buf[j] = src_device[local_row * lc_cap + local_col];
+                KOKKOS_LAMBDA(int64_t j) {
+                    int64_t vec_idx = fvi_cap + j;
+                    int64_t row = (ko_cap >= 0) ? vec_idx : vec_idx - ko_cap;
+                    int64_t col = (ko_cap >= 0) ? vec_idx + ko_cap : vec_idx;
+                    int64_t local_row = row - rs_cap;
+                    int64_t local_col = col - cs_cap;
+                    send_buf[j] = src_device[(int64_t)local_row * lc_cap + local_col];
                 });
             device_pack_send<2, 1>(partition, dag_group->partition_proxy_1, r.target_ci,
                                    node->id, 0, source_name, region_data, byte_size, send_buf);
@@ -384,7 +384,7 @@ static void diag_send(PartitionImpl<N_src>* partition, DAGNode* node, int source
                 }
                 int local_row = row - row_start;
                 int local_col = col - col_start;
-                send_buf[j] = src_data[local_row * local_cols + local_col];
+                send_buf[j] = src_data[(int64_t)local_row * local_cols + local_col];
             }
             ct_send_data(proxy_at<1>(dag_group->partition_proxy_1, r.target_ci), node->id,
                          /*input_index=*/0, source_name, 1, region_data, byte_size,
@@ -486,7 +486,7 @@ void ArrayDAGExecutorND<N>::execute_diag_node(DAGNode* node) {
                     partition->allocate_or_reuse(out_region, out_gs, result_name, dt, out_decomp);
 #ifndef USE_KOKKOS
                 std::memset(partition->arrays[result_name]->data_ptr(), 0,
-                            local_rows * local_cols * dtype_size(dt));
+                            (size_t)local_rows * local_cols * dtype_size(dt));
 #endif
                 node_finished(node->id);
                 return;
@@ -664,7 +664,7 @@ static void tile_send(PartitionImpl<N_src>* partition, DAGNode* node, int source
         }
     }
 
-    int local_size = src->local_size();
+    int64_t local_size = src->local_size();
     int64_t byte_size = local_size * sizeof(T);
 
     std::function<void(int, ChareIndex<N_tgt>&)> send_to_chares;
@@ -701,7 +701,7 @@ static void tile_send(PartitionImpl<N_src>* partition, DAGNode* node, int source
             T* src_device = static_cast<T*>(src->device_data_ptr());
             Kokkos::parallel_for(
                 CT_COMM_POLICY(partition, local_size),
-                KOKKOS_LAMBDA(int j) { send_buf[j] = src_device[j]; });
+                KOKKOS_LAMBDA(int64_t j) { send_buf[j] = src_device[j]; });
             device_pack_send<N_src, N_tgt>(partition,
                                            PartitionProxyHelper<N_tgt>::get(dag_group), ci,
                                            node->id, 0, source_name, region_data, byte_size,
