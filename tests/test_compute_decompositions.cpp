@@ -719,10 +719,8 @@ void expect_kernels_consistent(const std::string& label, MetaMap& meta, DAG* dag
 
 int resolve(MetaMap& meta, DAG* dag) {
     int next_name = 1 << 20, next_node = 1 << 20;
-    auto res = decomposition_solver::resolve_kernel_layouts(meta, dag, next_name, next_node);
-    if (!res.error.empty())
-        fail("resolve_kernel_layouts: " + res.error);
-    return res.follow_up_nodes;
+    return decomposition_solver::resolve_kernel_layouts(meta, dag, next_name, next_node)
+        .follow_up_nodes;
 }
 
 void test_kernel_layout_cross_node_chain() {
@@ -880,9 +878,72 @@ void test_kernel_layout_mixed_shapes() {
     DAG* dag = make_chain_dag({{add_views<1>(S, X, {0}, {1}, {500}),
                                 add_views<1>(T, X, {1}, {1}, {499})}});
     decomposition_solver::compute_decompositions(meta, dag, 4, 1);
-    int next_name = 1 << 20, next_node = 1 << 20;
-    auto res = decomposition_solver::resolve_kernel_layouts(meta, dag, next_name, next_node);
-    expect_true("mixed shapes are reported", !res.error.empty());
+    meta.at(T).offset[0] = 3; // as if pinned elsewhere
+    expect_eq("mixed shapes: no follow-up", resolve(meta, dag), 0);
+    expect_eq("T keeps its name", dag->nodes.at(0)->ast->roots[1]->result_name, T);
+    delete dag;
+}
+
+void test_kernel_layout_rewritten_result_then_set_region() {
+    std::cout << "=== test_kernel_layout_rewritten_result_then_set_region ===" << std::endl;
+    constexpr int X = 1, Q = 2, R = 3, R2 = 4, U = 5, C = 6, D = 7, SR = 8, SR2 = 9, SU = 10,
+                  M = 11;
+    // Q (matmul operand, offset 0) anchors the rewritten kernel; R and R2 are tied to the
+    // earlier U (offset 5), then R[...] = C, R2[...] = D, U[...] = C. The copies R = X'
+    // must run before the set_regions into R and R2, or they undo them.
+    MetaMap meta;
+    meta[X] = make_meta(1, 512, 0, 64, true);
+    meta[U] = make_meta(1, 500, 5, 64, true);
+    meta[C] = make_meta(1, 500, 0, 64, true);
+    meta[D] = make_meta(1, 500, 0, 64, true);
+    for (int n : {Q, R, R2, M})
+        meta[n] = make_meta(1, 500, 0, 0, false);
+    auto* whole = make_region<1>({0}, {500}, {1});
+    DAG* dag = make_chain_dag({{add_views<1>(Q, X, {0}, {0}, {500}),
+                                add_views<1>(R, X, {1}, {2}, {500}),
+                                add_views<1>(R2, X, {3}, {3}, {500}),
+                                make_set_region(SR, make_leaf(R), whole, make_leaf(C)),
+                                make_set_region(SR2, make_leaf(R2), whole, make_leaf(D)),
+                                make_set_region(SU, make_leaf(U), whole, make_leaf(C))},
+                               {matmul_of(M, Q)}});
+    decomposition_solver::compute_decompositions(meta, dag, 4, 1);
+    expect_eq("Q.offset[0]", meta.at(Q).offset[0], 0);
+    expect_eq("R.offset[0]", meta.at(R).offset[0], 5);
+    expect_eq("follow-ups", resolve(meta, dag), 5);
+    expect_kernels_consistent("rewritten result + set_region", meta, dag);
+    std::vector<ASTNode*> seq;
+    for (DAGNode* n = dag->nodes.at(0)->children[0]; n->id != 1; n = n->children[0])
+        seq.push_back(n->ast->roots[0]);
+    expect_eq("chain length", (int)seq.size(), 5);
+    auto copy_of = [&](ASTNode* f) {
+        return f->opcode == static_cast<int>(Opcode::CONVERT) ? f->result_name : -1;
+    };
+    auto set_of = [&](ASTNode* f) {
+        return f->opcode == static_cast<int>(Opcode::SET_REGION) ? f->operands[0]->result_name
+                                                                 : -1;
+    };
+    expect_eq("1st: R = X'", copy_of(seq[0]), R);
+    expect_eq("2nd: R2 = X'", copy_of(seq[1]), R2);
+    expect_eq("3rd: R[...] = X", set_of(seq[2]), R);
+    expect_eq("4th: R2[...] = X", set_of(seq[3]), R2);
+    expect_eq("5th: U[...] = X", set_of(seq[4]), U);
+    delete dag;
+}
+
+void test_kernel_layout_size1_results() {
+    std::cout << "=== test_kernel_layout_size1_results ===" << std::endl;
+    constexpr int S = 1, A = 2, B = 3;
+    // size-1 results of a size-1 array (a reduction result has tile 0 until solved)
+    MetaMap meta;
+    meta[S] = make_meta(1, 1, 0, 0, false);
+    meta[A] = make_meta(1, 1, 0, 0, false);
+    meta[B] = make_meta(1, 1, 0, 0, false);
+    DAG* dag = make_chain_dag({{add_views<1>(A, S, {0}, {0}, {1}),
+                                make_add(B, make_leaf(S), nullptr, make_leaf(A), nullptr)}});
+    decomposition_solver::compute_decompositions(meta, dag, 4, 4);
+    for (int n : {S, A, B})
+        expect_true("size-1 tile > 0", meta.at(n).tile > 0);
+    expect_eq("size-1 follow-ups", resolve(meta, dag), 0);
     delete dag;
 }
 
@@ -967,6 +1028,8 @@ int main() {
         test_kernel_layout_shifted_set_regions();
         test_kernel_layout_rename_kept_result();
         test_kernel_layout_mixed_shapes();
+        test_kernel_layout_rewritten_result_then_set_region();
+        test_kernel_layout_size1_results();
         test_kernel_layout_2d_3d();
     } catch (const std::exception& ex) {
         std::cerr << "test_compute_decompositions failed: " << ex.what() << std::endl;

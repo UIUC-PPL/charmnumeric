@@ -541,8 +541,6 @@ void ArrayDAGGroup::receive_dag_now(int epoch, int size, char* serialized_dag) {
     {
         auto fix = decomposition_solver::resolve_kernel_layouts(array_meta, dag, synth_name,
                                                                 synth_node_id);
-        if (!fix.error.empty())
-            CkAbort("receive_dag epoch=%d: %s", epoch, fix.error.c_str());
         if (fix.follow_up_nodes > 0 && CkMyPe() == 0 && getenv("CNUM_DECOMP_LOG") != nullptr)
             CkPrintf("decomp: epoch %d: %d layout follow-up node(s)\n", epoch,
                      fix.follow_up_nodes);

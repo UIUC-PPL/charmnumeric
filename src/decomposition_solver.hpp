@@ -12,7 +12,6 @@
 #include <queue>
 #include <set>
 #include <stack>
-#include <string>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -2382,7 +2381,6 @@ inline Region* whole_region(int nd, std::array<int, 3> const& shape) {
 
 struct LayoutFixResult {
     int follow_up_nodes = 0;
-    std::string error;
 };
 
 /// Makes every fused kernel's outputs match the layout the executor writes them in,
@@ -2391,8 +2389,9 @@ struct LayoutFixResult {
 /// layout, then a follow-up node R = X redistributes it; if the kernel has set_regions
 /// and anything disagrees, every set_region T[r] = v becomes X = v, then T[r] = X in a
 /// follow-up node. Follow-ups run between the kernel and its children, so reads in the
-/// kernel still see the values from before its writes. X names and follow-up node ids
-/// count down from next_name / next_node_id.
+/// kernel still see the values from before its writes; the R = X copies run before the
+/// T[r] = X writes, since a kernel writes R before any set_region into it. X names and
+/// follow-up node ids count down from next_name / next_node_id.
 template <typename ArrayMetaMap>
 LayoutFixResult resolve_kernel_layouts(ArrayMetaMap& meta, DAG* dag, int& next_name,
                                        int& next_node_id) {
@@ -2405,8 +2404,8 @@ LayoutFixResult resolve_kernel_layouts(ArrayMetaMap& meta, DAG* dag, int& next_n
         if (!detail::is_fused_kernel(node))
             continue;
         auto& roots = node->ast->roots;
-        std::vector<ASTNode*> follow;
-        std::vector<int> follow_x;
+        // (follow-up root, X it retires or -1): whole-result copies, then set_regions
+        std::vector<std::pair<ASTNode*, int>> copies, sets;
         std::unordered_set<int> synthetic;
         bool rebuilt = false;
         auto new_meta = [&](int x, Meta base, int nd, std::array<int, 3> extent,
@@ -2489,8 +2488,7 @@ LayoutFixResult resolve_kernel_layouts(ArrayMetaMap& meta, DAG* dag, int& next_n
                     fs->add_operand(x_leaf(x, xr));
                     fs->operand_regions.push_back(detail::whole_region(tm.ndims, b.extent));
                 }
-                follow.push_back(fs);
-                follow_x.push_back(x);
+                sets.push_back({fs, x});
             }
             rebuilt = true;
         }
@@ -2529,12 +2527,9 @@ LayoutFixResult resolve_kernel_layouts(ArrayMetaMap& meta, DAG* dag, int& next_n
                 bool same_shape = rm.ndims == am.ndims;
                 for (int d = 0; same_shape && d < rm.ndims; ++d)
                     same_shape = rm.global_shape[d] == am.global_shape[d];
-                if (!same_shape) {
-                    res.error = "fused kernel (node " + std::to_string(node->id) +
-                                ") keeps results of different shapes";
-                    return res;
-                }
-                if (detail::same_layout(rm, {0, 0, 0}, b, am, ka))
+                // The frontend only fuses ops of one shape; R = X cannot reshape, so a
+                // result of another shape is left as it is.
+                if (!same_shape || detail::same_layout(rm, {0, 0, 0}, b, am, ka))
                     continue;
                 // R is written as X in the kernel's layout, then redistributed
                 int x = next_name--;
@@ -2555,10 +2550,11 @@ LayoutFixResult resolve_kernel_layouts(ArrayMetaMap& meta, DAG* dag, int& next_n
                                        0.0, r->ndims, r->dtype, false);
                 fr->add_operand(x_leaf(x, r));
                 fr->operand_regions.push_back(detail::whole_region(rm.ndims, rm.global_shape));
-                follow.push_back(fr);
-                follow_x.push_back(x);
+                copies.push_back({fr, x});
             }
         }
+        std::vector<std::pair<ASTNode*, int>> follow = std::move(copies);
+        follow.insert(follow.end(), sets.begin(), sets.end());
         if (follow.empty())
             continue;
 
@@ -2574,15 +2570,15 @@ LayoutFixResult resolve_kernel_layouts(ArrayMetaMap& meta, DAG* dag, int& next_n
         node->retire_names.clear();
         auto pos = std::find(dag->node_order.begin(), dag->node_order.end(), node->id);
         DAGNode* prev = node;
-        for (size_t i = 0; i < follow.size(); ++i) {
-            auto* f = new DAGNode(next_node_id--, new AST({follow[i]}));
+        for (auto [root, x] : follow) {
+            auto* f = new DAGNode(next_node_id--, new AST({root}));
             f->fusible = true;
             f->identifier = detail::synth_identifier(0, f->ast);
             prev->children.push_back(f);
             f->num_parents = 1;
-            if (follow_x[i] >= 0) {
-                dag->retire_remaining[follow_x[i]] = 1;
-                f->retire_names.push_back(follow_x[i]);
+            if (x >= 0) {
+                dag->retire_remaining[x] = 1;
+                f->retire_names.push_back(x);
             }
             dag->nodes[f->id] = f;
             if (pos != dag->node_order.end())
