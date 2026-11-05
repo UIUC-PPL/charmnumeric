@@ -58,7 +58,7 @@ Distributed N-dimensional array DSL built on charmtyles. The backend stores 1-3D
 | `_reduce()` | Builds a REDUCTION (opcode 60) node: operands `x, kind, axis_mask, keepdims, ddof, in_dtype` |
 | `sum/prod/mean/var/std/amax/amin/argmax/argmin/count_nonzero/all/any` | NumPy-style API (`axis`, `keepdims`, `dtype`, `out`); also installed as `Array`/`ArrayView` methods |
 | `bincount()` | BINCOUNT (opcode 61) node; needs `minlength` or `interface=` |
-| `quantile()` / `percentile()` | 1-D (or axis=None) with up to 256 needed ranks: one SELECT node (`_select`), no sort; otherwise sort + take |
+| `quantile()` / `percentile()` | 1-D (or axis=None) with up to 256 needed ranks: one SELECT node (`_select`), no sort; otherwise distributed sort + take |
 | `norm()` | `cnp.linalg.norm` subset (vector 2/1/inf/-inf/0, matrix fro/inf/-inf/1/-1, axis) |
 
 ### `charmnumeric/linalg.py` — Dense linear algebra (`cnp.linalg`)
@@ -251,8 +251,8 @@ Started from `set_proxies`, off the CCS-ready path: rank 0 of each process expor
 | `executor_reducer.cpp` | `determine_dtype<N>()` (dtype of a node from its AST or arrays) |
 | `executor_transfer.cpp` | Cross-partition data transfer |
 | `executor_transpose.cpp` | TRANSPOSE (2-D/3-D axis permutation of an array or view): point-to-point pack/send, `transpose_place` receive side |
-| `executor_castscansort.cpp` | SCAN (cumsum/cumprod/nan*; opcode 81): each chare sends its line totals to the later chares along the axis, then scans its tile once with the folded carry (CUB single-pass scan per long line on NVIDIA); narrow int/bool inputs are cast in the kernel. SORT/ARGSORT (82-83) of other shapes: local per-line sort when the axis is not split across chares, else a gather to one chare (complex, split axis) |
-| `executor_sort.cpp` | 1-D SORT/ARGSORT of real types: sample sort over the chares (pooled samples -> splitters on (key, index), stable multi-way split, buckets exchanged by pointer on the same PE or as device messages, CUB radix sort per bucket, then the sorted runs moved to the result tiles). SELECT (190): order statistics by radix selection (histogram rounds of the top key bits, coordinated by the first chare, then a gather of the few candidates); `receive_sort_msg` carries the control messages. Radix keys order like NumPy (NaNs last) |
+| `executor_castscansort.cpp` | SCAN (cumsum/cumprod/nan*; opcode 81): each chare sends its line totals to the later chares along the axis, then scans its tile once with the folded carry (CUB single-pass scan per long line on NVIDIA); narrow int/bool inputs are cast in the kernel. SORT/ARGSORT (82-83): dispatch to `executor_sort.cpp`; only arrays of at most `CNUM_SORT_GATHER_MAX` (65536) elements split along the axis gather to one chare (`sort_root`) |
+| `executor_sort.cpp` | 1-D SORT/ARGSORT (every dtype; complex keys are (real, imag) radix keys in NumPy's NaN-class order): sample sort over the chares (pooled samples -> splitters on (key, index), stable multi-way split, buckets exchanged by pointer on the same PE or as device messages, CUB radix sort per bucket, then the sorted runs moved to the result tiles). SELECT (190): order statistics by radix selection (histogram rounds of the top key bits, coordinated by the first chare, then a gather of the few candidates); `receive_sort_msg` carries the control messages. Radix keys order like NumPy (NaNs last). N-D (`ds_axis_local`, `execute_ax_node`): a tile holding whole lines sorts them (CUB segmented sort in batches on NVIDIA, host elsewhere); along a split axis the P tiles sharing a line set split those lines P ways, send each owner its part of them, the owners sort whole lines and send the results back (two all-to-alls, pointer handoff on the same PE) |
 | `executor_incremental.cpp` | Incremental computation |
 | `executor_ast_visitor.cpp` | AST visitor for elementwise node execution |
 | `partition_lifecycle.cpp` | `init()`, `create()`, `run()`, destructor |
