@@ -48,6 +48,8 @@ struct LaMsgHeader {
     int64_t count;
 };
 
+constexpr int64_t LA_CHUNK = int64_t(1) << 26; // largest pooled comm buffer
+
 namespace {
 
 struct LaOperand {
@@ -81,6 +83,20 @@ std::array<int, 3> la_region_shape(Region* r, std::array<int, 3> s) {
             s[d] = ar->size(d);
     }
     return s;
+}
+
+/// View of operand i in its array's local coordinates.
+template <int N>
+ArrayRegion<N> la_view(const LaOperand& o, const std::array<int, 3>& gshape) {
+    if (o.region == nullptr || o.region->is_global) {
+        std::array<int, N> st{}, e{}, one{};
+        for (int d = 0; d < N; ++d) {
+            e[d] = gshape[d];
+            one[d] = 1;
+        }
+        return ArrayRegion<N>(st, e, one);
+    }
+    return *static_cast<ArrayRegion<N>*>(o.region);
 }
 
 } // namespace
@@ -751,6 +767,12 @@ static LaHandles& la_handles(cudaStream_t st) {
         return cublas##P##gemm(h, CUBLAS_OP_T, CUBLAS_OP_N, m, n, k, &minus, A, lda, B, ldb,     \
                                &one, C, ldc);                                                    \
     }                                                                                            \
+    inline cublasStatus_t gemm_sub(cublasHandle_t h, cublasOperation_t ta, int m, int n, int k,  \
+                                   const T* A, int lda, const T* B, int ldb, T* C, int ldc) {    \
+        const T minus = -1, one = 1;                                                             \
+        return cublas##P##gemm(h, ta, CUBLAS_OP_N, m, n, k, &minus, A, lda, B, ldb, &one, C,     \
+                               ldc);                                                             \
+    }                                                                                            \
     inline cublasStatus_t syrk_sub_t(cublasHandle_t h, int n, int k, const T* A, int lda, T* C,  \
                                      int ldc) {                                                  \
         const T minus = -1, one = 1;                                                             \
@@ -824,6 +846,12 @@ static LaHandles& la_handles(cudaStream_t st) {
         const T one(1, 0);                                                                       \
         return cublas##P##trsm(h, CUBLAS_SIDE_LEFT, u, t, d, m, n, cu(&one), cu(A), lda, cu(B),  \
                                ldb);                                                             \
+    }                                                                                            \
+    inline cublasStatus_t gemm_sub(cublasHandle_t h, cublasOperation_t ta, int m, int n, int k,  \
+                                   const T* A, int lda, const T* B, int ldb, T* C, int ldc) {    \
+        const T minus(-1, 0), one(1, 0);                                                         \
+        return cublas##P##gemm(h, ta, CUBLAS_OP_N, m, n, k, cu(&minus), cu(A), lda, cu(B), ldb,  \
+                               cu(&one), cu(C), ldc);                                            \
     }                                                                                            \
     inline cublasStatus_t geam_t(cublasHandle_t h, int m, int n, const T* A, int lda, T* C,     \
                                  int ldc) {                                                      \
@@ -1232,8 +1260,6 @@ enum LaDevKind : int {
     LA_DK_TSSIGN = 8
 };
 
-constexpr int64_t LA_CHUNK = int64_t(1) << 26; // largest pooled comm buffer
-
 /// A factored tile Y_xk = L_xk^T (column-major, i.e. L_xk row-major) received in chunks.
 struct LaPanel {
     char* p = nullptr;
@@ -1267,9 +1293,30 @@ static LaDevRoot* la_dev_state(LaDevRoot*& d) {
 
 namespace {
 
+/// Stream-ordered allocation; large ones first evict cached arrays and message blocks
+/// beyond what the pool already holds, and a failure releases the caches and retries.
 void* la_dalloc(size_t bytes, cudaStream_t st) {
     void* p = nullptr;
-    CT_CUDA_CHECK(cudaMallocAsync(&p, std::max<size_t>(bytes, 1), st));
+    bytes = std::max<size_t>(bytes, 1);
+    if (bytes >= (size_t(1) << 26)) {
+        int dev = 0;
+        cudaMemPool_t mp;
+        uint64_t res = 0, used = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess &&
+            cudaDeviceGetDefaultMemPool(&mp, dev) == cudaSuccess) {
+            cudaMemPoolGetAttribute(mp, cudaMemPoolAttrReservedMemCurrent, &res);
+            cudaMemPoolGetAttribute(mp, cudaMemPoolAttrUsedMemCurrent, &used);
+        }
+        int64_t held = res > used ? static_cast<int64_t>(res - used) : 0;
+        if (static_cast<int64_t>(bytes) > held)
+            device_make_room(static_cast<int64_t>(bytes) - held);
+    }
+    if (cudaMallocAsync(&p, bytes, st) != cudaSuccess) {
+        cudaGetLastError();
+        release_device_caches();
+        if (cudaMallocAsync(&p, bytes, st) != cudaSuccess)
+            device_oom(static_cast<int64_t>(bytes));
+    }
     return p;
 }
 
@@ -1381,20 +1428,6 @@ int la_root_nd(const LaSpec& s) {
     return rn;
 }
 
-/// View of operand i in its array's local coordinates.
-template <int N>
-ArrayRegion<N> la_view(const LaOperand& o, const std::array<int, 3>& gshape) {
-    if (o.region == nullptr || o.region->is_global) {
-        std::array<int, N> st{}, e{}, one{};
-        for (int d = 0; d < N; ++d) {
-            e[d] = gshape[d];
-            one[d] = 1;
-        }
-        return ArrayRegion<N>(st, e, one);
-    }
-    return *static_cast<ArrayRegion<N>*>(o.region);
-}
-
 /// tssvd whose view columns lie in one column of tiles: every chare holding rows holds
 /// whole rows, so per-chare Gram matrices sum to A^T A.
 /// Number of tiles along dimension d that the (2-D) view of operand 0 spans; 0 if unknown.
@@ -1402,7 +1435,7 @@ int la_tiles_spanned(const LaSpec& s, ArrayDAGGroup* g, int d) {
     auto it = g->array_meta.find(s.in[0].name);
     if (s.in[0].nd != 2 || it == g->array_meta.end() || it->second.tile <= 0)
         return 0;
-    ArrayDecomp<2> dec = it->second.template decomp<2>();
+    ArrayDecomp<2> dec = it->second.decomp<2>();
     ArrayRegion<2> v = la_view<2>(s.in[0], it->second.global_shape);
     int cnt = s.in[0].shape[d];
     int first = v.start[d] + dec.offset[d];
@@ -2550,6 +2583,1153 @@ static void la_dev_execute(ArrayDAGExecutorND<N>* ex, PartitionImpl<N>* p, Array
 
 #endif // USE_NVIDIA
 
+// ---- Distributed LU (solve, inv, det, slogdet) ----
+// M = A^T (a row-major tile of A is a column-major block of M) is factored with partial
+// pivoting, M = P L U, so A x = b is U^T y = b, L^T w = y, x = P w. Panels of nb columns of
+// M (nb rows of A) are dealt cyclically to one worker chare per PE, which holds them in W
+// (column-major, leading dimension n) and the matching rows of b in B. The owner of panel k
+// factors it and sends it with its pivots to the other workers; every worker then swaps the
+// rows of its other panels and updates its later ones (trsm, gemm), the owner of panel k + 1
+// that panel first (lookahead). The substitutions pass each solved block on the same way.
+// A single worker on NVIDIA runs getrf/getrs on the whole of W.
+
+#if defined(USE_NVIDIA) || !defined(USE_KOKKOS)
+#define CT_LA_LU 1
+
+enum LaLuKind : int { LU_A = 16, LU_B, LU_PANEL, LU_Y, LU_Z, LU_X, LU_POKE };
+
+struct LaLuBlob {
+    char* buf = nullptr;
+    bool comm = false;          // buf is the one received message
+    int64_t got = 0, total = 0; // 8-byte words
+};
+
+struct LaLu {
+    int op = 0, n = 0, nb = 0, np = 0, Q = 1, me = -1, nrhs = 0;
+    std::vector<int> wpe; // worker w: its PE and chare
+    std::vector<std::array<int, 2>> wci;
+    char* W = nullptr;
+    char* B = nullptr;
+    char* diag = nullptr;    // worker 0 of det/slogdet: diagonal of U
+    int64_t* piv = nullptr;  // pivots of panel k at [k * nb], 1-based within the panel
+    int64_t wcols = 0, covered = 0, expected = 0;
+    int pokes_sent = 0, pokes_got = 0;
+    bool assembled = false, whole = false, done = false;
+    int phase = 0, next = 0;
+    std::vector<char> factored, solved;
+    std::map<std::pair<int, int>, LaLuBlob> blobs;
+#ifdef USE_NVIDIA
+    cudaEvent_t ready = nullptr; // W, B allocated (on the creating chare's stream)
+    std::vector<cudaEvent_t> placed;
+    int* info = nullptr;
+    char* work = nullptr;
+    size_t work_bytes = 0;
+    std::vector<char> hwork;
+#endif
+    int owner(int j) const { return j % Q; }
+    int width(int j) const { return std::min(nb, n - j * nb); }
+    int64_t loff(int j) const { return static_cast<int64_t>(j / Q) * nb; }
+    /// Local offset of this worker's first panel >= j (wcols if none).
+    int64_t loff_ge(int j) const {
+        int f = j + ((me - j) % Q + Q) % Q;
+        return f >= np ? wcols : loff(f);
+    }
+    int64_t ldb() const { return std::max<int64_t>(wcols, 1); }
+};
+
+static std::unordered_map<int, LaLu*>& la_lu_reg() {
+    thread_local std::unordered_map<int, LaLu*> reg; // node -> this PE's worker
+    return reg;
+}
+
+static int la_lu_env(const char* name, int dflt) {
+    const char* e = getenv(name);
+    return e ? atoi(e) : dflt;
+}
+
+static bool la_lu_use(const LaSpec& s) {
+    if (s.op != LA_SOLVE && s.op != LA_INV && s.op != LA_DET && s.op != LA_SLOGDET)
+        return false;
+    static const int min_n = la_lu_env("CNUM_LA_LU_MIN", 2048);
+    return min_n > 0 && s.in[0].nd == 2 && s.in[0].rows() >= min_n;
+}
+
+/// Panels and workers: the first chare (row-major) of A's tiles on each PE.
+static bool la_lu_geometry(const LaSpec& s, ArrayDAGGroup* g, LaLu& L) {
+#ifdef USE_NVIDIA
+    static const int nb = la_lu_env("CNUM_LA_LU_NB", 512);
+#else
+    static const int nb = la_lu_env("CNUM_LA_LU_NB", 128);
+#endif
+    L.op = s.op;
+    L.n = s.in[0].rows();
+    L.nb = std::max(1, std::min(nb, L.n));
+    L.np = (L.n + L.nb - 1) / L.nb;
+    int P = CkNumPes(), found = 0;
+    std::vector<std::array<int, 2>> first(P, {-1, -1});
+    auto it = g->array_meta.find(s.in[0].name);
+    if (it == g->array_meta.end() || it->second.ndims != 2 || it->second.tile <= 0)
+        return false;
+    ArrayDecomp<2> dec = it->second.decomp<2>();
+    int a0 = dec.offset[0] / dec.tile, b0 = dec.offset[1] / dec.tile;
+    for (int a = a0; a < a0 + dec.num_chares(0) && found < P; ++a)
+        for (int b = b0; b < b0 + dec.num_chares(1) && found < P; ++b) {
+            int idx[2] = {a, b};
+            int pe = chare_home_pe(2, idx, P);
+            if (first[pe][0] < 0) {
+                first[pe] = {a, b};
+                ++found;
+            }
+        }
+    for (int pe = 0; pe < P && static_cast<int>(L.wpe.size()) < L.np; ++pe)
+        if (first[pe][0] >= 0) {
+            L.wpe.push_back(pe);
+            L.wci.push_back(first[pe]);
+        }
+    if (L.wpe.empty())
+        return false;
+    L.Q = static_cast<int>(L.wpe.size());
+    for (int w = 0; w < L.Q; ++w)
+        if (L.wpe[w] == CkMyPe())
+            L.me = w;
+    L.nrhs = s.op == LA_SOLVE ? s.in[1].cols() : s.op == LA_INV ? L.n : 0;
+    if (L.me >= 0) {
+        for (int j = L.me; j < L.np; j += L.Q)
+            L.wcols += L.width(j);
+        L.expected = L.n * L.wcols + (s.op == LA_SOLVE ? L.wcols * L.nrhs : 0);
+    }
+    return true;
+}
+
+namespace {
+
+// Memory, copies and element loops: device (stream-ordered on the chare's compute stream)
+// on NVIDIA, host otherwise.
+#ifdef USE_NVIDIA
+#define LU_LAMBDA KOKKOS_LAMBDA
+template <int N, typename F>
+void lu_for(PartitionImpl<N>* p, int64_t n, const F& f) {
+    if (n > 0)
+        Kokkos::parallel_for(CT_COMPUTE_POLICY(p, n), f);
+}
+template <int N>
+char* lu_alloc(PartitionImpl<N>* p, int64_t bytes) {
+    return static_cast<char*>(la_dalloc(bytes, p->compute_stream_raw));
+}
+template <int N>
+void lu_release(PartitionImpl<N>* p, void* q) {
+    la_dfree(q, p->compute_stream_raw);
+}
+char* lu_msg_alloc(int64_t bytes) {
+    return static_cast<char*>(comm_alloc(std::max<int64_t>(bytes, 16)));
+}
+template <int N>
+void lu_msg_free(PartitionImpl<N>* p, char* b) {
+    la_free_after(p, std::vector<void*>{b});
+}
+template <int N>
+void lu_copy2d(PartitionImpl<N>* p, void* d, int64_t dp, const void* s, int64_t sp, int64_t w,
+               int64_t h) {
+    if (w > 0 && h > 0)
+        CT_CUDA_CHECK(cudaMemcpy2DAsync(d, dp, s, sp, w, h, cudaMemcpyDeviceToDevice,
+                                        p->compute_stream_raw));
+}
+template <int N>
+void lu_zero(PartitionImpl<N>* p, void* d, int64_t bytes) {
+    if (bytes > 0)
+        CT_CUDA_CHECK(cudaMemsetAsync(d, 0, bytes, p->compute_stream_raw));
+}
+template <int N>
+void lu_to_dev(PartitionImpl<N>* p, void* d, const void* h, int64_t bytes) {
+    if (bytes > 0)
+        CT_CUDA_CHECK(cudaMemcpyAsync(d, h, bytes, cudaMemcpyHostToDevice, p->compute_stream_raw));
+}
+template <int N>
+void lu_to_host(PartitionImpl<N>* p, void* h, const void* d, int64_t bytes) {
+    CT_CUDA_CHECK(cudaMemcpyAsync(h, d, bytes, cudaMemcpyDeviceToHost, p->compute_stream_raw));
+    CT_CUDA_CHECK(cudaStreamSynchronize(p->compute_stream_raw));
+}
+template <int N>
+void lu_sync(PartitionImpl<N>* p) {
+    CT_CUDA_CHECK(cudaStreamSynchronize(p->compute_stream_raw));
+}
+template <int N>
+void lu_mark(PartitionImpl<N>* p, const char* what) {
+    la_smark(p->compute_stream_raw, what);
+}
+#else
+#define LU_LAMBDA [=]
+template <int N, typename F>
+void lu_for(PartitionImpl<N>*, int64_t n, const F& f) {
+    for (int64_t i = 0; i < n; ++i)
+        f(i);
+}
+template <int N>
+char* lu_alloc(PartitionImpl<N>*, int64_t bytes) {
+    return new char[std::max<int64_t>(bytes, 16)];
+}
+template <int N>
+void lu_release(PartitionImpl<N>*, void* q) {
+    delete[] static_cast<char*>(q);
+}
+char* lu_msg_alloc(int64_t bytes) { return new char[std::max<int64_t>(bytes, 16)]; }
+template <int N>
+void lu_msg_free(PartitionImpl<N>*, char* b) {
+    delete[] b;
+}
+template <int N>
+void lu_copy2d(PartitionImpl<N>*, void* d, int64_t dp, const void* s, int64_t sp, int64_t w,
+               int64_t h) {
+    for (int64_t i = 0; i < h && w > 0; ++i)
+        memcpy(static_cast<char*>(d) + i * dp, static_cast<const char*>(s) + i * sp, w);
+}
+template <int N>
+void lu_zero(PartitionImpl<N>*, void* d, int64_t bytes) {
+    if (bytes > 0)
+        memset(d, 0, bytes);
+}
+template <int N>
+void lu_to_dev(PartitionImpl<N>*, void* d, const void* h, int64_t bytes) {
+    if (bytes > 0)
+        memcpy(d, h, bytes);
+}
+template <int N>
+void lu_to_host(PartitionImpl<N>*, void* h, const void* d, int64_t bytes) {
+    if (bytes > 0)
+        memcpy(h, d, bytes);
+}
+template <int N>
+void lu_sync(PartitionImpl<N>*) {}
+template <int N>
+void lu_mark(PartitionImpl<N>*, const char* what) {
+    la_mark(what);
+}
+#endif
+
+/// dst[i * di + j * dj] = T(src[base + i * si + j * sj]) for i < h, j < w.
+template <int N, typename S, typename T>
+void lu_k_put(PartitionImpl<N>* p, T* dst, int64_t di, int64_t dj, const S* src, int64_t base,
+              int64_t si, int64_t sj, int64_t h, int64_t w) {
+    lu_for(p, h * w, LU_LAMBDA(int64_t k) {
+        int64_t i = k / w, j = k % w;
+        dst[i * di + j * dj] = cn_cast<T>(src[base + i * si + j * sj]);
+    });
+}
+
+/// Row interchanges top + i <-> top + piv[i] - 1, in order, on each of ncols columns.
+template <int N, typename T>
+void lu_k_laswp(PartitionImpl<N>* p, T* A, int64_t lda, int64_t ncols, int64_t top,
+                const int64_t* piv, int npiv) {
+    lu_for(p, ncols, LU_LAMBDA(int64_t j) {
+        T* c = A + j * lda;
+        for (int i = 0; i < npiv; ++i) {
+            int64_t r = top + i, q = top + piv[i] - 1;
+            if (q != r) {
+                T t = c[r];
+                c[r] = c[q];
+                c[q] = t;
+            }
+        }
+    });
+}
+
+/// B = this worker's rows of the identity (B zeroed before).
+template <int N, typename T>
+void lu_k_eye(PartitionImpl<N>* p, T* B, int64_t ldb, int64_t rows, int nb, int Q, int me) {
+    lu_for(p, rows, LU_LAMBDA(int64_t r) {
+        int64_t g = (me + (r / nb) * Q) * static_cast<int64_t>(nb) + r % nb;
+        B[r + g * ldb] = T(1);
+    });
+}
+
+template <int N, typename T>
+void lu_k_xpack(PartitionImpl<N>* p, T* dst, const int* lr, const T* B, int64_t ldb, int64_t k,
+                int64_t c0, int64_t w) {
+    lu_for(p, k * w, LU_LAMBDA(int64_t t) {
+        int64_t i = t / w, c = t % w;
+        dst[t] = B[lr[i] + (c0 + c) * ldb];
+    });
+}
+
+template <int N, typename T>
+void lu_k_xput(PartitionImpl<N>* p, T* out, int64_t tc, int64_t coff, const int* rows, int64_t r0,
+               const T* src, int64_t k, int64_t w) {
+    lu_for(p, k * w, LU_LAMBDA(int64_t t) {
+        int64_t i = t / w, c = t % w;
+        out[(rows[i] - r0) * tc + coff + c] = src[t];
+    });
+}
+
+// Dense kernels (column-major).
+#ifdef USE_NVIDIA
+template <typename T>
+cudaDataType lu_cuda_type() {
+    if constexpr (std::is_same_v<T, float>)
+        return CUDA_R_32F;
+    else if constexpr (std::is_same_v<T, double>)
+        return CUDA_R_64F;
+    else if constexpr (std::is_same_v<T, cn_c64>)
+        return CUDA_C_32F;
+    else
+        return CUDA_C_64F;
+}
+
+cusolverDnParams_t lu_params() {
+    thread_local cusolverDnParams_t prm = nullptr;
+    if (prm == nullptr)
+        CT_CUSOLVER_CHECK(cusolverDnCreateParams(&prm));
+    return prm;
+}
+
+template <typename T>
+void lu_getrf(PartitionImpl<2>* p, LaLu* L, int64_t m, int64_t w, T* A, int64_t lda,
+              int64_t* piv) {
+    cudaStream_t cs = p->compute_stream_raw;
+    LaHandles& h = la_handles(cs);
+    cudaDataType ty = lu_cuda_type<T>();
+    size_t db = 0, hb = 0;
+    CT_CUSOLVER_CHECK(
+        cusolverDnXgetrf_bufferSize(h.solver, lu_params(), m, w, ty, A, lda, ty, &db, &hb));
+    if (db > L->work_bytes) {
+        la_dfree(L->work, cs);
+        L->work = static_cast<char*>(la_dalloc(db, cs));
+        L->work_bytes = db;
+    }
+    if (hb > L->hwork.size())
+        L->hwork.resize(hb);
+    CT_CUSOLVER_CHECK(cusolverDnXgetrf(h.solver, lu_params(), m, w, ty, A, lda, piv, ty, L->work,
+                                       db, hb ? L->hwork.data() : nullptr, hb, L->info));
+}
+
+/// Solves A x = B with M = A^T = P L U factored in place (getrs of M^T).
+template <typename T>
+void lu_getrs(PartitionImpl<2>* p, LaLu* L, int64_t n, int64_t nrhs, const T* M, int64_t lda,
+              T* B, int64_t ldb) {
+    LaHandles& h = la_handles(p->compute_stream_raw);
+    cudaDataType ty = lu_cuda_type<T>();
+    CT_CUSOLVER_CHECK(cusolverDnXgetrs(h.solver, lu_params(), CUBLAS_OP_T, n, nrhs, ty, M, lda,
+                                       L->piv, ty, B, ldb, L->info));
+}
+
+/// B = op(A)^-1 B with A unit lower (trans or not) or upper non-unit (trans).
+template <typename T>
+void lu_trsm(PartitionImpl<2>* p, bool lower, bool trans, int64_t m, int64_t nc, const T* A,
+             int64_t lda, T* B, int64_t ldb) {
+    if (m <= 0 || nc <= 0)
+        return;
+    LaHandles& h = la_handles(p->compute_stream_raw);
+    CT_CUBLAS_CHECK(cula::trsm(h.blas, lower ? CUBLAS_FILL_MODE_LOWER : CUBLAS_FILL_MODE_UPPER,
+                               trans ? CUBLAS_OP_T : CUBLAS_OP_N,
+                               lower ? CUBLAS_DIAG_UNIT : CUBLAS_DIAG_NON_UNIT, static_cast<int>(m),
+                               static_cast<int>(nc), A, static_cast<int>(lda), B,
+                               static_cast<int>(ldb)));
+}
+
+/// C (m x nn) -= op(A) B, op(A) = A^T (A is k x m) or A (m x k).
+template <typename T>
+void lu_gemm_sub(PartitionImpl<2>* p, bool ta, int64_t m, int64_t nn, int64_t k, const T* A,
+                 int64_t lda, const T* B, int64_t ldb, T* C, int64_t ldc) {
+    if (m <= 0 || nn <= 0 || k <= 0)
+        return;
+    LaHandles& h = la_handles(p->compute_stream_raw);
+    CT_CUBLAS_CHECK(cula::gemm_sub(h.blas, ta ? CUBLAS_OP_T : CUBLAS_OP_N, static_cast<int>(m),
+                                   static_cast<int>(nn), static_cast<int>(k), A,
+                                   static_cast<int>(lda), B, static_cast<int>(ldb), C,
+                                   static_cast<int>(ldc)));
+}
+#else
+template <typename T>
+using LuMap = Eigen::Map<Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>, 0, Eigen::OuterStride<>>;
+
+/// Unblocked partial-pivoted LU of the m x w panel A (LAPACK getf2 semantics).
+template <typename T>
+void lu_getrf(PartitionImpl<2>*, LaLu*, int64_t m, int64_t w, T* A, int64_t lda, int64_t* piv) {
+    using R = la_real_t<T>;
+    for (int64_t j = 0; j < std::min(m, w); ++j) {
+        T* cj = A + j * lda;
+        int64_t pr = j;
+        R best = -1;
+        for (int64_t i = j; i < m; ++i) {
+            R v = std::abs(cj[i]);
+            if (v > best) {
+                best = v;
+                pr = i;
+            }
+        }
+        piv[j] = pr + 1;
+        if (cj[pr] != T(0)) {
+            if (pr != j)
+                for (int64_t c = 0; c < w; ++c)
+                    std::swap(A[j + c * lda], A[pr + c * lda]);
+            for (int64_t i = j + 1; i < m; ++i)
+                cj[i] /= cj[j];
+        }
+        for (int64_t c = j + 1; c < w; ++c) {
+            T* cc = A + c * lda;
+            T f = cc[j];
+            if (f != T(0))
+                for (int64_t i = j + 1; i < m; ++i)
+                    cc[i] -= cj[i] * f;
+        }
+    }
+}
+
+template <typename T>
+void lu_trsm(PartitionImpl<2>*, bool lower, bool trans, int64_t m, int64_t nc, const T* A,
+             int64_t lda, T* B, int64_t ldb) {
+    if (m <= 0 || nc <= 0)
+        return;
+    LuMap<T> a(const_cast<T*>(A), m, m, Eigen::OuterStride<>(lda));
+    LuMap<T> b(B, m, nc, Eigen::OuterStride<>(ldb));
+    if (lower && !trans)
+        a.template triangularView<Eigen::UnitLower>().solveInPlace(b);
+    else if (lower)
+        a.template triangularView<Eigen::UnitLower>().transpose().solveInPlace(b);
+    else
+        a.template triangularView<Eigen::Upper>().transpose().solveInPlace(b);
+}
+
+template <typename T>
+void lu_gemm_sub(PartitionImpl<2>*, bool ta, int64_t m, int64_t nn, int64_t k, const T* A,
+                 int64_t lda, const T* B, int64_t ldb, T* C, int64_t ldc) {
+    if (m <= 0 || nn <= 0 || k <= 0)
+        return;
+    LuMap<T> b(const_cast<T*>(B), k, nn, Eigen::OuterStride<>(ldb));
+    LuMap<T> c(C, m, nn, Eigen::OuterStride<>(ldc));
+    if (ta) {
+        LuMap<T> a(const_cast<T*>(A), k, m, Eigen::OuterStride<>(lda));
+        c.noalias() -= a.transpose() * b;
+    } else {
+        LuMap<T> a(const_cast<T*>(A), m, k, Eigen::OuterStride<>(lda));
+        c.noalias() -= a * b;
+    }
+}
+#endif
+
+/// LU message: rows/ids in r0, r1 and c0, c1 (device buffer on NVIDIA; host otherwise).
+template <int N, int M>
+void lu_send(PartitionImpl<N>* p, ArrayDAGGroup* g, const ChareIndex<M>& ci, int node_id,
+             int name, int kind, int r0, int r1, int c0, int c1, char* buf, int64_t bytes) {
+#ifdef USE_NVIDIA
+    int rd[6] = {r0, r1, 0, c0, c1, 0};
+    la_comm_after_compute(p);
+    la_dev_send_to<N, M>(p, g, ci, node_id, kind, name, rd, bytes, buf);
+#else
+    (void)p;
+    (void)name;
+    LaMsgHeader h = {};
+    h.kind = 3;
+    h.operand = kind;
+    h.start[0] = r0;
+    h.start[1] = r1;
+    h.start[2] = c0;
+    h.size[0] = c1;
+    h.count = bytes;
+    std::vector<char> msg(sizeof(h) + bytes);
+    memcpy(msg.data(), &h, sizeof(h));
+    if (bytes > 0)
+        memcpy(msg.data() + sizeof(h), buf, bytes);
+    delete[] buf;
+    la_send_to<M>(g, ci, node_id, msg);
+#endif
+}
+
+/// Host message to the worker: local pieces of the operands are in place.
+void lu_poke(ArrayDAGGroup* g, int node_id, const std::array<int, 2>& w) {
+    LaMsgHeader h = {};
+    h.kind = 3;
+    h.operand = LU_POKE;
+    std::vector<char> msg(sizeof(h));
+    memcpy(msg.data(), &h, sizeof(h));
+    la_send_to<2>(g, ChareIndex<2>{{w[0], w[1]}}, node_id, msg);
+}
+
+/// Sends `bytes` (a multiple of 8) at src to every other worker, in chunks.
+void lu_bcast(PartitionImpl<2>* p, ArrayDAGGroup* g, int node_id, const LaSpec& s, LaLu* L,
+              int kind, int id, const char* src, int64_t bytes) {
+    int64_t words = bytes / 8, per = LA_CHUNK / 8;
+    for (int w = 0; w < L->Q; ++w) {
+        if (w == L->me)
+            continue;
+        ChareIndex<2> ci{{L->wci[w][0], L->wci[w][1]}};
+        for (int64_t lo = 0; lo < words; lo += per) {
+            int64_t hi = std::min(words, lo + per), nbytes = (hi - lo) * 8;
+            char* buf = lu_msg_alloc(nbytes);
+            lu_copy2d(p, buf, nbytes, src + lo * 8, nbytes, nbytes, 1);
+            lu_send<2, 2>(p, g, ci, node_id, s.out_name, kind, id, static_cast<int>(lo),
+                          static_cast<int>(hi), static_cast<int>(words), buf, nbytes);
+        }
+    }
+}
+
+/// Small sends: one host message per worker (no device message latency).
+void lu_bcast_host(PartitionImpl<2>* p, ArrayDAGGroup* g, int node_id, LaLu* L, int kind, int id,
+                   const char* src, int64_t bytes) {
+    LaMsgHeader h = {};
+    h.kind = 3;
+    h.operand = kind;
+    h.start[0] = id;
+    h.start[2] = static_cast<int>(bytes / 8);
+    h.size[0] = static_cast<int>(bytes / 8);
+    h.count = bytes;
+    std::vector<char> msg(sizeof(h) + bytes);
+    memcpy(msg.data(), &h, sizeof(h));
+    lu_to_host(p, msg.data() + sizeof(h), src, bytes);
+    for (int w = 0; w < L->Q; ++w)
+        if (w != L->me)
+            la_send_to<2>(g, ChareIndex<2>{{L->wci[w][0], L->wci[w][1]}}, node_id, msg);
+}
+
+template <int N>
+void lu_blob_recv(PartitionImpl<N>* p, LaLu* L, const LaDevChunk& c) {
+    LaLuBlob& b = L->blobs[{c.kind, c.r0}];
+    int64_t lo = c.r1, hi = c.c0;
+    b.total = c.c1;
+    if (lo == 0 && hi == b.total) {
+        b.buf = c.buf;
+        b.comm = true;
+    } else {
+        if (b.buf == nullptr)
+            b.buf = lu_alloc(p, b.total * 8);
+        lu_copy2d(p, b.buf + lo * 8, (hi - lo) * 8, c.buf, (hi - lo) * 8, (hi - lo) * 8, 1);
+        lu_msg_free(p, c.buf);
+    }
+    b.got += hi - lo;
+}
+
+const char* lu_blob(LaLu* L, int kind, int id) {
+    auto it = L->blobs.find({kind, id});
+    if (it == L->blobs.end() || it->second.got < it->second.total)
+        return nullptr;
+    return it->second.buf;
+}
+
+void lu_blob_release(PartitionImpl<2>* p, LaLu* L, int kind, int id) {
+    auto it = L->blobs.find({kind, id});
+    if (it->second.comm)
+        lu_msg_free(p, it->second.buf);
+    else
+        lu_release(p, it->second.buf);
+    L->blobs.erase(it);
+}
+
+int64_t lu_piv_bytes(int w) { return (static_cast<int64_t>(w) * 8 + 63) / 64 * 64; }
+
+/// Owner: factor panel k in place and send it (pivots, then rows [k nb, n)).
+template <typename T>
+void lu_factor(PartitionImpl<2>* p, ArrayDAGGroup* g, int node_id, const LaSpec& s, LaLu* L,
+               int k) {
+    int64_t n = L->n, top = static_cast<int64_t>(k) * L->nb, m = n - top;
+    int wk = L->width(k);
+    T* P = reinterpret_cast<T*>(L->W) + top + L->loff(k) * n;
+    lu_getrf<T>(p, L, m, wk, P, n, L->piv + top);
+    L->factored[k] = 1;
+    if (L->Q == 1)
+        return;
+    int64_t pb = lu_piv_bytes(wk), bytes = (pb + m * wk * sizeof(T) + 7) / 8 * 8;
+    char* st = lu_alloc(p, bytes);
+    lu_copy2d(p, st, wk * 8, L->piv + top, wk * 8, wk * 8, 1);
+    lu_copy2d(p, st + pb, m * sizeof(T), P, n * sizeof(T), m * sizeof(T), wk);
+    lu_bcast(p, g, node_id, s, L, LU_PANEL, k, st, bytes);
+    lu_release(p, st);
+}
+
+/// Trailing update of local columns [c0, c1) by panel k (P: rows [k nb, n), leading dim lp).
+template <typename T>
+void lu_update(PartitionImpl<2>* p, LaLu* L, int k, const T* P, int64_t lp, int64_t c0,
+               int64_t c1) {
+    if (c1 <= c0)
+        return;
+    int64_t n = L->n, top = static_cast<int64_t>(k) * L->nb, m = n - top;
+    int wk = L->width(k);
+    T* X = reinterpret_cast<T*>(L->W) + top + c0 * n;
+    lu_trsm<T>(p, true, false, wk, c1 - c0, P, lp, X, n);
+    lu_gemm_sub<T>(p, false, m - wk, c1 - c0, wk, P + wk, lp, X, n, X + wk, n);
+}
+
+/// Factorization: apply the panels in order; false while one is missing.
+template <typename T>
+bool lu_factor_loop(PartitionImpl<2>* p, ArrayDAGGroup* g, int node_id, const LaSpec& s,
+                    LaLu* L) {
+    int64_t n = L->n;
+    T* Wt = reinterpret_cast<T*>(L->W);
+    while (L->next < L->np) {
+        int k = L->next, wk = L->width(k);
+        int64_t top = static_cast<int64_t>(k) * L->nb;
+        bool mine = L->owner(k) == L->me;
+        const T* P;
+        int64_t lp;
+        if (mine) {
+            if (!L->factored[k])
+                lu_factor<T>(p, g, node_id, s, L, k);
+            P = Wt + top + L->loff(k) * n;
+            lp = n;
+        } else {
+            const char* b = lu_blob(L, LU_PANEL, k);
+            if (b == nullptr)
+                return false;
+            lu_copy2d(p, L->piv + top, wk * 8, b, wk * 8, wk * 8, 1);
+            P = reinterpret_cast<const T*>(b + lu_piv_bytes(wk));
+            lp = n - top;
+        }
+        if (L->diag)
+            lu_copy2d(p, L->diag + top * sizeof(T), sizeof(T), P, (lp + 1) * sizeof(T), sizeof(T),
+                      wk);
+        // the panel's interchanges on every other local column
+        int64_t a = mine ? L->loff(k) : L->wcols, e = mine ? a + wk : L->wcols;
+        lu_k_laswp<2, T>(p, Wt, n, a, top, L->piv + top, wk);
+        lu_k_laswp<2, T>(p, Wt + e * n, n, L->wcols - e, top, L->piv + top, wk);
+        int64_t t0 = L->loff_ge(k + 1);
+        int k1 = k + 1;
+        if (k1 < L->np && L->owner(k1) == L->me && !L->factored[k1]) {
+            lu_update<T>(p, L, k, P, lp, t0, t0 + L->width(k1));
+            lu_factor<T>(p, g, node_id, s, L, k1);
+            t0 += L->width(k1);
+        }
+        lu_update<T>(p, L, k, P, lp, t0, L->wcols);
+        if (!mine)
+            lu_blob_release(p, L, LU_PANEL, k);
+        ++L->next;
+    }
+    return true;
+}
+
+/// Owner: solve block j of U^T y = b (fwd) or L^T w = y, and send it.
+template <typename T>
+void lu_bsolve(PartitionImpl<2>* p, ArrayDAGGroup* g, int node_id, const LaSpec& s, LaLu* L,
+               int j, bool fwd) {
+    int64_t n = L->n, top = static_cast<int64_t>(j) * L->nb, lj = L->loff(j), ldb = L->ldb();
+    int wj = L->width(j);
+    T* Bj = reinterpret_cast<T*>(L->B) + lj;
+    lu_trsm<T>(p, !fwd, true, wj, L->nrhs, reinterpret_cast<T*>(L->W) + top + lj * n, n, Bj, ldb);
+    L->solved[j] = 1;
+    if (L->Q == 1)
+        return;
+    int64_t bytes = (wj * L->nrhs * sizeof(T) + 7) / 8 * 8;
+    char* st = lu_alloc(p, bytes);
+    lu_copy2d(p, st, wj * sizeof(T), Bj, ldb * sizeof(T), wj * sizeof(T), L->nrhs);
+    if (bytes <= (int64_t(1) << 20))
+        lu_bcast_host(p, g, node_id, L, fwd ? LU_Y : LU_Z, j, st, bytes);
+    else
+        lu_bcast(p, g, node_id, s, L, fwd ? LU_Y : LU_Z, j, st, bytes);
+    lu_release(p, st);
+}
+
+/// Local rows [r0, r1) of B -= (rows of block j in those columns of W)^T y_j.
+template <typename T>
+void lu_bupdate(PartitionImpl<2>* p, LaLu* L, int j, const T* y, int64_t ly, int64_t r0,
+                int64_t r1) {
+    if (r1 <= r0)
+        return;
+    int64_t n = L->n, top = static_cast<int64_t>(j) * L->nb;
+    lu_gemm_sub<T>(p, true, r1 - r0, L->nrhs, L->width(j),
+                   reinterpret_cast<const T*>(L->W) + top + r0 * n, n, y, ly,
+                   reinterpret_cast<T*>(L->B) + r0, L->ldb());
+}
+
+/// Forward (U^T) or backward (L^T) substitution; false while a block is missing.
+template <typename T>
+bool lu_subst(PartitionImpl<2>* p, ArrayDAGGroup* g, int node_id, const LaSpec& s, LaLu* L,
+              bool fwd) {
+    int kind = fwd ? LU_Y : LU_Z;
+    while (fwd ? L->next < L->np : L->next >= 0) {
+        int j = L->next;
+        bool mine = L->owner(j) == L->me;
+        const T* y;
+        int64_t ly;
+        if (mine) {
+            if (!L->solved[j])
+                lu_bsolve<T>(p, g, node_id, s, L, j, fwd);
+            y = reinterpret_cast<const T*>(L->B) + L->loff(j);
+            ly = L->ldb();
+        } else {
+            const char* b = lu_blob(L, kind, j);
+            if (b == nullptr)
+                return false;
+            y = reinterpret_cast<const T*>(b);
+            ly = L->width(j);
+        }
+        int j1 = fwd ? j + 1 : j - 1;
+        bool ahead = j1 >= 0 && j1 < L->np && L->owner(j1) == L->me && !L->solved[j1];
+        if (fwd) {
+            int64_t r0 = L->loff_ge(j + 1);
+            if (ahead) {
+                lu_bupdate<T>(p, L, j, y, ly, r0, r0 + L->width(j1));
+                lu_bsolve<T>(p, g, node_id, s, L, j1, true);
+                r0 += L->width(j1);
+            }
+            lu_bupdate<T>(p, L, j, y, ly, r0, L->wcols);
+        } else {
+            int64_t r1 = L->loff_ge(j);
+            if (ahead) {
+                lu_bupdate<T>(p, L, j, y, ly, r1 - L->width(j1), r1);
+                lu_bsolve<T>(p, g, node_id, s, L, j1, false);
+                r1 -= L->width(j1);
+            }
+            lu_bupdate<T>(p, L, j, y, ly, 0, r1);
+        }
+        if (!mine)
+            lu_blob_release(p, L, kind, j);
+        L->next += fwd ? 1 : -1;
+    }
+    return true;
+}
+
+/// Send result rows to the output tiles: row i is local row lr of B (src = v[i]), or vals[i].
+template <int M, typename T>
+void lu_output_nd(PartitionImpl<2>* p, ArrayDAGGroup* g, int node_id, const LaSpec& s, LaLu* L,
+                  const std::vector<int64_t>& v, const T* vals) {
+    ArrayDecomp<M> decomp = g->array_meta[s.out_name].template decomp<M>();
+    std::array<int, M> bs{}, be{}, one{};
+    for (int d = 0; d < M; ++d) {
+        be[d] = s.out_shape[d];
+        one[d] = 1;
+    }
+    ArrayRegion<M> box(bs, be, one);
+    std::vector<std::vector<int>> keep;
+    for (auto& [ci, pg] : decompose(decomp.to_global(box), decomp)) {
+        ArrayRegion<M> piece = decomp.to_local(pg);
+        if (piece.size() <= 0)
+            continue;
+        int64_t h = piece.size(0), w = M == 2 ? piece.size(M - 1) : 1;
+        int pr0 = piece.start[0], pc0 = M == 2 ? piece.start[M - 1] : 0;
+        std::vector<int> rows, lr;
+        for (int64_t i = pr0; i < pr0 + h; ++i) {
+            if (vals) {
+                rows.push_back(static_cast<int>(i));
+                lr.push_back(0);
+                continue;
+            }
+            int64_t src = v[i];
+            int jj = static_cast<int>(src / L->nb);
+            if (L->owner(jj) == L->me) {
+                rows.push_back(static_cast<int>(i));
+                lr.push_back(
+                    static_cast<int>(L->loff(jj) + src - static_cast<int64_t>(jj) * L->nb));
+            }
+        }
+        int64_t per = std::max<int64_t>(1, LA_CHUNK / (w * static_cast<int64_t>(sizeof(T))));
+        for (int64_t a = 0; a < static_cast<int64_t>(rows.size()); a += per) {
+            int64_t k = std::min<int64_t>(per, rows.size() - a);
+            int64_t hb = (8 * k + 15) / 16 * 16, bytes = hb + k * w * sizeof(T);
+            char* buf = lu_msg_alloc(bytes);
+            lu_to_dev(p, buf, rows.data() + a, 4 * k);
+            lu_to_dev(p, buf + 4 * k, lr.data() + a, 4 * k);
+            T* dst = reinterpret_cast<T*>(buf + hb);
+            if (vals) {
+                std::vector<T> hv(k);
+                for (int64_t i = 0; i < k; ++i)
+                    hv[i] = vals[rows[a + i]];
+                lu_to_dev(p, dst, hv.data(), k * sizeof(T));
+                lu_sync(p);
+            } else {
+                lu_k_xpack<2, T>(p, dst, reinterpret_cast<const int*>(buf + 4 * k),
+                                 reinterpret_cast<const T*>(L->B), L->ldb(), k, pc0, w);
+            }
+            lu_send<2, M>(p, g, ci, node_id, s.out_name, LU_X, static_cast<int>(k), 0, pc0,
+                          static_cast<int>(pc0 + w), buf, bytes);
+        }
+        keep.push_back(std::move(rows));
+        keep.push_back(std::move(lr));
+    }
+    lu_sync(p); // the row lists were copied from pageable memory
+}
+
+template <typename T>
+void lu_output(PartitionImpl<2>* p, ArrayDAGGroup* g, int node_id, const LaSpec& s, LaLu* L) {
+    int64_t n = L->n;
+    std::vector<int64_t> v(n);
+    for (int64_t i = 0; i < n; ++i)
+        v[i] = i;
+    if (!L->whole) { // x = P w: the interchanges in reverse order
+        std::vector<int64_t> piv(n);
+        lu_to_host(p, piv.data(), L->piv, n * 8);
+        for (int64_t k = n - 1; k >= 0; --k)
+            std::swap(v[k], v[(k / L->nb) * L->nb + piv[k] - 1]);
+    }
+    if (s.out_nd == 1)
+        lu_output_nd<1, T>(p, g, node_id, s, L, v, nullptr);
+    else
+        lu_output_nd<2, T>(p, g, node_id, s, L, v, nullptr);
+}
+
+template <typename T>
+void lu_det(PartitionImpl<2>* p, ArrayDAGGroup* g, int node_id, const LaSpec& s, LaLu* L) {
+    int64_t n = L->n;
+    std::vector<T> diag(n);
+    std::vector<int64_t> piv(n);
+    lu_to_host(p, diag.data(), L->diag, n * sizeof(T));
+    lu_to_host(p, piv.data(), L->piv, n * 8);
+    int psign = 1;
+    for (int64_t i = 0; i < n; ++i)
+        if ((L->whole ? 0 : (i / L->nb) * L->nb) + piv[i] - 1 != i)
+            psign = -psign;
+    LaProblem<T> P;
+    P.R = s.out_rows();
+    P.C = 1;
+    P.out.assign(P.R, T(0));
+    slogdet_from_lu(P, diag.data(), 1, static_cast<int>(n), psign);
+    lu_output_nd<1, T>(p, g, node_id, s, L, {}, P.out.data());
+}
+
+/// Worker: assemble, factor, substitute, send the result.
+template <typename T>
+void la_lu_run(PartitionImpl<2>* p, ArrayDAGGroup* g, int node_id, const LaSpec& s, LaLu* L) {
+    int64_t n = L->n;
+    T* Wt = reinterpret_cast<T*>(L->W);
+    if (!L->assembled) {
+        if (L->covered < L->expected || L->pokes_got < L->pokes_sent)
+            return;
+#ifdef USE_NVIDIA
+        cudaStream_t cs = p->compute_stream_raw;
+        CT_CUDA_CHECK(cudaStreamWaitEvent(cs, L->ready, 0));
+        for (cudaEvent_t e : L->placed) {
+            CT_CUDA_CHECK(cudaStreamWaitEvent(cs, e, 0));
+            cudaEventDestroy(e);
+        }
+        L->placed.clear();
+#endif
+        L->assembled = true;
+        lu_mark(p, "assembled");
+        if (L->op == LA_INV) {
+            lu_zero(p, L->B, L->wcols * L->nrhs * sizeof(T));
+            lu_k_eye<2, T>(p, reinterpret_cast<T*>(L->B), L->ldb(), L->wcols, L->nb, L->Q, L->me);
+        }
+#ifdef USE_NVIDIA
+        if (L->Q == 1) {
+            lu_getrf<T>(p, L, n, n, Wt, n, L->piv);
+            L->whole = true;
+            if (L->diag)
+                lu_copy2d(p, L->diag, sizeof(T), Wt, (n + 1) * sizeof(T), sizeof(T), n);
+            lu_mark(p, "getrf");
+            if (L->nrhs > 0) {
+                lu_getrs<T>(p, L, n, L->nrhs, Wt, n, reinterpret_cast<T*>(L->B), L->ldb());
+                lu_mark(p, "getrs");
+            }
+            L->phase = 3;
+        }
+#endif
+    }
+    if (L->phase == 0) {
+        if (!lu_factor_loop<T>(p, g, node_id, s, L))
+            return;
+        lu_mark(p, "factor");
+        L->phase = L->nrhs > 0 ? 1 : 3;
+        L->next = 0;
+        L->solved.assign(L->np, 0);
+    }
+    if (L->phase == 1) {
+        if (!lu_subst<T>(p, g, node_id, s, L, true))
+            return;
+        lu_mark(p, "forward");
+        L->phase = 2;
+        L->next = L->np - 1;
+        L->solved.assign(L->np, 0);
+    }
+    if (L->phase == 2) {
+        if (!lu_subst<T>(p, g, node_id, s, L, false))
+            return;
+        lu_mark(p, "backward");
+        L->phase = 3;
+    }
+    if (L->phase == 3) {
+        if (L->nrhs > 0)
+            lu_output<T>(p, g, node_id, s, L);
+        else if (L->me == 0)
+            lu_det<T>(p, g, node_id, s, L);
+        lu_mark(p, "output");
+        L->phase = 4;
+        L->done = true;
+    }
+}
+
+void la_lu_free(PartitionImpl<2>* p, int node_id, LaLu* L) {
+    lu_release(p, L->W);
+    lu_release(p, L->B);
+    lu_release(p, L->piv);
+    lu_release(p, L->diag);
+#ifdef USE_NVIDIA
+    la_dfree(L->work, p->compute_stream_raw);
+    la_dfree(L->info, p->compute_stream_raw);
+    cudaEventDestroy(L->ready);
+#endif
+    la_lu_reg().erase(node_id);
+    delete L;
+}
+
+/// This PE's worker state, created (and W, B allocated) by the first chare to need it.
+template <int N, typename T>
+LaLu* la_lu_ctx(PartitionImpl<N>* p, const LaSpec& s, ArrayDAGGroup* g, int node_id) {
+    auto& reg = la_lu_reg();
+    auto it = reg.find(node_id);
+    if (it != reg.end())
+        return it->second;
+    auto* L = new LaLu();
+    if (!la_lu_geometry(s, g, *L) || L->me < 0)
+        CkAbort("linalg: no LU worker on PE %d", CkMyPe());
+    int64_t n = L->n;
+    L->W = lu_alloc(p, n * L->wcols * sizeof(T));
+    if (L->nrhs > 0)
+        L->B = lu_alloc(p, L->wcols * L->nrhs * sizeof(T));
+    L->piv = reinterpret_cast<int64_t*>(lu_alloc(p, n * 8));
+    if ((s.op == LA_DET || s.op == LA_SLOGDET) && L->me == 0)
+        L->diag = lu_alloc(p, n * sizeof(T));
+    L->factored.assign(L->np, 0);
+    L->solved.assign(L->np, 0);
+#ifdef USE_NVIDIA
+    L->info = reinterpret_cast<int*>(lu_alloc(p, sizeof(int)));
+    CT_CUDA_CHECK(cudaEventCreateWithFlags(&L->ready, cudaEventDisableTiming));
+    CT_CUDA_CHECK(cudaEventRecord(L->ready, p->compute_stream_raw));
+#endif
+    reg[node_id] = L;
+    return L;
+}
+
+/// Moves this chare's block of operand opi (A: into W as M = A^T; b: into B) to the
+/// workers: in place on this PE, else as messages. True if any part went in place.
+template <int N, typename S, typename T, typename Ctx>
+bool la_lu_place(PartitionImpl<N>* p, ArrayDAGGroup* g, int node_id, const LaSpec& s, int opi,
+                 CTArrayBase<N>* arr, const LaLu& geo, Ctx& ctx) {
+    if constexpr (N > 2) {
+        return false;
+    } else {
+        const LaOperand& o = s.in[opi];
+        ArrayRegion<N> view =
+            la_view<N>(o, {arr->global_shape[0], N > 1 ? arr->global_shape[N - 1] : 1, 1});
+        ArrayRegion<N> tile = arr->decomp.chare_region_local(p->nd_index());
+        for (int d = 0; d < N; ++d)
+            if (tile.size(d) <= 0)
+                return false;
+        auto [blk, ok] = intersect(view, tile);
+        if (!ok || blk.size() <= 0)
+            return false;
+        const S* src = static_cast<const S*>(arr->device_data_ptr());
+        int64_t tc = N == 2 ? arr->region.size(N - 1) : 1;
+        int h = blk.size(0), w = N == 2 ? blk.size(N - 1) : 1;
+        int64_t rs = static_cast<int64_t>(view.step[0]) * tc;
+        int64_t cs = N == 2 ? view.step[N - 1] : 1;
+        int64_t base = static_cast<int64_t>(blk.start[0] - tile.start[0]) * tc;
+        int vr0 = (blk.start[0] - view.start[0]) / view.step[0], vc0 = 0;
+        if constexpr (N == 2) {
+            base += blk.start[1] - tile.start[1];
+            vc0 = (blk.start[1] - view.start[1]) / view.step[1];
+        }
+        int64_t n = geo.n, nb = geo.nb;
+        LaLu* L = nullptr;
+        for (int j = static_cast<int>(vr0 / nb); j * nb < vr0 + h; ++j) {
+            int rr0 = std::max<int>(vr0, j * nb), rr1 = std::min<int64_t>(vr0 + h, (j + 1) * nb);
+            int wk = geo.owner(j);
+            int64_t lrow = geo.loff(j) + rr0 - j * nb, sb = base + (rr0 - vr0) * rs;
+            if (geo.wpe[wk] == CkMyPe()) {
+                if (L == nullptr) {
+                    L = ctx();
+#ifdef USE_NVIDIA
+                    CT_CUDA_CHECK(cudaStreamWaitEvent(p->compute_stream_raw, L->ready, 0));
+#endif
+                }
+                if (opi == 0)
+                    lu_k_put<N, S, T>(p, reinterpret_cast<T*>(L->W) + vc0 + lrow * n, n, 1, src,
+                                      sb, rs, cs, rr1 - rr0, w);
+                else
+                    lu_k_put<N, S, T>(p, reinterpret_cast<T*>(L->B) + lrow + vc0 * L->ldb(), 1,
+                                      L->ldb(), src, sb, rs, cs, rr1 - rr0, w);
+                L->covered += static_cast<int64_t>(rr1 - rr0) * w;
+                continue;
+            }
+            ChareIndex<2> ci{{geo.wci[wk][0], geo.wci[wk][1]}};
+            int rc = static_cast<int>(
+                std::max<int64_t>(1, LA_CHUNK / (static_cast<int64_t>(w) * sizeof(T))));
+            for (int r = rr0; r < rr1; r += rc) {
+                int hh = std::min(rc, rr1 - r);
+                int64_t bytes = static_cast<int64_t>(hh) * w * sizeof(T);
+                char* buf = lu_msg_alloc(bytes);
+                T* d = reinterpret_cast<T*>(buf);
+                int64_t sr = sb + (r - rr0) * rs;
+                if (opi == 0)
+                    lu_k_put<N, S, T>(p, d, w, 1, src, sr, rs, cs, hh, w);
+                else
+                    lu_k_put<N, S, T>(p, d, 1, hh, src, sr, rs, cs, hh, w);
+                lu_send<N, 2>(p, g, ci, node_id, s.out_name, opi == 0 ? LU_A : LU_B, r, r + hh,
+                              vc0, vc0 + w, buf, bytes);
+            }
+        }
+#ifdef USE_NVIDIA
+        if (L) {
+            cudaEvent_t e;
+            CT_CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+            CT_CUDA_CHECK(cudaEventRecord(e, p->compute_stream_raw));
+            L->placed.push_back(e);
+        }
+#endif
+        return L != nullptr;
+    }
+}
+
+template <int N, typename T>
+void la_lu_recv(PartitionImpl<N>* p, const LaSpec& s, LinalgState<N>& st, const LaDevChunk& c) {
+    LaLu* L = st.lu;
+    switch (c.kind) {
+    case LU_A:
+    case LU_B: {
+        int j = c.r0 / L->nb;
+        int64_t w = c.c1 - c.c0, hh = c.r1 - c.r0, lrow = L->loff(j) + c.r0 - j * L->nb;
+        if (c.kind == LU_A)
+            lu_copy2d(p, reinterpret_cast<T*>(L->W) + c.c0 + lrow * L->n, L->n * sizeof(T), c.buf,
+                      w * sizeof(T), w * sizeof(T), hh);
+        else
+            lu_copy2d(p, reinterpret_cast<T*>(L->B) + lrow + c.c0 * L->ldb(),
+                      L->ldb() * sizeof(T), c.buf, hh * sizeof(T), hh * sizeof(T), w);
+        L->covered += hh * w;
+        lu_msg_free(p, c.buf);
+        break;
+    }
+    case LU_PANEL:
+    case LU_Y:
+    case LU_Z:
+        lu_blob_recv<N>(p, L, c);
+        break;
+    case LU_X: {
+        int64_t k = c.r0, w = c.c1 - c.c0, tc = 1, coff = 0;
+        if constexpr (N == 2) {
+            tc = st.mine.size(1);
+            coff = c.c0 - st.mine.start[1];
+        }
+        T* out = static_cast<T*>(p->arrays[s.out_name]->device_data_ptr());
+        lu_k_xput<N, T>(p, out, tc, coff, reinterpret_cast<const int*>(c.buf), st.mine.start[0],
+                        reinterpret_cast<const T*>(c.buf + (8 * k + 15) / 16 * 16), k, w);
+        lu_msg_free(p, c.buf);
+        st.out_covered += k * w;
+        break;
+    }
+    default:
+        CkAbort("linalg: bad LU message kind %d", c.kind);
+    }
+}
+
+} // namespace
+
+template <int N>
+static bool la_lu_progress(PartitionImpl<N>* p, ArrayDAGGroup* g, int node_id, const LaSpec& s,
+                           LinalgState<N>& st) {
+    la_cur_node = node_id;
+    for (auto& msg : st.stash) {
+        LaMsgHeader h;
+        memcpy(&h, msg.data(), sizeof(h));
+        if (h.operand == LU_POKE) {
+            if (st.lu == nullptr)
+                CkAbort("linalg: LU poke at a non-worker");
+            ++st.lu->pokes_got;
+            continue;
+        }
+        char* b = lu_msg_alloc(h.count);
+        lu_to_dev(p, b, msg.data() + sizeof(h), h.count);
+        st.dev_stash.push_back({h.operand, h.start[0], h.start[1], h.start[2], h.size[0], b});
+    }
+    st.stash.clear();
+    std::vector<LaDevChunk> chunks;
+    chunks.swap(st.dev_stash);
+    la_dispatch(s.dt, [&](auto tag) {
+        using T = decltype(tag);
+        for (auto& c : chunks)
+            la_lu_recv<N, T>(p, s, st, c);
+        if constexpr (N == 2)
+            if (st.lu)
+                la_lu_run<T>(p, g, node_id, s, st.lu);
+    });
+    if (st.lu && st.lu->done) {
+        if constexpr (N == 2)
+            la_lu_free(p, node_id, st.lu);
+        st.lu = nullptr;
+        la_report(node_id, "lu");
+    }
+    return st.lu == nullptr && (!st.owner || st.out_covered >= st.out_expected);
+}
+
+/// LU path for this node (false: not applicable, use the gathered path).
+template <int N>
+static bool la_lu_execute(ArrayDAGExecutorND<N>* ex, PartitionImpl<N>* p, ArrayDAGGroup* g,
+                          DAGNode* node, const LaSpec& s) {
+    LaLu geo;
+    if (!la_lu_use(s) || !la_lu_geometry(s, g, geo))
+        return false;
+#ifdef USE_NVIDIA
+    p->compute_after_others();
+#endif
+    auto idx = p->nd_index();
+    bool worker = false;
+    if constexpr (N == 2)
+        worker = geo.me >= 0 && idx[0] == geo.wci[geo.me][0] && idx[1] == geo.wci[geo.me][1];
+    LaLu* L = nullptr;
+    auto ctx = [&]() {
+        if (L == nullptr)
+            la_dispatch(s.dt, [&](auto t) { L = la_lu_ctx<N, decltype(t)>(p, s, g, node->id); });
+        return L;
+    };
+    bool local = false;
+    for (int i = 0; i < (s.op == LA_SOLVE ? 2 : 1); ++i) {
+        if (s.in[i].nd != N)
+            continue;
+        auto it = p->arrays.find(s.in[i].name);
+        if (it == p->arrays.end())
+            continue;
+        cn_dispatch(it->second->dtype, [&](auto stag) {
+            la_dispatch(s.dt, [&](auto ttag) {
+                local |= la_lu_place<N, decltype(stag), decltype(ttag)>(p, g, node->id, s, i,
+                                                                        it->second, geo, ctx);
+            });
+        });
+    }
+    if (worker)
+        ctx();
+    else if (local) {
+        ++ctx()->pokes_sent;
+        lu_poke(g, node->id, geo.wci[geo.me]);
+    }
+    bool owner = false;
+    ArrayRegion<N> mine;
+    if (N == s.out_nd) {
+        ArrayDecomp<N> out_decomp = g->array_meta[s.out_name].template decomp<N>();
+        mine = out_decomp.chare_region_local(idx);
+        owner = true;
+        for (int d = 0; d < N; ++d)
+            if (mine.size(d) <= 0)
+                owner = false;
+        if (owner) {
+            std::array<int, N> gs{}, zeros{}, sizes{}, ones{};
+            for (int d = 0; d < N; ++d) {
+                gs[d] = s.out_shape[d];
+                sizes[d] = mine.size(d);
+                ones[d] = 1;
+            }
+            p->ensure_array(ArrayRegion<N>(zeros, sizes, ones), gs, s.out_name, s.dt, out_decomp,
+                            false);
+#ifdef USE_NVIDIA
+            p->compute_after_others();
+#endif
+        }
+    }
+    if (!worker && !owner) {
+        ex->node_finished(node->id);
+        return true;
+    }
+    LinalgState<N>& st = ex->la_state[node->id];
+    st.node = node;
+    st.started = true;
+    st.lu_mode = true;
+    st.owner = owner;
+    st.mine = mine;
+    st.out_expected = owner ? mine.size() : 0;
+    if (worker)
+        st.lu = ctx();
+    if (la_lu_progress<N>(p, g, node->id, s, st)) {
+        ex->la_state.erase(node->id);
+        ex->node_finished(node->id);
+    }
+    return true;
+}
+
+#endif // LU path
+
 /// Process stashed messages; returns true once this chare is done with the node.
 template <int N>
 static bool la_progress(PartitionImpl<N>* partition, ArrayDAGGroup* g, int node_id,
@@ -2603,6 +3783,10 @@ void ArrayDAGExecutorND<N>::execute_linalg_node(DAGNode* node) {
     }
     if (s.dt != DType::FLOAT32 && s.dt != DType::FLOAT64 && !dtype_is_complex(s.dt))
         CkAbort("linalg: unsupported result dtype %d", (int)s.dt);
+#ifdef CT_LA_LU
+    if (la_lu_execute<N>(this, partition, g, node, s))
+        return;
+#endif
 #ifdef USE_NVIDIA
     la_dev_execute<N>(this, partition, g, node, s);
     return;
@@ -2670,6 +3854,15 @@ void ArrayDAGExecutorND<N>::on_linalg_msg(int node_id, char* data, int64_t size)
         return;
     auto* g = static_cast<ArrayDAGGroup*>(group);
     LaSpec s = la_spec_of(st.node, g);
+#ifdef CT_LA_LU
+    if (st.lu_mode) {
+        if (la_lu_progress<N>(partition, g, node_id, s, st)) {
+            la_state.erase(node_id);
+            node_finished(node_id);
+        }
+        return;
+    }
+#endif
 #ifdef USE_NVIDIA
     if (la_dev_progress<N>(partition, g, node_id, s, st)) {
 #else
@@ -2691,7 +3884,9 @@ void ArrayDAGExecutorND<N>::on_linalg_device(int node_id, int kind, const int* r
         return;
     auto* g = static_cast<ArrayDAGGroup*>(group);
     LaSpec s = la_spec_of(st.node, g);
-    if (la_dev_progress<N>(partition, g, node_id, s, st)) {
+    bool done = st.lu_mode ? la_lu_progress<N>(partition, g, node_id, s, st)
+                           : la_dev_progress<N>(partition, g, node_id, s, st);
+    if (done) {
         la_state.erase(node_id);
         node_finished(node_id);
     }

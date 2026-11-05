@@ -587,6 +587,7 @@ struct LaDevChunk {
     char* buf;
 };
 struct LaDevRoot;
+struct LaLu;
 
 /// LINALG state on one result chare; early messages wait in `stash`.
 template <int N>
@@ -600,6 +601,8 @@ struct LinalgState {
     std::vector<std::vector<char>> inputs; // gathered operand blocks (root)
     std::vector<LaDevChunk> dev_stash;     // device chunks that arrived before the node
     LaDevRoot* dev = nullptr;              // root's device operands (executor_linalg.cpp)
+    bool lu_mode = false;                  // distributed LU node
+    LaLu* lu = nullptr;                    // this chare is its PE's LU worker
     ArrayRegion<N> mine;
     int64_t in_covered = 0, in_expected = 0;
     int64_t out_covered = 0, out_expected = 0;
