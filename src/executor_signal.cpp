@@ -572,13 +572,14 @@ void fft_conv_gpu(PartitionImpl<N>* partition, T* out, const T* w, const T* v,
     int64_t os[N];
     row_major_strides<N>(len, os);
     copy_box<N, T>(partition, out, 0, os, wp, base, Ls, len);
-    compute_fence(partition);
-    cufftDestroy(fwd);
-    cufftDestroy(inv);
-    free_buffer(reinterpret_cast<char*>(wp));
-    free_buffer(reinterpret_cast<char*>(vp));
-    free_buffer(reinterpret_cast<char*>(wf));
-    free_buffer(reinterpret_cast<char*>(vf));
+    ct_after_stream(partition->compute_stream_raw, [fwd, inv] {
+        cufftDestroy(fwd);
+        cufftDestroy(inv);
+    });
+    free_buffer(partition, reinterpret_cast<char*>(wp));
+    free_buffer(partition, reinterpret_cast<char*>(vp));
+    free_buffer(partition, reinterpret_cast<char*>(wf));
+    free_buffer(partition, reinterpret_cast<char*>(vf));
 }
 #endif
 
@@ -644,7 +645,7 @@ void send_input(PartitionImpl<N>* partition, int node_id, const SigGeom<N>& s, i
         char* buf = alloc_buffer(bytes);
         copy_box<N, T>(partition, reinterpret_cast<T*>(buf), 0, pstride, src_ptr, base, sstride,
                        ext);
-        compute_fence(partition);
+        comm_after_compute(partition);
         ChareIndex<N> target;
         int region_data[N * 3];
         for (int d = 0; d < N; ++d) {
@@ -744,8 +745,7 @@ void finish_flip(PartitionImpl<N>* partition, const SigGeom<N>& s, PendingComm<N
             base += (len[d] - 1) * stride[d];
     }
     copy_box<N, T>(partition, out, 0, stride, box, base, sstride, len);
-    compute_fence(partition);
-    free_buffer(reinterpret_cast<char*>(box));
+    free_buffer(partition, reinterpret_cast<char*>(box));
 }
 
 template <int N, typename T>
@@ -788,9 +788,8 @@ void finish_conv(PartitionImpl<N>* partition, const SigGeom<N>& s, PendingComm<N
     } else {
         direct_conv<N, T>(partition, out, w, v, len, f);
     }
-    compute_fence(partition);
-    free_buffer(reinterpret_cast<char*>(w));
-    free_buffer(reinterpret_cast<char*>(v));
+    free_buffer(partition, reinterpret_cast<char*>(w));
+    free_buffer(partition, reinterpret_cast<char*>(v));
 }
 
 
@@ -1012,7 +1011,7 @@ void send_bmm_input(PartitionImpl<N>* partition, int node_id, const SigGeom<N>& 
 #else
             ct_send_data(proxy_at<N>(partition->thisProxy, m.target), node_id, i, v.name, N,
                          m.region_data, m.bytes, m.buf);
-            free_buffer(m.buf);
+            free_buffer(partition, m.buf);
 #endif
         }
         msgs.clear();
