@@ -51,6 +51,32 @@ for shape in ((1100001,), (1100, 1037), (133, 131, 9)):
         C.check(f"matmul operand {shape}", t, th, **TOL)
         C.check(f"matmul {shape}", y, mh @ th, rtol=1e-9)
 
+    # q (matmul operand) anchors the rewritten kernel; r is tied to u, so r = X' must
+    # run before r[...] = c
+    if len(shape) <= 2:
+        u = view(base, 5, shape) * 1.0
+        c = view(base, 2, shape) * 3.0
+        sync(iface)
+        q = view(base, 0, shape) * 2.0
+        r = view(base, 1, shape) + 1.0
+        r[...] = c
+        u[...] = q + 1.0
+        n = shape[0]
+        if len(shape) == 1:
+            y = cnp.arange(2 * n, dtype=np.float64).reshape(2, n) * 1e-6 @ q
+        else:
+            y = q @ (cnp.arange(shape[1], dtype=np.float64) * 1e-6)
+        qh = view(bh, 0, shape) * 2.0
+        if len(shape) == 1:
+            yh = np.arange(2 * n, dtype=np.float64).reshape(2, n) * 1e-6 @ qh
+        else:
+            yh = qh @ (np.arange(shape[1], dtype=np.float64) * 1e-6)
+        C.check(f"set_region into a rewritten result {shape}", r, view(bh, 2, shape) * 3.0,
+                **TOL)
+        C.check(f"rewritten kernel: anchor {shape}", q, qh, **TOL)
+        C.check(f"rewritten kernel: fixed target {shape}", u, qh + 1.0, **TOL)
+        C.check(f"rewritten kernel: matmul {shape}", y, yh, rtol=1e-9)
+
     # one kernel writes two earlier arrays at different offsets
     u = view(base, 0, shape) * 1.0
     w = view(base, 5, shape) * 1.0
