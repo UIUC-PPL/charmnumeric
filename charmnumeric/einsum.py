@@ -29,6 +29,7 @@ from .charmnumeric import (
     _write_out,
     asarray,
     nonfusible_op,
+    zeros,
 )
 
 _LETTERS = string.ascii_letters
@@ -324,6 +325,10 @@ def _contract_pair(a, la, b, lb, keep, sizes, dtype, final=None):
             if len(vec.shape) == 1 and lm == free + con:
                 out = free
                 return _shaped(_arrange(mat, lm, [free, con]) @ vec, out, sizes), out
+            if len(vec.shape) == 1 and lm == con + free:
+                # vec @ mat: a transposed matvec, no n^2 temporary
+                out = free
+                return _shaped(vec @ _arrange(mat, lm, [con, free]), out, sizes), out
         if len(sa | sb) <= 3 or sa == sb:
             return _label_product(a, la, b, lb, keep, sizes, dtype, final)
         return _grouped_product(a, la, b, lb, batch, con, fa, fb, sizes, dtype)
@@ -453,11 +458,14 @@ def einsum(*operands, out=None, dtype=None, order="K", casting="safe", optimize=
         return _write_out(np.einsum(subscripts, *ops, dtype=dtype), out)
     res_dtype = _normalize_dtype(res_dtype)
     if any(int(a.size) == 0 for a in arrays):
-        # nothing to multiply: zeros (empty sums) or an empty result, made on the host
-        host = [np.asarray(op) if _is_scalar_like(op) else np.zeros(s, dtype=d)
-                for op, s, d in zip(ops, shapes, dtypes)]
-        return _einsum_out(asarray(np.asarray(np.einsum(subscripts, *host)).astype(res_dtype)),
-                           out, casting)
+        # nothing to multiply: zeros (empty sums) or an empty result
+        inputs, output = _parse(subscripts, shapes)
+        sizes = {}
+        for labels, shape in zip(inputs, shapes):
+            for l, s in zip(labels, shape):
+                if int(s) != 1 or l not in sizes:
+                    sizes[l] = int(s)
+        return _einsum_out(zeros(tuple(sizes[l] for l in output), dtype=res_dtype), out, casting)
 
     inputs, output = _parse(subscripts, shapes)
     sizes = {}

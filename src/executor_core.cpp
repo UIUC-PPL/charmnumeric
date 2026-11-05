@@ -43,7 +43,7 @@ static void send_remote_input(PartitionImpl<N>* partition, DAGNode* node, const 
         }
     }
 
-    std::array<int, N> arr_strides;
+    std::array<int64_t, N> arr_strides;
     arr_strides[N - 1] = 1;
     for (int d = N - 2; d >= 0; --d)
         arr_strides[d] = arr_strides[d + 1] * arr->region.size(d + 1);
@@ -66,7 +66,8 @@ static void send_remote_input(PartitionImpl<N>* partition, DAGNode* node, const 
     T* src_device = static_cast<T*>(arr->device_data_ptr());
 
     // Capture strides/offsets in plain arrays for KOKKOS_LAMBDA
-    int overlap_sizes[N], local_starts[N], src_strides_arr[N], overlap_steps[N];
+    int overlap_sizes[N], local_starts[N], overlap_steps[N];
+    int64_t src_strides_arr[N];
     for (int d = 0; d < N; d++) {
         overlap_sizes[d] = overlap.size(d);
         local_starts[d] = overlap.start[d] - cs[d];
@@ -75,13 +76,13 @@ static void send_remote_input(PartitionImpl<N>* partition, DAGNode* node, const 
     }
 
     Kokkos::parallel_for(
-        CT_COMM_POLICY(partition, total_size), KOKKOS_LAMBDA(int flat_idx) {
-            int remaining = flat_idx;
-            int src_flat = 0;
+        CT_COMM_POLICY(partition, total_size), KOKKOS_LAMBDA(int64_t flat_idx) {
+            int64_t remaining = flat_idx;
+            int64_t src_flat = 0;
             for (int d = N - 1; d >= 0; --d) {
-                int coord_d = remaining % overlap_sizes[d];
-                remaining /= overlap_sizes[d];
-                src_flat += (local_starts[d] + coord_d * overlap_steps[d]) * src_strides_arr[d];
+                int coord_d = (int)ct_divmod(remaining, overlap_sizes[d]);
+                src_flat += (int64_t)(local_starts[d] + coord_d * overlap_steps[d]) *
+                            src_strides_arr[d];
             }
             send_buf[flat_idx] = src_device[src_flat];
         });

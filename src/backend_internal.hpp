@@ -382,6 +382,84 @@ inline void local_gemv(const Exec& exec, const T* mat, int ld, int rows, int col
 }
 #endif
 
+#ifdef USE_KOKKOS
+/// Partial column sums for local_gemv_t: item k * cols + c sums rows [k * len, (k + 1) * len)
+/// of column c (consecutive items read consecutive columns).
+template <typename T, typename Acc>
+struct GemvTFunctor {
+    const T* mat;
+    int64_t ld;
+    int rows, cols, chunks, len;
+    const T* vec;
+    Acc* tmp;
+    T* res;
+
+    KOKKOS_INLINE_FUNCTION void operator()(const int64_t i) const {
+        int k = (int)(i / cols), c = (int)(i % cols);
+        int r1 = (k + 1) * len < rows ? (k + 1) * len : rows;
+        Acc s = Acc(0);
+        for (int r = k * len; r < r1; ++r)
+            s += static_cast<Acc>(mat[r * ld + c]) * static_cast<Acc>(vec[r]);
+        if (chunks == 1)
+            res[c] = static_cast<T>(s);
+        else
+            tmp[i] = s;
+    }
+};
+
+template <typename T, typename Acc>
+struct GemvTJoinFunctor {
+    const Acc* tmp;
+    int cols, chunks;
+    T* res;
+
+    KOKKOS_INLINE_FUNCTION void operator()(const int64_t c) const {
+        Acc s = Acc(0);
+        for (int k = 0; k < chunks; ++k)
+            s += tmp[(int64_t)k * cols + c];
+        res[c] = static_cast<T>(s);
+    }
+};
+
+/// Row-major res[cols] = mat[rows x cols]^T * vec (device pointers, row stride ld); stream
+/// ordering as local_gemv.
+template <typename T, typename Exec>
+inline void local_gemv_t(const Exec& exec, const T* mat, int64_t ld, int rows, int cols,
+                         const T* vec, T* res) {
+    if (cols <= 0)
+        return;
+    using Acc = std::conditional_t<std::is_same_v<T, float>, double, T>;
+#ifdef USE_NVIDIA
+    ct_after_default(exec.cuda_stream());
+#else
+    Kokkos::DefaultExecutionSpace().fence("ct_gemv_t inputs");
+#endif
+    // enough items to fill the device, at least 64 rows per item
+    int chunks = (int)std::max<int64_t>(
+        1, std::min<int64_t>((rows + 63) / 64, (1 << 18) / std::max(1, cols)));
+    int len = std::max(1, (rows + chunks - 1) / chunks); // rows <= 0: res is zero-filled
+    chunks = std::max(1, (rows + len - 1) / len);
+    Acc* tmp = chunks > 1 ? static_cast<Acc*>(comm_alloc((int64_t)chunks * cols * sizeof(Acc)))
+                          : nullptr;
+    Kokkos::parallel_for(
+        "ct_gemv_t",
+        Kokkos::RangePolicy<Exec, Kokkos::IndexType<int64_t>>(exec, 0, (int64_t)chunks * cols),
+        GemvTFunctor<T, Acc>{mat, ld, rows, cols, chunks, len, vec, tmp, res});
+    if (chunks > 1)
+        Kokkos::parallel_for(
+            "ct_gemv_t_join",
+            Kokkos::RangePolicy<Exec, Kokkos::IndexType<int64_t>>(exec, 0, (int64_t)cols),
+            GemvTJoinFunctor<T, Acc>{tmp, cols, chunks, res});
+#ifdef USE_NVIDIA
+    comm_free_after(exec.cuda_stream(), tmp);
+#else
+    exec.fence("ct_gemv_t");
+    if (tmp)
+        comm_free(tmp);
+#endif
+}
+#endif
+
 /// SUMMA panel update: C[c_row:c_row+a_rows, c_col:c_col+b_cols] +=
 ///   A[:, a_col_off:a_col_off+k_size] * B[b_row_off:b_row_off+k_size, :].
 /// A is a_rows x a_k_size, B is b_k_size x b_cols, C is c_rows x c_cols, all row-major.
@@ -407,19 +485,7 @@ inline void panel_gemm_accumulate(T* a_data, int a_rows, int a_k_size, int a_col
     );
 }
 
-/// Eigen-based gemv: res = mat[:, :actual_cols] * vec.
-/// Matrix is row-major with `local_cols` stride.
 #ifndef USE_KOKKOS
-template <typename T>
-inline void eigen_gemv(T* mat_data, int local_rows, int local_cols,
-                       T* vec_data, int actual_cols, T* res_data) {
-    Eigen::Map<Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>
-        mat(mat_data, local_rows, local_cols);
-    Eigen::Map<Eigen::Matrix<T, Eigen::Dynamic, 1>> vec(vec_data, actual_cols);
-    Eigen::Map<Eigen::Matrix<T, Eigen::Dynamic, 1>> res(res_data, local_rows);
-    res.noalias() = mat.leftCols(actual_cols) * vec;
-}
-
 /// Eigen-based sub-matrix gemv: res = mat[row_offset:row_offset+sub_rows,
 ///                                      col_offset:col_offset+sub_cols] * vec.
 /// full_local_cols is the row stride of the full local matrix (row-major).
@@ -431,11 +497,23 @@ inline void eigen_gemv_sub(T* mat_data, int full_local_cols,
     typedef Eigen::Stride<Eigen::Dynamic, 1> RowStride;
     Eigen::Map<Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>,
                0, RowStride>
-        sub_mat(mat_data + row_offset * full_local_cols + col_offset,
+        sub_mat(mat_data + (int64_t)row_offset * full_local_cols + col_offset,
                 sub_rows, sub_cols, RowStride(full_local_cols, 1));
     Eigen::Map<Eigen::Matrix<T, Eigen::Dynamic, 1>> vec(vec_data, sub_cols);
     Eigen::Map<Eigen::Matrix<T, Eigen::Dynamic, 1>> res(res_data, sub_rows);
     res.noalias() = sub_mat * vec;
+}
+
+/// res[sub_cols] = sub-matrix^T * vec; mat_data points at the sub-matrix, row stride ld.
+template <typename T>
+inline void eigen_gemv_t_sub(T* mat_data, int64_t ld, int sub_rows, int sub_cols, T* vec_data,
+                             T* res_data) {
+    typedef Eigen::Stride<Eigen::Dynamic, 1> RowStride;
+    Eigen::Map<Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>, 0, RowStride>
+        sub_mat(mat_data, sub_rows, sub_cols, RowStride(ld, 1));
+    Eigen::Map<Eigen::Matrix<T, Eigen::Dynamic, 1>> vec(vec_data, sub_rows);
+    Eigen::Map<Eigen::Matrix<T, Eigen::Dynamic, 1>> res(res_data, sub_cols);
+    res.noalias() = sub_mat.transpose() * vec;
 }
 
 /// Eigen-based gemv on a 2D sub-matrix extracted from a 3D tile.
@@ -451,25 +529,23 @@ inline void eigen_gemv_sub_3d(T* mat_data,
                                int sub_rows, int sub_cols,
                                T* vec_data, T* res_data) {
     T* base;
-    int row_stride, col_stride;
+    int64_t row_stride, col_stride;
+    const int64_t plane = (int64_t)local_d1 * local_d2;
 
     if (dropped_dim == 0) {
         // Sub-matrix at (dd, row, col): contiguous 2D block
-        base = mat_data + dd_local_offset * local_d1 * local_d2
-             + row_offset * local_d2 + col_offset;
+        base = mat_data + dd_local_offset * plane + (int64_t)row_offset * local_d2 + col_offset;
         row_stride = local_d2;
         col_stride = 1;
     } else if (dropped_dim == 1) {
         // Sub-matrix at (row, dd, col)
-        base = mat_data + row_offset * local_d1 * local_d2
-             + dd_local_offset * local_d2 + col_offset;
-        row_stride = local_d1 * local_d2;
+        base = mat_data + row_offset * plane + (int64_t)dd_local_offset * local_d2 + col_offset;
+        row_stride = plane;
         col_stride = 1;
     } else {
         // Sub-matrix at (row, col, dd)
-        base = mat_data + row_offset * local_d1 * local_d2
-             + col_offset * local_d2 + dd_local_offset;
-        row_stride = local_d1 * local_d2;
+        base = mat_data + row_offset * plane + (int64_t)col_offset * local_d2 + dd_local_offset;
+        row_stride = plane;
         col_stride = local_d2;
     }
 
@@ -508,11 +584,11 @@ inline void eigen_gemm_sub(T* a_data, int a_full_cols,
     typedef Eigen::Stride<Eigen::Dynamic, 1> RowStride;
     Eigen::Map<Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>,
                0, RowStride>
-        A_sub(a_data + a_row_offset * a_full_cols + a_col_offset,
+        A_sub(a_data + (int64_t)a_row_offset * a_full_cols + a_col_offset,
               sub_rows, k_size, RowStride(a_full_cols, 1));
     Eigen::Map<Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>,
                0, RowStride>
-        B_sub(b_data + b_row_offset * b_full_cols + b_col_offset,
+        B_sub(b_data + (int64_t)b_row_offset * b_full_cols + b_col_offset,
               k_size, sub_cols, RowStride(b_full_cols, 1));
     Eigen::Map<Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>
         C(c_data, sub_rows, sub_cols);
@@ -727,7 +803,7 @@ inline void cross_matmul_send_result_3d_to_1d(PartitionImpl<3>* partition, DAGNo
     T* send_buf = static_cast<T*>(comm_alloc(byte_size));
     Kokkos::parallel_for(
         CT_COMM_POLICY(partition, result_rows),
-        KOKKOS_LAMBDA(int i) { send_buf[i] = result_data[i]; });
+        KOKKOS_LAMBDA(int64_t i) { send_buf[i] = result_data[i]; });
     device_pack_send<3, 1>(partition, proxy_1d, target_ci, node->id, 0, result_name, region_data,
                            byte_size, send_buf);
 #endif
@@ -761,7 +837,7 @@ inline void cross_matmul_send_result_2d_to_1d(PartitionImpl<2>* partition, DAGNo
     T* send_buf = static_cast<T*>(comm_alloc(byte_size));
     Kokkos::parallel_for(
         CT_COMM_POLICY(partition, result_rows),
-        KOKKOS_LAMBDA(int i) { send_buf[i] = result_data[i]; });
+        KOKKOS_LAMBDA(int64_t i) { send_buf[i] = result_data[i]; });
     device_pack_send<2, 1>(partition, proxy_1d, target_ci, node->id, 0, result_name, region_data,
                            byte_size, send_buf);
 #endif
@@ -950,7 +1026,7 @@ inline void cross_set_region_send(PartitionImpl<N_src>* partition, DAGNode* node
     auto chare_map = decompose(mapped_region, tgt_decomp);
 
     // Compute source strides
-    std::array<int, N_src> src_strides;
+    std::array<int64_t, N_src> src_strides;
     src_strides[N_src - 1] = 1;
     for (int d = N_src - 2; d >= 0; --d)
         src_strides[d] = src_strides[d + 1] * src->region.size(d + 1);
@@ -981,7 +1057,7 @@ inline void cross_set_region_send(PartitionImpl<N_src>* partition, DAGNode* node
         for (int d = 0; d < N_tgt; ++d)
             idx[d] = cr.start[d];
         for (int64_t flat = 0; flat < total_size; ++flat) {
-            int src_flat = 0;
+            int64_t src_flat = 0;
             for (int sd = 0; sd < N_src; ++sd)
                 src_flat += (xmap.src_coord(sd, idx) - src_cs[sd]) * src_strides[sd];
             send_buf[flat] = src_data[src_flat];
@@ -1003,7 +1079,8 @@ inline void cross_set_region_send(PartitionImpl<N_src>* partition, DAGNode* node
         T* src_device = static_cast<T*>(src->device_data_ptr());
 
         int dm[N_tgt], cr_start[N_tgt], cr_sizes[N_tgt], cr_step[N_tgt], t_s[N_tgt], t_st[N_tgt];
-        int sc[N_src], ss[N_src], v_s[N_src], v_st[N_src];
+        int sc[N_src], v_s[N_src], v_st[N_src];
+        int64_t ss[N_src];
         for (int d = 0; d < N_tgt; ++d) {
             dm[d] = xmap.src_dim[d];
             cr_start[d] = cr.start[d];
@@ -1020,14 +1097,12 @@ inline void cross_set_region_send(PartitionImpl<N_src>* partition, DAGNode* node
         }
 
         Kokkos::parallel_for(
-            CT_COMM_POLICY(partition, total_size), KOKKOS_LAMBDA(int flat_idx) {
-                int remaining = flat_idx;
+            CT_COMM_POLICY(partition, total_size), KOKKOS_LAMBDA(int64_t flat_idx) {
+                int64_t remaining = flat_idx;
                 int tgt_coords[N_tgt];
-                for (int d = N_tgt - 1; d >= 0; --d) {
-                    tgt_coords[d] = cr_start[d] + (remaining % cr_sizes[d]) * cr_step[d];
-                    remaining /= cr_sizes[d];
-                }
-                int src_flat = 0;
+                for (int d = N_tgt - 1; d >= 0; --d)
+                    tgt_coords[d] = cr_start[d] + (int)ct_divmod(remaining, cr_sizes[d]) * cr_step[d];
+                int64_t src_flat = 0;
                 for (int sd = 0; sd < N_src; ++sd) {
                     int coord = v_s[sd];
                     for (int td = 0; td < N_tgt; ++td) {
@@ -1036,7 +1111,7 @@ inline void cross_set_region_send(PartitionImpl<N_src>* partition, DAGNode* node
                             break;
                         }
                     }
-                    src_flat += (coord - sc[sd]) * ss[sd];
+                    src_flat += (int64_t)(coord - sc[sd]) * ss[sd];
                 }
                 send_buf[flat_idx] = src_device[src_flat];
             });

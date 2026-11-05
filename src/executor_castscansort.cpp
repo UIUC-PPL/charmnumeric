@@ -316,7 +316,7 @@ void lines_cub(PartitionImpl<N>* partition, const Tin* in, Tout* out, Tout* tota
                const Tout* carry, const LineGeom<N>& g, ScanOp<Tout> op) {
     cudaStream_t st = partition->compute_stream_raw;
     int64_t astride = g.strides[g.axis];
-    int len = (int)g.len;
+    int64_t len = g.len;
     ScanBin<Tout> bin{op};
     auto it_of = [&](int64_t l) {
         return thrust::make_transform_iterator(

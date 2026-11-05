@@ -116,6 +116,19 @@ inline int matmul_drop_dim(ASTNode* root, int idx) {
     return drop_dim_3d(*r, want_rows, want_cols);
 }
 
+/// MATMUL with a third operand 1: res = mat^T @ vec (vector along the matrix rows).
+inline bool matmul_trans(ASTNode* root) {
+    return root->operands.size() >= 3 && root->operands[2]->is_scalar &&
+           root->operands[2]->scalar == 1.0;
+}
+
+/// Result indices [k_lo, k_hi) of the rows rs, rs + st, ... (< re) that lie in [lo, hi).
+inline void stepped_rows(int rs, int re, int st, int lo, int hi, int& k_lo, int& k_hi) {
+    auto up = [st](int64_t a) { return a <= 0 ? 0 : (int)((a + st - 1) / st); };
+    k_lo = up((int64_t)std::max(lo, rs) - rs);
+    k_hi = std::max(k_lo, up((int64_t)std::min(hi, re) - rs));
+}
+
 /// Order of the frees into the caches (least recently freed is evicted first).
 inline std::atomic<uint64_t>& cache_clock() {
     static std::atomic<uint64_t> c{0};
@@ -375,7 +388,7 @@ class CTArrayBase {
     ArrayRegion<N> region;
     ArrayDecomp<N> decomp;
     std::array<int, N> global_shape;
-    int global_size; // total elements across all dimensions
+    int64_t global_size; // total elements across all dimensions
     bool owner;
     DType dtype;
     uint64_t retired_at = 0; // cache_clock() when it entered a free list
@@ -414,7 +427,7 @@ class Array : public CTArrayBase<N> {
         this->global_size = 1;
         for (int d = 0; d < N; ++d)
             this->global_size *= global_shape_[d];
-        int n = this->region.size();
+        int64_t n = this->region.size();
 #ifdef USE_KOKKOS
         if (zero)
             d_view = Kokkos::View<T*, DeviceSpace>("array_device", n);
@@ -424,13 +437,13 @@ class Array : public CTArrayBase<N> {
 #else
         data = new T[n];
         if (zero)
-            for (int i = 0; i < n; i++)
+            for (int64_t i = 0; i < n; i++)
                 data[i] = T(0);
 #endif
     }
 
     /// Non-owning constructor (wraps existing buffer).
-    Array(T* data_, int name_, int size_) {
+    Array(T* data_, int name_, int64_t size_) {
         this->name = name_;
         this->owner = false;
         this->dtype = dtype_of<T>();
@@ -440,7 +453,7 @@ class Array : public CTArrayBase<N> {
         // No device allocation for non-owning arrays
 #else
         data = data_;
-        for (int i = 0; i < size_; i++)
+        for (int64_t i = 0; i < size_; i++)
             data[i] = T(0);
 #endif
     }
