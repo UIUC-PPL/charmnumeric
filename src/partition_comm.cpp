@@ -138,6 +138,10 @@ void PartitionImpl<N>::receive_data(int node_id, int input_index, int name, int 
         executor->on_linalg_device(node_id, input_index - LA_DEV_INPUT, region_data, buf);
         return;
     }
+    if (input_index == IX_DEV_INPUT) {
+        executor->on_index_device(node_id, region_data, buf, size);
+        return;
+    }
 #else
     char* buf = data;
     if (!owned) {
