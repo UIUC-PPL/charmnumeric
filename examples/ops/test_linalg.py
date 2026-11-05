@@ -85,6 +85,17 @@ def check_cholesky(chk, n, dt):
           np.linalg.cholesky(ah.astype(np.float64), upper=True), tol(dt))
 
 
+def check_cholesky_complex(chk, n):
+    r1, r2 = cnp.random.rand(n, n), cnp.random.rand(n, n)
+    rh = cnp.random.transposed(r1) - 1j * cnp.random.transposed(r2)
+    a = (r1 + 1j * r2) @ rh + float(n) * cnp.eye(n, dtype=np.complex128)
+    ah = get(a)
+    close(chk, f"cholesky n={n} complex128", get(cnp.linalg.cholesky(a)),
+          np.linalg.cholesky(ah), 1e-9)
+    close(chk, f"cholesky upper n={n} complex128", get(cnp.linalg.cholesky(a, upper=True)),
+          np.linalg.cholesky(ah, upper=True), 1e-9)
+
+
 def check_notpd(chk, n, k):
     """cholesky of eye(n) with a[k, k] = -1 is all NaN, wherever the failing tile is."""
     a = cnp.eye(n)
@@ -326,6 +337,7 @@ def main():
     # GPU builds (2-D tile 1024): tiled cholesky on several chares; tssvd columns in two tiles
     for dt in (np.float64, np.float32):
         check_cholesky(chk, 2600, dt)
+    check_cholesky_complex(chk, 1100)
     for k in (0, 1500, 2599):
         check_notpd(chk, 2600, k)
     check_tssvd(chk, 3000, 1100, np.float64)
