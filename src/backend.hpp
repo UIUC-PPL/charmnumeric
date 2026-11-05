@@ -728,6 +728,9 @@ class ArrayDAGGroup : public CBase_ArrayDAGGroup {
     // This persists across epochs so later DAGs do not reinterpret old data
     // using freshly recomputed metadata unless the array is recreated.
     std::unordered_map<int, ArrayMetadata> live_array_meta;
+    // Names and node ids of the arrays and nodes resolve_kernel_layouts adds (count down).
+    int synth_name = 2147483646;
+    int synth_node_id = 2147483646;
 
     // UPLOAD payloads (held by PE 0 only) cut into per-chare tiles by stage_uploads() and
     // sent to each chare's home PE, keyed by (array name, chare index). A chare takes (and
