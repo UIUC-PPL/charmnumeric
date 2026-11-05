@@ -148,6 +148,9 @@ class MLIRJitCompiler {
                    void** functionOut);
 #endif
 
+    /// GPU: fuse adjacent elementwise loops into one kernel where possible.
+    bool fuseLoops = true;
+
     /// Op registries: map opcode → body builder lambdas.
     static const std::unordered_map<int, BinaryOpEntry>& binaryOpRegistry();
     static const std::unordered_map<int, UnaryOpEntry>& unaryOpRegistry();
