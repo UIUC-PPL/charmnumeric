@@ -197,6 +197,8 @@ def _wrap_device(idx, n, mode, oob=None):
 
 def _nonzero_flat(x):
     """Flat (row-major) positions of the nonzero elements of x, or None if none."""
+    if isinstance(x, _NDBase):
+        x = x._base  # folded storage keeps C order
     if x.dtype.itemsize > 8:
         x = _compare(x, 0, "not_equal")
     cnt = _count(x)
@@ -229,7 +231,7 @@ def _items(x, key, newaxes=None):
             raw.append(("...", None, 0))
         elif isinstance(k, slice):
             raw.append(("s", k, 1))
-        elif _is_array(k):
+        elif _is_array_nd(k):
             if _is_mask(k):
                 raw.append(("m", k, k.ndims))
             elif np.issubdtype(k.dtype, np.integer):
@@ -319,15 +321,11 @@ class _Plan:
                 self.sstarts)
 
 
-def _plan(x, items, mode="raise", newaxes=()):
-    """Linearize per-dim items over x; None if no index array is present.
-    ``final`` is the result shape (``E`` plus a 1 per newaxis)."""
+def _layout(items, newaxes=()):
+    """Result structure of a key with index arrays: (arrays, adv, slices, pre, post, B, final).
+    E = pre slice dims + B + post slice dims; ``final`` adds a 1 per newaxis."""
     arrays = [d for d, it in enumerate(items) if it[0] == "a"]
-    if not arrays:
-        return None
     adv = [d for d, it in enumerate(items) if it[0] in ("a", "i")]
-    root, base, mult = _geometry(x)
-
     B = tuple(np.broadcast_shapes(*[tuple(items[d][1].shape) for d in arrays]))
     # key positions: one per dim of x, plus the newaxes (before dim n[i])
     toks = []
@@ -342,7 +340,6 @@ def _plan(x, items, mode="raise", newaxes=()):
     pos = {t[1]: i for i, t in enumerate(toks) if t[0] == "x"}
     pre = [d for d in slices if pos[d] < first] if contiguous else []
     post = [d for d in slices if d not in pre]
-    E = tuple(items[d][3] for d in pre) + B + tuple(items[d][3] for d in post)
 
     def size(i):
         return 1 if toks[i][0] == "n" else items[toks[i][1]][3]
@@ -350,7 +347,18 @@ def _plan(x, items, mode="raise", newaxes=()):
     keep = [i for i, t in enumerate(toks) if t[0] == "n" or items[t[1]][0] == "s"]
     lead = [i for i in keep if contiguous and i < first]
     rest = [i for i in keep if i not in lead]
-    plan_final = tuple(size(i) for i in lead) + B + tuple(size(i) for i in rest)
+    final = tuple(size(i) for i in lead) + B + tuple(size(i) for i in rest)
+    return arrays, adv, slices, pre, post, B, final
+
+
+def _plan(x, items, mode="raise", newaxes=()):
+    """Linearize per-dim items over x; None if no index array is present.
+    ``final`` is the result shape (``E`` plus a 1 per newaxis)."""
+    if not any(it[0] == "a" for it in items):
+        return None
+    root, base, mult = _geometry(x)
+    arrays, adv, slices, pre, post, B, plan_final = _layout(items, newaxes)
+    E = tuple(items[d][3] for d in pre) + B + tuple(items[d][3] for d in post)
     if len(E) > 3:
         raise NotImplementedError(f"indexing result would have {len(E)} > 3 dimensions")
     for d in slices:
@@ -542,28 +550,112 @@ def setitem(x, key, value):
     _scatter(root, L, value, E, npre, npost, strides, sdims, sstarts)
 
 
-# ---- >3-D (folded) arrays: offsets computed on the host ----
+# ---- >3-D (folded) arrays: offsets built on the device ----
+#
+# x's storage root is 3-D, (s0 * ... * s[n-3], s[n-2], s[n-1]) in C order. Slices over the
+# last two dims of x that follow the index arrays stay GATHER/SCATTER slice dims (storage
+# dims 1 and 2); the other result dims are grouped into at most three dims of L (pre slices,
+# the index arrays, other post slices), each term an iota along its group or the index
+# arrays broadcast along theirs.
 
 
-def _host_key(key):
-    key = key if isinstance(key, tuple) else (key,)
-    return tuple(
-        np.asarray(k.get(default_interface())) if _is_array_nd(k)
-        else np.asarray(k) if isinstance(k, list) else k
-        for k in key
-    )
+def _flat_index(a, n):
+    """Device index array a as a 1-D (n,) array."""
+    if isinstance(a, _NDBase):
+        a = a._base
+    return a if tuple(a.shape) == (n,) else _reshape(a, (n,))
 
 
-def _folded_offsets(shape, key):
-    """Flat row-major offsets of x[key], shaped like the result (NumPy applies the key)."""
+def _folded_plan(x, key, mode="raise"):
+    """(L, E, npost, strides, sdims, sstarts, final) of an index-array key on a >3-D x, whose
+    root is the folded storage; L is None if E is empty."""
+    newaxes = []
+    items = _items(x, key, newaxes)
+    if not any(it[0] == "a" for it in items):
+        return None
+    arrays, adv, slices, pre, post, B, final = _layout(items, newaxes)
+    shape = tuple(x.shape)
     n = len(shape)
-    total = 0
-    stride = 1
-    for d in range(n - 1, -1, -1):
-        ar = np.arange(shape[d], dtype=np.int64).reshape((1,) * d + (-1,) + (1,) * (n - d - 1))
-        total = total + np.broadcast_to(ar, shape)[key] * stride
-        stride *= shape[d]
-    return total
+    mult = [1] * n
+    for d in range(n - 2, -1, -1):
+        mult[d] = mult[d + 1] * shape[d + 1]
+    base = sum(items[d][1] * mult[d] for d in slices + [d for d in adv if items[d][0] == "i"])
+    tail = [d for d in post if d >= n - 2]
+    rest = [d for d in post if d < n - 2]
+    nB = int(np.prod(B))
+    groups = [(pre, int(np.prod([items[d][3] for d in pre]))), (None, nB),
+              (rest, int(np.prod([items[d][3] for d in rest])))]
+    Ls = tuple(g for _, g in groups if g != 1) or (1,)
+    tail_e = tuple(items[d][3] for d in tail)
+    if len(Ls) + len(tail) <= 3:
+        E = Ls + tail_e
+    else:
+        E = (int(np.prod(Ls)),) + tail_e
+    out = (None, E, len(tail), [items[d][2] * mult[d] for d in tail], [d - (n - 3) for d in tail],
+           [items[d][1] for d in tail], final)
+    if int(np.prod(E)) == 0:
+        return out
+    axis = {}
+    k = 0
+    for gi, (_, g) in enumerate(groups):
+        if g != 1:
+            axis[gi] = k
+            k += 1
+
+    def coords(dims, gi):
+        """sum(i_d * step_d * mult_d) over dims, laid along group gi of Ls."""
+        if gi not in axis:
+            return None
+        c = _axis_range(Ls, axis[gi], groups[gi][1], _INT64)
+        t, inner = None, 1
+        for d in reversed(dims):
+            cnt, coef = items[d][3], items[d][2] * mult[d]
+            if cnt > 1:
+                i = c // inner if inner > 1 else c
+                if d != dims[0]:
+                    i = i % cnt
+                term = i * coef if coef != 1 else i
+                t = term if t is None else t + term
+            inner *= cnt
+        return t
+
+    host = None
+    devs = []
+    for d in arrays:
+        idx, trusted = items[d][1], items[d][2]
+        if _is_array_nd(idx):
+            if tuple(idx.shape) != B:
+                raise NotImplementedError(
+                    f"device index arrays must all have the same shape (got {tuple(idx.shape)} "
+                    f"and {B})"
+                )
+            idx = _flat_index(idx, nB)
+            oob = int(np.prod(shape)) // mult[d] + 1  # oob * mult[d] > every offset
+            idx = idx if trusted else _wrap_device(idx, shape[d], mode, oob)
+            if idx.dtype != _INT64:
+                idx = _cast_operand(idx, _INT64)
+            devs.append(idx * mult[d] if mult[d] != 1 else idx)
+        else:
+            h = _wrap_host(idx, shape[d], mode, d) * mult[d]
+            host = h if host is None else host + h
+    if host is not None:
+        h = asarray(np.ascontiguousarray(np.broadcast_to(host, B).reshape(nB)))
+        devs.append(h)
+    A = devs[0]
+    for t in devs[1:]:
+        A = A + t
+    if Ls != (nB,):
+        rs = tuple(nB if axis.get(1) == i else 1 for i in range(len(Ls)))
+        A = _broadcast_to(_reshape(A, rs), Ls)
+    L = A
+    for t in (coords(pre, 0), coords(rest, 2)):
+        if t is not None:
+            L = L + t
+    if base:
+        L = L + base
+    if len(E) - len(tail) != len(Ls):
+        L = _reshape(L, (E[0],))
+    return (L,) + out[1:]
 
 
 def _folded_mask(x, key):
@@ -580,12 +672,14 @@ def folded_getitem(x, key):
     k = _folded_mask(x, key)
     if k is not None:
         return _mask_getitem(x._base, k)
-    offs = _folded_offsets(tuple(x.shape), _host_key(key))
-    if offs.size == 0:
-        return empty(offs.shape, dtype=x.dtype)
-    L = asarray(np.ascontiguousarray(offs.reshape(-1)))
-    result = _gather(_flat_source(x), L, (offs.size,), 0, 0, [])
-    return _reshape(result, offs.shape)
+    plan = _folded_plan(x, key)
+    if plan is None:  # folded.getitem routes only keys with an index array or mask here
+        raise IndexError(f"unsupported index {key!r}")
+    L, E, npost, strides, sdims, sstarts, final = plan
+    if L is None:
+        return empty(final, dtype=x.dtype)
+    result = _gather(_flat_source(x), L, E, 0, npost, strides, sdims, sstarts)
+    return _reshape(result, final)
 
 
 def folded_setitem(x, key, value):
@@ -594,20 +688,21 @@ def folded_setitem(x, key, value):
     k = _folded_mask(x, key)
     if k is not None and not isinstance(value, _NDBase):
         return _mask_setitem(x._base, k, value)
-    offs = _folded_offsets(tuple(x.shape), _host_key(key))
-    if offs.size == 0:
-        return
     root = x._base
     if isinstance(root, ArrayView) and tuple(root.shape) != tuple(root._root_parent.shape):
         raise NotImplementedError("index arrays on a view of a >3-D array are not supported")
     root = root._root_parent if isinstance(root, ArrayView) else root
-    n = (int(offs.size),)
+    plan = _folded_plan(x, key)
+    if plan is None:
+        raise IndexError(f"unsupported index {key!r}")
+    L, E, npost, strides, sdims, sstarts, final = plan
+    if L is None:
+        return
     if _is_array_nd(value):
-        value = _reshape(_broadcast_to(_cast_operand(value, x.dtype), offs.shape), n)
+        value = _reshape(_broadcast_to(_cast_operand(value, x.dtype), final), E)
     elif not _is_scalar_like(value):
-        value = np.broadcast_to(np.asarray(value, dtype=x.dtype), offs.shape).reshape(-1)
-    L = asarray(np.ascontiguousarray(offs.reshape(-1)))
-    _scatter(root, L, _scatter_value(x, value, n), n, 0, 0, [])
+        value = np.broadcast_to(np.asarray(value, dtype=x.dtype), final).reshape(E)
+    _scatter(root, L, _scatter_value(x, value, E), E, 0, npost, strides, sdims, sstarts)
 
 
 # ---- NumPy functions ----
@@ -801,9 +896,18 @@ def compress(condition, a, axis=None, out=None):
     return take(a, idx, axis=axis, out=out)
 
 
+def _repeat_flat(x, r, total):
+    """x's elements in row-major order, each repeated r times (EXPAND mode 2)."""
+    if isinstance(x, _NDBase):
+        x = x._base
+    return nonfusible_op(x, 2, int(total), int(r), operation=ArrayOperation.expand,
+                         shape=(int(total),), dtype=x.dtype)
+
+
 def repeat(a, repeats, axis=None):
-    """numpy.repeat (blocking for device repeat counts: fetches their sum)."""
-    if not _is_array(a):
+    """numpy.repeat (blocking for device repeat counts: fetches their sum). A scalar count
+    with a 1-D result repeats the values directly (no index array)."""
+    if not _is_array_nd(a):
         host = np.asarray(a)
         if host.ndim == 0 and not _is_array(repeats):
             r = np.asarray(repeats)
@@ -811,8 +915,7 @@ def repeat(a, repeats, axis=None):
             return full((n,), host.item(), dtype=host.dtype)
         a = asarray(host)
     if axis is None:
-        a = _flat_source(a)
-        n = a.size
+        n = int(a.size)
     else:
         axis = _axis_index(axis, a.ndims)
         n = a.shape[axis]
@@ -830,13 +933,27 @@ def repeat(a, repeats, axis=None):
         r = int(repeats)
         if r < 0:
             raise ValueError("negative dimensions are not allowed")
+        if axis is None or a.ndims == 1:
+            if n * r == 0:
+                return create_array((0,), dtype=a.dtype)
+            return _repeat_flat(a, r, n * r)
         if r == 1:
             idx = arange(n, dtype=_INT64)
         else:
             idx = arange(n * r, dtype=_INT64) // r if n * r else np.zeros(0, np.int64)
     else:
-        idx = np.repeat(np.arange(n), np.broadcast_to(np.asarray(repeats), (n,)))
+        rep = np.broadcast_to(np.asarray(repeats), (n,))
+        rep = rep.astype(np.int64, casting="safe" if rep.size else "unsafe")
+        if (rep < 0).any():
+            raise ValueError("repeats may not contain negative values")
+        total = int(rep.sum())
+        if total:
+            idx = _expand(asarray(np.ascontiguousarray(rep)), True, total)
+        else:
+            idx = np.zeros(0, np.int64)
 
+    if axis is None:
+        a = _flat_source(a)
     return _take_valid(a, idx, axis)
 
 
