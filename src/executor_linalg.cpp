@@ -1045,6 +1045,7 @@ void* la_dalloc(size_t bytes, cudaStream_t st) {
     }
     if (cudaMallocAsync(&p, bytes, st) != cudaSuccess) {
         cudaGetLastError();
+        cudaDeviceSynchronize();
         release_device_caches();
         if (cudaMallocAsync(&p, bytes, st) != cudaSuccess)
             device_oom(static_cast<int64_t>(bytes));
@@ -3081,17 +3082,30 @@ bool lu_factor_loop(PartitionImpl<2>* p, ArrayDAGGroup* g, int node_id, const La
         if (L->diag)
             lu_copy2d(p, L->diag + top * sizeof(T), sizeof(T), P, (lp + 1) * sizeof(T), sizeof(T),
                       wk);
-        // the panel's interchanges on every other local column
-        int64_t a = mine ? L->loff(k) : L->wcols, e = mine ? a + wk : L->wcols;
-        lu_k_laswp<2, T>(p, Wt, n, a, top, L->piv + top, wk);
-        lu_k_laswp<2, T>(p, Wt + e * n, n, L->wcols - e, top, L->piv + top, wk);
+        // the panel's interchanges on every other local column, the next panel's first
+        auto swap = [&](int64_t c0, int64_t c1) {
+            if (c1 > c0)
+                lu_k_laswp<2, T>(p, Wt + c0 * n, n, c1 - c0, top, L->piv + top, wk);
+        };
+        std::vector<std::pair<int64_t, int64_t>> done; // ascending
+        if (mine)
+            done.push_back({L->loff(k), L->loff(k) + wk});
         int64_t t0 = L->loff_ge(k + 1);
         int k1 = k + 1;
         if (k1 < L->np && L->owner(k1) == L->me && !L->factored[k1]) {
-            lu_update<T>(p, L, k, P, lp, t0, t0 + L->width(k1));
+            int64_t t1 = t0 + L->width(k1);
+            swap(t0, t1);
+            lu_update<T>(p, L, k, P, lp, t0, t1);
             lu_factor<T>(p, g, node_id, s, L, k1);
-            t0 += L->width(k1);
+            done.push_back({t0, t1});
+            t0 = t1;
         }
+        int64_t c = 0;
+        for (auto& [x, y] : done) {
+            swap(c, x);
+            c = y;
+        }
+        swap(c, L->wcols);
         lu_update<T>(p, L, k, P, lp, t0, L->wcols);
         if (!mine)
             lu_blob_release(p, L, LU_PANEL, k);
@@ -3571,6 +3585,10 @@ static bool la_lu_progress(PartitionImpl<N>* p, ArrayDAGGroup* g, int node_id, c
     st.stash.clear();
     std::vector<LaDevChunk> chunks;
     chunks.swap(st.dev_stash);
+#ifdef USE_NVIDIA
+    if (st.lu && !chunks.empty())
+        CT_CUDA_CHECK(cudaStreamWaitEvent(p->compute_stream_raw, st.lu->ready, 0));
+#endif
     la_dispatch(s.dt, [&](auto tag) {
         using T = decltype(tag);
         for (auto& c : chunks)
