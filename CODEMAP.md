@@ -172,6 +172,7 @@ Bit-exact NumPy mirror of `src/creation_kernels.hpp` (Philox4x32-10, software lo
 | `assign_class_tiles` (in `compute_decompositions`) | 411 | Tile classes: arrays joined by unit-stride elementwise/COPY/SET_REGION accesses and REDUCE operands share one tile (members under half the largest one's size keep their own) — the heaviest array from an earlier DAG (or TRANSPOSE result) in the class, else the balanced tile of the class's largest extents capped by strided accesses; the offset DP then aligns them |
 | `detail::for_each_node_topo()` | 151 | Topological DAG traversal helper for solver passes |
 | `collect_unionable_nonfixed_leaves()` | 758 | Union-find guard: only unions zero-shift, same-tile, non-fixed temp leaves |
+| kept-results passes (in `compute_decompositions`) | 2032 | A fused elementwise kernel's kept results take one tile and offset (the first one's, or a fixed/zero-offset member's); next to a unit-step set_region (shifted or not) they take the target's tile and offset plus the region start: the executor writes them all in the chare layout of `fused_output_decomp_name` |
 
 ### `array_region.hpp` — N-D regions & decomposition (449+ lines)
 | Symbol | Line | Description |
@@ -285,6 +286,8 @@ Started from `set_proxies`, off the CCS-ready path: rank 0 of each process expor
 | `test_misaligned_after_flush_takes_source_tile()` | 518 | A result read through shifted views of an earlier DAG's array gets that array's tile and the view offset |
 | `test_reduce_operands_share_layout()` | 542 | A new REDUCE operand takes the other operand's tile and offset |
 | `test_small_class_member_keeps_own_tile()` | 571 | A (160,365,240) array written into a slice of a (1120,365,240) one keeps its own tile |
+| `test_fused_kept_results_share_layout()` | 597 | Two kept results of one kernel, one read through a shifted view, share tile and offset |
+| `test_set_region_kept_result_takes_target_layout()` | 623 | A kept result fused with an unshifted set_region takes the target's tile and offset |
 
 ### `backend.ci` — Charm++ interface (86 lines)
 Module `charmnumeric` (depends on `charmtyles`). Mainchare `Main`. Group `ArrayDAGGroup : DAGGroup` with entries: `set_proxies()`, `proxies_ready()` [reduction], `receive_dag()`, `receive_get_request()`, `gather()`. Arrays `Partition1D/2D/3D` with entries: `run()`, `receive_data()` [nocopy/nocopydevice], `send_complete()`, `receive_ipc()`, `receive_staged()` (GPU), `comm_done()`, `reduce_result()`, `receive_reduce_partial()`, `receive_linalg()`, `receive_shape()`, `receive_frag()`, `receive_sort_msg()` (Partition1D).

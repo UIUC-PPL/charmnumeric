@@ -185,6 +185,276 @@ inline void for_each_node_topo(DAG* dag, Fn&& fn) {
     assert(processed == static_cast<int>(dag->nodes.size()));
 }
 
+// ---- Fused-kernel layouts ----
+// execute_node.cpp computes a fused elementwise kernel over the chare grid of one array
+// (fused_output_decomp_name: the last set_region's target, else the first kept result)
+// and writes every kept result, and every other set_region's result buffer, in it.
+
+inline bool is_kept_root(ASTNode* root) {
+    auto op = static_cast<Opcode>(root->opcode);
+    return !root->is_temp && op != Opcode::NOOP && op != Opcode::CREATE &&
+           op != Opcode::SET_REGION;
+}
+
+/// Nodes the fused elementwise executor runs (cross-rank set_regions run as copies).
+inline bool is_fused_kernel(DAGNode* node) {
+    bool any = false;
+    for (ASTNode* root : node->ast->roots) {
+        auto op = static_cast<Opcode>(root->opcode);
+        if (op == Opcode::NOOP || op == Opcode::CREATE)
+            continue;
+        if (op == Opcode::SET_REGION) {
+            if (root->operands.size() < 2 || root->region == nullptr)
+                return false;
+            ASTNode* rhs = root->operands[1];
+            if (!rhs->is_scalar && !rhs->is_broadcast && rhs->ndims != root->ndims)
+                return false;
+        } else if (!is_elementwise(op) && op != Opcode::COPY) {
+            return false;
+        }
+        any = true;
+    }
+    return any;
+}
+
+/// Start and element count per dimension of `region` (nullptr/global: the whole shape).
+struct Box {
+    int nd = 0;
+    std::array<int, 3> start{}, extent{}, step{1, 1, 1};
+    bool unit = true;
+};
+
+inline Box region_box(Region* region, int nd, std::array<int, 3> const& shape) {
+    Box b;
+    b.nd = nd;
+    for (int d = 0; d < nd; ++d)
+        b.extent[d] = shape[d];
+    if (region == nullptr || region->is_global)
+        return b;
+    auto fill = [&](auto* r, int n) {
+        for (int d = 0; d < n; ++d) {
+            int st = r->step[d] > 0 ? r->step[d] : 1;
+            b.start[d] = r->start[d];
+            b.step[d] = st;
+            b.extent[d] = std::max(0, (r->stop[d] - r->start[d] + st - 1) / st);
+            b.unit &= st == 1;
+        }
+    };
+    switch (nd) {
+    case 1: fill(static_cast<ArrayRegion<1>*>(region), 1); break;
+    case 2: fill(static_cast<ArrayRegion<2>*>(region), 2); break;
+    case 3: fill(static_cast<ArrayRegion<3>*>(region), 3); break;
+    default: break;
+    }
+    return b;
+}
+
+/// The array whose decomposition (offset + shift) lays out the kernel, and its extent.
+struct KernelLayout {
+    int anchor = -1;
+    ASTNode* anchor_set = nullptr;
+    Box box;
+};
+
+template <typename ArrayMetaMap>
+bool kernel_layout(ArrayMetaMap& meta, DAGNode* node, KernelLayout& k) {
+    for (auto it = node->ast->roots.rbegin(); it != node->ast->roots.rend(); ++it)
+        if (static_cast<Opcode>((*it)->opcode) == Opcode::SET_REGION) {
+            auto m = meta.find((*it)->operands[0]->result_name);
+            if (m == meta.end())
+                return false;
+            k.anchor = m->first;
+            k.anchor_set = *it;
+            k.box = region_box((*it)->region, m->second.ndims, m->second.global_shape);
+            return true;
+        }
+    for (ASTNode* root : node->ast->roots)
+        if (is_kept_root(root)) {
+            auto m = meta.find(root->result_name);
+            if (m == meta.end())
+                return false;
+            k.anchor = m->first;
+            k.box = region_box(nullptr, m->second.ndims, m->second.global_shape);
+            return true;
+        }
+    return false;
+}
+
+/// Whether an array of layout `m`, shifted by `start`, is the kernel's layout.
+template <typename Meta>
+bool same_layout(Meta const& m, std::array<int, 3> const& start, Box const& extent,
+                 Meta const& anchor, KernelLayout const& k) {
+    if (!k.box.unit || !extent.unit || m.ndims != k.box.nd || m.tile != anchor.tile)
+        return false;
+    for (int d = 0; d < m.ndims; ++d)
+        if (extent.extent[d] != k.box.extent[d] ||
+            m.offset[d] + start[d] != anchor.offset[d] + k.box.start[d])
+            return false;
+    return true;
+}
+
+/// Ties each fused kernel's kept results and set_region targets to its anchor with a
+/// union-find over offset differences, so later kernels never undo earlier ones. Arrays
+/// other executors fix (earlier DAGs, zero-offset results, non-elementwise results) pin
+/// their set; a tie that contradicts a pin is skipped.
+template <typename ArrayMetaMap>
+void tie_kernel_layouts(ArrayMetaMap& meta, DAG* dag, std::unordered_set<int> const& pinned) {
+    using Off = std::array<int, 3>;
+    std::unordered_set<int> movable;
+    for_each_node_topo(dag, [&](DAGNode* node) {
+        bool fused = is_fused_kernel(node);
+        for (ASTNode* root : node->ast->roots) {
+            auto op = static_cast<Opcode>(root->opcode);
+            if ((fused && is_kept_root(root)) || is_creation(op))
+                movable.insert(root->result_name);
+        }
+    });
+    auto is_movable = [&](int name) {
+        auto it = meta.find(name);
+        return it != meta.end() && !it->second.decomp_final && movable.count(name) &&
+               !pinned.count(name);
+    };
+
+    std::map<int, int> parent;
+    std::map<int, Off> rel; // offset(x) = offset(parent) + rel
+    std::map<int, std::vector<int>> members;
+    std::map<int, bool> fixed;
+    std::map<int, Off> rep_off;
+    std::map<int, int> rep_tile;
+    auto add = [&](int n) {
+        if (parent.count(n))
+            return;
+        parent[n] = n;
+        rel[n] = {0, 0, 0};
+        members[n] = {n};
+        fixed[n] = !is_movable(n);
+        rep_off[n] = meta.at(n).offset;
+        rep_tile[n] = meta.at(n).tile;
+    };
+    auto find = [&](int n) {
+        Off s = {0, 0, 0};
+        int r = n;
+        while (parent[r] != r) {
+            for (int d = 0; d < 3; ++d)
+                s[d] += rel[r][d];
+            r = parent[r];
+        }
+        if (n != r) {
+            parent[n] = r;
+            rel[n] = s;
+        }
+        return std::make_pair(r, s);
+    };
+    // offset(a) = offset(b) + shift
+    auto unite = [&](int a, int b, Off shift, int nd) {
+        add(a);
+        add(b);
+        auto [ra, sa] = find(a);
+        auto [rb, sb] = find(b);
+        Off diff = {0, 0, 0}; // offset(ra) = offset(rb) + diff
+        for (int d = 0; d < nd; ++d)
+            diff[d] = sb[d] + shift[d] - sa[d];
+        if (ra == rb)
+            return;
+        auto fits = [&](int rep, Off off) {
+            for (int m : members[rep]) {
+                Off sm = find(m).second;
+                for (int d = 0; d < nd; ++d)
+                    if (off[d] + sm[d] < 0)
+                        return false;
+            }
+            return true;
+        };
+        if (fixed[ra] && fixed[rb]) {
+            if (rep_tile[ra] != rep_tile[rb])
+                return;
+            for (int d = 0; d < nd; ++d)
+                if (rep_off[ra][d] != rep_off[rb][d] + diff[d])
+                    return;
+        } else if (fixed[ra]) {
+            Off off = rep_off[ra];
+            for (int d = 0; d < nd; ++d)
+                off[d] -= diff[d];
+            if (!fits(rb, off))
+                return;
+            rep_off[rb] = off;
+            rep_tile[rb] = rep_tile[ra];
+            fixed[rb] = true;
+        } else if (fixed[rb]) {
+            Off off = rep_off[rb];
+            for (int d = 0; d < nd; ++d)
+                off[d] += diff[d];
+            if (!fits(ra, off))
+                return;
+        }
+        parent[ra] = rb;
+        rel[ra] = diff;
+        members[rb].insert(members[rb].end(), members[ra].begin(), members[ra].end());
+        members.erase(ra);
+    };
+
+    for_each_node_topo(dag, [&](DAGNode* node) {
+        KernelLayout k;
+        if (!is_fused_kernel(node) || !kernel_layout(meta, node, k) || !k.box.unit)
+            return;
+        int nd = k.box.nd;
+        for (ASTNode* root : node->ast->roots) {
+            int name = -1;
+            Box b;
+            if (is_kept_root(root)) {
+                auto it = meta.find(root->result_name);
+                if (it == meta.end() || root->result_name == k.anchor)
+                    continue;
+                name = it->first;
+                b = region_box(nullptr, it->second.ndims, it->second.global_shape);
+            } else if (static_cast<Opcode>(root->opcode) == Opcode::SET_REGION &&
+                       root != k.anchor_set) {
+                auto it = meta.find(root->operands[0]->result_name);
+                if (it == meta.end() || it->first == k.anchor)
+                    continue;
+                name = it->first;
+                b = region_box(root->region, it->second.ndims, it->second.global_shape);
+            } else {
+                continue;
+            }
+            bool fits = b.unit && b.nd == nd;
+            for (int d = 0; fits && d < nd; ++d)
+                fits = b.extent[d] == k.box.extent[d];
+            if (!fits)
+                continue;
+            Off shift = {0, 0, 0};
+            for (int d = 0; d < nd; ++d)
+                shift[d] = k.box.start[d] - b.start[d];
+            unite(name, k.anchor, shift, nd);
+        }
+    });
+
+    for (auto& [rep, list] : members) {
+        if (list.size() < 2)
+            continue;
+        int nd = meta.at(rep).ndims;
+        Off off = rep_off[rep];
+        int tile = rep_tile[rep];
+        if (!fixed[rep] && tile > 0)
+            for (int d = 0; d < nd; ++d) {
+                int lo = 0;
+                for (int m : list)
+                    lo = std::min(lo, off[d] + find(m).second[d]);
+                if (lo < 0)
+                    off[d] += (-lo + tile - 1) / tile * tile;
+            }
+        for (int m : list) {
+            if (!is_movable(m))
+                continue;
+            Off sm = find(m).second;
+            auto& mm = meta.at(m);
+            mm.tile = tile;
+            for (int d = 0; d < nd; ++d)
+                mm.offset[d] = off[d] + sm[d];
+        }
+    }
+}
+
 } // namespace detail
 
 template <typename ArrayMetaMap>
@@ -2029,51 +2299,17 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                 meta_it->second.offset = zero_offset;
         }
 
-        // The executor allocates a fused kernel's other kept results at the
-        // shifted set_region shape, so place them to match.
-        detail::for_each_node_topo(dag, [&](DAGNode* dag_node) {
-            for (ASTNode* root : dag_node->ast->roots) {
-                if (static_cast<Opcode>(root->opcode) != Opcode::SET_REGION ||
-                    root->operands.empty() || root->region == nullptr || root->region->is_global)
-                    continue;
-                auto target_it = array_meta.find(root->operands[0]->result_name);
-                if (target_it == array_meta.end())
-                    continue;
-                const auto& target = target_it->second;
-                int nd = target.ndims;
-                auto start = extract_region_start(root->region, nd);
-                auto step = extract_region_step(root->region, nd);
-                auto stop = extract_region_stop(root->region, nd, target.global_shape);
-                bool shifted = false, unit = true;
-                for (int d = 0; d < nd; ++d) {
-                    shifted |= start[d] != 0;
-                    unit &= step[d] == 1;
-                }
-                if (!shifted || !unit)
-                    continue;
-                for (ASTNode* other : dag_node->ast->roots) {
-                    if (other == root || other->is_temp ||
-                        static_cast<Opcode>(other->opcode) == Opcode::SET_REGION)
-                        continue;
-                    auto it = array_meta.find(other->result_name);
-                    if (it == array_meta.end() || it->second.decomp_final ||
-                        it->second.ndims != nd)
-                        continue;
-                    // zero-offset results are routed from tile 0 by their executors
-                    assert(!matmul_arrays.count(other->result_name));
-                    if (matmul_arrays.count(other->result_name))
-                        continue;
-                    bool same_shape = true;
-                    for (int d = 0; d < nd; ++d)
-                        same_shape &= it->second.global_shape[d] == stop[d] - start[d];
-                    if (!same_shape)
-                        continue;
-                    for (int d = 0; d < nd; ++d)
-                        it->second.offset[d] = target.offset[d] + start[d];
-                    it->second.tile = target.tile;
-                }
-            }
-        });
+        // Keep each fused kernel's results in its chare layout where the fixed arrays
+        // allow it.
+        for (auto& [name, meta] : array_meta) {
+            if (meta.decomp_final || meta.tile <= 0)
+                continue;
+            for (int d = 0; d < meta.ndims; ++d)
+                if (meta.offset[d] < 0)
+                    meta.offset[d] = positive_mod(meta.offset[d], meta.tile);
+        }
+        detail::tie_kernel_layouts(array_meta, dag, matmul_arrays);
+        align_transpose_results();
     }
 
     // Chare indices are global / tile, so a negative offset (from a view that
@@ -2089,5 +2325,6 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
     for (auto& [name, meta] : array_meta)
         meta.decomp_final = true;
 }
+
 
 } // namespace decomposition_solver
