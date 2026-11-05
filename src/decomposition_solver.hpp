@@ -2300,7 +2300,7 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
         }
 
         // Keep each fused kernel's results in its chare layout where the fixed arrays
-        // allow it.
+        // allow it; resolve_kernel_layouts() handles the rest.
         for (auto& [name, meta] : array_meta) {
             if (meta.decomp_final || meta.tile <= 0)
                 continue;
@@ -2326,5 +2326,273 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
         meta.decomp_final = true;
 }
 
+
+namespace detail {
+
+inline uint64_t mix64(uint64_t h, uint64_t v) {
+    h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    h ^= h >> 31;
+    h *= 0xbf58476d1ce4e5b9ULL;
+    return h ^ (h >> 29);
+}
+
+inline uint64_t mix_box(uint64_t h, Region* region, int nd) {
+    Box b = region_box(region, nd, {0, 0, 0});
+    h = mix64(h, region == nullptr ? 1 : region->is_global ? 2 : 3);
+    for (int d = 0; d < nd; ++d) {
+        h = mix64(h, (uint32_t)b.start[d]);
+        h = mix64(h, (uint32_t)b.extent[d]);
+        h = mix64(h, (uint32_t)b.step[d]);
+    }
+    return h;
+}
+
+/// Identifier of a kernel built here (the frontend hashes the structure, regions included).
+inline int64_t synth_identifier(uint64_t seed, AST* ast) {
+    uint64_t h = mix64(0x6c61796f75747321ULL, seed);
+    for (ASTNode* root : ast->roots) {
+        h = mix64(h, (uint32_t)root->opcode);
+        h = mix64(h, (uint32_t)root->dtype);
+        h = mix64(h, (uint32_t)root->ndims);
+        h = mix64(h, root->is_temp);
+        h = mix_box(h, root->region, root->ndims);
+        for (size_t i = 0; i < root->operands.size(); ++i) {
+            ASTNode* op = root->operands[i];
+            h = mix64(h, op->is_scalar ? 1 : op->is_broadcast ? 2 : 3);
+            h = mix64(h, (uint32_t)op->dtype);
+            h = mix64(h, (uint32_t)op->opcode);
+            h = mix64(h, (uint32_t)op->ndims);
+            if (!op->is_scalar)
+                h = mix_box(h, root->get_operand_region((int)i), op->ndims);
+        }
+    }
+    return (int64_t)h;
+}
+
+inline Region* whole_region(int nd, std::array<int, 3> const& shape) {
+    switch (nd) {
+    case 1: return new ArrayRegion<1>({0}, {shape[0]}, {1});
+    case 2: return new ArrayRegion<2>({0, 0}, {shape[0], shape[1]}, {1, 1});
+    default: return new ArrayRegion<3>({0, 0, 0}, {shape[0], shape[1], shape[2]}, {1, 1, 1});
+    }
+}
+
+} // namespace detail
+
+struct LayoutFixResult {
+    int follow_up_nodes = 0;
+};
+
+/// Makes every fused kernel's outputs match the layout the executor writes them in,
+/// after all decompositions are final (tie_kernel_layouts leaves only conflicts with
+/// fixed arrays). A kept result R in another layout becomes a result X in the kernel's
+/// layout, then a follow-up node R = X redistributes it; if the kernel has set_regions
+/// and anything disagrees, every set_region T[r] = v becomes X = v, then T[r] = X in a
+/// follow-up node. Follow-ups run between the kernel and its children, so reads in the
+/// kernel still see the values from before its writes; the R = X copies run before the
+/// T[r] = X writes, since a kernel writes R before any set_region into it. X names and
+/// follow-up node ids count down from next_name / next_node_id.
+template <typename ArrayMetaMap>
+LayoutFixResult resolve_kernel_layouts(ArrayMetaMap& meta, DAG* dag, int& next_name,
+                                       int& next_node_id) {
+    using Meta = typename ArrayMetaMap::mapped_type;
+    LayoutFixResult res;
+    std::vector<DAGNode*> order;
+    detail::for_each_node_topo(dag, [&](DAGNode* n) { order.push_back(n); });
+
+    for (DAGNode* node : order) {
+        if (!detail::is_fused_kernel(node))
+            continue;
+        auto& roots = node->ast->roots;
+        // (follow-up root, X it retires or -1): whole-result copies, then set_regions
+        std::vector<std::pair<ASTNode*, int>> copies, sets;
+        std::unordered_set<int> synthetic;
+        bool rebuilt = false;
+        auto new_meta = [&](int x, Meta base, int nd, std::array<int, 3> extent,
+                            std::array<int, 3> offset) {
+            base.ndims = nd;
+            base.global_shape = {0, 0, 0};
+            base.offset = {0, 0, 0};
+            for (int d = 0; d < nd; ++d) {
+                base.global_shape[d] = extent[d];
+                base.offset[d] = offset[d];
+            }
+            base.decomp_final = true;
+            meta[x] = base;
+        };
+        auto x_leaf = [&](int x, ASTNode* like) {
+            auto* leaf = new ASTNode(x, static_cast<int>(Opcode::NOOP));
+            leaf->ndims = like->ndims;
+            leaf->dtype = like->dtype;
+            return leaf;
+        };
+
+        detail::KernelLayout k;
+        if (!detail::kernel_layout(meta, node, k))
+            continue;
+        if (k.anchor_set != nullptr) {
+            bool has_data = false, conflict = false;
+            Meta const& am = meta.at(k.anchor);
+            for (ASTNode* root : roots) {
+                auto op = static_cast<Opcode>(root->opcode);
+                if (detail::is_kept_root(root)) {
+                    has_data = true;
+                    auto it = meta.find(root->result_name);
+                    if (it == meta.end())
+                        continue;
+                    detail::Box b = detail::region_box(nullptr, it->second.ndims,
+                                                       it->second.global_shape);
+                    conflict |= !detail::same_layout(it->second, {0, 0, 0}, b, am, k);
+                } else if (op == Opcode::SET_REGION) {
+                    ASTNode* rhs = root->operands[1];
+                    has_data |= !rhs->is_scalar && !rhs->is_broadcast;
+                    if (root == k.anchor_set)
+                        continue;
+                    Meta const& tm = meta.at(root->operands[0]->result_name);
+                    detail::Box b = detail::region_box(root->region, tm.ndims, tm.global_shape);
+                    conflict |= !detail::same_layout(tm, b.start, b, am, k);
+                }
+            }
+            if (!has_data || !conflict)
+                continue;
+            for (size_t i = 0; i < roots.size(); ++i) {
+                ASTNode* s = roots[i];
+                if (static_cast<Opcode>(s->opcode) != Opcode::SET_REGION)
+                    continue;
+                ASTNode* target = s->operands[0];
+                ASTNode* rhs = s->operands[1];
+                Meta const& tm = meta.at(target->result_name);
+                detail::Box b = detail::region_box(s->region, tm.ndims, tm.global_shape);
+                auto* fs = new ASTNode(s->result_name, s->opcode, false, false, 0.0, s->ndims,
+                                       s->dtype, false);
+                fs->region = s->region;
+                fs->add_operand(target);
+                fs->operand_regions.push_back(s->get_operand_region(0));
+                int x = -1;
+                if (rhs->is_scalar || rhs->is_broadcast) {
+                    fs->add_operand(rhs);
+                    fs->operand_regions.push_back(s->get_operand_region(1));
+                    roots.erase(roots.begin() + i--);
+                } else {
+                    x = next_name--;
+                    auto* xr = new ASTNode(x, static_cast<int>(Opcode::CONVERT), false, false,
+                                           0.0, s->ndims, target->dtype, false);
+                    xr->add_operand(rhs);
+                    xr->operand_regions.push_back(s->get_operand_region(1));
+                    roots[i] = xr;
+                    std::array<int, 3> off = {0, 0, 0};
+                    for (int d = 0; d < tm.ndims; ++d)
+                        off[d] = b.unit ? tm.offset[d] + b.start[d] : 0;
+                    new_meta(x, tm, tm.ndims, b.extent, off);
+                    synthetic.insert(x);
+                    fs->add_operand(x_leaf(x, xr));
+                    fs->operand_regions.push_back(detail::whole_region(tm.ndims, b.extent));
+                }
+                sets.push_back({fs, x});
+            }
+            rebuilt = true;
+        }
+
+        bool has_set = false;
+        std::vector<ASTNode*> kept;
+        for (ASTNode* root : roots) {
+            has_set |= static_cast<Opcode>(root->opcode) == Opcode::SET_REGION;
+            if (detail::is_kept_root(root) && meta.count(root->result_name))
+                kept.push_back(root);
+        }
+        if (!has_set && !kept.empty()) {
+            int ref = kept[0]->result_name;
+            for (ASTNode* r : kept)
+                if (!synthetic.count(r->result_name)) {
+                    ref = r->result_name;
+                    break;
+                }
+            for (int x : synthetic) {
+                Meta& xm = meta.at(x);
+                Meta const& rm = meta.at(ref);
+                if (xm.ndims == rm.ndims && xm.global_shape == rm.global_shape) {
+                    xm.tile = rm.tile;
+                    xm.offset = rm.offset;
+                }
+            }
+            detail::KernelLayout ka;
+            detail::kernel_layout(meta, node, ka);
+            Meta const am = meta.at(ka.anchor);
+            for (ASTNode* r : kept) {
+                int name = r->result_name;
+                if (name == ka.anchor)
+                    continue;
+                Meta const rm = meta.at(name);
+                detail::Box b = detail::region_box(nullptr, rm.ndims, rm.global_shape);
+                bool same_shape = rm.ndims == am.ndims;
+                for (int d = 0; same_shape && d < rm.ndims; ++d)
+                    same_shape = rm.global_shape[d] == am.global_shape[d];
+                // The frontend only fuses ops of one shape; R = X cannot reshape, so a
+                // result of another shape is left as it is.
+                if (!same_shape || detail::same_layout(rm, {0, 0, 0}, b, am, ka))
+                    continue;
+                // R is written as X in the kernel's layout, then redistributed
+                int x = next_name--;
+                new_meta(x, rm, rm.ndims, rm.global_shape, am.offset);
+                meta[x].tile = am.tile;
+                r->result_name = x;
+                for (ASTNode* other : roots)
+                    for (ASTNode*& op : other->operands)
+                        if (op->result_name == name && !op->is_scalar &&
+                            static_cast<Opcode>(op->opcode) == Opcode::NOOP) {
+                            auto* leaf = new ASTNode(x, static_cast<int>(Opcode::NOOP));
+                            leaf->is_broadcast = op->is_broadcast;
+                            leaf->ndims = op->ndims;
+                            leaf->dtype = op->dtype;
+                            op = leaf;
+                        }
+                auto* fr = new ASTNode(name, static_cast<int>(Opcode::CONVERT), false, false,
+                                       0.0, r->ndims, r->dtype, false);
+                fr->add_operand(x_leaf(x, r));
+                fr->operand_regions.push_back(detail::whole_region(rm.ndims, rm.global_shape));
+                copies.push_back({fr, x});
+            }
+        }
+        std::vector<std::pair<ASTNode*, int>> follow = std::move(copies);
+        follow.insert(follow.end(), sets.begin(), sets.end());
+        if (follow.empty())
+            continue;
+
+        node->ast->nodes.clear();
+        for (ASTNode* root : roots)
+            node->ast->nodes[root->result_name] = root;
+        if (rebuilt)
+            node->identifier = detail::synth_identifier((uint64_t)node->identifier, node->ast);
+
+        std::vector<DAGNode*> children = std::move(node->children);
+        std::vector<int> retire = std::move(node->retire_names);
+        node->children.clear();
+        node->retire_names.clear();
+        auto pos = std::find(dag->node_order.begin(), dag->node_order.end(), node->id);
+        DAGNode* prev = node;
+        for (auto [root, x] : follow) {
+            auto* f = new DAGNode(next_node_id--, new AST({root}));
+            f->fusible = true;
+            f->identifier = detail::synth_identifier(0, f->ast);
+            prev->children.push_back(f);
+            f->num_parents = 1;
+            if (x >= 0) {
+                dag->retire_remaining[x] = 1;
+                f->retire_names.push_back(x);
+            }
+            dag->nodes[f->id] = f;
+            if (pos != dag->node_order.end())
+                pos = dag->node_order.insert(pos + 1, f->id);
+            else
+                dag->node_order.push_back(f->id);
+            prev = f;
+        }
+        prev->children = std::move(children);
+        prev->retire_names.insert(prev->retire_names.end(), retire.begin(), retire.end());
+        dag->num_nodes = (int)dag->nodes.size();
+        res.follow_up_nodes += (int)follow.size();
+    }
+    return res;
+}
 
 } // namespace decomposition_solver

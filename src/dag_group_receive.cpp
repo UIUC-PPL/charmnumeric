@@ -2,6 +2,7 @@
 #include <memory>
 #include "backend.hpp"
 #include "dag_group_internal.hpp"
+#include "decomposition_solver.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -536,6 +537,14 @@ void ArrayDAGGroup::receive_dag_now(int epoch, int size, char* serialized_dag) {
             array_meta[ast_node->result_name] = meta;
         }
     });
+
+    {
+        auto fix = decomposition_solver::resolve_kernel_layouts(array_meta, dag, synth_name,
+                                                                synth_node_id);
+        if (fix.follow_up_nodes > 0 && CkMyPe() == 0 && getenv("CNUM_DECOMP_LOG") != nullptr)
+            CkPrintf("decomp: epoch %d: %d layout follow-up node(s)\n", epoch,
+                     fix.follow_up_nodes);
+    }
 
     // Pass 2: expand partitions now that tile sizes have been assigned.
     dag_group_for_each_node_topo(dag, [&](DAGNode* dag_node) {
