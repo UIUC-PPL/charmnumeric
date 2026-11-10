@@ -12,6 +12,7 @@ Deviations from NumPy: ``bincount`` needs ``minlength`` or ``interface=``
 
 import builtins
 import numbers
+import warnings
 
 import numpy as np
 
@@ -22,6 +23,7 @@ from .charmnumeric import (
     ArrayView,
     DType,
     _array_abs,
+    _astype,
     _NDBase,
     _imag,
     _is_array_nd,
@@ -30,8 +32,11 @@ from .charmnumeric import (
     _normalize_dtype,
     _real,
     asarray,
+    empty,
+    full,
     nonfusible_op,
 )
+from charmtyles.core import _shape_size
 
 # Reduction kinds. Must match enum RedOp in src/executor_reduction.cpp.
 _RED_SUM = 0
@@ -52,6 +57,8 @@ _RED_NORM_INF = 14
 _RED_NORM_NEGINF = 15
 
 _NORMS = (_RED_NORM2, _RED_NORM1, _RED_NORM_INF, _RED_NORM_NEGINF)
+_IDENTITY = {_RED_SUM: 0, _RED_PROD: 1, _RED_COUNT_NONZERO: 0, _RED_ALL: True, _RED_ANY: False,
+             _RED_NORM2: 0, _RED_NORM1: 0}
 
 
 def _normalize_axes(axis, ndim, single=False):
@@ -127,17 +134,45 @@ def _write_out(result, out):
     return out
 
 
+def _empty_reduce(a, op, axes, keepdims, out_dtype):
+    """NumPy's result of reducing a zero-size array."""
+    shape = _result_shape(a.shape, axes, keepdims)
+    if _shape_size(shape) == 0:
+        return empty(shape, dtype=out_dtype)
+    if op in _IDENTITY:
+        return full(shape, _IDENTITY[op], dtype=out_dtype)
+    if op in (_RED_MEAN, _RED_VAR, _RED_STD):
+        warnings.warn("Mean of empty slice", RuntimeWarning, stacklevel=4)
+        return full(shape, np.nan, dtype=out_dtype)
+    raise ValueError("zero-size array to reduction operation which has no identity")
+
+
 def _reduce(a, op, axis=None, keepdims=False, dtype=None, out=None, ddof=0, single=False):
     a = asarray(a)
+    if op in (_RED_SUM, _RED_PROD) and dtype is None and out is not None:
+        acc = np.result_type(_default_out_dtype(op, a.dtype), out.dtype)
+        if acc != _default_out_dtype(op, a.dtype):
+            dtype = acc  # NumPy accumulates in out's dtype when that is wider
     if isinstance(a, _NDBase):
         from .folded import reduce_nd
 
         return _write_out(reduce_nd(a, op, axis, keepdims, dtype, ddof, single), out)
     axes = _normalize_axes(axis, a.ndims, single=single)
-    if a.size == 0:
-        raise ValueError("zero-size arrays are not supported by charmnumeric reductions")
     if op in (_RED_ARGMAX, _RED_ARGMIN) and len(axes) not in (1, a.ndims):
         raise ValueError("argmax/argmin reduce over one axis or all axes")
+    out_dtype = _default_out_dtype(op, a.dtype) if dtype is None else _normalize_dtype(dtype)
+    if a.size == 0:
+        return _write_out(_empty_reduce(a, op, axes, keepdims, out_dtype), out)
+    if op in (_RED_VAR, _RED_STD) and ddof != int(ddof):
+        # fractional ddof: rescale the ddof=0 variance by n / (n - ddof)
+        n = _shape_size([a.shape[ax] for ax in axes])
+        result = _reduce(a, _RED_VAR, axis, keepdims, dtype, None, 0, single)
+        result = result * (n / (n - ddof) if n > ddof else np.inf)
+        if op == _RED_STD:
+            result = result.sqrt()
+        return _write_out(result, out)
+    if op in (_RED_SUM, _RED_PROD) and dtype is not None and out_dtype != a.dtype:
+        a = _astype(a, out_dtype)  # NumPy accumulates in the requested dtype
 
     if a.dtype.kind == "c" and (op in _NORMS or op in (_RED_VAR, _RED_STD)):
         # complex: norms of |a|; var(a) = var(a.real) + var(a.imag)
@@ -149,10 +184,6 @@ def _reduce(a, op, axis=None, keepdims=False, dtype=None, out=None, ddof=0, sing
             if op == _RED_STD:
                 result = result.sqrt()
         return _write_out(result, out)
-
-    out_dtype = _default_out_dtype(op, a.dtype)
-    if dtype is not None:
-        out_dtype = _normalize_dtype(dtype)
 
     mask = 0
     for ax in axes:

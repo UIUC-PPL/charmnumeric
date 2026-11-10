@@ -24,13 +24,18 @@ def default_interface():
 
 
 _BARRIER_NAME = -1  # kBarrierName in src/backend.hpp
+_ERROR_TAG = b"\x00charmnumeric-error\x00"  # kClientErrorTag in src/backend.hpp
 
 
 def synchronize(interface=None):
     """Block until the backend has finished every operation recorded so far."""
     from charmtyles.core import execute
 
+    from .charmnumeric import _DEFERRED_ERRORS, raise_deferred_errors
+
     interface = interface or default_interface()
+    if _DEFERRED_ERRORS:
+        raise_deferred_errors(interface)
     execute(interface)
     interface.get(1, _BARRIER_NAME, 0, dtype=np.bool_)
 
@@ -50,6 +55,14 @@ class CharmNumericInterface(CCSInterface):
         from charmtyles.core import set_auto_flush
 
         set_auto_flush(self, _AUTO_FLUSH if _AUTO_FLUSH > 0 else None)
+
+    def send_command_raw_var(self, handler, msg):
+        # A GET reply may instead carry an error from an earlier operation.
+        reply = super().send_command_raw_var(handler, msg)
+        if bytes(reply[:len(_ERROR_TAG)]) == _ERROR_TAG:
+            detail = bytes(reply[len(_ERROR_TAG):]).decode(errors="replace")
+            raise RuntimeError(f"charmnumeric server: {detail}")
+        return reply
 
     def from_bytes(self, payload, **kwargs):
         reply_type = kwargs.pop("reply_type", "array")
