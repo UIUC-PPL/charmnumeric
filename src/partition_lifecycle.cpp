@@ -26,6 +26,10 @@ void PartitionImpl<N>::init(typename PartitionTraits<N>::ProxyType proxy, std::a
     auto* dag_group = static_cast<ArrayDAGGroup*>(dag_proxy_.ckLocalBranch());
     executor = new ArrayDAGExecutorND<N>(dag_group, this);
     local_partitions<N>().push_back(this);
+    {
+        std::lock_guard<std::mutex> lock(free_lists_mutex());
+        process_partitions<N>().push_back(this);
+    }
     // Skip to the epoch where this partition was first created.
     // start_epoch - 1 so that next_epoch() advances to start_epoch.
     int se = dag_group->partition_grid[N].start_epoch;
@@ -44,11 +48,17 @@ PartitionImpl<N>::~PartitionImpl() {
     delete executor;
     for (auto& [name, arr] : arrays)
         delete arr;
-    for (auto& [key, bucket] : free_arrays)
-        for (auto* arr : bucket) {
-            retired_bytes() -= arr->local_size() * arr->elem_size();
-            delete arr;
-        }
+    {
+        std::lock_guard<std::mutex> lock(free_lists_mutex());
+        auto& all = process_partitions<N>();
+        all.erase(std::remove(all.begin(), all.end(), this), all.end());
+        for (auto& [key, bucket] : free_arrays)
+            for (auto* arr : bucket) {
+                retired_bytes() -= arr->local_size() * arr->elem_size();
+                delete arr;
+            }
+        free_arrays.clear();
+    }
 #ifdef USE_NVIDIA
     gpu_ipc_cancel(this); // sends waiting for an IPC block; their buffers are in pending_sends
 #endif
