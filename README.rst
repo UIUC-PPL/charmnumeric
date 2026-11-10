@@ -7,7 +7,7 @@ See CODEMAP.md for an overview of the code.
 Install
 -------
 
-Needs Linux x86_64, git, curl, GCC 9 or newer and Python 3.9+ (with headers) in an
+Needs Linux x86_64, git, curl, GCC 9 or newer and Python 3.12+ (with headers) in an
 activated virtualenv or conda env; NVIDIA GPU builds also need CUDA 12.x.
 ``scripts/install.sh`` builds what is missing (Charm++, Kokkos for GPUs, PyCCS),
 fetches LLVM/MLIR 22 and Eigen as conda-forge binaries, then ``pip install``\ s

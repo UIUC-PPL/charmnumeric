@@ -103,7 +103,7 @@ step "Checking the environment"
 for t in git curl tar make sha256sum; do command -v $t >/dev/null || die "$t not found"; done
 [ "$MLIR" = source ] && { command -v xz >/dev/null || die "xz not found (needed to unpack the LLVM sources)"; }
 PY=$(command -v python || command -v python3) || die "python not found"
-"$PY" -c 'import sys; sys.exit(sys.version_info < (3, 9))' || die "Python >= 3.9 required ($PY is $("$PY" -V 2>&1))"
+"$PY" -c 'import sys; sys.exit(sys.version_info < (3, 12))' || die "Python >= 3.12 required ($PY is $("$PY" -V 2>&1))"
 "$PY" -c 'import os, sys; sys.exit(not (sys.prefix != sys.base_prefix or os.environ.get("CONDA_PREFIX")))' ||
     die "activate a virtualenv (python3 -m venv ~/cnum-venv && . ~/cnum-venv/bin/activate) or a conda env first"
 "$PY" -c 'import os, sysconfig; assert os.path.exists(os.path.join(sysconfig.get_paths()["include"], "Python.h"))' 2>/dev/null ||

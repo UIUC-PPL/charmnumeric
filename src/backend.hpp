@@ -421,6 +421,10 @@ struct ShapeState {
 /// of every partition has finished all earlier epochs.
 constexpr int kBarrierName = -1;
 
+/// Prefix of a GET reply that carries a server error instead of data (charmnumeric/interface.py).
+constexpr char kClientErrorTag[] = "\0charmnumeric-error\0";
+constexpr int kClientErrorTagLen = sizeof(kClientErrorTag) - 1;
+
 class ArrayDAGGroup : public CBase_ArrayDAGGroup {
   public:
     // Per-ndims partition state: current chare grid and proxy.
@@ -434,6 +438,8 @@ class ArrayDAGGroup : public CBase_ArrayDAGGroup {
     CProxy_Partition3D partition_proxy_3;
     std::unordered_map<int64_t, void*> compile_cache;
     std::unordered_map<int64_t, void*> module_cache;
+    std::unordered_map<int64_t, std::string> compile_errors;
+    std::string client_error; // PE 0: sent with the next GET reply
     std::unordered_map<int, char*> gather_buffers;
     std::unordered_map<int, int64_t> gather_counts; // bytes gathered so far
     std::unordered_map<int, int64_t> gather_total;  // total bytes expected
@@ -523,8 +529,9 @@ class ArrayDAGGroup : public CBase_ArrayDAGGroup {
     void compute_decompositions(DAG* dag);
 
     // Shared
-    void* compile_node(DAGNode* node);
+    void* compile_node(DAGNode* node, std::string& error);
     void compile(DAG* dag);
+    void reply_to_client(int epoch, int64_t byte_size, char* data);
 };
 
 /// Result ndims and shape of a REDUCTION/BINCOUNT root (executor_reduction.cpp).

@@ -17,6 +17,7 @@ from .charmnumeric import (
     _imag,
     _is_array_nd,
     _real,
+    _reshape,
     _is_scalar_like,
     _log,
     _logical_and,
@@ -85,6 +86,10 @@ def tile(x, reps):
     if isinstance(reps, int):
         reps = (reps,)
     reps = tuple(int(rep) for rep in reps)
+    if not x.shape:
+        if not reps:
+            return x.copy()
+        x = _reshape(x, (1,))
 
     out_ndims = max(x.ndims, len(reps))
     padded_shape = (1,) * (out_ndims - x.ndims) + x.shape
