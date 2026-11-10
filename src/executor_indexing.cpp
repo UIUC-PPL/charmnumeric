@@ -2044,7 +2044,7 @@ void gx_send(PartitionImpl<N>* p, ArrayDAGGroup* g, int nd, const int dest[3], i
     if (inl && gpu_ipc_peer(pe)) {
         int slab;
         int64_t off;
-        if (void* blk = gpu_ipc_alloc(h.bytes, slab, off)) {
+        if (void* blk = gpu_ipc_alloc(h.bytes, slab, off, false, true)) {
             hapiCheck(cudaMemcpyAsync(blk, payload, h.bytes, cudaMemcpyDeviceToDevice,
                                       p->compute_stream_raw));
             compute_fence(p);
