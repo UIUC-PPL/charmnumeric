@@ -1159,7 +1159,28 @@ bool MLIRJitCompiler::lowerToNVIDIAHost() {
         }
         op->erase();
     }
+    // Free each temporary after its last user (launches are stream-ordered), not at the end,
+    // so a chain of unfused kernels holds only its live temporaries.
     for (memref::DeallocOp op : deallocs) {
+        Block* blk = op->getBlock();
+        Operation* last = nullptr;
+        SmallVector<Value> work{op.getMemref()};
+        while (!work.empty()) {
+            Value v = work.pop_back_val();
+            for (Operation* u : v.getUsers()) {
+                if (u == op.getOperation())
+                    continue;
+                for (Value r : u->getResults())
+                    if (isa<BaseMemRefType>(r.getType()))
+                        work.push_back(r);
+                Operation* a = blk->findAncestorOpInBlock(*u);
+                if (!a || (last && a->isBeforeInBlock(last)))
+                    continue;
+                last = a;
+            }
+        }
+        if (last && last->isBeforeInBlock(op))
+            op->moveAfter(last);
         b.setInsertionPoint(op);
         emitDealloc(op.getLoc(), op.getMemref());
         op.erase();
