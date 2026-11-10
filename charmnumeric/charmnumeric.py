@@ -842,14 +842,6 @@ def _scan(name, a, axis=None, dtype=None, out=None):
         a = _reshape(a, (-1,))
         axis = 0
     axis = _normalize_axis(axis, a.ndims)
-    if isinstance(a, _NDBase):
-        from .folded import along_last_dims
-
-        result = along_last_dims(a, axis, lambda b, ax: _scan(name, b, ax, dtype))
-        if out is not None:
-            out[...] = result
-            return out
-        return result
     if dtype is None:
         # NumPy's accumulation dtype (int64/uint64 for bool and small ints)
         dtype = getattr(np, name)(np.zeros(1, a.dtype)).dtype
@@ -859,6 +851,14 @@ def _scan(name, a, axis=None, dtype=None, out=None):
             # types out's dtype gives the same result modulo 2**bits
             ints = dtype.kind in "iu" and odt.kind in "iu"
             dtype = odt if ints else np.promote_types(dtype, odt)
+    if isinstance(a, _NDBase):
+        from .folded import along_last_dims
+
+        result = along_last_dims(a, axis, lambda b, ax: _scan(name, b, ax, dtype))
+        if out is not None:
+            out[...] = result
+            return out
+        return result
     dtype = _normalize_dtype(dtype)
     if a.dtype != dtype and not (dtype in _SCAN_WIDE and a.dtype in _SCAN_NARROW):
         a = _astype(a, dtype)  # SCAN casts the narrow integer inputs itself
@@ -878,7 +878,11 @@ def _scan(name, a, axis=None, dtype=None, out=None):
 
 
 def _sort(a, axis=-1, kind=None, order=None, arg=False):
-    """sort / argsort along one axis (stable, NaNs last: valid for every NumPy kind)."""
+    """sort / argsort along one axis (stable, NaNs last: valid for every NumPy kind).
+
+    Real sort values are decoded from radix keys: every NaN comes back as one canonical NaN,
+    and -0.0 sorts strictly before +0.0 (np.sort keeps their input order). Equal as floats.
+    """
     if order is not None:
         raise NotImplementedError("sort(order=...) needs structured dtypes")
     if kind is not None and not (isinstance(kind, str) and kind[:1].lower() in "qhms" and kind):
