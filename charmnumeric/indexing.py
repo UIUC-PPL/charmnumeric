@@ -38,6 +38,7 @@ from .charmnumeric import (
     _clip,
     _coerce_scalar,
     _compare,
+    defer_error,
     _fresh,
     _fresh_operands,
     _is_array,
@@ -181,10 +182,11 @@ def _index_int64(idx):
     return idx if idx.dtype == _INT64 else _cast_operand(idx, _INT64)
 
 
-def _wrap_device(idx, n, mode, oob=None):
+def _wrap_device(idx, n, mode, oob=None, axis=0):
     """int64 indices in [0, n); with mode 'raise' an out-of-range index becomes `oob`
     (default n), chosen by the caller so that its flat offset lies past the end of the
-    array: the backend drops it with a warning instead of writing a neighbour."""
+    array: the backend drops it instead of writing a neighbour, and the next get or sync
+    raises IndexError."""
     idx = _index_int64(idx)
     if mode == "wrap":
         return idx % n
@@ -192,7 +194,10 @@ def _wrap_device(idx, n, mode, oob=None):
         return _clip(idx, 0, n - 1)
     w = _where(_compare(idx, 0, "less"), idx + n, idx)
     oob = n if oob is None else oob
-    return _where(_compare(w, n, "greater_equal"), oob, _where(_compare(w, 0, "less"), oob, w))
+    w = _where(_compare(w, n, "greater_equal"), oob, _where(_compare(w, 0, "less"), oob, w))
+    defer_error(IndexError, f"a device index is out of bounds for axis {axis} with size {n}",
+                _compare(w, oob, "equal"))
+    return w
 
 
 def _nonzero_flat(x):
@@ -382,7 +387,7 @@ def _plan(x, items, mode="raise", newaxes=()):
                     f"and {B})"
                 )
             oob = root.size // mult[d] + 1  # oob * mult[d] > every offset into root
-            devs.append((idx if trusted else _wrap_device(idx, x.shape[d], mode, oob), mult[d]))
+            devs.append((idx if trusted else _wrap_device(idx, x.shape[d], mode, oob, d), mult[d]))
         else:
             host = host + _wrap_host(idx, x.shape[d], mode, d) * mult[d]
     if not devs:
@@ -760,7 +765,7 @@ def _along_axis(arr, indices, axis):
         return root, (asarray(np.ascontiguousarray(L)) if L.size else None), ishape
     if not np.issubdtype(indices.dtype, np.integer):
         raise IndexError("arrays used as indices must be of integer type")
-    L = _wrap_device(indices, n, "raise", root.size // mult[axis] + 1) * mult[axis]
+    L = _wrap_device(indices, n, "raise", root.size // mult[axis] + 1, axis) * mult[axis]
     for d in range(nd):
         if d != axis and ishape[d] > 1:
             L = L + _axis_range(ishape, d, ishape[d], _INT64) * mult[d]
@@ -822,6 +827,9 @@ def repeat(a, repeats, axis=None):
             raise ValueError(f"operands could not be broadcast together with shape ({n},)")
         if repeats.shape[0] == 1 and n != 1:
             raise NotImplementedError("repeat with a size-1 device repeats array")
+        if not np.can_cast(np.dtype(repeats.dtype), np.int64, casting="safe"):
+            raise TypeError(f"Cannot cast array data from dtype('{np.dtype(repeats.dtype)}') "
+                            "to dtype('int64') according to the rule 'safe'")
         if _count(repeats, "min") < 0:
             raise ValueError("repeats may not contain negative values")
         total = _count(repeats, "sum")
@@ -852,7 +860,7 @@ def _take_valid(a, idx, axis):
 
 
 def choose(a, choices, out=None, mode="raise"):
-    """numpy.choose (mode 'raise' does not check device indices)."""
+    """numpy.choose (mode 'raise': an invalid entry raises ValueError at the next get or sync)."""
     if mode not in ("raise", "wrap", "clip"):
         raise ValueError(f"clipmode must be one of 'clip', 'raise', or 'wrap' (got {mode!r})")
     n = len(choices)
@@ -865,6 +873,8 @@ def choose(a, choices, out=None, mode="raise"):
         idx = _clip(a, 0, n - 1)
     else:
         idx = a
+        defer_error(ValueError, "invalid entry in choice array",
+                    _compare(_clip(a, 0, n - 1), a, "not_equal"))
     choices = [c if _is_array(c) else (_coerce_scalar(c) if _is_scalar_like(c) else asarray(c))
                for c in choices]
     arrays = [c for c in choices if _is_array(c)]

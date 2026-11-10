@@ -25,6 +25,8 @@ from ._native_region import NativeArrayRegion
 
 
 _FULL_REGION_CACHE = {}
+# Device-index errors seen lazily: [exception, message, count array]; raised at the next get/sync.
+_DEFERRED_ERRORS = []
 _DEFAULT_DTYPE = np.dtype("float64")
 _FULL_SLICE = slice(None)
 
@@ -1874,6 +1876,26 @@ class _ArrayMethods(object):
         return _sort(self, axis, kind, order, arg=True)
 
 
+
+def defer_error(exc, msg, bad):
+    """Raise exc(msg) at the next get or sync if the backend bool array `bad` has a True."""
+    from .reductions import count_nonzero
+
+    cnt = count_nonzero(bad)
+    for e in _DEFERRED_ERRORS:
+        if e[0] is exc:
+            e[2] = e[2] + cnt
+            return
+    _DEFERRED_ERRORS.append([exc, msg, cnt])
+
+
+def raise_deferred_errors(interface):
+    pending = list(_DEFERRED_ERRORS)
+    _DEFERRED_ERRORS.clear()
+    for exc, msg, cnt in pending:
+        if int(cnt.get(interface).reshape(-1)[0]):
+            raise exc(msg)
+
 class Array(FrontendObject, _ArrayMethods, _ElementwiseMethods, _HostConversions):
     # __eq__ is elementwise; keep FrontendObject's name-based hash
     __hash__ = FrontendObject.__hash__
@@ -1927,6 +1949,8 @@ class Array(FrontendObject, _ArrayMethods, _ElementwiseMethods, _HostConversions
         return f"Array(shape={self.shape}, dtype={dtype_name}, name={self.name})"
 
     def get(self, interface):
+        if _DEFERRED_ERRORS:
+            raise_deferred_errors(interface)
         if self._size == 0:
             return np.empty(self._shape, dtype=self.dtype)
         _fresh(self)
