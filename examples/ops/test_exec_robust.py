@@ -95,20 +95,20 @@ def norms(chk, iface, rng):
 
 
 def matmul_dim_drop(chk, iface, rng):
-    def sq(s):
-        return tuple(d for d in s if d != 1)
-    for sa, sb in [((50, 1, 40), (40, 30)), ((1, 50, 40), (40, 30)), ((50, 40, 1), (40, 30)),
-                   ((50, 40), (40, 1, 30)), ((50, 40), (1, 40, 30)), ((1, 50, 40), (40, 30, 1)),
-                   ((300, 1, 600), (600, 500)), ((300, 600), (600, 1, 500)),
-                   ((1, 300, 600), (600, 20)), ((3000, 1, 600), (600, 20))]:
+    # 3-D operands with a size-1 dim are batches (NumPy), not squeezed matrices
+    for sa, sb in [((50, 1, 40), (40, 30)), ((1, 50, 40), (40, 30)), ((50, 40, 1), (1, 30)),
+                   ((50, 40), (1, 40, 30)), ((1, 50, 40), (1, 40, 30)),
+                   ((300, 1, 600), (600, 500)), ((1, 300, 600), (600, 20)),
+                   ((3000, 1, 600), (600, 20))]:
         a, b = rng.standard_normal(sa), rng.standard_normal(sb)
         A, B = cnp.array(a), cnp.array(b)
-        exp = a.reshape(sq(sa) if len(sa) == 3 else sa) @ b.reshape(sq(sb) if len(sb) == 3 else sb)
-        chk.check(f"{sa} @ {sb}", cnp.reshape(A @ B, exp.shape), exp, rtol=1e-10, atol=1e-10)
+        chk.check(f"{sa} @ {sb}", A @ B, a @ b, rtol=1e-10, atol=1e-10)
         if len(sa) == 3:
-            x = rng.standard_normal(exp.shape[0] and a.reshape(sq(sa)).shape[1])
-            chk.check(f"{sa} @ vec", A @ cnp.array(x), a.reshape(sq(sa)) @ x, rtol=1e-10,
-                      atol=1e-10)
+            x = rng.standard_normal(sa[-1])
+            chk.check(f"{sa} @ vec", A @ cnp.array(x), a @ x, rtol=1e-10, atol=1e-10)
+    for sa, sb in [((50, 40), (40, 1, 30)), ((50, 40, 1), (40, 30))]:
+        A, B = cnp.zeros(sa), cnp.zeros(sb)
+        chk.raises(f"{sa} @ {sb}", ValueError, lambda: A @ B)
     # (1, K, 1) operands: the dropped dim is fixed by the other operand (wire-level test)
     K = 40
     a = rng.standard_normal((2, K, 3))

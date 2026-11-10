@@ -204,13 +204,11 @@ void ArrayDAGExecutorND<N>::execute_cross_set_region_node(DAGNode* node) {
 /// Receivers place data by array_meta's offset; it must match the sender's buffer.
 template <int N>
 static void check_meta_offset(ArrayDAGGroup* dag_group, int name, ArrayDecomp<N> const& decomp) {
-#ifndef NDEBUG
     auto it = dag_group->array_meta.find(name);
     for (int d = 0; it != dag_group->array_meta.end() && d < N; ++d)
         if (it->second.offset[d] != decomp.offset[d])
             CkAbort("array %d: decomposition offset %d != metadata offset %d (dim %d)", name,
                     decomp.offset[d], it->second.offset[d], d);
-#endif
 }
 
 template <int N_src, typename T>
@@ -510,6 +508,8 @@ void ArrayDAGExecutorND<N>::execute_diag_node(DAGNode* node) {
                 pre_buffers = std::move(pre_it->second.remote_buffers);
             }
             int remaining = expected_msgs - pre_arrived;
+            for (auto& rb : pre_buffers[0])
+                check_transfer_piece<N>(dag_group->array_meta, node, rb.region);
             pending[node->id] = {node, remaining, {my_input}, std::move(pre_buffers)};
             if (remaining <= 0)
                 on_comm_done(node->id);
@@ -574,6 +574,8 @@ void ArrayDAGExecutorND<N>::execute_diag_node(DAGNode* node) {
                 pre_buffers = std::move(pre_it->second.remote_buffers);
             }
             int remaining = expected_msgs - pre_arrived;
+            for (auto& rb : pre_buffers[0])
+                check_transfer_piece<N>(dag_group->array_meta, node, rb.region);
             pending[node->id] = {node, remaining, {my_input}, std::move(pre_buffers)};
             if (remaining <= 0)
                 on_comm_done(node->id);
@@ -873,6 +875,8 @@ void ArrayDAGExecutorND<N>::execute_tile_node(DAGNode* node) {
             pre_buffers = std::move(pre_it->second.remote_buffers);
         }
         int remaining = expected_msgs - pre_arrived;
+        for (auto& rb : pre_buffers[0])
+            check_transfer_piece<N>(dag_group->array_meta, node, rb.region);
         pending[node->id] = {node, remaining, {my_input}, std::move(pre_buffers)};
         if (remaining <= 0)
             on_comm_done(node->id);

@@ -195,7 +195,7 @@ void ArrayDAGGroup::epoch_arrived(int epoch, std::function<void()> run) {
         early_epochs.emplace(epoch, std::move(run));
         return;
     }
-    run(); // epoch < next_epoch: the client reconnected and restarted its count
+    run(); // epoch < next_epoch runs at once; a client restarting its count is not supported
     next_epoch = epoch + 1;
     for (auto it = early_epochs.find(next_epoch); it != early_epochs.end();
          it = early_epochs.find(next_epoch)) {
