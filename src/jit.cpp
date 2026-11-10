@@ -51,6 +51,7 @@
 #include <numeric>
 #include "mlir/Target/LLVM/NVVM/Target.h"
 #include "mlir/Target/LLVMIR/Dialect/GPU/GPUToLLVMIRTranslation.h"
+#include <cuda_runtime_api.h>
 #endif
 
 namespace {
@@ -92,6 +93,7 @@ namespace {
 struct JitModule {
     std::unique_ptr<mlir::ExecutionEngine> engine;
     std::unique_ptr<llvm::orc::LLJIT> jit;
+    std::vector<void*> cuModules; // loaded by jit_prewarm's constructors
 };
 
 bool jitCacheEnabled();
@@ -127,8 +129,12 @@ void touchCacheEntry(const std::string& path, std::time_t mtime = 0) {
     struct stat st;
     if (!mtime && stat(path.c_str(), &st) == 0)
         mtime = st.st_mtime;
-    if (mtime && std::time(nullptr) - mtime > 3600)
-        utimes(path.c_str(), nullptr);
+    if (!mtime || std::time(nullptr) - mtime <= 3600 || utimes(path.c_str(), nullptr) == 0)
+        return;
+    // Not ours to touch (a group-shared cache): replace it with a fresh copy we own.
+    std::string tmp = cacheTmpName(path);
+    if (llvm::sys::fs::copy_file(path, tmp) || rename(tmp.c_str(), path.c_str()) != 0)
+        unlink(tmp.c_str());
 }
 } // namespace
 
@@ -512,6 +518,14 @@ const typename Entry::Fn* pickBody(const Entry& e, BodyKind k) {
     return (f && *f) ? f : nullptr;
 }
 
+std::string dtypeName(DType dt) {
+    static const char* names[NUM_DTYPES] = {
+        "float32", "float64", "int32",  "int64",  "bool",    "int8",      "int16",
+        "uint8",   "uint16",  "uint32", "uint64", "float16", "complex64", "complex128"};
+    int i = static_cast<int>(dt);
+    return i >= 0 && i < NUM_DTYPES ? names[i] : std::to_string(i);
+}
+
 DType realOf(DType dt) {
     return dt == DType::COMPLEX64 ? DType::FLOAT32 : DType::FLOAT64;
 }
@@ -623,9 +637,9 @@ void MLIRJitCompiler::emitOp(ASTNode* node, mlir::Location loc) {
                 return (*f)(b, l, a[0], a[1], a[2]);
             };
         }
-        if (!body)
-            llvm::report_fatal_error(llvm::Twine("JIT: opcode ") + llvm::Twine(node->opcode) +
-                                     " is not defined for dtype " + llvm::Twine((int)C));
+        if (!body && buildError.empty())
+            buildError = "opcode " + std::to_string(node->opcode) +
+                         " has no JIT kernel for dtype " + dtypeName(C);
 
         // Operands convert to K (where's condition to i1); the body result
         // (i1 for predicates, real for complex abs/real/imag, 0/1 i8 for
@@ -643,6 +657,10 @@ void MLIRJitCompiler::emitOp(ASTNode* node, mlir::Location loc) {
             RB = DType::INT8;
         auto typed = [&](OpBuilder& b, Location l, ValueRange args) -> Value {
             SmallVector<Value, 3> conv;
+            if (!body) // writes zeros; the client gets the error at its next fetch
+                return convertValue(
+                    b, l, arith::ConstantOp::create(b, l, b.getF64FloatAttr(0.0)).getResult(),
+                    DType::FLOAT64, R);
             for (int i = 0; i < arity; ++i)
                 conv.push_back(convertValue(b, l, args[i], dts[i], tgt[i]));
             return convertValue(b, l, body(b, l, conv), RB, R);
@@ -1128,9 +1146,10 @@ extern "C" void cn_mgpuMemFree(void* ptr, CUstream s) {
     }
 }
 
-// Modules load and kernels launch in the calling thread's current context (the
-// chare's device). The MLIR wrappers would use device 0's primary context, which
-// differs once Kokkos picks a device per local rank (e.g. SLURM_LOCALID under srun).
+// Modules load and kernels launch in the calling thread's current context, else
+// the primary context of its runtime device (the chare's device, set per PE). The
+// MLIR wrappers would use device 0's, which differs once Kokkos picks a device per
+// local rank (e.g. SLURM_LOCALID under srun).
 void cnCheck(CUresult r, const char* what) {
     if (r != CUDA_SUCCESS)
         llvm::report_fatal_error(llvm::Twine(what) + " failed: " + llvm::Twine(r));
@@ -1161,9 +1180,12 @@ bool cnEnsureContext() {
         cnOk(CUDA_ERROR_INVALID_CONTEXT, "");
         return false;
     }
+    int ordinal = 0;
+    if (cudaGetDevice(&ordinal) != cudaSuccess)
+        llvm::report_fatal_error("cudaGetDevice failed");
     CUdevice dev;
     cnCheck(cuInit(0), "cuInit");
-    cnCheck(cuDeviceGet(&dev, 0), "cuDeviceGet");
+    cnCheck(cuDeviceGet(&dev, ordinal), "cuDeviceGet");
     cnCheck(cuDevicePrimaryCtxRetain(&ctx, dev), "cuDevicePrimaryCtxRetain");
     cnCheck(cuCtxSetCurrent(ctx), "cuCtxSetCurrent");
     return true;
@@ -2005,6 +2027,13 @@ const std::unordered_map<int, TernaryOpEntry>& MLIRJitCompiler::ternaryOpRegistr
           [](OpBuilder& b, Location loc, Value x, Value lo, Value hi) {
               Value m = arith::MaxUIOp::create(b, loc, x, lo).getResult();
               return arith::MinUIOp::create(b, loc, m, hi).getResult();
+          },
+          // lexicographic, NaN of the clipped value first, as NumPy's complex loop
+          [](OpBuilder& b, Location loc, Value x, Value lo, Value hi) {
+              Value m = selC(b, loc, orI(b, loc, clt(b, loc, lo, x, false), cAnyNan(b, loc, x)),
+                             x, lo);
+              return selC(b, loc, orI(b, loc, clt(b, loc, m, hi, false), cAnyNan(b, loc, m)), m,
+                          hi);
           }}},
     };
     return registry;
@@ -2467,7 +2496,17 @@ std::string cachePath(const std::string& ir) {
     NvTarget target = nvTarget();
     h.update("nvidia " + target.chip + " " + target.features + " cubin " + target.device);
 #endif
-    h.update(llvm::sys::getHostCPUName());
+    static const std::string host = [] {
+        std::vector<std::string> features;
+        for (const auto& f : llvm::sys::getHostCPUFeatures())
+            features.push_back((f.second ? " +" : " -") + f.first().str());
+        std::sort(features.begin(), features.end());
+        std::string s = llvm::sys::getHostCPUName().str();
+        for (const std::string& f : features)
+            s += f;
+        return s;
+    }();
+    h.update(host);
     return dir + "/" + llvm::toHex(h.final(), true) + ".o";
 }
 
@@ -2590,7 +2629,7 @@ void* loadCachedKernel(const std::string& path, void** moduleOut, bool soft = fa
             unlink(path.c_str());
         return nullptr;
     }
-    *moduleOut = new JitModule{nullptr, std::move(*jit)};
+    *moduleOut = new JitModule{nullptr, std::move(*jit), std::move(sl.modules)};
     return fn->toPtr<void*>();
 }
 
@@ -2638,6 +2677,38 @@ struct PreloadedKernel {
 std::unordered_map<std::string, PreloadedKernel>& preloadedKernels() {
     static std::unordered_map<std::string, PreloadedKernel> cache;
     return cache;
+}
+std::chrono::steady_clock::time_point& preloadTime() {
+    static std::chrono::steady_clock::time_point t;
+    return t;
+}
+/// Unloads pre-warmed kernels still unrequested after CNUM_JIT_PRELOAD_TTL_S seconds (default
+/// 300), so they do not hold their LLJIT and CUmodule for the life of the process.
+void releaseStalePreloaded() {
+    auto& pre = preloadedKernels();
+    if (pre.empty())
+        return;
+    static const double ttl = [] {
+        const char* e = getenv("CNUM_JIT_PRELOAD_TTL_S");
+        return e ? atof(e) : 300.0;
+    }();
+    if (std::chrono::duration<double>(std::chrono::steady_clock::now() - preloadTime()).count() <
+        ttl)
+        return;
+#ifdef USE_NVIDIA
+    CUcontext ctx = nullptr;
+    if (cuCtxGetCurrent(&ctx) != CUDA_SUCCESS || !ctx)
+        return;
+#endif
+    for (auto& [path, k] : pre) {
+        auto* jm = static_cast<JitModule*>(k.module);
+#ifdef USE_NVIDIA
+        for (void* m : jm->cuModules)
+            cuModuleUnload(static_cast<CUmodule>(m));
+#endif
+        delete jm;
+    }
+    pre.clear();
 }
 // The context and caches are per process; SMP PEs (threads) must not use them concurrently.
 std::mutex& jitMutex() {
@@ -2953,16 +3024,17 @@ bool lockFree(const std::string& lock, LockWatch& w) {
 #endif
 } // namespace
 
-void* jit_compile_ast(void* ast, void** moduleHandleOut) {
+void* jit_compile_ast(void* ast, void** moduleHandleOut, std::string* errorOut) {
     void* fn = nullptr;
-    jit_compile_batch(&ast, 1, &fn, moduleHandleOut);
+    jit_compile_batch(&ast, 1, &fn, moduleHandleOut, errorOut);
     return fn;
 }
 
-void jit_compile_batch(void* const* asts, int n, void** fns, void** moduleHandles) {
+void jit_compile_batch(void* const* asts, int n, void** fns, void** moduleHandles,
+                       std::string* errors) {
     std::lock_guard<std::mutex> lock(jitMutex());
     struct Item {
-        std::string key, path;
+        std::string key, path, error;
         int same = -1; // index of the item with the same kernel
         bool local = false; // compile without a claim
         int fd = -1;
@@ -2983,6 +3055,9 @@ void jit_compile_batch(void* const* asts, int n, void** fns, void** moduleHandle
             // Kernels take every array as a dynamic memref, so equal IR means an equal kernel.
             llvm::raw_string_ostream os(it.key);
             node_jit.printModule(os);
+            it.error = node_jit.error();
+            if (errors)
+                errors[i] = it.error;
         }
         auto hit = kernelCache().find(it.key);
         auto dup = first.find(it.key);
@@ -2995,7 +3070,8 @@ void jit_compile_batch(void* const* asts, int n, void** fns, void** moduleHandle
             first.emplace(it.key, i);
             jitMark("build");
 #if !defined(USE_AMD) && !defined(USE_INTEL)
-            it.path = cachePath(it.key);
+            releaseStalePreloaded();
+            it.path = it.error.empty() ? cachePath(it.key) : std::string();
             fns[i] = loadCached(it.path, &moduleHandles[i], &it.local);
 #endif
             if (fns[i])
@@ -3156,6 +3232,7 @@ int jit_prewarm(double budget_ms) {
         }
         std::sort(files.rbegin(), files.rend());
         std::lock_guard<std::mutex> lock(jitMutex());
+        preloadTime() = std::chrono::steady_clock::now();
         for (const auto& [mtime, path] : files) {
             if (spent() >= budget_ms)
                 break;
