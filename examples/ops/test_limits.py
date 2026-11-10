@@ -3,7 +3,7 @@
 linspace built on the device, einsum 'ij,i->j' without an n^2 temporary, stepped views in
 matvec/matmul, and (LIMITS_BIG=1) kernels on tiles of more than 2**31 elements.
 
-Env: CNUM_HOST, CNUM_PORT, CNUM_ODF; LIMITS_TESTS=guard,creation,einsum,stepped,big selects
+Env: CNUM_HOST, CNUM_PORT, CNUM_ODF; LIMITS_TESTS=guard,creation,einsum,stepped,long,big selects
 sections (big only with LIMITS_BIG=1; run it with CNUM_ODF=1 so a chare holds > 2**31
 elements); LIMITS_SHAPE=R,C (default 65536,32769).
 """
@@ -213,6 +213,43 @@ def test_stepped(chk, iface):
                   rtol=1e-9, atol=1e-9)
 
 
+def test_long(chk, iface):
+    n = 2**31 - 1
+    print(f"-- long: int8 ({n},), slices with steps over 2**30")
+    a = cnp.zeros((n,), dtype=np.int8)
+    marks = {5: 7, 6: 1, 2**30 + 6: 9, n - 1: 3}
+    for i, v in marks.items():
+        a[i] = v
+
+    def ref(*keys):
+        r = range(n)
+        for key in keys:
+            r = r[key]
+        return np.array([marks.get(i, 0) for i in r], dtype=np.int8)
+
+    for label, keys in [("[5::2**40]", (slice(5, None, 2**40),)),
+                        ("[5::2**30 + 1]", (slice(5, None, 2**30 + 1),)),
+                        ("[5::2**31 - 2]", (slice(5, None, 2**31 - 2),)),
+                        ("[0::2**31 - 1]", (slice(0, None, n),)),
+                        ("[n - 1::2**40]", (slice(n - 1, None, 2**40),)),
+                        ("[5:][::2**30 + 1]", (slice(5, None), slice(None, None, 2**30 + 1))),
+                        ("[2**30:][6::2**40]", (slice(2**30, None), slice(6, None, 2**40))),
+                        ("[1::3][2::2**40]", (slice(1, None, 3), slice(2, None, 2**40)))]:
+        v = a
+        for key in keys:
+            v = v[key]
+        exact(chk, f"a{label}", v.get(iface), ref(*keys))
+    a[4::2**40] = 2
+    a[1::2**30 + 1] = -1
+    marks.update({4: 2, 1: -1, 2**30 + 2: -1})
+    exact(chk, "a[4::2**40] = 2", a[0:8].get(iface), ref(slice(0, 8)))
+    exact(chk, "a[1::2**30 + 1] = -1", a[2**30:2**30 + 8].get(iface),
+          ref(slice(2**30, 2**30 + 8)))
+    tot = int(cnp.sum(a, dtype=np.int64).get(iface))
+    chk.true("sum(a) int64", tot == sum(marks.values()), f"{tot} vs {sum(marks.values())}")
+    del a
+
+
 def test_big(chk, iface):
     if os.environ.get("LIMITS_BIG", "0") in ("", "0"):
         print("-- big: skipped (LIMITS_BIG=1 enables it)")
@@ -292,12 +329,12 @@ def test_big(chk, iface):
 
 
 SECTIONS = {"guard": test_guard, "creation": test_creation, "einsum": test_einsum,
-            "stepped": test_stepped, "big": test_big}
+            "stepped": test_stepped, "long": test_long, "big": test_big}
 
 
 def main(chk):
     iface = _cnum_connect.get_interface()
-    names = os.environ.get("LIMITS_TESTS", "guard,creation,einsum,stepped,big").split(",")
+    names = os.environ.get("LIMITS_TESTS", "guard,creation,einsum,stepped,long,big").split(",")
     for name in names:
         SECTIONS[name](chk, iface)
 

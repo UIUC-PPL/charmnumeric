@@ -375,8 +375,10 @@ class ArrayRegion(Region):
             new_start[d] = self.start[d] + inner.start[d] * self.step[d]
             new_stop[d] = self.start[d] + inner.stop[d] * self.step[d]
             new_step[d] = self.step[d] * inner.step[d]
-            if new_step[d] > new_stop[d] - new_start[d]:
-                new_step[d] = max(new_stop[d] - new_start[d], 1)
+            if new_step[d] >= new_stop[d] - new_start[d]:
+                # at most one element: [start, start + 1) keeps region sizes small
+                new_stop[d] = new_start[d] + (new_stop[d] > new_start[d])
+                new_step[d] = 1
         return ArrayRegion(new_start, new_stop, new_step)
 
     def overlaps(self, other):
@@ -501,8 +503,10 @@ def _parse_key(key, shape, ndims):
                 raise NotImplementedError("negative slicing is not supported yet")
             if stop_i < start_i:
                 stop_i = start_i
-            if step_i > stop_i - start_i:
-                step_i = max(stop_i - start_i, 1)
+            if step_i >= stop_i - start_i:
+                # at most one element: [start, start + 1) keeps region sizes small
+                stop_i = start_i + (stop_i > start_i)
+                step_i = 1
         elif item.__class__ is int or isinstance(item, numbers.Integral):
             start_i = int(item)
             if start_i < 0:
@@ -3037,7 +3041,11 @@ def _axis_range(shape, axis, n, dtype, recipe=None):
 
 
 def meshgrid(*xi, copy=True, sparse=False, indexing="xy"):
-    """numpy.meshgrid for up to three 1-D inputs; device inputs must come from arange/linspace."""
+    """numpy.meshgrid for up to three inputs (flattened like NumPy's).
+
+    Any input works: arange/linspace results are rebuilt on the device from their recipe,
+    and other arrays are broadcast from their 1-D values on the device.
+    """
     if indexing not in ("xy", "ij"):
         raise ValueError("Valid values for `indexing` are 'xy' and 'ij'.")
     ndim = len(xi)

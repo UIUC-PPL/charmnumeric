@@ -165,6 +165,8 @@ void ArrayDAGExecutorND<N>::execute_matmul_node(DAGNode* node) {
 
         if (mat_ndims == 3) {
             // --- 3D matrix path (dimension-dropped matvec) ---
+            if (matmul_trans(matmul_root))
+                CkAbort("MATMUL: x @ A on a 3-D matrix view is not supported");
             int tile_3d = array_tile(dag_group->array_meta, mat_name, 3);
 
             // operand_regions[0] is a 3D region, operand_regions[1] is 1D vec region

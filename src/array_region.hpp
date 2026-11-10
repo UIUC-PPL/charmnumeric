@@ -107,7 +107,9 @@ class ArrayRegion : public Region {
     }
 
     /// Number of elements along dimension d
-    int size(int d) const { return (stop[d] - start[d] + step[d] - 1) / step[d]; }
+    int size(int d) const {
+        return static_cast<int>((int64_t(stop[d]) - start[d] + step[d] - 1) / step[d]);
+    }
 
     /// Total number of elements across all dimensions
     int64_t size() const {

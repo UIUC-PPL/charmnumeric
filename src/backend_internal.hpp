@@ -922,8 +922,8 @@ struct CrossSetRegionMap {
                 continue;
             }
             auto ceil_k = [&](int coord) {
-                int num = coord - vs[d];
-                return num <= 0 ? 0 : (num + vstep[d] - 1) / vstep[d];
+                int64_t num = int64_t(coord) - vs[d];
+                return num <= 0 ? 0 : static_cast<int>((num + vstep[d] - 1) / vstep[d]);
             };
             k_lo[d] = ceil_k(src_chare.start[d]);
             k_hi[d] = std::min(vn[d], ceil_k(src_chare.stop[d]));
