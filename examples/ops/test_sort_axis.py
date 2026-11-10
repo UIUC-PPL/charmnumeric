@@ -109,7 +109,9 @@ def main(chk):
             both(f"{np.dtype(dt).name} {shape}", cnp.asarray(h), h, axis)
 
     # few lines of 2**22+ elements: one 1-D sort per line
-    for shape, axis in (((3, 4_194_311), 1), ((4_194_311, 1), 0)):
+    # (strided column writes for axis 0 and a middle axis)
+    for shape, axis in (((3, 4_194_311), 1), ((4_194_311, 1), 0), ((4_194_311, 3), 0),
+                        ((2, 4_194_311, 2), 1)):
         h = make(shape, np.float32, rng, True)
         both(f"float32 {shape}", cnp.asarray(h), h, axis)
 

@@ -59,7 +59,7 @@ def find_charm_include():
     )
 
 
-install_requires = ['numpy', 'Cython']
+install_requires = ['numpy>=2.0', 'Cython']
 tests_require = ['pytest']
 docs_require = ['sphinx']
 
@@ -106,6 +106,7 @@ setup(
     classifiers=classifiers,
     packages=find_packages(),
     ext_modules=cythonize(extensions, language_level='3', include_path=[str(CHARMTYLES_HOME)]),
+    python_requires='>=3.12',
     install_requires=install_requires,
     extras_require={
         "docs": docs_require,
