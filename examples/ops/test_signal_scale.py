@@ -47,6 +47,9 @@ def main():
 
     if on("conv"):
         print("convolve: 1-D, many chares")
+        # first: the result grows the 1-D grid, so its leaders notify chares just inserted
+        conv_case("1d full grows the grid (400003)*(400001)", (400003,), (400001,), ("full",),
+                  ("fft",))
         conv_case("1d (1200007)*(33)", (1200007,), (33,), ("same", "valid"), ("direct", "fft"),
                   dtype=np.float32)
         conv_case("1d (1200007)*(5001)", (1200007,), (5001,), ("same",), ("fft",))

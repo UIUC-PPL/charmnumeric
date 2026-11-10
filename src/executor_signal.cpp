@@ -1492,16 +1492,16 @@ struct FftPlan {
     uint64_t used;
 };
 
-/// A cuFFT plan for `batch` dense row-major transforms of extents n, made once per PE and
-/// shape (at most kMaxPlans kept). It has no work area: fft_run passes one per call, so
-/// chares on other streams can share the plan.
+/// A cuFFT plan for `batch` dense row-major transforms of extents n, made once per stream
+/// and shape (at most kMaxPlans per PE): cuFFT is thread-safe only across plans, so chares
+/// never share one between streams. It has no work area: fft_run passes one per call.
 template <int N>
-FftPlan& fft_plan(const int64_t* n, int64_t batch, cufftType type) {
-    constexpr size_t kMaxPlans = 16;
-    using Key = std::tuple<int, std::array<int64_t, 3>, int64_t, int>;
+FftPlan& fft_plan(cudaStream_t stream, const int64_t* n, int64_t batch, cufftType type) {
+    constexpr size_t kMaxPlans = 64;
+    using Key = std::tuple<uintptr_t, int, std::array<int64_t, 3>, int64_t, int>;
     thread_local std::map<Key, FftPlan> plans;
     thread_local uint64_t clock = 0;
-    Key key{N, pad3<N>(n), batch, (int)type};
+    Key key{reinterpret_cast<uintptr_t>(stream), N, pad3<N>(n), batch, (int)type};
     auto it = plans.find(key);
     if (it != plans.end()) {
         it->second.used = ++clock;
@@ -1512,7 +1512,10 @@ FftPlan& fft_plan(const int64_t* n, int64_t batch, cufftType type) {
         for (auto j = plans.begin(); j != plans.end(); ++j)
             if (j->second.used < old->second.used)
                 old = j;
-        cufftDestroy(old->second.h); // a rare eviction; may wait for the device
+        // FFTs queued with the plan may still be running on its stream
+        cufftHandle h = old->second.h;
+        ct_after_stream(reinterpret_cast<cudaStream_t>(std::get<0>(old->first)),
+                        [h] { cufftDestroy(h); });
         plans.erase(old);
     }
     FftPlan p{0, 0, ++clock};
@@ -1550,7 +1553,7 @@ char* filter_spectrum(PartitionImpl<N>* partition, const T* v, const ConvBlocks<
     C* spec = static_cast<C*>(comm_alloc(cb.lc * (int64_t)sizeof(C)));
     fill_zero<N, T>(partition, vp, cb.lvol);
     copy_box<N, T>(partition, vp, 0, Ls, v, 0, fs, cb.f);
-    fft_run(partition, fft_plan<N>(cb.L, 1, CT::r2c),
+    fft_run(partition, fft_plan<N>(partition->compute_stream_raw, cb.L, 1, CT::r2c),
             [&](cufftHandle h) { return CT::fwd(h, vp, spec); });
     comm_free_after(partition->compute_stream_raw, vp);
     return reinterpret_cast<char*>(spec);
@@ -1584,12 +1587,12 @@ void conv_fft_blocks(PartitionImpl<N>* partition, T* out, const T* w, const int6
         ConvGather<T> g{xb, w, {L3[0], L3[1], L3[2]}, {B3[0], B3[1], B3[2]},
                         {e3[0], e3[1], e3[2]}, {n3[0], n3[1], n3[2]}, first};
         Kokkos::parallel_for("ct_conv_gather", CT_COMPUTE_POLICY(partition, k * cb.lvol), g);
-        fft_run(partition, fft_plan<N>(cb.L, k, CT::r2c),
+        fft_run(partition, fft_plan<N>(partition->compute_stream_raw, cb.L, k, CT::r2c),
                 [&](cufftHandle h) { return CT::fwd(h, xb, xf); });
         Kokkos::parallel_for("ct_conv_mul", CT_COMPUTE_POLICY(partition, k * cb.lc),
                              ConvSpecMul<T, C>{xf, reinterpret_cast<const C*>(spec), cb.lc,
                                                T(1) / T(cb.lvol)});
-        fft_run(partition, fft_plan<N>(cb.L, k, CT::c2r),
+        fft_run(partition, fft_plan<N>(partition->compute_stream_raw, cb.L, k, CT::c2r),
                 [&](cufftHandle h) { return CT::inv(h, xf, xb); });
         ConvScatter<T> sc{out, xb, {L3[0], L3[1], L3[2]}, {B3[0], B3[1], B3[2]},
                           {f3[0], f3[1], f3[2]}, {len3[0], len3[1], len3[2]},
@@ -1717,25 +1720,14 @@ void conv_release(PartitionImpl<N>* partition, int node_id) {
     conv_shared().erase(it);
 }
 
-/// Tells result chare ci (on this PE) that this PE's shared entry for node_id is ready.
+/// Tells result chare ci (on this PE) that this PE's shared entry for node_id is ready. A
+/// message, so Charm++ holds it until a chare inserted this epoch exists.
 template <int N>
 void conv_notify(PartitionImpl<N>* partition, int node_id, const std::array<int, N>& ci) {
     ChareIndex<N> target;
     for (int d = 0; d < N; ++d)
         target.idx[d] = ci[d];
-    auto proxy = proxy_at<N>(partition->thisProxy, target);
-    auto* local = proxy.ckLocal();
-    if (local == nullptr)
-        CkAbort("CONVOLVE: a result chare placed on PE %d is not there; the shared filter "
-                "relies on partitions staying where chare_home_pe puts them (no migration)",
-                CkMyPe());
-    PendingComm<N>& comm = local->impl.executor->pending[node_id];
-    if (comm.expected_msgs > 0) {
-        if (--comm.expected_msgs == 0)
-            proxy.comm_done(node_id);
-    } else {
-        --comm.expected_msgs;
-    }
+    proxy_at<N>(partition->thisProxy, target).conv_ready(node_id);
 }
 
 /// Send this chare's block of the filter to the leader of every PE that holds result chares.
@@ -1771,24 +1763,29 @@ void send_filter(PartitionImpl<N>* partition, int node_id, const SigGeom<N>& s) 
     const T* src_ptr = static_cast<const T*>(src->device_data_ptr());
     const int64_t bytes = count * (int64_t)sizeof(T);
     const ConvPeers<N>& peers = conv_peers<N>(s);
-    std::vector<std::pair<ChareIndex<N>, char*>> sends;
+    std::vector<ChareIndex<N>> targets;
     for (const auto& l : peers.leader) {
         if (l[0] < 0)
             continue;
         ChareIndex<N> target;
         for (int d = 0; d < N; ++d)
             target.idx[d] = l[d];
-        char* buf = alloc_buffer(bytes);
-        copy_box<N, T>(partition, reinterpret_cast<T*>(buf), 0, pstride, src_ptr, base, sstride,
-                       ext);
-        sends.push_back({target, buf});
+        targets.push_back(target);
     }
+    if (targets.empty())
+        return;
+    // one packed copy for every leader: it is read-only until the last send frees it
+    char* buf = alloc_buffer(bytes);
+    copy_box<N, T>(partition, reinterpret_cast<T*>(buf), 0, pstride, src_ptr, base, sstride, ext);
 #ifdef USE_NVIDIA
     partition->join_streams(); // the sends start on the comm stream
 #elif defined(USE_KOKKOS)
     Kokkos::fence("ct_conv_filter");
 #endif
-    for (auto& [target, buf] : sends) {
+#ifdef USE_KOKKOS
+    comm_share(buf, (int)targets.size());
+#endif
+    for (auto& target : targets) {
 #ifndef NDEBUG
         partition->comm_bytes_sent += bytes;
 #endif
@@ -1798,9 +1795,11 @@ void send_filter(PartitionImpl<N>* partition, int node_id, const SigGeom<N>& s) 
 #else
         ct_send_data(proxy_at<N>(partition->thisProxy, target), node_id, 1, v.name, N,
                      region_data, bytes, buf);
-        delete[] buf;
 #endif
     }
+#ifndef USE_KOKKOS
+    delete[] buf;
+#endif
 }
 
 /// The PE's leader, once its filter pieces are in: builds the shared filter or spectrum
@@ -2106,6 +2105,20 @@ void ArrayDAGExecutorND<N>::finish_signal_node(PendingComm<N>& comm) {
         });
 }
 
+template <int N>
+void PartitionImpl<N>::conv_ready(int node_id) {
+    PendingComm<N>& comm = executor->pending[node_id];
+    if (comm.expected_msgs > 0) {
+        if (--comm.expected_msgs == 0)
+            executor->on_comm_done(node_id);
+    } else {
+        --comm.expected_msgs;
+    }
+}
+
+template void PartitionImpl<1>::conv_ready(int);
+template void PartitionImpl<2>::conv_ready(int);
+template void PartitionImpl<3>::conv_ready(int);
 template void ArrayDAGExecutorND<1>::execute_signal_node(DAGNode*);
 template void ArrayDAGExecutorND<2>::execute_signal_node(DAGNode*);
 template void ArrayDAGExecutorND<3>::execute_signal_node(DAGNode*);

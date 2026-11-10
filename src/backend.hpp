@@ -240,6 +240,7 @@ struct CommPool {
     std::unordered_map<void*, int64_t> live_large; // block -> bytes
     std::multimap<int64_t, FreeBlock> free_large;
     int64_t large_cached = 0;
+    std::unordered_map<void*, int> shared; // block -> comm_free calls left (comm_share)
     std::mutex mu; // shared by the PEs of a process (SMP)
 };
 
@@ -329,9 +330,26 @@ inline void* comm_alloc(int64_t bytes) {
     return ptr;
 }
 
+/// Makes the next `users` comm_free calls on ptr release it only once, at the last one.
+inline void comm_share(void* ptr, int users) {
+    if (users <= 1)
+        return;
+    auto& pool = comm_pool();
+    std::lock_guard<std::mutex> lock(pool.mu);
+    pool.shared[ptr] = users;
+}
+
 inline void comm_free(void* ptr) {
     auto& pool = comm_pool();
     std::lock_guard<std::mutex> lock(pool.mu);
+    if (!pool.shared.empty()) {
+        auto sh = pool.shared.find(ptr);
+        if (sh != pool.shared.end()) {
+            if (--sh->second > 0)
+                return;
+            pool.shared.erase(sh);
+        }
+    }
     auto it = pool.live.find(ptr);
     if (it == pool.live.end()) {
         auto lt = pool.live_large.find(ptr);
@@ -1207,6 +1225,7 @@ class PartitionImpl {
                         int64_t size, char* data);
 #endif
     void comm_done(int node_id);
+    void conv_ready(int node_id);
     void reduce_result(int node_id, int64_t size, char* data);
     void receive_reduce_partial(int node_id, int64_t size, char* data);
     void receive_linalg(int node_id, int64_t size, char* data);
@@ -1345,6 +1364,7 @@ class Partition1D : public CBase_Partition1D {
     }
 #endif
     void comm_done(int node_id) { impl.comm_done(node_id); }
+    void conv_ready(int node_id) { impl.conv_ready(node_id); }
     void reduce_result(int node_id, int64_t size, char* data) {
         impl.reduce_result(node_id, size, data);
     }
@@ -1411,6 +1431,7 @@ class Partition2D : public CBase_Partition2D {
     }
 #endif
     void comm_done(int node_id) { impl.comm_done(node_id); }
+    void conv_ready(int node_id) { impl.conv_ready(node_id); }
     void reduce_result(int node_id, int64_t size, char* data) {
         impl.reduce_result(node_id, size, data);
     }
@@ -1477,6 +1498,7 @@ class Partition3D : public CBase_Partition3D {
     }
 #endif
     void comm_done(int node_id) { impl.comm_done(node_id); }
+    void conv_ready(int node_id) { impl.conv_ready(node_id); }
     void reduce_result(int node_id, int64_t size, char* data) {
         impl.reduce_result(node_id, size, data);
     }
