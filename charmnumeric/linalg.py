@@ -274,7 +274,11 @@ def solve_triangular(a, b, trans=0, lower=False, unit_diagonal=False, overwrite_
 
 def tssvd(a):
     """Tall-skinny SVD (cuPyNumeric): eigh of A^T A (summed per-chare Gram matrices),
-    then U = A @ (V S^-1) as a distributed matmul. Returns u (M, N), s (N,), vh (N, N)."""
+    then U = A @ (V S^-1) as a distributed matmul. Returns u (M, N), s (N,), vh (N, N).
+
+    Not for rank-deficient or ill-conditioned input: squaring the condition number makes the
+    smallest singular values vanish (s = 0, then inf/NaN columns in u) once kappa(A) is about
+    7e7 for float64 or 3e3 for float32. Use svd for such matrices."""
     a = asarray(a)
     if a.ndim != 2 or a.size <= 1:
         raise ValueError(f"Invalid input shape for tssvd: {a.shape}")
