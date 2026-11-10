@@ -576,10 +576,10 @@ void fft_conv_gpu(PartitionImpl<N>* partition, T* out, const T* w, const T* v,
         cufftDestroy(fwd);
         cufftDestroy(inv);
     });
-    free_buffer(partition, reinterpret_cast<char*>(wp));
-    free_buffer(partition, reinterpret_cast<char*>(vp));
-    free_buffer(partition, reinterpret_cast<char*>(wf));
-    free_buffer(partition, reinterpret_cast<char*>(vf));
+    free_after_compute(partition, wp);
+    free_after_compute(partition, vp);
+    free_after_compute(partition, wf);
+    free_after_compute(partition, vf);
 }
 #endif
 
