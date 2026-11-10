@@ -25,23 +25,19 @@ IFACE = None
 def make(shape, dtype, seed):
     """Native pseudo-random input: floats clipped to [-0.97, 0.97], ints in [-50, 50).
 
-    Each intermediate is execute()d before reuse, since a fused temporary read
-    twice currently comes back as zeros. 1-D inputs are row sums of (n, 2) inputs.
+    Fused temporaries (l2, x) are read several times in one kernel.
+    1-D inputs are row sums of (n, 2) inputs.
     """
     dtype = np.dtype(dtype)
     if len(shape) == 1:
         return make((shape[0], 2), dtype, seed) @ cnp.ones((2,), dtype=dtype)
     if dtype.kind == "i":
         L = U.linear_index(shape, dtype=dtype)
-        execute(IFACE)
         l2 = U.int_mod(L, 1009)
-        execute(IFACE)
         h = (l2 * l2) * 13 + l2 * (7 + seed) + 3 * seed
-        execute(IFACE)
         return U.int_mod(h, 100) - 50
     u = U.uniform(shape, seed=seed, dtype=dtype)
     x = 2.0 * u - 1.0
-    execute(IFACE)
     hi = 0.5 + 0.5 * cnp.tanh(1e10 * (x - 0.97))
     lo = 0.5 + 0.5 * cnp.tanh(1e10 * (-0.97 - x))
     return x + hi * (0.97 - x) + lo * (-0.97 - x)
@@ -50,7 +46,6 @@ def make(shape, dtype, seed):
 def small_int(shape, dtype, seed, m, lo=0):
     """Native ints in [lo, lo + m)."""
     P = make(shape, dtype, seed) + 50  # [0, 100)
-    execute(IFACE)
     return U.int_mod(P, m) + lo
 
 

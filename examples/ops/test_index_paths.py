@@ -52,8 +52,9 @@ vals = rng.integers(-9, 9, size=(len(range(699, -1, -2)), 5))
 t[::-2, dev(cols)] = dev(vals)
 th[::-2, cols] = vals
 C.check("t[::-2, dev cols] = array (dup cols)", t, th)
-t[dev(rows), 8:0:-2] = dev(rng.integers(0, 5, size=(33, 4)))
-th[rows, 8:0:-2] = C.fetch(t)[rows, 8:0:-2]
+vals = rng.integers(0, 5, size=(33, 4))
+t[dev(rows), 8:0:-2] = dev(vals)
+th[rows, 8:0:-2] = vals
 C.check("t[dev rows, 8:0:-2] = array (dup rows)", t, th)
 
 # ---- 3-D: index arrays around a slice, slices around an index ----
@@ -172,15 +173,32 @@ for idt in (np.int8, np.uint8, np.int16, np.int32):
     th[ri.astype(int), cj.astype(int)] = 3
     C.check(f"t[{n} rows, {n} cols] = 3", t, th)
 
-# ---- a per-dimension index out of range never reaches a neighbouring element ----
+# ---- a per-dimension index out of range raises at the next get and never reaches a
+# neighbouring element ----
 oz = cnp.zeros((50, 40), dtype=np.int64)
 oz[dev(np.array([1, 2, 3, 4])), dev(np.array([5, 40, -41, -40]))] = 7
 ozh = np.zeros((50, 40), dtype=np.int64)
 ozh[[1, 4], [5, 0]] = 7
-C.check("oz[i, j] = 7, j out of range dropped", oz, ozh)
+C.raises("oz[i, j] = 7, j out of range", IndexError, lambda: C.fetch(oz))
+C.check("oz[i, j] = 7, only in-range entries written", oz, ozh)
 src = cnp.arange(2000, dtype=np.int64).reshape(50, 40)
-C.check("src[i, j], j out of range reads 0",
-        src[dev(np.array([1, 2, 49])), dev(np.array([39, 40, 0]))], np.array([79, 0, 1960]))
+C.raises("src[i, j], j out of range", IndexError,
+         lambda: C.fetch(src[dev(np.array([1, 2, 49])), dev(np.array([39, 40, 0]))]))
+C.check("src[i, j] in range after the error",
+        src[dev(np.array([1, 2, 49])), dev(np.array([39, 39, 0]))], np.array([79, 119, 1960]))
+a10 = cnp.arange(10.0)
+C.raises("a[dev [3, 12]]", IndexError, lambda: C.fetch(a10[cnp.asarray(np.array([3, 12]))]))
+C.raises("take dev index out of range, then synchronize", IndexError,
+         lambda: (cnp.take(a10, dev(np.array([-11]))), cnp.synchronize()))
+C.raises("put dev index out of range", IndexError,
+         lambda: (cnp.put(a10, dev(np.array([10])), 1.0), C.fetch(a10)))
+C.raises("take_along_axis dev index out of range", IndexError,
+         lambda: C.fetch(cnp.take_along_axis(src[:2], dev(np.array([[0], [40]])), 1)))
+C.raises("choose mode=raise, invalid entry", ValueError,
+         lambda: C.fetch(cnp.choose(dev(np.array([0, 3, 1])), [cnp.zeros((3,)), cnp.ones((3,))])))
+C.check("choose mode=raise after the error",
+        cnp.choose(dev(np.array([0, 1, 1])), [cnp.zeros((3,)), cnp.ones((3,))]),
+        np.array([0.0, 1.0, 1.0]))
 
 # ---- bad device inputs raise as in NumPy ----
 fidx = cnp.zeros((3,), dtype=np.float64)
@@ -189,6 +207,12 @@ C.raises("take axis float device index", IndexError, lambda: cnp.take(src, fidx,
 C.raises("put float device index", IndexError, lambda: cnp.put(oz, fidx, 1))
 C.raises("negative device repeats", ValueError,
          lambda: cnp.repeat(cnp.arange(3), dev(np.array([1, -1, 2]))))
+C.raises("float device repeats", TypeError,
+         lambda: cnp.repeat(cnp.arange(2), dev(np.array([1.5, 1.5]))))
+C.raises("uint64 device repeats", TypeError,
+         lambda: cnp.repeat(cnp.arange(2), dev(np.array([1, 2], dtype=np.uint64))))
+C.check("bool device repeats", cnp.repeat(cnp.arange(3), dev(np.array([True, False, True]))),
+        np.repeat(np.arange(3), np.array([True, False, True])))
 
 # ---- values aliasing the target across several chares ----
 q2 = cnp.arange(600_000, dtype=np.int64)
@@ -220,11 +244,29 @@ s2h = np.arange(300_001.0)[5:] - np.arange(300_001.0)[:-5]
 s2h[oi[:500] % 1000] = shh[oi[:500]]
 C.check("shifted[idx] = shifted[idx]", sh2, s2h)
 
-# ---- out-of-bounds device indices are dropped, the rest is written ----
+# ---- out-of-bounds device indices raise at the next get; the rest is written ----
 o = cnp.zeros((50,), dtype=np.int64)
 o[dev(np.array([3, 60, 7]))] = 1
 oh = np.zeros(50, dtype=np.int64)
 oh[[3, 7]] = 1
-C.check("dropped out-of-bounds device index", o, oh)
+C.raises("out-of-bounds device index", IndexError, lambda: C.fetch(o))
+C.check("in-range device indices written", o, oh)
+
+# ---- few array-valued entries into a large tile (sparse last-write dedupe) ----
+nb = 3_000_000
+sb = cnp.zeros((nb,), dtype=np.float64)
+sbh = np.zeros(nb)
+si = np.array([5, nb - 1, 5, 1_000_003, nb - 1, 17, 5, 2_999_000, 17, 0])
+sv = rng.random(si.size)
+sb[dev(si)] = dev(sv)
+sbh[si] = sv
+C.check("sparse dup scatter into 3M", sb, sbh)
+sb2 = cnp.zeros((1500, 2000), dtype=np.float32)
+sb2h = np.zeros((1500, 2000), dtype=np.float32)
+ri, cj = np.array([3, 1400, 3, 700, 3]), np.array([10, 1999, 10, 5, 11])
+sv2 = rng.random(5).astype(np.float32)
+sb2[dev(ri), dev(cj)] = dev(sv2)
+sb2h[ri, cj] = sv2
+C.check("sparse dup scatter into 2-D", sb2, sb2h)
 
 C.finish()

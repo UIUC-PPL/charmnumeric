@@ -7,6 +7,7 @@ Each run_timed* call runs the program with charmnumeric, then with NumPy, and co
   (signs and tie order are not unique), then replayed;
 - the last recorded local of each function (sys.monitoring) is compared against
   NumPy; floats use a tolerance relative to the largest magnitude in the record.
+  Timings (from the timers, and arithmetic on them) are not compared.
 
 The last line is ``PASS <program>`` or ``FAIL <program>: <reasons>``.
 With --package numpy the program runs on NumPy only.
@@ -86,6 +87,27 @@ def nthroot(x, p, lower_bound=1):
 # ---- timers ----
 
 
+class _Elapsed(float):
+    """Milliseconds from a timer; arithmetic on it stays _Elapsed (not compared)."""
+
+
+def _elapsed_op(name):
+    op = getattr(float, name)
+
+    def fn(self, *args):
+        r = op(self, *args)
+        return r if r is NotImplemented else _Elapsed(r)
+
+    return fn
+
+
+for _name in ("add", "sub", "mul", "truediv", "floordiv", "mod", "pow"):
+    for _dunder in (f"__{_name}__", f"__r{_name}__"):
+        setattr(_Elapsed, _dunder, _elapsed_op(_dunder))
+for _dunder in ("__neg__", "__pos__", "__abs__"):
+    setattr(_Elapsed, _dunder, _elapsed_op(_dunder))
+
+
 class _Timer:
     def __init__(self, interface=None):
         self._interface = interface
@@ -102,7 +124,7 @@ class _Timer:
         assert self._t0 is not None, "Timer.stop() called without preceding Timer.start()"
         if self._interface is not None:
             cnp.synchronize(self._interface)
-        return (time.perf_counter() - self._t0) * 1e3
+        return _Elapsed((time.perf_counter() - self._t0) * 1e3)
 
     def sync(self, sync_mode="fence"):
         if sync_mode == "block" and self._interface is not None:
@@ -115,7 +137,7 @@ def get_timer(np, *, blocking=False):
 
 def timed_loop(f, timer, runs, warmup=0, *, sync_mode="fence"):
     if runs <= 0:
-        return 0.0
+        return _Elapsed(0.0)
     for i in range(runs + warmup):
         if i == warmup:
             timer.start()
@@ -387,7 +409,8 @@ def _recording(store):
 
 
 def _comparable(x):
-    return isinstance(x, _DEVICE + (numpy.ndarray, numpy.generic, int))
+    return isinstance(x, _DEVICE + (numpy.ndarray, numpy.generic, int, float, complex)) \
+        and not isinstance(x, _Elapsed)
 
 
 def _magnitude(x):
@@ -415,6 +438,8 @@ def _compare_records(where, got_rec, want_rec, failures, stats=None):
             print(f"[trace] {where}.{var} {type(g).__name__} {getattr(g, 'shape', '')}",
                   file=sys.stderr, flush=True)
         host.append((var, numpy.asarray(_host(g)), w))
+    # one scale per record: locals of iterative solvers (residuals, step sizes) carry the
+    # rounding of the larger values they are computed from
     scale = max([_magnitude(numpy.asarray(w)) for _, _, w in host] + [0.0])
     for var, g, w in host:
         label = f"{where}: {var}"

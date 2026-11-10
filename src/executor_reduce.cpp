@@ -7,10 +7,11 @@
 #ifdef USE_KOKKOS
 /// sum(x * y); KokkosBlas::dot conjugates a complex x, NumPy's dot does not.
 template <typename T>
-static T device_dot_nc(const T* x, const T* y, int n) {
+static T device_dot_nc(const T* x, const T* y, int64_t n) {
     T sum = T(0);
     Kokkos::parallel_reduce(
-        Kokkos::RangePolicy<>(0, n), KOKKOS_LAMBDA(int i, T& acc) { acc += x[i] * y[i]; }, sum);
+        Kokkos::RangePolicy<Kokkos::IndexType<int64_t>>(0, n),
+        KOKKOS_LAMBDA(int64_t i, T& acc) { acc += x[i] * y[i]; }, sum);
     return sum;
 }
 #endif
@@ -73,7 +74,7 @@ void ArrayDAGExecutorND<N>::execute_reduce_node(DAGNode* node) {
         }
 
         if (lhs_it != partition->arrays.end() && rhs_it != partition->arrays.end()) {
-            int local_size =
+            int64_t local_size =
                 std::min(lhs_it->second->local_size(), rhs_it->second->local_size());
 
 #ifdef USE_KOKKOS
@@ -107,8 +108,8 @@ void ArrayDAGExecutorND<N>::execute_reduce_node(DAGNode* node) {
             });
 #endif
 
-            DBG_PRINT("[1D Chare %d]   local dot computed (local_size=%d)\n",
-                      partition->index[0], local_size);
+            DBG_PRINT("[1D Chare %d]   local dot computed (local_size=%lld)\n",
+                      partition->index[0], (long long)local_size);
         }
         // else: contrib.value is all zeros — contributes 0 to the reduction
 
