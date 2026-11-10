@@ -199,13 +199,13 @@ DS_FN int group_of(K k, int W, int depth, const K* grp, int G) {
     return -1;
 }
 
-DS_FN uint64_t mix64(uint64_t x) {
-    x += 0x9e3779b97f4a7c15ull;
 /// Byte offset of n keys stored after n int64 values (16-byte keys stay aligned).
 DS_FN int64_t keys_after(int64_t n) {
     return (8 * n + 15) / 16 * 16;
 }
 
+DS_FN uint64_t mix64(uint64_t x) {
+    x += 0x9e3779b97f4a7c15ull;
     x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
     x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
     return x ^ (x >> 31);
