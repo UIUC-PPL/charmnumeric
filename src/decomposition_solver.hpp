@@ -12,6 +12,7 @@
 #include <queue>
 #include <set>
 #include <stack>
+#include <string>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -2377,10 +2378,34 @@ inline Region* whole_region(int nd, std::array<int, 3> const& shape) {
     }
 }
 
+/// Whether a fused kernel without set_regions keeps results of different shapes. The
+/// executor writes them all over its anchor's iteration space, and R = X cannot reshape.
+template <typename ArrayMetaMap>
+bool kept_shapes_differ(ArrayMetaMap const& meta, DAGNode* node) {
+    KernelLayout k;
+    if (!is_fused_kernel(node) || !kernel_layout(meta, node, k) || k.anchor_set != nullptr)
+        return false;
+    auto const& am = meta.at(k.anchor);
+    for (ASTNode* root : node->ast->roots) {
+        if (!is_kept_root(root))
+            continue;
+        auto it = meta.find(root->result_name);
+        if (it == meta.end())
+            continue;
+        if (it->second.ndims != am.ndims)
+            return true;
+        for (int d = 0; d < am.ndims; ++d)
+            if (it->second.global_shape[d] != am.global_shape[d])
+                return true;
+    }
+    return false;
+}
+
 } // namespace detail
 
 struct LayoutFixResult {
     int follow_up_nodes = 0;
+    std::string error;
 };
 
 /// Makes every fused kernel's outputs match the layout the executor writes them in,
@@ -2403,6 +2428,11 @@ LayoutFixResult resolve_kernel_layouts(ArrayMetaMap& meta, DAG* dag, int& next_n
     for (DAGNode* node : order) {
         if (!detail::is_fused_kernel(node))
             continue;
+        if (detail::kept_shapes_differ(meta, node)) {
+            res.error = "fused kernel (node " + std::to_string(node->id) +
+                        ") keeps results of different shapes";
+            return res;
+        }
         auto& roots = node->ast->roots;
         // (follow-up root, X it retires or -1): whole-result copies, then set_regions
         std::vector<std::pair<ASTNode*, int>> copies, sets;
@@ -2524,12 +2554,7 @@ LayoutFixResult resolve_kernel_layouts(ArrayMetaMap& meta, DAG* dag, int& next_n
                     continue;
                 Meta const rm = meta.at(name);
                 detail::Box b = detail::region_box(nullptr, rm.ndims, rm.global_shape);
-                bool same_shape = rm.ndims == am.ndims;
-                for (int d = 0; same_shape && d < rm.ndims; ++d)
-                    same_shape = rm.global_shape[d] == am.global_shape[d];
-                // The frontend only fuses ops of one shape; R = X cannot reshape, so a
-                // result of another shape is left as it is.
-                if (!same_shape || detail::same_layout(rm, {0, 0, 0}, b, am, ka))
+                if (detail::same_layout(rm, {0, 0, 0}, b, am, ka))
                     continue;
                 // R is written as X in the kernel's layout, then redistributed
                 int x = next_name--;
@@ -2593,6 +2618,37 @@ LayoutFixResult resolve_kernel_layouts(ArrayMetaMap& meta, DAG* dag, int& next_n
         res.follow_up_nodes += (int)follow.size();
     }
     return res;
+}
+
+/// FNV-1a hash of the solved DAG (node ids, roots, their layouts) and the synthetic name
+/// and node counters. resolve_kernel_layouts runs on every PE, so PEs must agree on it.
+template <typename ArrayMetaMap>
+uint64_t layout_hash(ArrayMetaMap const& meta, DAG* dag, int next_name, int next_node_id) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](int64_t v) {
+        for (int b = 0; b < 8; ++b) {
+            h ^= (uint64_t)(v >> (8 * b)) & 0xff;
+            h *= 1099511628211ull;
+        }
+    };
+    mix(next_name);
+    mix(next_node_id);
+    detail::for_each_node_topo(dag, [&](DAGNode* node) {
+        mix(node->id);
+        for (ASTNode* root : node->ast->roots) {
+            mix(root->result_name);
+            mix(root->opcode);
+            auto it = meta.find(root->result_name);
+            if (it == meta.end())
+                continue;
+            mix(it->second.tile);
+            for (int d = 0; d < 3; ++d) {
+                mix(it->second.offset[d]);
+                mix(it->second.global_shape[d]);
+            }
+        }
+    });
+    return h;
 }
 
 } // namespace decomposition_solver

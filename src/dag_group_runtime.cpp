@@ -266,6 +266,16 @@ void ArrayDAGGroup::mem_report(int epoch) {
     mem_stats_report(this, epoch);
 }
 
+void ArrayDAGGroup::check_layout_hash(int epoch, int64_t hash) {
+    auto [it, fresh] = layout_hashes.try_emplace(epoch, hash);
+    if (fresh)
+        return;
+    if (it->second != hash)
+        CkAbort("receive_dag epoch=%d: PEs %d and %d solved the DAG's layouts differently",
+                epoch, (CkMyPe() + CkNumPes() - 1) % CkNumPes(), CkMyPe());
+    layout_hashes.erase(it);
+}
+
 void ArrayDAGGroup::barrier_arrive(int epoch) {
     if (--barrier_pending[epoch] != 0)
         return;

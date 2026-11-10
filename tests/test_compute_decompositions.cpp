@@ -879,8 +879,22 @@ void test_kernel_layout_mixed_shapes() {
                                 add_views<1>(T, X, {1}, {1}, {499})}});
     decomposition_solver::compute_decompositions(meta, dag, 4, 1);
     meta.at(T).offset[0] = 3; // as if pinned elsewhere
-    expect_eq("mixed shapes: no follow-up", resolve(meta, dag), 0);
-    expect_eq("T keeps its name", dag->nodes.at(0)->ast->roots[1]->result_name, T);
+    expect_true("mixed shapes detected",
+                decomposition_solver::detail::kept_shapes_differ(meta, dag->nodes.at(0)));
+    int next_name = 1 << 20, next_node = 1 << 20;
+    auto fix = decomposition_solver::resolve_kernel_layouts(meta, dag, next_name, next_node);
+    expect_true("mixed shapes reported", !fix.error.empty());
+    meta.at(T).global_shape[0] = 500;
+    expect_true("same shapes not reported",
+                !decomposition_solver::detail::kept_shapes_differ(meta, dag->nodes.at(0)));
+    uint64_t h = decomposition_solver::layout_hash(meta, dag, next_name, next_node);
+    expect_true("layout hash repeats",
+                h == decomposition_solver::layout_hash(meta, dag, next_name, next_node));
+    expect_true("layout hash sees the counters",
+                h != decomposition_solver::layout_hash(meta, dag, next_name - 1, next_node));
+    meta.at(T).offset[0] = 4;
+    expect_true("layout hash sees offsets",
+                h != decomposition_solver::layout_hash(meta, dag, next_name, next_node));
     delete dag;
 }
 
