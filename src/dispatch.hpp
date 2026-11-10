@@ -129,12 +129,28 @@ static void deferred_send_cb(void* param, void* msg) {
             p->node_id, p->input_index, p->inp_name, N_target, p->region_data, p->byte_size,
             CkMyNode(), -1, reinterpret_cast<int64_t>(p->send_buf), 0, nullptr, cb);
     } else if (p->byte_size > ct_msg_max_bytes()) {
-        // another process, no IPC block or pinned block: a pageable copy, in fragments
-        std::unique_ptr<char[]> host(new char[p->byte_size]);
-        hapiCheck(cudaMemcpy(host.get(), p->send_buf, p->byte_size, cudaMemcpyDeviceToHost));
-        ct_send_frags(proxy_at<N_target>(p->target_proxy, p->target_ci), MSG_STAGED, p->node_id,
-                      ct_data_meta(p->input_index, p->inp_name, N_target, p->region_data),
-                      p->byte_size, host.get());
+        // another process, no IPC block or pinned block: stream the payload as fragments
+        // through one reusable pinned chunk (marshalling copies each fragment at the call)
+        auto target = proxy_at<N_target>(p->target_proxy, p->target_ci);
+        std::vector<int> meta =
+            ct_data_meta(p->input_index, p->inp_name, N_target, p->region_data);
+        int64_t chunk = std::min<int64_t>(ct_msg_max_bytes(), int64_t(64) << 20);
+        char* pin = static_cast<char*>(pinned_alloc(chunk));
+        std::unique_ptr<char[]> pageable;
+        if (!pin) {
+            pageable.reset(new char[chunk]);
+            pin = pageable.get();
+        }
+        int64_t seq = ct_next_frag_seq();
+        for (int64_t off = 0; off < p->byte_size; off += chunk) {
+            int64_t n = std::min(chunk, p->byte_size - off);
+            hapiCheck(cudaMemcpy(pin, static_cast<char*>(p->send_buf) + off, n,
+                                 cudaMemcpyDeviceToHost));
+            target.receive_frag(p->node_id, MSG_STAGED, CkMyPe(), seq, (int)meta.size(),
+                                meta.data(), p->byte_size, off, n, pin);
+        }
+        if (!pageable)
+            pinned_free(pin);
         p->partition->send_complete(p->send_id);
     } else {
         proxy_at<N_target>(p->target_proxy, p->target_ci).receive_data(
