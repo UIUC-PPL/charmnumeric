@@ -5,6 +5,7 @@
 
 #include "mlir/IR/Verifier.h"
 
+#include <algorithm>
 #include <chrono>
 #include <limits>
 
@@ -36,6 +37,7 @@
 #include <numeric>
 #include "mlir/Target/LLVM/NVVM/Target.h"
 #include "mlir/Target/LLVMIR/Dialect/GPU/GPUToLLVMIRTranslation.h"
+#include <cuda_runtime_api.h>
 #endif
 
 namespace {
@@ -478,6 +480,14 @@ const typename Entry::Fn* pickBody(const Entry& e, BodyKind k) {
     return (f && *f) ? f : nullptr;
 }
 
+std::string dtypeName(DType dt) {
+    static const char* names[NUM_DTYPES] = {
+        "float32", "float64", "int32",  "int64",  "bool",    "int8",      "int16",
+        "uint8",   "uint16",  "uint32", "uint64", "float16", "complex64", "complex128"};
+    int i = static_cast<int>(dt);
+    return i >= 0 && i < NUM_DTYPES ? names[i] : std::to_string(i);
+}
+
 DType realOf(DType dt) {
     return dt == DType::COMPLEX64 ? DType::FLOAT32 : DType::FLOAT64;
 }
@@ -589,9 +599,9 @@ void MLIRJitCompiler::emitOp(ASTNode* node, mlir::Location loc) {
                 return (*f)(b, l, a[0], a[1], a[2]);
             };
         }
-        if (!body)
-            llvm::report_fatal_error(llvm::Twine("JIT: opcode ") + llvm::Twine(node->opcode) +
-                                     " is not defined for dtype " + llvm::Twine((int)C));
+        if (!body && buildError.empty())
+            buildError = "opcode " + std::to_string(node->opcode) +
+                         " has no JIT kernel for dtype " + dtypeName(C);
 
         // Operands convert to K (where's condition to i1); the body result
         // (i1 for predicates, real for complex abs/real/imag, 0/1 i8 for
@@ -609,6 +619,10 @@ void MLIRJitCompiler::emitOp(ASTNode* node, mlir::Location loc) {
             RB = DType::INT8;
         auto typed = [&](OpBuilder& b, Location l, ValueRange args) -> Value {
             SmallVector<Value, 3> conv;
+            if (!body) // writes zeros; the client gets the error at its next fetch
+                return convertValue(
+                    b, l, arith::ConstantOp::create(b, l, b.getF64FloatAttr(0.0)).getResult(),
+                    DType::FLOAT64, R);
             for (int i = 0; i < arity; ++i)
                 conv.push_back(convertValue(b, l, args[i], dts[i], tgt[i]));
             return convertValue(b, l, body(b, l, conv), RB, R);
@@ -1089,9 +1103,10 @@ extern "C" void cn_mgpuMemFree(void* ptr, CUstream s) {
     }
 }
 
-// Modules load and kernels launch in the calling thread's current context (the
-// chare's device). The MLIR wrappers would use device 0's primary context, which
-// differs once Kokkos picks a device per local rank (e.g. SLURM_LOCALID under srun).
+// Modules load and kernels launch in the calling thread's current context, else
+// the primary context of its runtime device (the chare's device, set per PE). The
+// MLIR wrappers would use device 0's, which differs once Kokkos picks a device per
+// local rank (e.g. SLURM_LOCALID under srun).
 void cnCheck(CUresult r, const char* what) {
     if (r != CUDA_SUCCESS)
         llvm::report_fatal_error(llvm::Twine(what) + " failed: " + llvm::Twine(r));
@@ -1100,9 +1115,12 @@ void cnEnsureContext() {
     CUcontext ctx = nullptr;
     if (cuCtxGetCurrent(&ctx) == CUDA_SUCCESS && ctx)
         return;
+    int ordinal = 0;
+    if (cudaGetDevice(&ordinal) != cudaSuccess)
+        llvm::report_fatal_error("cudaGetDevice failed");
     CUdevice dev;
     cnCheck(cuInit(0), "cuInit");
-    cnCheck(cuDeviceGet(&dev, 0), "cuDeviceGet");
+    cnCheck(cuDeviceGet(&dev, ordinal), "cuDeviceGet");
     cnCheck(cuDevicePrimaryCtxRetain(&ctx, dev), "cuDevicePrimaryCtxRetain");
     cnCheck(cuCtxSetCurrent(ctx), "cuCtxSetCurrent");
 }
@@ -1884,6 +1902,13 @@ const std::unordered_map<int, TernaryOpEntry>& MLIRJitCompiler::ternaryOpRegistr
           [](OpBuilder& b, Location loc, Value x, Value lo, Value hi) {
               Value m = arith::MaxUIOp::create(b, loc, x, lo).getResult();
               return arith::MinUIOp::create(b, loc, m, hi).getResult();
+          },
+          // lexicographic, NaN of the clipped value first, as NumPy's complex loop
+          [](OpBuilder& b, Location loc, Value x, Value lo, Value hi) {
+              Value m = selC(b, loc, orI(b, loc, clt(b, loc, lo, x, false), cAnyNan(b, loc, x)),
+                             x, lo);
+              return selC(b, loc, orI(b, loc, clt(b, loc, m, hi, false), cAnyNan(b, loc, m)), m,
+                          hi);
           }}},
     };
     return registry;
@@ -2175,7 +2200,17 @@ std::string cachePath(const std::string& ir) {
     NvTarget target = nvTarget();
     h.update("nvidia " + target.chip + " " + target.features);
 #endif
-    h.update(llvm::sys::getHostCPUName());
+    static const std::string host = [] {
+        std::vector<std::string> features;
+        for (const auto& f : llvm::sys::getHostCPUFeatures())
+            features.push_back((f.second ? " +" : " -") + f.first().str());
+        std::sort(features.begin(), features.end());
+        std::string s = llvm::sys::getHostCPUName().str();
+        for (const std::string& f : features)
+            s += f;
+        return s;
+    }();
+    h.update(host);
     return cacheDir() + "/" + llvm::toHex(h.final(), true) + ".o";
 }
 
@@ -2314,16 +2349,16 @@ std::mutex& jitMutex() {
 }
 } // namespace
 
-static void* jit_compile_ast_impl(void* ast, void** moduleHandleOut);
+static void* jit_compile_ast_impl(void* ast, void** moduleHandleOut, std::string* errorOut);
 
-void* jit_compile_ast(void* ast, void** moduleHandleOut) {
+void* jit_compile_ast(void* ast, void** moduleHandleOut, std::string* errorOut) {
     static const bool timeIt = getenv("CNUM_JIT_TIME") != nullptr;
     JitTimer timer;
     jitTimer = timeIt ? &timer : nullptr;
     void* fn;
     {
         std::lock_guard<std::mutex> lock(jitMutex());
-        fn = jit_compile_ast_impl(ast, moduleHandleOut);
+        fn = jit_compile_ast_impl(ast, moduleHandleOut, errorOut);
     }
     if (timeIt && !timer.line.empty())
         llvm::errs() << "jit:" << timer.line << "\n";
@@ -2331,7 +2366,7 @@ void* jit_compile_ast(void* ast, void** moduleHandleOut) {
     return fn;
 }
 
-static void* jit_compile_ast_impl(void* ast, void** moduleHandleOut) {
+static void* jit_compile_ast_impl(void* ast, void** moduleHandleOut, std::string* errorOut) {
     MLIRJitCompiler node_jit;
     node_jit.buildFromAST(ast);
     // Kernels take every array as a dynamic memref, so equal IR means an equal kernel.
@@ -2340,6 +2375,9 @@ static void* jit_compile_ast_impl(void* ast, void** moduleHandleOut) {
         llvm::raw_string_ostream os(key);
         node_jit.printModule(os);
     }
+    const std::string& error = node_jit.error();
+    if (!error.empty() && errorOut)
+        *errorOut = error;
     auto hit = kernelCache().find(key);
     if (hit != kernelCache().end()) {
         *moduleHandleOut = hit->second.first;
@@ -2347,7 +2385,7 @@ static void* jit_compile_ast_impl(void* ast, void** moduleHandleOut) {
     }
     jitMark("build");
 #if !defined(USE_AMD) && !defined(USE_INTEL)
-    std::string path = cachePath(key);
+    std::string path = error.empty() ? cachePath(key) : std::string();
     if (!path.empty()) {
         void* fn = loadCachedKernel(path, moduleHandleOut);
         if (fn) {

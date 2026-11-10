@@ -123,13 +123,15 @@ class Checker:
         return np.asarray(x.get(self.iface))
 
     def check(self, label, got, expected, rtol=0.0, atol=0.0, dtype=None):
+        """Compare a charmnumeric result with NumPy's; the dtype must be NumPy's
+        (``expected``'s, unless ``dtype`` is given)."""
         self.count += 1
+        expected = np.asarray(expected)
         if hasattr(got, "get"):
-            want_dtype = got.dtype if dtype is None else dtype
+            want_dtype = expected.dtype if dtype is None else dtype
             got = np.asarray(got.get(self.iface))
         else:
             want_dtype = dtype
-        expected = np.asarray(expected)
         msg = None
         if got.shape != expected.shape:
             msg = f"shape {got.shape} != {expected.shape}"

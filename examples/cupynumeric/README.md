@@ -6,15 +6,17 @@ except `benchmark.py` (the old harness) is here, unchanged: each file is the
 upstream file plus one 2-line comment above its `from _benchmark import ...`
 line. `upstream/` holds the unmodified originals (fetched 2026-10-09 from
 `main`, with the `_benchmark` package they import), so
-`diff upstream/<name>.py <name>.py` shows only that comment. The programs run
+`diff upstream/<name>.py <name>.py` shows only that comment. Both are
+NVIDIA's code under the Apache License 2.0 (`upstream/LICENSE`,
+`upstream/NOTICE`). The programs run
 with `np` = charmnumeric through `_benchmark.py`, a stand-in for cuPyNumeric's
 `_benchmark` package, which also checks every run against NumPy.
 
 ## Running
 
 ```bash
-. /u/atahilyani/cnum-gpu/wt/ports/env_ports.sh   # or the main tree's environment
-cd example/charmnumeric/examples/cupynumeric
+# charmtyles and charmnumeric importable (PYTHONPATH or installed), Python >= 3.12
+cd examples/cupynumeric
 
 # starts a local backend automatically (charmnumeric.start(); stopped at exit)
 python stencil.py
@@ -40,7 +42,7 @@ last line printed is exactly `PASS <name>` or `FAIL <name>: <reasons>`
 
 Flags the regression passes to each program; "(defaults)" means none. A
 runner reads them from the code span in the second column
-(`wt/ports/run_suite.sh` splits the row on backticks and takes field 4;
+(e.g. by splitting the row on backticks and taking field 4;
 "(defaults)" yields nothing). All upstream defaults finish in well under 2
 minutes on the CPU build at +p1 and +p2 (times: one `harness/run_one.sh`
 run, server start included), so no program needs smaller sizes.
@@ -100,10 +102,12 @@ the harness object (`np`, `timer`, `package`, `repeat`, `run`, `run_timed`,
     returns (`sys.monitoring`, events only on the program's own code objects,
     so the library runs at full speed). The last record of each function is
     compared between the runs: device arrays and NumPy values by shape, dtype
-    and value, Python ints exactly; Python floats (timings) are skipped.
-    Floating values are compared with `|got - want| <= rtol * (|want| + S)`,
-    `S` the largest magnitude in the same record, `rtol` 1e-2/2e-5/1e-6 for
-    float16/float32/float64 (and the complex types).
+    and value, Python ints exactly, Python floats and complexes like NumPy
+    float64/complex128 values; timings (`timer.stop()`, `timed_loop`, and
+    arithmetic on them) are skipped. Floating values are compared with
+    `|got - want| <= rtol * (|want| + S)`, `S` the largest finite magnitude
+    in the same record, `rtol` 1e-2/2e-5/1e-6 for float16/float32/float64 (and
+    the complex types). `sys.monitoring` needs Python >= 3.12.
   - *Results NumPy leaves partly unspecified.* QR/SVD/TSSVD/eigh factors
     (signs) and `argsort` (order of ties unless `kind="stable"`): the NumPy
     run checks the charmnumeric result against its own input (Q R = A,

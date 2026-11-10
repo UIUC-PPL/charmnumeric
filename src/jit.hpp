@@ -126,6 +126,8 @@ class MLIRJitCompiler {
     MLIRJitCompiler();
 
     void buildFromAST(void* astPtr);
+    /// Why the built module cannot run (an op without a body for its dtype); empty if it can.
+    const std::string& error() const { return buildError; }
     bool optimizeAndFuse();
     std::unique_ptr<mlir::ExecutionEngine> generateCPU();
     bool loadCPU(std::unique_ptr<mlir::ExecutionEngine>& engine, const char* kernelName,
@@ -166,6 +168,7 @@ class MLIRJitCompiler {
     /// Distinguish repeated views of the same array by the carried operand region.
     std::unordered_map<std::string, mlir::Value> leafValues;
     std::vector<mlir::Value> tempValues; // deferred deallocs for temporaries
+    std::string buildError;
 
     // AST helpers
     void collectLeaves(AST* ast, std::vector<LeafUse>& memrefLeaves,
