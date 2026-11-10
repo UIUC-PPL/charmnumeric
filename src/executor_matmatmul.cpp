@@ -629,7 +629,7 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
                     for (int tj = first_c_col_chare; tj <= last_c_col_chare; tj++) {
                         for (int ti = first_dest_row_chare; ti <= last_dest_row_chare; ti++) {
                             int dest_row_start_c = std::max(c_row_start, ti * tile_2d);
-                            int dest_row_end_c = std::min(c_row_end, (ti + 1) * tile_2d);
+                            int dest_row_end_c = tile_end(ti, tile_2d, c_row_end);
                             int send_rows = dest_row_end_c - dest_row_start_c;
                             int send_row_off = dest_row_start_c - c_row_start;
 
@@ -676,7 +676,7 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
                     for (int tj = first_c_col_chare; tj <= last_c_col_chare; tj++) {
                         for (int ti = first_dest_row_chare; ti <= last_dest_row_chare; ti++) {
                             int dest_row_start_c = std::max(c_row_start, ti * tile_2d);
-                            int dest_row_end_c = std::min(c_row_end, (ti + 1) * tile_2d);
+                            int dest_row_end_c = tile_end(ti, tile_2d, c_row_end);
                             int send_rows = dest_row_end_c - dest_row_start_c;
                             int send_row_off = dest_row_start_c - c_row_start;
 
@@ -737,7 +737,7 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
                     for (int ti = first_c_row_chare; ti <= last_c_row_chare; ti++) {
                         for (int tj = first_dest_col_chare; tj <= last_dest_col_chare; tj++) {
                             int dest_col_start_c = std::max(c_col_start, tj * tile_2d);
-                            int dest_col_end_c = std::min(c_col_end, (tj + 1) * tile_2d);
+                            int dest_col_end_c = tile_end(tj, tile_2d, c_col_end);
                             int send_cols = dest_col_end_c - dest_col_start_c;
                             int send_col_off = dest_col_start_c - c_col_start;
 
@@ -785,7 +785,7 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
                     for (int ti = first_c_row_chare; ti <= last_c_row_chare; ti++) {
                         for (int tj = first_dest_col_chare; tj <= last_dest_col_chare; tj++) {
                             int dest_col_start_c = std::max(c_col_start, tj * tile_2d);
-                            int dest_col_end_c = std::min(c_col_end, (tj + 1) * tile_2d);
+                            int dest_col_end_c = tile_end(tj, tile_2d, c_col_end);
                             int send_cols = dest_col_end_c - dest_col_start_c;
                             int send_col_off = dest_col_start_c - c_col_start;
 

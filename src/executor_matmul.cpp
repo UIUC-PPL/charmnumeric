@@ -225,7 +225,7 @@ void ArrayDAGExecutorND<N>::execute_matmul_node(DAGNode* node) {
 
                     for (int tc = fc; tc <= lc; tc++) {
                         int chare_col_start = std::max(mat_col_lo, tc * tile_3d);
-                        int chare_col_end = std::min(mat_col_hi, (tc + 1) * tile_3d);
+                        int chare_col_end = tile_end(tc, tile_3d, mat_col_hi);
                         int send_len = chare_col_end - chare_col_start;
                         int local_offset = (chare_col_start - cd_s + vec_s) - my_vec_start;
 
@@ -255,7 +255,7 @@ void ArrayDAGExecutorND<N>::execute_matmul_node(DAGNode* node) {
                     for (int tc = first_col_chare; tc <= last_col_chare; tc++) {
                         for (int tr = first_row_chare; tr <= last_row_chare; tr++) {
                             int global_row_lo = std::max(tr * tile_3d, rd_s);
-                            int global_row_hi = std::min((tr + 1) * tile_3d, rd_e);
+                            int global_row_hi = tile_end(tr, tile_3d, rd_e);
                             int result_lo = global_row_lo - rd_s;
                             int result_hi = global_row_hi - rd_s;
                             if (result_lo < my_result_end && result_hi > my_result_start)
@@ -317,8 +317,8 @@ void ArrayDAGExecutorND<N>::execute_matmul_node(DAGNode* node) {
             int last_col_chare = (mat_ce > 0) ? (mat_ce - 1) / tile_2d : 0;
             // result rows [k_lo, k_hi) computed by row chare tr (empty: tr has no selected row)
             auto row_chare_results = [&](int tr, int& k_lo, int& k_hi) {
-                stepped_rows(mat_rs, mat_re, mat_rst, tr * tile_2d, (tr + 1) * tile_2d, k_lo,
-                             k_hi);
+                stepped_rows(mat_rs, mat_re, mat_rst, tr * tile_2d, tile_end(tr, tile_2d, mat_re),
+                             k_lo, k_hi);
             };
             if (matmul_trans(matmul_root)) {
                 // res[j] = sum_i mat[mat_rs + i, mat_cs + j] * vec[vec_s + i]: vector pieces go
@@ -333,7 +333,7 @@ void ArrayDAGExecutorND<N>::execute_matmul_node(DAGNode* node) {
                         int row_hi = mat_rs + (rel_end - vec_s);
                         for (int tr = row_lo / tile_2d; tr <= (row_hi - 1) / tile_2d; tr++) {
                             int rs = std::max(row_lo, tr * tile_2d);
-                            int re = std::min(row_hi, (tr + 1) * tile_2d);
+                            int re = tile_end(tr, tile_2d, row_hi);
                             int local_offset = (rs - mat_rs + vec_s) - my_vec_start;
                             for (int tc = first_col_chare; tc <= last_col_chare; tc++) {
                                 ChareIndex<2> target_ci;
@@ -352,7 +352,7 @@ void ArrayDAGExecutorND<N>::execute_matmul_node(DAGNode* node) {
                 int total_expected = 0;
                 for (int tc = first_col_chare; my_lo < my_hi && tc <= last_col_chare; tc++) {
                     int lo = std::max(tc * tile_2d, mat_cs) - mat_cs;
-                    int hi = std::min((tc + 1) * tile_2d, mat_ce) - mat_cs;
+                    int hi = tile_end(tc, tile_2d, mat_ce) - mat_cs;
                     if (lo < my_hi && hi > my_lo)
                         total_expected += last_row_chare - first_row_chare + 1;
                 }
@@ -388,7 +388,7 @@ void ArrayDAGExecutorND<N>::execute_matmul_node(DAGNode* node) {
                     int lc = (mat_col_hi - 1) / tile_2d;
                     for (int tc = fc; tc <= lc; tc++) {
                         int chare_col_start = std::max(mat_col_lo, tc * tile_2d);
-                        int chare_col_end = std::min(mat_col_hi, (tc + 1) * tile_2d);
+                        int chare_col_end = tile_end(tc, tile_2d, mat_col_hi);
                         int send_len = chare_col_end - chare_col_start;
                         int local_offset = (chare_col_start - mat_cs + vec_s) - my_vec_start;
 

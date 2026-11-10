@@ -108,7 +108,7 @@ struct OutGeom {
     int tile = 1;
 
     int chare_start(int k, int c) const { return std::max(c * tile, off[k]); }
-    int chare_stop(int k, int c) const { return std::min((c + 1) * tile, off[k] + shape[k]); }
+    int chare_stop(int k, int c) const { return tile_end(c, tile, int64_t(off[k]) + shape[k]); }
 };
 
 ShapeSpec parse_shape(ASTNode* root) {
@@ -196,11 +196,11 @@ bool src_block(PartitionImpl<N>* partition, CTArrayBase<N>* arr, Region* view_ba
             vstep = r->step[d];
             vsize = r->size(d);
         }
-        int a = tile.start[d] - dec.offset[d] - vstart;
-        int e = tile.stop[d] - dec.offset[d] - vstart;
+        int64_t a = int64_t(tile.start[d]) - dec.offset[d] - vstart;
+        int64_t e = int64_t(tile.stop[d]) - dec.offset[d] - vstart;
         b.vsize[d] = vsize;
-        b.lo[d] = a <= 0 ? 0 : (a + vstep - 1) / vstep;
-        b.hi[d] = e <= 0 ? 0 : std::min(vsize, (e + vstep - 1) / vstep);
+        b.lo[d] = a <= 0 ? 0 : static_cast<int>((a + vstep - 1) / vstep);
+        b.hi[d] = e <= 0 ? 0 : static_cast<int>(std::min<int64_t>(vsize, (e + vstep - 1) / vstep));
         if (b.lo[d] >= b.hi[d])
             return false;
         b.base += (int64_t)(vstart + dec.offset[d] - tile.start[d]) * lstride[d];

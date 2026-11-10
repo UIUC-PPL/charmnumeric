@@ -1064,9 +1064,10 @@ inline void cross_set_region_send(PartitionImpl<N_src>* partition, DAGNode* node
 
             // Advance odometer
             for (int d = N_tgt - 1; d >= 0; --d) {
-                idx[d] += cr.step[d];
-                if (idx[d] < cr.stop[d])
+                if (cr.stop[d] - idx[d] > cr.step[d]) {
+                    idx[d] += cr.step[d];
                     break;
+                }
                 idx[d] = cr.start[d];
             }
         }

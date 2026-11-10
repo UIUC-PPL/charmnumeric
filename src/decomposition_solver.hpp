@@ -49,7 +49,7 @@ inline int ct_min_tile(int ndims) {
 inline int64_t tile_count(const std::array<int, 3>& shape, int ndims, int tile) {
     int64_t count = 1;
     for (int d = 0; d < ndims; ++d)
-        count *= (std::max(1, shape[d]) + tile - 1) / tile;
+        count *= (std::max<int64_t>(1, shape[d]) + tile - 1) / tile;
     return count;
 }
 
@@ -61,7 +61,7 @@ inline int64_t busiest_pe_elems(const std::array<int, 3>& shape, int ndims, int 
     std::array<int, 3> n = {1, 1, 1};
     int64_t count = 1, full = 1;
     for (int d = 0; d < ndims; ++d) {
-        n[d] = (std::max(1, shape[d]) + tile - 1) / tile;
+        n[d] = static_cast<int>((std::max<int64_t>(1, shape[d]) + tile - 1) / tile);
         count *= n[d];
         full *= std::min(tile, std::max(1, shape[d]));
     }
@@ -110,7 +110,8 @@ inline int balanced_tile(const std::array<int, 3>& shape, int ndims, int64_t max
     if (auto it = cache.find(key); it != cache.end())
         return it->second;
     int pow2 = min_tile;
-    while (tile_count(shape, ndims, pow2) > max_tiles && pow2 < smax)
+    while (tile_count(shape, ndims, pow2) > max_tiles && pow2 < smax &&
+           pow2 <= std::numeric_limits<int>::max() / 2)
         pow2 *= 2;
     if (key.num_pes == 1)
         return cache[key] = pow2;
@@ -124,7 +125,8 @@ inline int balanced_tile(const std::array<int, 3>& shape, int ndims, int64_t max
                 break;
             cands.insert((int)std::min<int64_t>(t, std::numeric_limits<int>::max()));
         }
-    cands.insert((smax + align - 1) / align * align);
+    cands.insert((int)std::min<int64_t>((int64_t(smax) + align - 1) / align * align,
+                                        std::numeric_limits<int>::max()));
     // one estimator for every candidate, and at most ~1M chare visits per shape
     bool exact = max_tiles <= 4096 && (int64_t)cands.size() * max_tiles <= (1 << 20);
     int best = -1;

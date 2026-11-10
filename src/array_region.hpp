@@ -7,8 +7,15 @@
 #include <charmtyles/core/dag.hpp> // extract<T>
 #include <charmtyles/core/region.hpp>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <vector>
+
+/// min((c + 1) * tile, limit), the end of tile c clipped to limit, without the product
+/// overflowing int when the extent is near 2**31.
+inline int tile_end(int c, int tile, int64_t limit) {
+    return static_cast<int>(std::min<int64_t>(int64_t(c + 1) * tile, limit));
+}
 
 #ifndef DBG_PRINT
 #ifdef NDEBUG
@@ -350,9 +357,9 @@ class ArrayDecomp {
 
     /// Number of chares along dimension d for this array.
     int num_chares(int d) const {
-        int gstart = offset[d];
-        int gstop = offset[d] + global_shape[d];
-        return (gstop + tile - 1) / tile - gstart / tile;
+        int64_t gstart = offset[d];
+        int64_t gstop = gstart + global_shape[d];
+        return static_cast<int>((gstop + tile - 1) / tile - gstart / tile);
     }
 
     /// Global-space region owned by chare ci (clipped to this array's extent).
@@ -360,7 +367,7 @@ class ArrayDecomp {
         ArrayRegion<N> r;
         for (int d = 0; d < N; ++d) {
             r.start[d] = std::max(ci[d] * tile, offset[d]);
-            r.stop[d] = std::min((ci[d] + 1) * tile, offset[d] + global_shape[d]);
+            r.stop[d] = tile_end(ci[d], tile, int64_t(offset[d]) + global_shape[d]);
             r.step[d] = 1;
         }
         return r;
@@ -380,11 +387,11 @@ class ArrayDecomp {
     /// decomposition-global coords) that chare c holds; false if it is empty.
     bool view_block(int d, int c, int vstart, int vstep, int vsize, int& lo, int& hi) const {
         int cs = chare_start_global(d, c);
-        int ce = std::min((c + 1) * tile, offset[d] + global_shape[d]);
-        int a = cs - vstart;
-        int b = ce - vstart;
-        lo = a <= 0 ? 0 : (a + vstep - 1) / vstep;
-        hi = b <= 0 ? 0 : std::min(vsize, (b + vstep - 1) / vstep);
+        int ce = tile_end(c, tile, int64_t(offset[d]) + global_shape[d]);
+        int64_t a = int64_t(cs) - vstart;
+        int64_t b = int64_t(ce) - vstart;
+        lo = a <= 0 ? 0 : static_cast<int>((a + vstep - 1) / vstep);
+        hi = b <= 0 ? 0 : static_cast<int>(std::min<int64_t>(vsize, (b + vstep - 1) / vstep));
         return lo < hi;
     }
 };
@@ -542,7 +549,9 @@ std::vector<ArrayRegion<N>> subtract(ArrayRegion<N> const& r1, ArrayRegion<N> co
         // bogus fragments like [64:65:2] that contain no real source element.
         int covered_stop = overlap.stop[d];
         if (remainder.step[d] > 1)
-            covered_stop = overlap.start[d] + overlap.size(d) * remainder.step[d];
+            covered_stop = static_cast<int>(std::min<int64_t>(
+                overlap.start[d] + int64_t(overlap.size(d)) * remainder.step[d],
+                remainder.stop[d]));
 
         // Left slab: remainder up to the overlap start in dimension d
         if (remainder.start[d] < overlap.start[d]) {
@@ -586,7 +595,8 @@ ArrayRegion<N> map(ArrayRegion<N> const& r1, ArrayRegion<N> const& parent1,
         // Translate to parent2's coordinate space
         result.start[d] = parent2.start[d] + lo * parent2.step[d];
         result.step[d] = ls * parent2.step[d];
-        result.stop[d] = result.start[d] + count * result.step[d];
+        result.stop[d] = static_cast<int>(std::min<int64_t>(
+            result.start[d] + int64_t(count) * result.step[d], std::numeric_limits<int>::max()));
     }
 
     return result;
@@ -814,7 +824,9 @@ align_fragments(std::vector<std::vector<FragmentData<N, T>>> const& inputs,
                 ArrayRegion<N> cell;
                 for (int d = 0; d < N; ++d) {
                     cell.start[d] = gs[d] + grid[d][idx[d]] * gst[d];
-                    cell.stop[d] = gs[d] + grid[d][idx[d] + 1] * gst[d];
+                    cell.stop[d] = static_cast<int>(
+                        std::min<int64_t>(gs[d] + int64_t(grid[d][idx[d] + 1]) * gst[d],
+                                          std::numeric_limits<int>::max()));
                     cell.step[d] = frag.step[d];
                 }
 
@@ -885,7 +897,7 @@ decompose(ArrayRegion<N> const& region, ArrayDecomp<N> const& decomp) {
     std::array<int, N> chare_start, chare_stop;
     for (int d = 0; d < N; ++d) {
         chare_start[d] = region.start[d] / decomp.tile;
-        chare_stop[d] = (region.stop[d] + decomp.tile - 1) / decomp.tile;
+        chare_stop[d] = static_cast<int>((int64_t(region.stop[d]) + decomp.tile - 1) / decomp.tile);
     }
 
     // Iterate over all chare indices in the N-dimensional range

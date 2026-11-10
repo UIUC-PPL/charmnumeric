@@ -350,7 +350,8 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                             for (int rk = first_result_chare; rk <= last_result_chare; rk++) {
                                 // Tile boundaries in result-local space
                                 int send_start = std::max(result_lo, rk * tile_1d - res_offset);
-                                int send_end = std::min(result_hi, (rk + 1) * tile_1d - res_offset);
+                                int send_end = static_cast<int>(std::min<int64_t>(
+                                    result_hi, int64_t(rk + 1) * tile_1d - res_offset));
                                 int send_len = send_end - send_start;
                                 int data_offset = send_start - result_lo;
 
@@ -565,7 +566,8 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                             for (int rk = first_result_chare; rk <= last_result_chare; rk++) {
                                 // Tile boundaries in result-local space
                                 int send_start = std::max(result_lo, rk * tile_1d - res_offset);
-                                int send_end = std::min(result_hi, (rk + 1) * tile_1d - res_offset);
+                                int send_end = static_cast<int>(std::min<int64_t>(
+                                    result_hi, int64_t(rk + 1) * tile_1d - res_offset));
                                 int send_len = send_end - send_start;
                                 int data_offset = send_start - result_lo;
 
@@ -1167,9 +1169,10 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
 
                                     int d = N - 1;
                                     while (d >= 0) {
-                                        idx[d] += overlap.step[d];
-                                        if (idx[d] < overlap.stop[d])
+                                        if (overlap.stop[d] - idx[d] > overlap.step[d]) {
+                                            idx[d] += overlap.step[d];
                                             break;
+                                        }
                                         idx[d] = overlap.start[d];
                                         --d;
                                     }
@@ -1263,9 +1266,10 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
 
                                         int d = N - 1;
                                         while (d >= 0) {
-                                            idx[d] += loc_overlap.step[d];
-                                            if (idx[d] < loc_overlap.stop[d])
+                                            if (loc_overlap.stop[d] - idx[d] > loc_overlap.step[d]) {
+                                                idx[d] += loc_overlap.step[d];
                                                 break;
+                                            }
                                             idx[d] = loc_overlap.start[d];
                                             --d;
                                         }

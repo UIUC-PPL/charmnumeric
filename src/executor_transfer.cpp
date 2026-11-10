@@ -335,7 +335,7 @@ static void diag_send(PartitionImpl<N_src>* partition, DAGNode* node, int source
             int target_chare = vec_idx / tile_1d;
             ChareIndex<1> target_ci;
             target_ci.idx[0] = target_chare;
-            int end = std::min(diag_hi, (target_chare + 1) * tile_1d);
+            int end = tile_end(target_chare, tile_1d, diag_hi);
             ranges.push_back({target_ci, vec_idx, end - vec_idx});
             vec_idx = end;
         }

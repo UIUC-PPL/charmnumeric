@@ -122,7 +122,7 @@ void expand_partition_nd(CProxy_ArrayDAGGroup proxy, typename PartitionTraits<N>
 
     bool needs_expansion = false;
     for (int d = 0; d < N; ++d) {
-        needed[d] = (region->size(d) + tile - 1) / tile;
+        needed[d] = static_cast<int>((int64_t(region->size(d)) + tile - 1) / tile);
         if (needed[d] > current_grid[d])
             needs_expansion = true;
     }

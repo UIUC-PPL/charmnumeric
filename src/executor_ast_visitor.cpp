@@ -289,9 +289,10 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
 
                     int d = N - 1;
                     while (d >= 0) {
-                        idx[d] += overlap.step[d];
-                        if (idx[d] < overlap.stop[d])
+                        if (overlap.stop[d] - idx[d] > overlap.step[d]) {
+                            idx[d] += overlap.step[d];
                             break;
+                        }
                         idx[d] = overlap.start[d];
                         --d;
                     }
