@@ -2,12 +2,17 @@
 
 // Narrow MLIR JIT interface for TUs nvcc compiles (it cannot parse MLIR headers).
 
+#include <string>
+
 /// Returns the "fused_kernel" pointer (nullptr on failure); the module handle goes to moduleHandle.
-void* jit_compile_ast(void* ast, void** moduleHandle);
+/// If an op has no kernel body for its dtype, *error says so and the kernel writes zeros there.
+void* jit_compile_ast(void* ast, void** moduleHandle, std::string* error = nullptr);
 
 /// jit_compile_ast for n kernels at once: misses compile in parallel (CNUM_JIT_THREADS), and
-/// servers sharing the disk cache compile each kernel once (the others load it).
-void jit_compile_batch(void* const* asts, int n, void** fns, void** moduleHandles);
+/// servers sharing the disk cache compile each kernel once (the others load it). errors, if
+/// given, holds n strings: each kernel's error as jit_compile_ast reports it.
+void jit_compile_batch(void* const* asts, int n, void** fns, void** moduleHandles,
+                       std::string* errors = nullptr);
 
 /// Identical kernels share one module: free each once. No-op on GPU builds.
 void jit_free_module(void* moduleHandle);
