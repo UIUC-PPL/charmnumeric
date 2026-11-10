@@ -191,7 +191,7 @@ inline bool device_cache_room(int64_t cached) {
 /// device_cache_floor() and `bytes` plus device_reserve() do not fit (defined below).
 inline void device_make_room(int64_t bytes);
 
-/// Frees the cached message buffers and this PE's retired arrays (defined below).
+/// Frees the cached message buffers and the retired arrays of this process (defined below).
 inline void release_device_caches();
 
 [[noreturn]] inline void device_oom(int64_t bytes) {
@@ -365,6 +365,13 @@ inline void comm_free(void* ptr) {
 inline std::atomic<int64_t>& retired_device_bytes() {
     static std::atomic<int64_t> bytes{0};
     return bytes;
+}
+
+/// Guards the retired-array free lists of every partition in this process (SMP: the PEs
+/// share one device budget, so eviction must reach all of them). Taken before the comm pool's.
+inline std::mutex& free_lists_mutex() {
+    static std::mutex mu;
+    return mu;
 }
 
 /// Type-erased base class for N-D arrays.
@@ -893,7 +900,9 @@ class PartitionImpl {
     static std::atomic<int64_t>& retired_bytes() {
         return retired_device_bytes();
     }
-    /// 1/2 of the device, split among the processes on it (CNUM_FREE_LIST_MB).
+    /// 1/2 of the device, split among the processes on it (CNUM_FREE_LIST_MB). The large
+    /// comm block cache has its own 1/2, so together the caches stay below about 3/4 of the
+    /// device (device_cache_room keeps device_reserve() free beyond the floor).
     static int64_t retired_limit() {
 #ifdef USE_NVIDIA
         return device_budget("CNUM_FREE_LIST_MB", 2);
@@ -930,6 +939,7 @@ class PartitionImpl {
     /// Move an array from `arrays` into the free list (or delete it if the
     /// free list for its key is full).
     void retire_array(int name) {
+        std::lock_guard<std::mutex> lock(free_lists_mutex());
         auto it = arrays.find(name);
         if (it == arrays.end()) {
             DBG_PRINT("[PE %d] Partition<%d> retire_array name=%d: no local buffer\n",
@@ -959,7 +969,7 @@ class PartitionImpl {
         }
     }
 
-    /// Free the retired arrays (release_device_caches).
+    /// Free the retired arrays (release_device_caches); free_lists_mutex held.
     void release_retired() {
         for (auto& [key, bucket] : free_arrays)
             for (auto* arr : bucket) {
@@ -969,7 +979,8 @@ class PartitionImpl {
         free_arrays.clear();
     }
 
-    /// cache_clock() of this chare's least recently retired array (max if none).
+    /// cache_clock() of this chare's least recently retired array (max if none);
+    /// free_lists_mutex held.
     uint64_t oldest_retired() const {
         uint64_t s = std::numeric_limits<uint64_t>::max();
         for (auto& [key, bucket] : free_arrays)
@@ -997,6 +1008,7 @@ class PartitionImpl {
     /// Try to pop a reusable buffer from the free list.
     /// Returns nullptr if none available.
     CTArrayBase<N>* try_reuse(DType dtype, const ArrayRegion<N>& region) {
+        std::lock_guard<std::mutex> lock(free_lists_mutex());
         auto it = free_arrays.find(make_free_key(dtype, region));
         if (it == free_arrays.end() || it->second.empty())
             return nullptr;
@@ -1209,6 +1221,13 @@ std::vector<PartitionImpl<N>*>& local_partitions() {
     return parts;
 }
 
+/// Every PE's chares of each rank in this process; guarded by free_lists_mutex().
+template <int N>
+std::vector<PartitionImpl<N>*>& process_partitions() {
+    static std::vector<PartitionImpl<N>*> parts;
+    return parts;
+}
+
 /// CNUM_MEM_STATS=1: one line of memory use per PE at each barrier (partition_get.cpp).
 void mem_stats_report(ArrayDAGGroup* g, int epoch);
 bool mem_stats_on();
@@ -1216,11 +1235,12 @@ bool mem_stats_on();
 #ifdef USE_KOKKOS
 inline void release_device_caches() {
     Kokkos::fence("ct_release_device_caches");
-    for (auto* p : local_partitions<1>())
+    std::lock_guard<std::mutex> free_lock(free_lists_mutex());
+    for (auto* p : process_partitions<1>())
         p->release_retired();
-    for (auto* p : local_partitions<2>())
+    for (auto* p : process_partitions<2>())
         p->release_retired();
-    for (auto* p : local_partitions<3>())
+    for (auto* p : process_partitions<3>())
         p->release_retired();
     auto& pool = comm_pool();
     std::lock_guard<std::mutex> lock(pool.mu);
@@ -1233,7 +1253,7 @@ inline void release_device_caches() {
 #endif
 }
 
-/// Frees the least recently freed large block or retired array of this PE.
+/// Frees the least recently freed large block or retired array of this process.
 inline bool evict_oldest_cached() {
     uint64_t best = std::numeric_limits<uint64_t>::max();
     std::function<void()> evict;
@@ -1246,9 +1266,10 @@ inline bool evict_oldest_cached() {
             }
         }
     };
-    scan(local_partitions<1>());
-    scan(local_partitions<2>());
-    scan(local_partitions<3>());
+    std::lock_guard<std::mutex> free_lock(free_lists_mutex());
+    scan(process_partitions<1>());
+    scan(process_partitions<2>());
+    scan(process_partitions<3>());
     auto& pool = comm_pool();
     std::lock_guard<std::mutex> lock(pool.mu);
     auto it = comm_oldest_large(pool);
