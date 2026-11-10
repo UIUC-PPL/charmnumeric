@@ -1,4 +1,4 @@
-# Codemap: Charmnumeric (`example/charmnumeric/`)
+# Codemap: Charmnumeric (repository root)
 
 Distributed N-dimensional array DSL built on charmtyles. The backend stores 1-3D tile-decomposed arrays; arrays with more than 3 dims are folded into 3-D storage by the frontend (`folded.py`). Python `Array`/`ArrayView` classes extend `FrontendObject`; C++ backend uses Charm++ chare arrays (`Partition<N>`) with optional MLIR JIT and GPU (Kokkos) support.
 
@@ -123,7 +123,7 @@ Bit-exact NumPy mirror of `src/creation_kernels.hpp` (Philox4x32-10, software lo
 ### Array creation in `charmnumeric/charmnumeric.py`
 `_creation_op()` builds UPLOAD (50) / RANDOM (51) / IOTA (52) nodes: `[region, (hi, lo) scalar word pairs..., InlineData]`. `_upload()` (bulk host data), `arange`, `linspace`, `indices`, `meshgrid`, `eye` (all native).
 
-## C++ Backend (`example/charmnumeric/src/`)
+## C++ Backend (`src/`)
 
 ### `backend.hpp` — Core backend types (673 lines)
 | Symbol | Line | Description |
@@ -244,7 +244,7 @@ Bit-exact NumPy mirror of `src/creation_kernels.hpp` (Philox4x32-10, software lo
 | `creation_kernels.hpp` | Host/device element functions: Philox RNG, Box-Muller with software log/cos, arange/linspace/indices/eye |
 | `jit.cpp` | MLIRJitCompiler implementation — buildFromAST (per-leaf element types), emitOp (per-op compute dtype, `convertValue`), registries |
 
-## Standalone C++ Tests (`example/charmnumeric/tests/`)
+## Standalone C++ Tests (`tests/`)
 
 ### `test_compute_decompositions.cpp` — Standalone decomposition coverage (416 lines)
 | Symbol | Line | Description |

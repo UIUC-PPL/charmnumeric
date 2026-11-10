@@ -20,6 +20,7 @@ from charmtyles.core import _shape_size
 
 from .charmnumeric import (
     _is_array_nd,
+    _matmul_2d,
     _is_scalar_like,
     _normalize_dtype,
     _reshape,
@@ -361,7 +362,8 @@ def _contract_pair(a, la, b, lb, keep, sizes, dtype, final=None):
         Ny = _prod([sizes[l] for l in fy])
         r = empty((Bt, Mx, Ny), dtype=dtype)
         for i in range(Bt):
-            r[i] = px[(slice(None),) * bx + (slice(i, i + 1),)] @ py[(slice(None),) * by + (slice(i, i + 1),)]
+            r[i] = _matmul_2d(px[(slice(None),) * bx + (slice(i, i + 1),)],
+                              py[(slice(None),) * by + (slice(i, i + 1),)])
     return _shaped(r, out, sizes), out
 
 
