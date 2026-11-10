@@ -80,11 +80,11 @@ _COUNT_CACHE_MAX = 8
 
 
 def _count(x, kind="nonzero"):
-    """count_nonzero(x), or sum(x) / amin(x) (kind "sum" / "min"), as an int, a blocking get; cached on x's
-    root until the root is written."""
-    from .reductions import amin, count_nonzero, sum as _sum
+    """count_nonzero(x), or sum(x) / amin(x) / amax(x) (kind "sum" / "min" / "max"), as an
+    int, a blocking get; cached on x's root until the root is written."""
+    from .reductions import amax, amin, count_nonzero, sum as _sum
 
-    fn = {"nonzero": count_nonzero, "sum": _sum, "min": amin}[kind]
+    fn = {"nonzero": count_nonzero, "sum": _sum, "min": amin, "max": amax}[kind]
     if x.__class__ is not Array and x.__class__ is not ArrayView:
         return _fetch_int(fn(x))
     _fresh(x)  # a linked copy may refresh (a write) first
@@ -193,6 +193,16 @@ def _wrap_device(idx, n, mode, oob=None):
     w = _where(_compare(idx, 0, "less"), idx + n, idx)
     oob = n if oob is None else oob
     return _where(_compare(w, n, "greater_equal"), oob, _where(_compare(w, 0, "less"), oob, w))
+
+
+def _check_bounds_device(idx, n, axis):
+    """IndexError like NumPy if a device index array has an entry outside [-n, n) (a
+    blocking get of its min and max)."""
+    if idx.dtype == _BOOL or not np.issubdtype(idx.dtype, np.integer) or idx.size == 0:
+        return
+    for v in (_count(idx, "max"), _count(idx, "min")):
+        if v >= n or v < -n:
+            raise IndexError(f"index {v} is out of bounds for axis {axis} with size {n}")
 
 
 def _nonzero_flat(x):
@@ -629,6 +639,8 @@ def _folded_plan(x, key, mode="raise"):
                     f"device index arrays must all have the same shape (got {tuple(idx.shape)} "
                     f"and {B})"
                 )
+            if not trusted and mode == "raise":
+                _check_bounds_device(idx, shape[d], d)
             idx = _flat_index(idx, nB)
             oob = int(np.prod(shape)) // mult[d] + 1  # oob * mult[d] > every offset
             idx = idx if trusted else _wrap_device(idx, shape[d], mode, oob)
@@ -925,12 +937,15 @@ def repeat(a, repeats, axis=None):
             raise ValueError(f"operands could not be broadcast together with shape ({n},)")
         if repeats.shape[0] == 1 and n != 1:
             raise NotImplementedError("repeat with a size-1 device repeats array")
+        if not np.can_cast(repeats.dtype, _INT64, "safe"):
+            raise TypeError(f"Cannot cast array data from {repeats.dtype!r} to "
+                            f"{_INT64!r} according to the rule 'safe'")
         if _count(repeats, "min") < 0:
             raise ValueError("repeats may not contain negative values")
         total = _count(repeats, "sum")
         idx = _expand(repeats, True, total) if total else np.zeros(0, np.int64)
     elif np.ndim(repeats) == 0:
-        r = int(repeats)
+        r = int(np.asarray(repeats).astype(np.int64, casting="safe"))
         if r < 0:
             raise ValueError("negative dimensions are not allowed")
         if axis is None or a.ndims == 1:

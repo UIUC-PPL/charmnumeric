@@ -18,7 +18,8 @@ axis=None, transpose, matmul, einsum/tensordot. Limits:
 - Transposes run as 3-D transposes of grouped reshapes (einsum.permute).
 - matmul (`@`) is batched through einsum.
 - Index arrays and masks build their offsets on the device (indexing.py), then
-  run one GATHER/SCATTER.
+  run one GATHER/SCATTER. Device index arrays are bounds-checked with one blocking
+  min/max get each, so out-of-range entries raise IndexError like NumPy.
 - var/std/argmax/argmin over axes that split into more than 3 groups of
   adjacent dims, take along an axis, and linalg raise NotImplementedError.
 """

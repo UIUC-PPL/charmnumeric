@@ -140,6 +140,11 @@ C.check("repeat folded axis=None", cnp.repeat(dev(fh), 2), np.repeat(fh, 2))
 C.raises("repeat negative host counts", ValueError, lambda: cnp.repeat(dev(ah[:3]), [1, -1, 2]))
 C.raises("repeat float host counts", TypeError, lambda: cnp.repeat(dev(ah[:3]), [1.5, 1, 2]))
 C.raises("repeat negative scalar", ValueError, lambda: cnp.repeat(dev(ah[:3]), -1))
+C.raises("repeat float device counts", TypeError,
+         lambda: cnp.repeat(dev(ah[:2]), dev(np.array([1.5, 1.5]))))
+C.raises("repeat float device counts axis=0", TypeError,
+         lambda: cnp.repeat(dev(rnd((2, 3))), dev(np.array([1.0, 2.0])), axis=0))
+C.raises("repeat float scalar", TypeError, lambda: cnp.repeat(dev(ah[:3]), 1.5))
 
 # ---- index arrays on >3-D arrays ----
 
@@ -201,6 +206,39 @@ for shape in [(6, 7, 8, 9), (3, 4, 5, 6, 7), (40, 30, 70, 60)]:
     yh[mh] = -1.5
     C.check("folded [mask2d] = scalar" + s, y, yh)
 C.raises("folded index out of bounds", IndexError, lambda: dev(rnd((2, 3, 4, 5)))[[0, 2]])
+# device index arrays are bounds-checked too (min/max on the device)
+oh = rnd((2, 3, 4, 5))
+o = dev(oh)
+C.raises("folded device index out of bounds", IndexError, lambda: o[dev(np.array([0, 2]))])
+C.raises("folded device index out of bounds (negative)", IndexError,
+         lambda: o[:, dev(np.array([1, -4]))])
+C.raises("folded device index out of bounds (mixed)", IndexError,
+         lambda: o[[0, 1], :, dev(np.array([3, 4]))])
+
+
+def _oob_set():
+    o[..., dev(np.array([1, 5]))] = 1.0
+
+
+C.raises("folded device index out of bounds (set)", IndexError, _oob_set)
+C.check("folded device index unchanged after the failed set", o, oh)
+C.check("folded device index negative in range", o[:, dev(np.array([-3, 2, -1]))],
+        oh[:, np.array([-3, 2, -1])])
+# duplicate indices on >3-D arrays: the last write wins, as in NumPy
+dh = rnd((4, 3, 5, 6))
+d = dev(dh)
+di = np.array([1, 3, 1, 0, 3, 1])
+vh = rnd((len(di), 3, 5, 6))
+d[dev(di)] = dev(vh)
+dh[di] = vh
+C.check("folded dup scatter [dev i] = array", d, dh)
+vh = rnd((len(di), 3))
+d[di, :, 2, 4] = dev(vh)
+dh[di, :, 2, 4] = vh
+C.check("folded dup scatter [host i, :, 2, 4] = array", d, dh)
+d[dev(di), 1, :, dev(np.array([0, 5, 5, 0, 2, 5]))] = dev(vh[:, :1] * np.ones((1, 5)))
+dh[di, 1, :, np.array([0, 5, 5, 0, 2, 5])] = vh[:, :1] * np.ones((1, 5))
+C.check("folded dup scatter [dev i, 1, :, dev j] = array", d, dh)
 
 # keys without index arrays stay on the basic (view / block) path
 fh = rnd((3, 4, 5, 6))
