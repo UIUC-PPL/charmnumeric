@@ -683,7 +683,7 @@ void ix_send_staged(PartitionImpl<N>* p, ArrayDAGGroup* g, int nd, const int des
         // a pageable destination: returns once the copy is done
         hapiCheck(cudaMemcpyAsync(pin ? pin : msg.data() + msg.size() - bytes, src, bytes,
                                   cudaMemcpyDeviceToHost, p->compute_stream_raw));
-    ix_after_compute(p, [g, nd, to, node_id, msg, pin, bytes]() mutable {
+    ix_after_compute(p, [g, nd, to, node_id, msg = std::move(msg), pin, bytes]() mutable {
         if (pin) {
             memcpy(msg.data() + msg.size() - bytes, pin, bytes);
             pinned_free(pin);
