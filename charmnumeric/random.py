@@ -89,7 +89,14 @@ def _emit(recipe):
     shape = recipe.shape
     if int(np.prod(shape)) == 0:
         return create_array(shape, dtype=recipe.dtype)
-    strides = list(recipe.strides) + [0] * (3 - len(recipe.strides))
+    strides = list(recipe.strides)
+    if len(shape) > 3:
+        # >3-D draws fill the folded 3-D storage, whose leading dim merges shape[:-2]
+        lead = strides[:-2]
+        if any(lead[d] != lead[d + 1] * shape[d + 1] for d in range(len(lead) - 1)):
+            raise NotImplementedError("permuted random draws with more than 3 dims")
+        strides = [lead[-1]] + strides[-2:]
+    strides += [0] * (3 - len(strides))
     words = [recipe.kind, recipe.seed, recipe.stream, recipe.a, recipe.b] + [
         _u64_from_int(s) for s in strides
     ]
@@ -262,6 +269,8 @@ def transposed(x, axes=None):
     axes = tuple(range(nd))[::-1] if axes is None else tuple(int(a) % nd for a in axes)
     if sorted(axes) != list(range(nd)):
         raise ValueError(f"invalid axes {axes} for a {nd}-D array")
+    if nd > 3:
+        return x.transpose(axes)
     shape = tuple(recipe.shape[a] for a in axes)
     strides = tuple(recipe.strides[a] for a in axes)
     return _emit(_Recipe(recipe.kind, recipe.seed, recipe.stream, recipe.a, recipe.b, shape,

@@ -14,16 +14,17 @@ struct JitCompileJob {
     void* ast;
     void* module_handle;
     void* func_ptr;
+    std::string* error;
 };
 
 void* jit_compile_thread(void* arg) {
     auto* job = static_cast<JitCompileJob*>(arg);
-    job->func_ptr = jit_compile_ast(job->ast, &job->module_handle);
+    job->func_ptr = jit_compile_ast(job->ast, &job->module_handle, job->error);
     return nullptr;
 }
 
-void* jit_compile_ast_big_stack(void* ast, void** moduleHandle) {
-    JitCompileJob job{ast, nullptr, nullptr};
+void* jit_compile_ast_big_stack(void* ast, void** moduleHandle, std::string* error) {
+    JitCompileJob job{ast, nullptr, nullptr, error};
     pthread_attr_t attr;
     pthread_t thread;
     bool ran = false;
@@ -43,12 +44,12 @@ void* jit_compile_ast_big_stack(void* ast, void** moduleHandle) {
 } // namespace
 #endif
 
-void* ArrayDAGGroup::compile_node(DAGNode* node) {
+void* ArrayDAGGroup::compile_node(DAGNode* node, std::string& error) {
     void* moduleHandle = nullptr;
 #if !defined(USE_NVIDIA) && !defined(USE_AMD) && !defined(USE_INTEL)
-    void* funcPtr = jit_compile_ast_big_stack(node->ast, &moduleHandle);
+    void* funcPtr = jit_compile_ast_big_stack(node->ast, &moduleHandle, &error);
 #else
-    void* funcPtr = jit_compile_ast(node->ast, &moduleHandle);
+    void* funcPtr = jit_compile_ast(node->ast, &moduleHandle, &error);
 #endif
     if (!funcPtr)
         return nullptr;
@@ -76,9 +77,15 @@ void ArrayDAGGroup::compile(DAG* dag) {
                 continue;
             }
             newly_compiled++;
-            void* compiled_fn = compile_node(node);
+            std::string error;
+            void* compiled_fn = compile_node(node, error);
             compile_cache[node->identifier] = compiled_fn;
+            if (!error.empty())
+                compile_errors[node->identifier] = error;
         }
+        auto err = compile_errors.find(node->identifier);
+        if (err != compile_errors.end() && CkMyPe() == 0 && client_error.empty())
+            client_error = err->second;
     }
     DBG_PRINT("[PE %d] compile: %d new kernels, %d cached kernels total\n",
               CkMyPe(), newly_compiled, (int)compile_cache.size());
