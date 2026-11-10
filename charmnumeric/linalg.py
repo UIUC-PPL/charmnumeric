@@ -14,7 +14,8 @@ Deviations from NumPy:
   real-only;
 - failures do not raise: a non-positive-definite ``cholesky`` returns NaNs, a
   singular ``solve``/``inv`` returns inf/NaN;
-- ``lstsq`` returns ``rank`` as a 0-d array, and residuals even when ``rank < N``.
+- ``lstsq`` returns ``rank`` as a 0-d int32 array, and residuals even when ``rank < N``;
+- a failed SVD/tssvd/eigh returns all-NaN factors.
 """
 
 import builtins
@@ -249,7 +250,7 @@ def lstsq(a, b, rcond=None):
     else:
         x = _block(P, 0, n, 0, nrhs)
     s = _vec(P, n, 0, k)
-    rank = _la(_LA_RESHAPE, [P[n + 1:n + 2, 0:1]], (), dt)
+    rank = _la(_LA_RESHAPE, [P[n + 1:n + 2, 0:1]], (), dt).astype(np.int32)
     if m <= n:
         residuals = np.empty((0,), dtype=dt)
     else:
