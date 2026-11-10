@@ -39,7 +39,17 @@ node), ``--jobs N``, ``--notebook`` (Jupyter extras). ``CHARM_HOME``, ``MLIR_DIR
 and ``Kokkos_ROOT`` from the environment are used when they fit the requested
 configuration. The script uses ``gcc``/``g++`` (``CNUM_CC``/``CNUM_CXX`` to change)
 and ignores ``CC``/``CXX``: wrappers such as Cray's link MPI and CUDA libraries into
-everything. Paths must not contain spaces.
+everything. Paths must not contain spaces. The script needs bash >= 4.4 and CMake >= 3.21 (pip-installed
+if missing). It replaces directories under ``--prefix`` (``mlir``, ``kokkos``, a cloned
+``src/charmtyles``) only if it created them; otherwise it stops. Classic ``CHARM_HOME`` and
+``--charm`` builds must use the netlrts machine layer.
+
+What is pinned: Charm++ (tag and commit SHA), PyCCS (commit), micromamba, the LLVM source,
+Kokkos and Kokkos Kernels (versions with sha256). Not pinned: the conda-forge LLVM/MLIR
+and Eigen packages (versions are, their builds and transitive dependencies are not), the
+charmtyles clone (the branch tip, or ``--core-ref``) and pip's build dependencies. A
+``Kokkos_ROOT`` built for another GPU architecture than ``--cuda-arch`` (or the visible GPU)
+is an error.
 
 Without the script, ``pip install .`` (``-C cmake.define.GPU_BACKEND=NVIDIA`` for
 GPUs) or a plain CMake build of ``src/`` work once the dependencies are findable:
@@ -51,7 +61,9 @@ GPUs) or a plain CMake build of ``src/`` work once the dependencies are findable
 
 The CMake build compiles the charmtyles core itself (``-DCHARMTYLES_CORE_BUILD_DIR``
 uses a prebuilt one) and downloads Eigen if none is installed. A CUDA Charm++
-selects the NVIDIA backend. ``CHARM_HOME`` is fixed when a build directory is first
+selects the NVIDIA backend; without ``GPU_BACKEND`` or ``CHARM_HOME`` (``. .deps/env.sh``),
+a plain ``pip install .`` picks a CPU Charm++ from ``.deps``, so it ignores a ``--gpu`` build
+there. ``CHARM_HOME`` is fixed when a build directory is first
 configured; pass ``-DCHARM_HOME=...`` to change it.
 
 On NCSA Delta: ``module load cuda/12.9`` (the default CUDA 13 is untested) and use

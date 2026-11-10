@@ -19,7 +19,7 @@ notebook = ["jupyterlab", "ipykernel", "matplotlib", "nbclient", "nbformat"]
 
 [tool.scikit-build]
 minimum-version = "build-system.requires"
-cmake.version = ">=3.20"
+cmake.version = ">=3.21"
 build-dir = "build/{wheel_tag}"
 wheel.packages = ["charmnumeric"]
 # Local build products in the source package; CMake installs the real ones.

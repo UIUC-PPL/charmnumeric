@@ -33,21 +33,26 @@ def _check_binary(label, path):
     return ok
 
 
-def _check_loads(path):
+def _check_loads(path, label="server", shared_lib=False):
     # loader trace mode: resolves all libraries and symbol versions, runs no Charm++ code
     env = dict(os.environ, LD_TRACE_LOADED_OBJECTS="1")
+    ldd = shutil.which("ldd")
+    if shared_lib and ldd is None:
+        print(f"[warn] {label} loads: ldd not found, not checked")
+        return
     try:
-        out = subprocess.run([path], env=env, capture_output=True, text=True, timeout=60)
+        out = subprocess.run([ldd, path] if shared_lib else [path], env=env,
+                             capture_output=True, text=True, timeout=60)
     except OSError as exc:
-        _report(False, "server loads", str(exc))
+        _report(False, f"{label} loads", str(exc))
         return
     text = out.stdout + out.stderr
     bad = sorted({line.strip() for line in text.splitlines() if "not found" in line or "error" in line.lower()})
     if bad and all(line.startswith("libcuda.so") for line in bad):
         # no NVIDIA driver here (e.g. a login node); the GPU nodes provide libcuda
-        print(f"[warn] server loads: {'; '.join(bad)} (fine without a GPU driver; run on a GPU node)")
+        print(f"[warn] {label} loads: {'; '.join(bad)} (fine without a GPU driver; run on a GPU node)")
         return
-    _report(out.returncode == 0 and not bad, "server loads (libraries and symbol versions)",
+    _report(out.returncode == 0 and not bad, f"{label} loads (libraries and symbol versions)",
             "; ".join(bad) if bad else ("" if out.returncode == 0 else f"exit {out.returncode}"))
 
 
@@ -82,7 +87,16 @@ def main():
             _check_loads(bi.SERVER)
         if bi.CHARMRUN is not None:
             _check_binary("charmrun", bi.CHARMRUN)
+        elif not bi.RECONVERSE:
+            _report(False, "charmrun", f"not found (expected from {bi.CHARM_HOME}; {reinstall})")
         if bi.GPU_BACKEND == "NVIDIA":
+            # dlopen'd by the GPU JIT, so the server's own library check does not cover it
+            runtime = os.path.join(os.path.dirname(bi.SERVER), "libmlir_cuda_runtime.so")
+            if os.path.isfile(runtime):
+                _check_loads(runtime, "libmlir_cuda_runtime", shared_lib=True)
+            else:
+                print("[warn] libmlir_cuda_runtime.so is not next to the server; the GPU JIT "
+                      "uses the path it was built with (or $CNUM_MLIR_CUDA_RUNTIME)")
             smi = shutil.which("nvidia-smi")
             gpus = subprocess.run([smi, "-L"], capture_output=True, text=True).stdout if smi else ""
             n = gpus.count("GPU ")

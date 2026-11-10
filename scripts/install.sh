@@ -2,6 +2,9 @@
 # Installs charmnumeric into the active venv/conda env, building or reusing Charm++,
 # MLIR 22, Kokkos (GPU) and PyCCS. Re-running skips finished steps. See --help.
 set -euo pipefail
+# Empty arrays under `set -u` need bash >= 4.4 (RHEL 7 has 4.2: module load a newer bash).
+(( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )) ||
+    { echo "install.sh: error: bash >= 4.4 required (this is $BASH_VERSION)" >&2; exit 1; }
 
 CHARM_REPO=https://github.com/charmplusplus/charm
 CHARM_CLASSIC_REF=v8.1.0           CHARM_CLASSIC_SHA=69c48ad848a26455a33ee736f45c3ef7d64e101b
@@ -85,6 +88,13 @@ fetch() {  # url sha256 dest; a stale or corrupt file is downloaded again once
     done
     die "checksum mismatch for $1"
 }
+own() {  # dir; this script may delete dir: it is new, or was created by this script (see $PREFIX/.cnum-owned)
+    local m; m=$PREFIX/.cnum-owned/$(printf %s "$1" | tr / _)
+    if [ -e "$1" ] && [ ! -f "$m" ] && [ ! -f "$1/.cnum-arch" ]; then
+        die "$1 exists but was not created by install.sh, and it would have to be replaced; move it away or use another --prefix"
+    fi
+    mkdir -p "$PREFIX/.cnum-owned" && : > "$m"
+}
 ver_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
 
 # --- preflight -----------------------------------------------------------
@@ -107,13 +117,13 @@ command -v "$CXX" >/dev/null && command -v "$CC" >/dev/null || die "compiler $CC
 gccv=$("$CXX" -dumpfullversion 2>/dev/null || "$CXX" -dumpversion)
 [ -n "${CNUM_CXX:-}" ] || ver_ge "$gccv" 9 || die "g++ >= 9 needed (found $gccv); load a newer GCC or set CNUM_CC/CNUM_CXX"
 echo "compilers: $CC, $CXX $gccv; Python $("$PY" -V 2>&1 | cut -d' ' -f2), pip $("$PY" -m pip --version | awk '{print $2}')"
-cmake_ok() { command -v cmake >/dev/null && ver_ge "$(cmake --version | awk 'NR==1{print $3}')" 3.20; }
-need=(); cmake_ok || need+=("cmake>=3.20")
+cmake_ok() { command -v cmake >/dev/null && ver_ge "$(cmake --version | awk 'NR==1{print $3}')" 3.21; }
+need=(); cmake_ok || need+=("cmake>=3.21")
 [ "$MLIR" = source ] && ! command -v ninja >/dev/null && need+=(ninja)
 if [ ${#need[@]} -gt 0 ]; then
     echo "pip installing ${need[*]}"; "$PY" -m pip install -q "${need[@]}"; hash -r
 fi
-cmake_ok || die "cmake >= 3.20 needed"
+cmake_ok || die "cmake >= 3.21 needed"
 if [ $GPU = 1 ]; then
     NVCC=$(command -v nvcc || echo "${CUDA_HOME:-/nonexistent}/bin/nvcc")
     [ -x "$NVCC" ] || die "--gpu needs the CUDA toolkit: put nvcc on PATH or set CUDA_HOME"
@@ -134,6 +144,7 @@ CORE=${CHARMTYLES_HOME:-$(cd "$CN/../.." && pwd)}
 if [ ! -f "$CORE/include/charmtyles/core/charmtyles.ci" ]; then
     CORE=$PREFIX/src/charmtyles
     if [ ! -d "$CORE/.git" ]; then
+        own "$CORE"
         if [ -n "$CORE_REF" ]; then
             step "Cloning charmtyles ($CORE_REF) into $CORE"
             git clone -q "$CORE_REPO" "$CORE" && git -C "$CORE" -c advice.detachedHead=false checkout -q "$CORE_REF" ||
@@ -154,18 +165,23 @@ export CHARMTYLES_HOME=$CORE
 charm_ok() { [ -x "$1/bin/charmc" ] && [ -f "$1/lib/libck.a" ]; }
 charm_cuda() { grep -q conv-mach-cuda.h "$1/include/conv-mach-opt.h" 2>/dev/null; }
 charm_rcv() { [ -e "$1/lib/libreconverse.so" ] || [ -e "$1/lib/libreconverse.a" ]; }
+charm_layer() {  # machine layer, e.g. netlrts
+    local l; l=$(sed -n 's/^#define CHARM_PLATFORM \([a-z0-9]*\)-.*/\1/p' "$1/include/conv-autoconfig.h" 2>/dev/null | head -1)
+    echo "${l:-unknown}"
+}
 charm_fits() {
     charm_ok "$1" || return 1
     local c=0 r=0; charm_cuda "$1" && c=1; charm_rcv "$1" && r=1
-    [ $c = $GPU ] && [ $r = $RCV ]
+    [ $c = $GPU ] && [ $r = $RCV ] || return 1
+    [ $RCV = 1 ] || [ "$(charm_layer "$1")" = netlrts ]  # the launcher uses charmrun ++local (netlrts)
 }
 want=classic; [ $RCV = 0 ] || want=Reconverse; [ $GPU = 0 ] || want="$want CUDA"
 if [ -n "$CHARM" ]; then
     charm_ok "$CHARM" || die "--charm $CHARM is not a complete Charm++ build (needs bin/charmc and lib/libck.a)"
-    charm_fits "$CHARM" || die "--charm $CHARM does not match the requested $want configuration"
+    charm_fits "$CHARM" || die "--charm $CHARM does not match the requested $want configuration (machine layer $(charm_layer "$CHARM"); classic builds need netlrts, e.g. ./build charm++ netlrts-linux-x86_64)"
 elif [ -n "${CHARM_HOME:-}" ]; then
     if charm_fits "$CHARM_HOME"; then CHARM=$CHARM_HOME
-    else warn "ignoring CHARM_HOME=$CHARM_HOME: not a complete $want Charm++ build; building one in $PREFIX"; fi
+    else warn "ignoring CHARM_HOME=$CHARM_HOME: not a complete $want netlrts Charm++ build (machine layer $(charm_layer "$CHARM_HOME")); building one in $PREFIX"; fi
 fi
 if [ -z "$CHARM" ]; then
     if [ $RCV = 1 ]; then ref=$CHARM_RECONVERSE_REF sha=$CHARM_RECONVERSE_SHA arch=reconverse-linux-x86_64
@@ -201,7 +217,7 @@ elif [ "$MLIR" = conda ]; then
         step "Fetching LLVM/MLIR $LLVM_VER and Eigen from conda-forge into $MLIR_PREFIX"
         mkdir -p "$PREFIX/bin"; MM=$PREFIX/bin/micromamba
         fetch "$MICROMAMBA_URL" "$MICROMAMBA_SHA256" "$MM"; chmod +x "$MM"
-        rm -rf "$MLIR_PREFIX"
+        own "$MLIR_PREFIX"; rm -rf "$MLIR_PREFIX"
         MAMBA_ROOT_PREFIX=$PREFIX/mamba run_logged "$LOG/mlir-conda.log" \
             "$MM" create -y -p "$MLIR_PREFIX" -c conda-forge --override-channels \
             "mlir=$LLVM_VER" "llvmdev=$LLVM_VER" eigen=3.4.0
@@ -249,20 +265,26 @@ if [ $GPU = 1 ]; then
             warn "ignoring Kokkos_ROOT=$Kokkos_ROOT: no Kokkos and Kokkos Kernels there (KokkosKernels_ROOT may point elsewhere); using $PREFIX/kokkos"
         else
             KOKKOS=$Kokkos_ROOT
-            [ -z "$KARCH" ] || grep -q "KOKKOS_ARCH_$KARCH\b" "$KOKKOS/include/KokkosCore_config.h" 2>/dev/null ||
-                warn "Kokkos at $KOKKOS was not built for $KARCH (--cuda-arch $CUDA_ARCH)"
+            if [ -n "$KARCH" ]; then
+                cfgh=$KOKKOS/include/KokkosCore_config.h
+                if [ ! -f "$cfgh" ]; then
+                    warn "cannot check which GPU architecture Kokkos_ROOT=$KOKKOS was built for ($cfgh missing)"
+                elif ! grep -q "KOKKOS_ARCH_$KARCH\b" "$cfgh"; then
+                    die "Kokkos_ROOT=$KOKKOS was not built for $KARCH (--cuda-arch $CUDA_ARCH) and would fail at run time; unset Kokkos_ROOT to build one under $PREFIX/kokkos, or point it at a matching build"
+                fi
+            fi
         fi
     fi
     if [ -z "$KOKKOS" ]; then
         KOKKOS=$PREFIX/kokkos; unset KokkosKernels_ROOT
         built=$(cat "$KOKKOS/.cnum-arch" 2>/dev/null || true)
         if [ -n "$built" ] && [ -n "$KARCH" ] && [ "$built" != "$KARCH" ]; then
-            echo "Kokkos in $KOKKOS was built for $built; rebuilding for $KARCH"; rm -rf "$KOKKOS"; built=""
+            echo "Kokkos in $KOKKOS was built for $built; rebuilding for $KARCH"; own "$KOKKOS"; rm -rf "$KOKKOS"; built=""
         fi
         if [ -z "$built" ]; then
             [ -n "$KARCH" ] || die "no GPU visible to detect its architecture; pass --cuda-arch (80 = A100, 86 = A40, 90 = H100)"
             step "Building Kokkos and Kokkos Kernels $KOKKOS_VER for $KARCH into $KOKKOS (log: $LOG/kokkos.log)"
-            mkdir -p "$PREFIX/src"; rm -rf "$KOKKOS"
+            mkdir -p "$PREFIX/src"; own "$KOKKOS"; rm -rf "$KOKKOS"
             fetch "https://github.com/kokkos/kokkos/releases/download/$KOKKOS_VER/kokkos-$KOKKOS_VER.tar.gz" $KOKKOS_SHA256 "$PREFIX/src/kokkos-$KOKKOS_VER.tar.gz"
             fetch "https://github.com/kokkos/kokkos-kernels/releases/download/$KOKKOS_VER/kokkos-kernels-$KOKKOS_VER.tar.gz" $KK_SHA256 "$PREFIX/src/kokkos-kernels-$KOKKOS_VER.tar.gz"
             tar -xzf "$PREFIX/src/kokkos-$KOKKOS_VER.tar.gz" -C "$PREFIX/src"
@@ -336,7 +358,7 @@ export CMAKE_BUILD_PARALLEL_LEVEL=$JOBS
 skargs=(-C "build-dir=build/$cfg" -C "cmake.define.CHARM_HOME=$CHARM" -C "cmake.define.CHARMTYLES_HOME=$CORE"
         -C "cmake.define.CNUM_DEPS_DIR=$PREFIX" -C "cmake.define.MLIR_DIR=$MLIR_DIR" -C "cmake.define.LLVM_DIR=$LLVM_DIR"
         -C "cmake.define.GPU_BACKEND=$([ $GPU = 1 ] && echo NVIDIA || echo OFF)")
-spec=$CN; [ $NOTEBOOK = 1 ] && spec="$CN[notebook]"
+spec=$CN; [ $NOTEBOOK = 1 ] && spec="${CN}[notebook]"
 run_logged "$LOG/pip-charmnumeric.log" "$PY" -m pip install -v "${pe[@]}" "${skargs[@]}" "$spec"
 
 step "Self test"
