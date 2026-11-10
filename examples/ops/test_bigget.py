@@ -5,8 +5,13 @@ Each chare sends its tile to PE 0 in a few large messages, whatever the row leng
 to send one message per row: 248M messages for take_pairs at 500000 x 32, which never
 finished). The default cases are small. CNUM_BIGGET=1 adds take_pairs at 500000 x 32
 (1.98 GB) and arrays just over 2 GiB with 8-byte rows, about 10 GB of client memory and
-4-5 GB on the server's PE 0. Running the server with CNUM_MSG_MAX_BYTES=<small> also tests
-tiles split over several messages.
+4-5 GB on the server's PE 0.
+
+Tiles split over several messages only when the server runs with a small CNUM_MSG_MAX_BYTES;
+the default run never splits one. Export it for both the server and this client to run the
+split cases too (the client reads the same variable), e.g.
+
+    CNUM_MSG_MAX_BYTES=4099 harness/run_one.sh server.out 4 33001 examples/ops/test_bigget.py
 
 Run as e.g. harness/run_one.sh server.out 4 33001 examples/ops/test_bigget.py
 """
@@ -20,6 +25,7 @@ import numpy as np
 import charmnumeric as cnp
 from _ops_common import Checker, connect
 
+SPLIT = os.environ.get("CNUM_MSG_MAX_BYTES", "") not in ("", "0")
 HEAVY = os.environ.get("CNUM_BIGGET", "") not in ("", "0")
 
 
@@ -44,6 +50,14 @@ def reshaped(chk, shape, dtype):
     chk.check(f"get {shape} {np.dtype(dtype).name}", x, np.arange(n, dtype=dtype).reshape(shape))
 
 
+def from_host(chk, shape, dtype, rng):
+    h = rng.integers(0, 200, size=shape)
+    if np.dtype(dtype).kind == "c":
+        h = h + 1j * rng.integers(-5, 5, size=shape)
+    h = h.astype(dtype)
+    chk.check(f"get {shape} {np.dtype(dtype).name}", cnp.asarray(h), h)
+
+
 def small(chk):
     for shape, dt in [((20001, 37, 2), np.int32), ((3001, 2, 1), np.float64), ((7, 5, 3), np.int8),
                       ((200001, 3), np.int16), ((1001, 1), np.float32), ((400, 300, 1), np.int64)]:
@@ -53,6 +67,15 @@ def small(chk):
     chk.check("get of a column slice", x[:, 3:5], h[:, 3:5])
     chk.check("get of a strided view", x[1::3, ::7], h[1::3, ::7])
     take_pairs(chk, 20000, 32, timed=True)
+    rng = np.random.default_rng(7)
+    for shape, dt in [((20001, 5, 2), np.bool_), ((400001, 3), np.bool_), ((9001, 7), np.complex64),
+                      ((50001, 2, 3), np.complex128), ((11, 13), np.bool_)]:
+        from_host(chk, shape, dt, rng)
+    if SPLIT:
+        for shape, dt in [((20001, 37, 2), np.complex128), ((100003, 3), np.bool_),
+                          ((4099, 5), np.int32)]:
+            from_host(chk, shape, dt, rng)
+        take_pairs(chk, 20000, 32)
 
 
 def heavy(chk):
