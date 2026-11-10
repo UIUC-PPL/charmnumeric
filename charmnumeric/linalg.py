@@ -10,7 +10,8 @@ matrices with at least ``CNUM_LA_LU_MIN`` (server env, default 2048) rows are di
 instead: row panels are dealt cyclically to one worker per PE (``CNUM_LA_LU_NB`` rows,
 default 512 on NVIDIA, 128 on CPU), so each worker holds about 1/P of the matrix, and
 factored with partial pivoting (except for ``solve_triangular``). On NVIDIA, ``cholesky``
-of a matrix spanning several tiles is factored in place in the result tiles.
+of a whole (unsliced) square array spanning several tiles, with a result tiled the same
+way, is factored tile by tile in the result tiles (``CNUM_LA_DIST=0`` gathers instead).
 
 Deviations from NumPy:
 
@@ -18,7 +19,8 @@ Deviations from NumPy:
   inputs are factored in float64; float16 is rejected); lstsq, slogdet and tssvd are
   real-only;
 - failures do not raise: a non-positive-definite ``cholesky`` returns NaNs, a
-  singular ``solve``/``inv`` returns inf/NaN;
+  singular ``solve``/``inv`` returns inf/NaN, and an ``lstsq`` whose SVD does not
+  converge returns NaN ``x`` and ``s`` with rank 0;
 - ``lstsq`` returns ``rank`` as a 0-d array, and residuals even when ``rank < N``.
 """
 
@@ -141,7 +143,8 @@ def _block(P, r0, r1, c0, c1):
 
 
 def cholesky(a, /, *, upper=False):
-    """Cholesky factor L (A = L L^T) or, with upper=True, U (A = U^T U)."""
+    """Cholesky factor L (A = L L^H) from A's lower triangle or, with upper=True, U
+    (A = U^H U) from its upper triangle."""
     a = _matrix(a, square=True)
     n = a.shape[0]
     return _la(_LA_CHOLESKY, [a], (n, n), _result_dtype(a), (bool(upper),))

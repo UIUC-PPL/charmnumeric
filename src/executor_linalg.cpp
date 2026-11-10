@@ -987,7 +987,8 @@ enum LaDevKind : int {
     LA_DK_TSQ = 6,
     LA_DK_TSTOP = 7,
     LA_DK_TSSIGN = 8,
-    LA_DK_FLIP = 9
+    LA_DK_FLIP = 9,
+    LA_DK_SEED = 10
 };
 
 /// A factored tile Y_xk = L_xk^T (column-major, i.e. L_xk row-major) received in chunks.
@@ -1006,7 +1007,7 @@ struct LaDevRoot {
     bool dist = false, factored = false, status = false, failed = false;
     int ta = 0, tb = 0, nt = 0, t = 0, n = 0, applied = 0;
     bool upper = false, flipped = false; // upper: tile (a, b) ends as L_ba^T
-    int64_t flip_got = 0;
+    int64_t flip_got = 0, seed_got = 0; // seed: upper, a > b, A_ba^H from tile (b, a)
     std::map<std::pair<int, int>, LaPanel> pan; // (x, k) -> Y_xk
     // TSQR: this chare's block (reflectors in a, tau; rows [qr0, qr0 + qh)); root's R_i
     bool tsqr = false, tsq_wait = false, tsr_wait = false;
@@ -1929,11 +1930,13 @@ T* la_dev_compute(PartitionImpl<N>* p, const LaSpec& s, LaDevRoot* D, int64_t& l
             la_dev_svd<N, T>(p, A, lda, m, n, false, true, U, S, VT, ldvt, info, tmp);
             la_smark(cs, "gesvd");
             std::vector<T> sv(k), inv(k);
+            int hinfo = 0;
             CT_CUDA_CHECK(cudaMemcpyAsync(sv.data(), S, sizeof(T) * k, cudaMemcpyDeviceToHost, cs));
+            CT_CUDA_CHECK(cudaMemcpyAsync(&hinfo, info, sizeof(int), cudaMemcpyDeviceToHost, cs));
             CT_CUDA_CHECK(cudaStreamSynchronize(cs));
             T cut = static_cast<T>(s.p[0]) * (k > 0 ? sv[0] : T(0));
             int rank = 0;
-            for (int i = 0; i < k; ++i) {
+            for (int i = 0; i < k && hinfo == 0; ++i) {
                 inv[i] = sv[i] > cut ? T(1) / sv[i] : T(0);
                 rank += sv[i] > cut;
             }
@@ -1952,6 +1955,7 @@ T* la_dev_compute(PartitionImpl<N>* p, const LaSpec& s, LaDevRoot* D, int64_t& l
             CT_CUBLAS_CHECK(cula::gemm(h.blas, CUBLAS_OP_T, CUBLAS_OP_N, n, bn, k, VT, ldvt, t1, k,
                                        out, R_));
             la_k_from_real<N, T, T>(p, out + n, R_, S, k);
+            la_k_nan_if<N, T>(p, out, R_, n + 1, C_, info, la_nan<T>()); // gesvd did not converge
             la_k_set<N, T>(p, out + n + 1, static_cast<T>(rank));
             CT_CUDA_CHECK(cudaStreamSynchronize(cs)); // inv is pageable
             la_smark(cs, "lstsq");
@@ -2011,8 +2015,9 @@ T* la_dev_compute(PartitionImpl<N>* p, const LaSpec& s, LaDevRoot* D, int64_t& l
 // ---- Distributed cholesky (whole operand, result tiled like the operand) ----
 // Tile (a, b) works on Y_ab = L_ab^T, column-major, which is L_ab in the row-major tile:
 // Y_aa: potrf(upper); Y_ab: trsm by Y_bb^H after the updates Y_ab -= Y_bk^H Y_ak, k < b
-// (^H is ^T for real types). upper: then tile (a, b), a > b, sends L_ab^H to tile (b, a)
-// and diagonal tiles transpose in place.
+// (^H is ^T for real types). upper factors the Hermitian matrix of A's upper triangle: tile
+// (a, b), a >= b, starts as A_ba^H, and once factored tile (a, b), a > b, sends L_ab^H to
+// tile (b, a) and diagonal tiles transpose in place.
 
 bool la_use_dist(const LaSpec& s, ArrayDAGGroup* g, int& nt, int& t) {
     if (s.op != LA_CHOLESKY)
@@ -2117,6 +2122,8 @@ void la_chol_step(PartitionImpl<N>* p, ArrayDAGGroup* g, int node_id, const LaSp
         LaDevRoot* D = st.dev;
         la_cur_node = node_id;
         int a = D->ta, b = D->tb, ba = la_tdim(D, a), bb = la_tdim(D, b);
+        if (D->upper && a > b && D->seed_got < static_cast<int64_t>(ba) * bb)
+            return;
         T* Y = static_cast<T*>(p->arrays[s.out_name]->device_data_ptr());
         LaHandles& h = la_handles(cs);
         for (int k = 0; k < b && !D->factored; ++k) {
@@ -2184,18 +2191,47 @@ void la_chol_step(PartitionImpl<N>* p, ArrayDAGGroup* g, int node_id, const LaSp
     }
 }
 
-/// Chare (a, b) of the grid: the result tile starts as A's tile (zero above the diagonal).
+/// dst (cols x rows) = src^H for the row-major rows x cols tile src.
 template <int N, typename S, typename T>
-void la_chol_start(PartitionImpl<N>* p, const LaSpec& s, LaDevRoot* D) {
+void la_chol_ct(PartitionImpl<N>* p, T* dst, const S* src, int rows, int cols) {
+    if constexpr (std::is_same_v<S, T>) {
+        la_k_ct<N, T>(p, dst, rows, src, cols, rows, cols);
+    } else {
+        cudaStream_t cs = p->compute_stream_raw;
+        int64_t count = static_cast<int64_t>(rows) * cols;
+        T* X = static_cast<T*>(la_dalloc(count * sizeof(T), cs));
+        la_k_pack<N, S, T>(p, X, static_cast<int>(count), 1, src, 0, 1, 0);
+        la_k_ct<N, T>(p, dst, rows, X, cols, rows, cols);
+        la_dfree(X, cs);
+    }
+}
+
+/// Chare (a, b) of the grid: the result tile starts as A's tile (zero above the diagonal);
+/// upper: as A_ba^H, sent by tile (b, a) unless diagonal.
+template <int N, typename S, typename T>
+void la_chol_start(PartitionImpl<N>* p, ArrayDAGGroup* g, int node_id, const LaSpec& s,
+                   LaDevRoot* D) {
     cudaStream_t cs = p->compute_stream_raw;
     T* Y = static_cast<T*>(p->arrays[s.out_name]->device_data_ptr());
-    int64_t count = static_cast<int64_t>(la_tdim(D, D->ta)) * la_tdim(D, D->tb);
-    if (D->ta < D->tb) {
+    int a = D->ta, b = D->tb, ba = la_tdim(D, a), bb = la_tdim(D, b);
+    int64_t count = static_cast<int64_t>(ba) * bb;
+    const S* src = static_cast<const S*>(p->arrays[s.in[0].name]->device_data_ptr());
+    if (a < b) {
+        if (D->upper) {
+            T* X = static_cast<T*>(la_dalloc(count * sizeof(T), cs));
+            la_chol_ct<N, S, T>(p, X, src, ba, bb);
+            la_chol_send<N, T>(p, g, node_id, s.out_name, X, count, b, a, b, a, LA_DK_SEED);
+            la_dfree(X, cs);
+        }
         CT_CUDA_CHECK(cudaMemsetAsync(Y, 0, count * sizeof(T), cs));
         D->factored = true;
         return;
     }
-    const S* src = static_cast<const S*>(p->arrays[s.in[0].name]->device_data_ptr());
+    if (D->upper) {
+        if (a == b)
+            la_chol_ct<N, S, T>(p, Y, src, ba, bb);
+        return;
+    }
     if constexpr (std::is_same_v<S, T>)
         CT_CUDA_CHECK(cudaMemcpyAsync(Y, src, count * sizeof(T), cudaMemcpyDeviceToDevice, cs));
     else
@@ -2234,7 +2270,7 @@ void la_chol_flip_recv(PartitionImpl<N>* p, const LaSpec& s, LaDevRoot* D, const
     CT_CUDA_CHECK(cudaMemcpyAsync(Y + c.c0, c.buf, (c.c1 - c.c0) * sizeof(T),
                                   cudaMemcpyDeviceToDevice, cs));
     la_free_after(p, std::vector<void*>{c.buf});
-    D->flip_got += c.c1 - c.c0;
+    (c.kind == LA_DK_SEED ? D->seed_got : D->flip_got) += c.c1 - c.c0;
 }
 
 } // namespace
@@ -2285,7 +2321,7 @@ static bool la_dev_progress(PartitionImpl<N>* p, ArrayDAGGroup* g, int node_id, 
         la_dispatch(s.dt, [&](auto tag) {
             using T = decltype(tag);
             for (auto& c : chunks) {
-                if (c.kind == LA_DK_FLIP)
+                if (c.kind == LA_DK_FLIP || c.kind == LA_DK_SEED)
                     la_chol_flip_recv<N, T>(p, s, D, c);
                 else
                     la_chol_recv<N, T>(p, D, c);
@@ -2381,7 +2417,7 @@ static void la_chol_execute(ArrayDAGExecutorND<N>* ex, PartitionImpl<N>* p, Arra
     D->upper = s.p[0] != 0;
     cn_dispatch(p->arrays[s.in[0].name]->dtype, [&](auto stag) {
         la_dispatch(s.dt, [&](auto ttag) {
-            la_chol_start<N, decltype(stag), decltype(ttag)>(p, s, D);
+            la_chol_start<N, decltype(stag), decltype(ttag)>(p, g, node->id, s, D);
         });
     });
     if (la_dev_progress<N>(p, g, node->id, s, st)) {
