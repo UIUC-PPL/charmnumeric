@@ -197,8 +197,8 @@ def main(chk):
         res = cnp.cumsum(I, axis=0, out=out)
         chk.true("cumsum out= returns out", res is out)
         check("cumsum out=", out, np.cumsum(Ih, axis=0))
-        T4 = real_data((2, 3, 4, 5), 76, lo=0.0, hi=1.0, dtype=np.float32)
-        T4h = T4.get(iface)
+        T4h = np.random.default_rng(76).uniform(0.0, 1.0, (2, 3, 4, 5)).astype(np.float32)
+        T4 = cnp.array(T4h)
         o4 = cnp.zeros((2, 3, 4, 5), dtype=np.float64)
         cnp.cumsum(T4, axis=2, out=o4)
         check("cumsum 4-D f32 out=f64 accumulates in f64", o4,
