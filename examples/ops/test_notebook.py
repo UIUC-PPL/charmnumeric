@@ -86,11 +86,25 @@ def display(chk):
             print(f"  FAIL display {label} ({n2} fetched):\n{plain}\n!=\n{want}")
         else:
             print(f"  PASS display {label}")
+    literals = [
+        ("literal small", cnp.arange(6.0) * 2,
+         "Array([ 0.,  2.,  4.,  6.,  8., 10.], dtype=float64)"),
+        ("literal empty", cnp.zeros((0, 3)), "Array([], shape=(0, 3), dtype=float64)"),
+    ]
+    for label, a, want in literals:
+        chk.count += 1
+        got = a._repr_mimebundle_()["text/plain"]
+        if got != want:
+            chk.failures.append(label)
+            print(f"  FAIL {label}: {got!r} != {want!r}")
+        else:
+            print(f"  PASS {label}")
     previous = cnp.set_display(preview=False)
     y = x + 1
     bundle, n = fetched(lambda: y._repr_mimebundle_())
     cnp.set_display(**previous)
     chk.count += 1
+
     if n or "pending" not in bundle["text/plain"]:
         chk.failures.append("preview=False")
         print(f"  FAIL preview=False ({n} fetched): {bundle['text/plain']}")
@@ -104,9 +118,9 @@ def display(chk):
 
 
 def slow_product():
-    a = cnp.ones((1500, 1500)) * 1e-3
+    a = cnp.ones((1500, 1500)) / 1500
     for _ in range(10):
-        a = (a @ a) * 1e-3
+        a = a @ a
     return cnp.sum(a)
 
 
@@ -124,7 +138,7 @@ def interrupt(chk, iface):
         signal.setitimer(signal.ITIMER_REAL, 0)
     chk.check("usable after Ctrl-C", cnp.arange(5) + 1, np.arange(5) + 1)
     ready = time.monotonic() - start
-    chk.check("interrupted result", total, np.asarray(0.0))
+    chk.check("interrupted result", total, np.asarray(1500.0), rtol=1e-6)
     chk.count += 1
     if waited is None:
         print("  SKIP Ctrl-C stops the wait: the product finished before the interrupt")

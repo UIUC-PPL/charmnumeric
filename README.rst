@@ -42,8 +42,8 @@ your arrays. Notebook behavior:
   arrays before plotting.
 - A server serves one client process; any other process (a restarted kernel, a
   forked child) gets ``ConnectionError`` when it connects. With a server you started
-  yourself, restart the server after restarting the kernel. ``cnp.start()`` gives
-  each kernel its own server, which avoids this.
+  yourself, restart the server after restarting the kernel. With the auto-start launcher (a separate PR),
+  ``cnp.start()`` gives each kernel its own server, which avoids this.
 - If the server exits, the next fetch raises ``ConnectionError`` instead of hanging.
   ``print(a)`` raises too; notebook display shows "values unavailable" instead.
 

@@ -13,19 +13,21 @@ import warnings
 import numpy as np
 
 _options = {"preview": True, "threshold": None, "edgeitems": None}
+_UNCHANGED = object()
 
 
-def set_display(preview=None, threshold=None, edgeitems=None):
+def set_display(preview=_UNCHANGED, threshold=_UNCHANGED, edgeitems=_UNCHANGED):
     """Set how notebooks and print() show arrays; returns the previous settings.
 
     preview: fetch values to show them (False shows only shape, dtype and size).
-    threshold, edgeitems: like numpy.set_printoptions (default: NumPy's settings),
-    and they also bound how many elements are fetched.
+    threshold, edgeitems: like numpy.set_printoptions; None means NumPy's setting. They
+    also bound how many elements are fetched. Omitted arguments stay as they are, so
+    ``set_display(**previous)`` restores.
     """
     previous = dict(_options)
     for key, value in (("preview", preview), ("threshold", threshold),
                        ("edgeitems", edgeitems)):
-        if value is not None:
+        if value is not _UNCHANGED:
             _options[key] = value
     return previous
 
@@ -79,7 +81,8 @@ def _repr_text(kind, values, summarized, shape, dtype):
     """NumPy's array_repr layout (shape shown when summarized), always naming the dtype."""
     prefix = f"{kind}("
     body = prefix + _text(values, summarized, separator=", ", prefix=prefix, suffix=")") + ","
-    extras = ", ".join(([f"shape={tuple(shape)}"] if summarized else [])
+    show_shape = summarized or (np.size(values) == 0 and tuple(shape) != (0,))
+    extras = ", ".join(([f"shape={tuple(shape)}"] if show_shape else [])
                        + [f"dtype={np.dtype(dtype).name}"]) + ")"
     last_line = len(body) - (body.rfind("\n") + 1)
     wraps = last_line + len(extras) + 1 > np.get_printoptions()["linewidth"]

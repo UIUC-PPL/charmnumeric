@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import socket
+import re
 import subprocess
 import time
 
@@ -34,21 +34,14 @@ def _server_binary():
     pytest.skip("no server.out; set CHARMNUMERIC_SERVER")
 
 
-def _free_port():
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 @pytest.fixture
 def server(tmp_path):
     binary = _server_binary()
-    port = _free_port()
     log = tmp_path / "server.log"
     pes = os.environ.get("CHARMNUMERIC_PES", "2")
     with log.open("w") as out:
         proc = subprocess.Popen([str(binary.parent / "charmrun"), f"+p{pes}", str(binary),
-                                 "++server", "++server-port", str(port), "++local"],
+                                 "++server", "++local"],
                                 stdout=out, stderr=subprocess.STDOUT)
     try:
         deadline = time.monotonic() + 120
@@ -56,7 +49,8 @@ def server(tmp_path):
             if proc.poll() is not None or time.monotonic() > deadline:
                 pytest.fail(f"server did not start:\n{log.read_text()}")
             time.sleep(0.2)
-        yield {"CNUM_HOST": "127.0.0.1", "CNUM_PORT": str(port)}
+        port = re.search(r"Server port = (\d+)", log.read_text()).group(1)
+        yield {"CNUM_HOST": "127.0.0.1", "CNUM_PORT": port}
     finally:
         proc.terminate()
         try:
@@ -105,8 +99,8 @@ STARTUP = ("import os, time\nimport numpy as np\nimport charmnumeric as cnp\n"
 # "Interrupt kernel" sends SIGINT to the kernel process; sent from inside, so it lands
 # while the cell runs however loaded the machine is.
 SLOW = ("import signal, threading\n"
-        "a = cnp.ones((1500, 1500)) * 1e-3\n"
-        "for _ in range(10):\n    a = (a @ a) * 1e-3\n"
+        "a = cnp.ones((1500, 1500)) / 1500\n"
+        "for _ in range(10):\n    a = a @ a\n"
         "t0 = time.monotonic()\n"
         "threading.Timer(1.0, os.kill, (os.getpid(), signal.SIGINT)).start()\n"
         "float(cnp.sum(a))")
@@ -141,7 +135,7 @@ def test_interrupt_rerun_and_restart(kernel_env):
         for i in (3, 4, 5):
             client.execute_cell(nb.cells[i], i)
         assert "Array([ 0.,  2.,  4.,  6.,  8., 10.], dtype=float64)" in _outputs(nb.cells[4])
-        assert _outputs(nb.cells[5]).strip() == "0.0"
+        assert float(_outputs(nb.cells[5])) == pytest.approx(1500.0, rel=1e-6)
 
     # A new kernel (as after "Restart kernel") cannot take over the server.
     fresh = nbformat.v4.new_notebook(cells=[_cell(STARTUP)])
