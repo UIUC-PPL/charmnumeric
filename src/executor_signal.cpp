@@ -1005,6 +1005,38 @@ inline bool cublas_layout(int64_t rows, int64_t cols, int64_t rs, int64_t cs,
 }
 #endif
 
+#if !defined(USE_KOKKOS)
+template <typename T>
+void bmm_eigen(int64_t bs, int64_t m, int64_t n, int64_t k, const T* a, const int64_t* as,
+               const T* b, const int64_t* bst, T* c, bool acc) {
+    using RM = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+    using CM = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
+    using OS = Eigen::OuterStride<>;
+    using GS = Eigen::Stride<Eigen::Dynamic, Eigen::Dynamic>;
+    // f(map) with the cheapest Eigen map of a (rows x cols) operand
+    auto with_map = [](const T* p, int64_t rows, int64_t cols, int64_t rs, int64_t cs,
+                       auto&& f) {
+        if (cs == 1 && rs >= cols)
+            f(Eigen::Map<const RM, 0, OS>(p, rows, cols, OS(rs)));
+        else if (rs == 1 && cs >= rows)
+            f(Eigen::Map<const CM, 0, OS>(p, rows, cols, OS(cs)));
+        else
+            f(Eigen::Map<const RM, 0, GS>(p, rows, cols, GS(rs, cs)));
+    };
+    for (int64_t q = 0; q < bs; ++q) {
+        Eigen::Map<RM> C(c + q * m * n, m, n);
+        with_map(a + q * as[0], m, k, as[1], as[2], [&](const auto& A) {
+            with_map(b + q * bst[0], k, n, bst[1], bst[2], [&](const auto& B) {
+                if (acc)
+                    C.noalias() += A * B;
+                else
+                    C.noalias() = A * B;
+            });
+        });
+    }
+}
+#endif
+
 /// c[q] (+)= a[q] * b[q] for q < bs: a[q] is m x k with element strides (as[1], as[2]),
 /// b[q] k x n with (bst[1], bst[2]), batch strides as[0], bst[0]; c dense (bs, m, n); `acc`
 /// adds to c.
@@ -1042,30 +1074,13 @@ void batched_gemm(PartitionImpl<N>* partition, int64_t bs, int64_t m, int64_t n,
     bmm_naive<N, T>(partition, bs, m, n, k, a, as, b, bst, c, acc);
 #else
     (void)partition;
-    using RM = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-    using CM = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
-    using OS = Eigen::OuterStride<>;
-    using GS = Eigen::Stride<Eigen::Dynamic, Eigen::Dynamic>;
-    // f(map) with the cheapest Eigen map of a (rows x cols) operand
-    auto with_map = [](const T* p, int64_t rows, int64_t cols, int64_t rs, int64_t cs,
-                       auto&& f) {
-        if (cs == 1 && rs >= cols)
-            f(Eigen::Map<const RM, 0, OS>(p, rows, cols, OS(rs)));
-        else if (rs == 1 && cs >= rows)
-            f(Eigen::Map<const CM, 0, OS>(p, rows, cols, OS(cs)));
-        else
-            f(Eigen::Map<const RM, 0, GS>(p, rows, cols, GS(rs, cs)));
-    };
-    for (int64_t q = 0; q < bs; ++q) {
-        Eigen::Map<RM> C(c + q * m * n, m, n);
-        with_map(a + q * as[0], m, k, as[1], as[2], [&](const auto& A) {
-            with_map(b + q * bst[0], k, n, bst[1], bst[2], [&](const auto& B) {
-                if (acc)
-                    C.noalias() += A * B;
-                else
-                    C.noalias() = A * B;
-            });
-        });
+    // signed integers wrap: multiply as unsigned (signed overflow is undefined behaviour)
+    if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool>) {
+        using U = std::make_unsigned_t<T>;
+        bmm_eigen<U>(bs, m, n, k, reinterpret_cast<const U*>(a), as,
+                     reinterpret_cast<const U*>(b), bst, reinterpret_cast<U*>(c), acc);
+    } else {
+        bmm_eigen<T>(bs, m, n, k, a, as, b, bst, c, acc);
     }
 #endif
 }
