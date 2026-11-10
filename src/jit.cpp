@@ -5,6 +5,7 @@
 
 #include "mlir/IR/Verifier.h"
 
+#include <algorithm>
 #include <chrono>
 #include <limits>
 
@@ -2199,7 +2200,17 @@ std::string cachePath(const std::string& ir) {
     NvTarget target = nvTarget();
     h.update("nvidia " + target.chip + " " + target.features);
 #endif
-    h.update(llvm::sys::getHostCPUName());
+    static const std::string host = [] {
+        std::vector<std::string> features;
+        for (const auto& f : llvm::sys::getHostCPUFeatures())
+            features.push_back((f.second ? " +" : " -") + f.first().str());
+        std::sort(features.begin(), features.end());
+        std::string s = llvm::sys::getHostCPUName().str();
+        for (const std::string& f : features)
+            s += f;
+        return s;
+    }();
+    h.update(host);
     return cacheDir() + "/" + llvm::toHex(h.final(), true) + ".o";
 }
 
