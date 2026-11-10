@@ -1,13 +1,17 @@
 """JIT edge cases vs NumPy: signed zeros (sign, maximum/minimum, clip, complex
-sign), empty arrays, GPU launch shapes (extents over 65535 off the
-contiguous dim, tile boundaries). CNUM_BIG_SHAPES=1 adds 8e7-element shapes."""
+sign and clip), empty arrays, GPU launch shapes (extents over 65535 off the
+contiguous dim, tile boundaries), and an op without a kernel for its dtype
+(an error at the next fetch, not a server abort). CNUM_BIG_SHAPES=1 adds
+8e7-element shapes and a scalar fill of a 3.2 GB array (one tile over 2 GiB
+with CNUM_ODF=1 at +p1)."""
 
 import os
 
 import numpy as np
 
 import charmnumeric as cnp
-from _ops_common import Checker, connect
+import charmnumeric.charmnumeric as cm
+from _ops_common import SIM, Checker, connect
 
 iface = connect()
 C = Checker("test_jit_edges", iface)
@@ -88,8 +92,9 @@ def ramp(shape, dtype=np.float64):
 
 
 # Large extents off the contiguous dim (were gridDim.y/z > 65535 on GPU) and rank 4
+BIG = os.environ.get("CNUM_BIG_SHAPES", "") not in ("", "0")
 SHAPES = [(3, 70000, 2), (2, 70001, 3), (70000, 3), (2, 3, 70000, 2), (2, 3, 4, 5, 6)]
-if os.environ.get("CNUM_BIG_SHAPES", "") not in ("", "0"):
+if BIG:
     SHAPES += [(2, 40_000_000), (70000, 300), (3, 70000, 70), (2, 2, 17_000_000)]
 for shape in SHAPES:
     a, ah = ramp(shape)
@@ -110,5 +115,32 @@ for n in (1, 255, 256, 257, 1023, 1025, 65537):
     hb = np.zeros((3, n + 40))
     hb[:, 1:n + 1] = hb[:, 1:n + 1] * 2.0 + 5.0
     C.check(f"b[:, 1:{n + 1}] = 2b + 5", b, hb)
+
+if BIG:
+    big = cnp.zeros((20000, 20000))
+    big.fill(1.0)
+    C.check("fill 20000^2: sum", cnp.sum(big), np.float64(4e8))
+    C.check("fill 20000^2: last row", big[-1], np.ones(20000))
+    del big
+
+# An op with no kernel body for its dtype (bitwise_and on float64, which the frontend
+# rejects) fails at the next fetch, and the server keeps running.
+if not SIM:
+    xs = np.arange(5.0)
+    x = cnp.array(xs)
+    bad = cm._ew(cm.ArrayOperation.bitwise_and, x, x, name="bitwise_and", dtype=np.float64)
+    try:
+        bad.get(iface)
+        err = None
+    except RuntimeError as e:
+        err = str(e)
+    C.count += 1
+    if err and "no JIT kernel" in err and "float64" in err:
+        print(f"  PASS registry gap reported: {err}")
+    else:
+        print(f"  FAIL registry gap: got {err!r}")
+        C.failures.append("registry gap")
+    C.check("server alive after registry gap", x * 2.0 + 1.0, xs * 2.0 + 1.0)
+    C.check("fetch after registry gap", x, xs)
 
 C.finish()

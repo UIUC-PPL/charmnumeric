@@ -310,7 +310,7 @@ inline void eigen_gemv_sub_3d(T* mat_data,
 
 /// Eigen-based dot product: returns a.dot(b) for vectors of length n.
 template <typename T>
-inline T eigen_dot(T* a_data, T* b_data, int n) {
+inline T eigen_dot(T* a_data, T* b_data, int64_t n) {
     Eigen::Map<Eigen::Matrix<T, Eigen::Dynamic, 1>> a(a_data, n);
     Eigen::Map<Eigen::Matrix<T, Eigen::Dynamic, 1>> b(b_data, n);
     if constexpr (cn_is_complex_v<T>)
