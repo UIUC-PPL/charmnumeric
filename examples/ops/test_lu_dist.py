@@ -1,13 +1,22 @@
 #!/usr/bin/env python
 """solve/inv/det/slogdet/solve_triangular against NumPy, for the distributed LU path.
 
-Matrices of at least CNUM_LA_LU_MIN rows (server env, default 2048) use the distributed
-LU; run the server with CNUM_LA_LU_MIN=1 (and a small CNUM_LA_LU_NB) to send every case
-here through it. Env: CNUM_HOST, CNUM_PORT, CNUM_ODF; LU_BIG=0 skips the n=2100 cases.
+Matrices of at least CNUM_LA_LU_MIN rows (server env, read once, default 2048) use the
+distributed LU, so against an already running server (CNUM_HOST, CNUM_PORT, CNUM_ODF) only
+the n=2100 cases reach it unless that server was started with CNUM_LA_LU_MIN=1.
+CNUM_SERVER=<server.out> makes the test start its own server with CNUM_LA_LU_MIN=1 and
+CNUM_LA_LU_NB=32 (unless set), so every case goes through the LU; CNUM_PES (default 2) and
+CNUM_SERVER_ARGS (e.g. "++mpiexec ...", default "++local") control the launch.
+LU_BIG=0 skips the n=2100 cases.
 """
 
 import os
+import shlex
+import socket
+import subprocess
 import sys
+import tempfile
+import time
 
 import numpy as np
 
@@ -100,7 +109,46 @@ def check_tri(chk, n, dt):
                           tol(dt) * max(1, n // 100))
 
 
+def start_server(path):
+    env = dict(os.environ, CNUM_LA_LU_MIN="1")
+    env.setdefault("CNUM_LA_LU_NB", "32")
+    with socket.socket() as so:
+        so.bind(("127.0.0.1", 0))
+        port = so.getsockname()[1]
+    charmrun = os.path.join(os.path.dirname(os.path.abspath(path)), "charmrun")
+    args = shlex.split(os.environ.get("CNUM_SERVER_ARGS", "++local"))
+    log = tempfile.NamedTemporaryFile("w+", prefix="lu_dist_server_", suffix=".log", delete=False)
+    cmd = [charmrun, f"+p{os.environ.get('CNUM_PES', '2')}", path, "++server", "++server-port",
+           str(port)] + args
+    proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
+    deadline = time.monotonic() + 180
+    while "CCS server ready" not in open(log.name).read():
+        if proc.poll() is not None or time.monotonic() > deadline:
+            proc.kill()
+            sys.exit(f"server failed to start, log in {log.name}")
+        time.sleep(0.5)
+    print(f"started {path} with CNUM_LA_LU_MIN=1 CNUM_LA_LU_NB={env['CNUM_LA_LU_NB']}, "
+          f"log in {log.name}")
+    os.environ.update(CNUM_HOST="127.0.0.1", CNUM_PORT=str(port))
+    return proc, port
+
+
 def main():
+    server = os.environ.get("CNUM_SERVER")
+    started = start_server(server) if server else None
+    try:
+        run()
+    finally:
+        if started is not None:
+            proc, port = started
+            proc.terminate()
+            time.sleep(1)
+            proc.kill()
+            proc.wait()
+            subprocess.run(["pkill", "-9", "-f", f"server-port {port}"], check=False)
+
+
+def run():
     global IFACE
     IFACE = connect()
     chk = Checker("test_lu_dist", IFACE)
