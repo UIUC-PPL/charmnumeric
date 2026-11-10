@@ -21,6 +21,11 @@ ArrayDAGGroup::ArrayDAGGroup() {
             Kokkos::initialize();
     });
     ++kokkos_users;
+#ifdef USE_NVIDIA
+    // SMP: each PE thread uses the device Kokkos chose for this process
+    if (cudaSetDevice(Kokkos::device_id()) != cudaSuccess)
+        CkAbort("PE %d: cudaSetDevice(%d) failed", CkMyPe(), Kokkos::device_id());
+#endif
 #endif
     if (CkMyPe() == 0) {
         CkArrayOptions opts;
@@ -129,7 +134,7 @@ void ArrayDAGGroup::compute_decompositions(DAG* dag) {
         for (ASTNode* op : n->operands)
             stack.push_back(op);
     }
-    static const bool log = getenv("CNUM_DECOMP_LOG") != nullptr && CkMyPe() == 0;
+    static thread_local const bool log = getenv("CNUM_DECOMP_LOG") != nullptr && CkMyPe() == 0;
     std::unordered_set<int> was_final;
     for (auto& [name, meta] : sub)
         if (log && meta.decomp_final)
@@ -207,8 +212,7 @@ void ArrayDAGGroup::receive_get_request_now(int ndims, int epoch, int name, int6
             }
             gather_early.erase(early_it);
             if (gather_counts[epoch] >= gather_total[epoch]) {
-                Server<CProxy_ArrayDAGGroup>::send_fetch_reply(epoch, byte_size,
-                                                               gather_buffers[epoch]);
+                reply_to_client(epoch, byte_size, gather_buffers[epoch], /*fetch=*/true);
                 gather_counts.erase(epoch);
                 gather_total.erase(epoch);
                 gather_buffers.erase(epoch);
@@ -221,6 +225,21 @@ void ArrayDAGGroup::mem_report(int epoch) {
     mem_stats_report(this, epoch);
 }
 
+void ArrayDAGGroup::reply_to_client(int epoch, int64_t byte_size, char* data, bool fetch) {
+    if (client_error.empty()) {
+        if (fetch)
+            Server<CProxy_ArrayDAGGroup>::send_fetch_reply(epoch, byte_size, data);
+        else
+            Server<CProxy_ArrayDAGGroup>::send_reply(epoch, byte_size, data);
+        return;
+    }
+    if (fetch)
+        delete[] data;
+    std::string msg = std::string(kClientErrorTag, kClientErrorTagLen) + client_error;
+    client_error.clear();
+    Server<CProxy_ArrayDAGGroup>::send_reply(epoch, (int64_t)msg.size(), &msg[0]);
+}
+
 void ArrayDAGGroup::barrier_arrive(int epoch) {
     if (--barrier_pending[epoch] != 0)
         return;
@@ -228,7 +247,7 @@ void ArrayDAGGroup::barrier_arrive(int epoch) {
     if (mem_stats_on())
         thisProxy.mem_report(epoch);
     char none = 0;
-    Server<CProxy_ArrayDAGGroup>::send_reply(epoch, 1, &none); // CCS needs a non-empty reply
+    reply_to_client(epoch, 1, &none); // CCS needs a non-empty reply
 }
 
 void ArrayDAGGroup::gather(int epoch, int name, int64_t offset, int64_t size, char* data) {
@@ -244,8 +263,7 @@ void ArrayDAGGroup::gather(int epoch, int name, int64_t offset, int64_t size, ch
     memcpy(gather_buffers[epoch] + offset, data, size);
     gather_counts[epoch] += size;
     if (gather_counts[epoch] >= gather_total[epoch]) {
-        Server<CProxy_ArrayDAGGroup>::send_fetch_reply(epoch, gather_total[epoch],
-                                                       gather_buffers[epoch]);
+        reply_to_client(epoch, gather_total[epoch], gather_buffers[epoch], /*fetch=*/true);
         gather_counts.erase(epoch);
         gather_total.erase(epoch);
         gather_buffers.erase(epoch);
