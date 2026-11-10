@@ -1045,7 +1045,6 @@ void* la_dalloc(size_t bytes, cudaStream_t st) {
     }
     if (cudaMallocAsync(&p, bytes, st) != cudaSuccess) {
         cudaGetLastError();
-        cudaDeviceSynchronize();
         release_device_caches();
         if (cudaMallocAsync(&p, bytes, st) != cudaSuccess)
             device_oom(static_cast<int64_t>(bytes));
@@ -3585,10 +3584,6 @@ static bool la_lu_progress(PartitionImpl<N>* p, ArrayDAGGroup* g, int node_id, c
     st.stash.clear();
     std::vector<LaDevChunk> chunks;
     chunks.swap(st.dev_stash);
-#ifdef USE_NVIDIA
-    if (st.lu && !chunks.empty())
-        CT_CUDA_CHECK(cudaStreamWaitEvent(p->compute_stream_raw, st.lu->ready, 0));
-#endif
     la_dispatch(s.dt, [&](auto tag) {
         using T = decltype(tag);
         for (auto& c : chunks)
