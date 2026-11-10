@@ -118,6 +118,15 @@ def flip(m, axis=None):
     m = _as_array(m)
     axes = [ax for ax in _flip_axes(axis, m.ndim) if m.shape[ax] > 1]
     if not axes or int(m.size) == 1:
+        return m.copy()
+    if len(m.shape) > 3:
+        # one axis at a time, as the middle dim of a (pre, n, post) reshape
+        from .charmnumeric import _reshape
+
+        shape = tuple(m.shape)
+        for ax in axes:
+            m3 = (int(np.prod(shape[:ax])), shape[ax], int(np.prod(shape[ax + 1:])))
+            m = _reshape(flip(_reshape(m, m3), 1), shape)
         return m
     mask = builtins.sum(1 << ax for ax in axes)
     return nonfusible_op(m, mask, operation=ArrayOperation.flip, shape=m.shape, dtype=m.dtype)
@@ -154,7 +163,8 @@ def split_negative_steps(key, shape):
             start, stop, step = item.indices(shape[ax])
             count = len(range(start, stop, step))
             if count == 0:
-                raise NotImplementedError("empty slices are not supported")
+                pos.append(slice(0, 0))
+                continue
             first = start + (count - 1) * step
             pos.append(slice(first, start + 1, -step))
             axes.append(ax)
