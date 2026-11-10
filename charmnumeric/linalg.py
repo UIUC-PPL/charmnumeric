@@ -14,7 +14,8 @@ Deviations from NumPy:
   real-only;
 - failures do not raise: a non-positive-definite ``cholesky`` returns NaNs, a
   singular ``solve``/``inv`` returns inf/NaN;
-- ``lstsq`` returns ``rank`` as a 0-d array, and residuals even when ``rank < N``.
+- ``lstsq`` returns ``rank`` as a 0-d int32 array, and residuals even when ``rank < N``;
+- a failed SVD/tssvd/eigh returns all-NaN factors.
 """
 
 import builtins
@@ -249,7 +250,7 @@ def lstsq(a, b, rcond=None):
     else:
         x = _block(P, 0, n, 0, nrhs)
     s = _vec(P, n, 0, k)
-    rank = _la(_LA_RESHAPE, [P[n + 1:n + 2, 0:1]], (), dt)
+    rank = _la(_LA_RESHAPE, [P[n + 1:n + 2, 0:1]], (), dt).astype(np.int32)
     if m <= n:
         residuals = np.empty((0,), dtype=dt)
     else:
@@ -274,7 +275,11 @@ def solve_triangular(a, b, trans=0, lower=False, unit_diagonal=False, overwrite_
 
 def tssvd(a):
     """Tall-skinny SVD (cuPyNumeric): eigh of A^T A (summed per-chare Gram matrices),
-    then U = A @ (V S^-1) as a distributed matmul. Returns u (M, N), s (N,), vh (N, N)."""
+    then U = A @ (V S^-1) as a distributed matmul. Returns u (M, N), s (N,), vh (N, N).
+
+    Not for rank-deficient or ill-conditioned input: squaring the condition number makes the
+    smallest singular values vanish (s = 0, then inf/NaN columns in u) once kappa(A) is about
+    7e7 for float64 or 3e3 for float32. Use svd for such matrices."""
     a = asarray(a)
     if a.ndim != 2 or a.size <= 1:
         raise ValueError(f"Invalid input shape for tssvd: {a.shape}")

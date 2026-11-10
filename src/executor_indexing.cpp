@@ -1368,11 +1368,20 @@ constexpr int64_t kGxUnits = int64_t(1) << 30;
 #define CT_IX_ATOMIC_ADD(p, v) Kokkos::atomic_add((p), (v))
 #define CT_IX_ATOMIC_MAX(p, v) Kokkos::atomic_max((p), (v))
 #define CT_IX_FETCH_ADD(p, v) Kokkos::atomic_fetch_add((p), (v))
+#define CT_IX_CAS(p, o, v) Kokkos::atomic_compare_exchange((p), (o), (v))
 #else
+#define CT_IX_CAS(p, o, v) ix_cas((p), (o), (v))
 #define CT_IX_ATOMIC_ADD(p, v) (*(p) += (v))
 #define CT_IX_ATOMIC_MAX(p, v) (*(p) = std::max(*(p), (v)))
 #define CT_IX_FETCH_ADD(p, v) ((*(p) += (v)) - (v))
 #endif
+
+inline int64_t ix_cas(int64_t* p, int64_t o, int64_t v) {
+    int64_t c = *p;
+    if (c == o)
+        *p = v;
+    return c;
+}
 
 template <int N, typename F>
 void gx_for(PartitionImpl<N>* p, int64_t n, const F& f) {
@@ -1743,6 +1752,26 @@ struct GxVBaseFn {
     }
 };
 
+/// akey[j] -> its slot in an open-addressing table (keys start at -1), for scatters
+/// with far fewer entries than tile elements.
+struct GxSlotFn {
+    int64_t* akey;
+    int64_t* keys;
+    int64_t mask;
+    CT_IX_FN void operator()(const int64_t j) const {
+        int64_t k = akey[j];
+        uint64_t h = (uint64_t)k * 0x9e3779b97f4a7c15ull;
+        int64_t s = (int64_t)(h ^ (h >> 31)) & mask;
+        while (true) {
+            int64_t prev = CT_IX_CAS(&keys[s], (int64_t)-1, k);
+            if (prev == -1 || prev == k)
+                break;
+            s = (s + 1) & mask;
+        }
+        akey[j] = s;
+    }
+};
+
 struct GxWinFn {
     const int64_t* ent;
     const int64_t* akey;
@@ -2015,7 +2044,7 @@ void gx_send(PartitionImpl<N>* p, ArrayDAGGroup* g, int nd, const int dest[3], i
     if (inl && gpu_ipc_peer(pe)) {
         int slab;
         int64_t off;
-        if (void* blk = gpu_ipc_alloc(h.bytes, slab, off)) {
+        if (void* blk = gpu_ipc_alloc(h.bytes, slab, off, false, true)) {
             hapiCheck(cudaMemcpyAsync(blk, payload, h.bytes, cudaMemcpyDeviceToDevice,
                                       p->compute_stream_raw));
             compute_fence(p);
@@ -2667,11 +2696,22 @@ void ArrayDAGExecutorND<N>::gx_progress(int node_id) {
                 gx_free(reinterpret_cast<char*>(ent));
             } else {
                 int64_t* akey = reinterpret_cast<int64_t*>(gx_alloc(n * sizeof(int64_t)));
-                int64_t* win = reinterpret_cast<int64_t*>(gx_alloc(aext * sizeof(int64_t)));
+                int64_t cap = 16;
+                while (cap < 2 * n)
+                    cap <<= 1;
+                int64_t wn = aext > 2 * cap ? cap : aext;
+                int64_t* win = reinterpret_cast<int64_t*>(gx_alloc(wn * sizeof(int64_t)));
                 int64_t* kept = reinterpret_cast<int64_t*>(gx_alloc(n * 2 * sizeof(int64_t)));
                 bf.akey = akey;
                 gx_for(partition, n, bf);
-                gx_for(partition, aext, GxSetFn<int64_t>{win, -1});
+                if (wn != aext) {
+                    int64_t* keys = reinterpret_cast<int64_t*>(gx_alloc(cap * sizeof(int64_t)));
+                    gx_for(partition, cap, GxSetFn<int64_t>{keys, -1});
+                    gx_for(partition, n, GxSlotFn{akey, keys, cap - 1});
+                    compute_fence(partition);
+                    gx_free(reinterpret_cast<char*>(keys));
+                }
+                gx_for(partition, wn, GxSetFn<int64_t>{win, -1});
                 gx_for(partition, n, GxWinFn{ent, akey, win});
                 int64_t nk = gx_scan(partition, n, GxKeepFn{ent, akey, win, dbase, kept});
                 compute_fence(partition);
