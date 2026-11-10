@@ -48,6 +48,20 @@ with np.errstate(all="ignore"):
     for dt in (np.complex128, np.complex64):
         check_bits(f"sign {np.dtype(dt)}", cnp.sign(cnp.array(cs.astype(dt))), np.sign(cs.astype(dt)))
 
+    # complex clip: lexicographic order, NaN of x kept, NaN bounds win otherwise
+    zs = np.array([1 + 1j, 3, -1 + 5j, 2 + 3j, complex(nan, 0), 0, 2, 2 - 1j, complex(0, nan),
+                   complex(-0.0, -0.0), complex(1, -0.0), complex(2, 1)])
+    los = np.array([0, 1 + 1j, 1 + 1j, complex(nan, 0), 0, 0, 1, 1, 0, 0, 1 + 1j, 2 + 1j])
+    his = np.array([2, 2 + 1j, 2 + 1j, 2, 2, complex(0, nan), 2, 2, 2, 2, 2 + 1j, 2 + 1j])
+    for dt in (np.complex128, np.complex64):
+        z, lo, hi = (v.astype(dt) for v in (zs, los, his))
+        s = f" {np.dtype(dt)}"
+        check_bits("clip(z, 0, 2)" + s, cnp.clip(cnp.array(z), 0, 2), np.clip(z, 0, 2))
+        check_bits("clip(z, lo, hi)" + s, cnp.clip(cnp.array(z), cnp.array(lo), cnp.array(hi)),
+                   np.clip(z, lo, hi))
+        check_bits("clip(z, 1+1j, None)" + s, cnp.clip(cnp.array(z), 1 + 1j, None),
+                   np.clip(z, 1 + 1j, None))
+
 for shape in [(0,), (3, 0), (0, 4, 5)]:
     a, ah = cnp.zeros(shape), np.zeros(shape)
     b, bh = cnp.zeros(shape) + 1.0, np.zeros(shape) + 1.0

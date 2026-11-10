@@ -478,6 +478,14 @@ const typename Entry::Fn* pickBody(const Entry& e, BodyKind k) {
     return (f && *f) ? f : nullptr;
 }
 
+std::string dtypeName(DType dt) {
+    static const char* names[NUM_DTYPES] = {
+        "float32", "float64", "int32",  "int64",  "bool",    "int8",      "int16",
+        "uint8",   "uint16",  "uint32", "uint64", "float16", "complex64", "complex128"};
+    int i = static_cast<int>(dt);
+    return i >= 0 && i < NUM_DTYPES ? names[i] : std::to_string(i);
+}
+
 DType realOf(DType dt) {
     return dt == DType::COMPLEX64 ? DType::FLOAT32 : DType::FLOAT64;
 }
@@ -589,9 +597,9 @@ void MLIRJitCompiler::emitOp(ASTNode* node, mlir::Location loc) {
                 return (*f)(b, l, a[0], a[1], a[2]);
             };
         }
-        if (!body)
-            llvm::report_fatal_error(llvm::Twine("JIT: opcode ") + llvm::Twine(node->opcode) +
-                                     " is not defined for dtype " + llvm::Twine((int)C));
+        if (!body && buildError.empty())
+            buildError = "opcode " + std::to_string(node->opcode) +
+                         " has no JIT kernel for dtype " + dtypeName(C);
 
         // Operands convert to K (where's condition to i1); the body result
         // (i1 for predicates, real for complex abs/real/imag, 0/1 i8 for
@@ -609,6 +617,10 @@ void MLIRJitCompiler::emitOp(ASTNode* node, mlir::Location loc) {
             RB = DType::INT8;
         auto typed = [&](OpBuilder& b, Location l, ValueRange args) -> Value {
             SmallVector<Value, 3> conv;
+            if (!body) // writes zeros; the client gets the error at its next fetch
+                return convertValue(
+                    b, l, arith::ConstantOp::create(b, l, b.getF64FloatAttr(0.0)).getResult(),
+                    DType::FLOAT64, R);
             for (int i = 0; i < arity; ++i)
                 conv.push_back(convertValue(b, l, args[i], dts[i], tgt[i]));
             return convertValue(b, l, body(b, l, conv), RB, R);
@@ -1884,6 +1896,13 @@ const std::unordered_map<int, TernaryOpEntry>& MLIRJitCompiler::ternaryOpRegistr
           [](OpBuilder& b, Location loc, Value x, Value lo, Value hi) {
               Value m = arith::MaxUIOp::create(b, loc, x, lo).getResult();
               return arith::MinUIOp::create(b, loc, m, hi).getResult();
+          },
+          // lexicographic, NaN of the clipped value first, as NumPy's complex loop
+          [](OpBuilder& b, Location loc, Value x, Value lo, Value hi) {
+              Value m = selC(b, loc, orI(b, loc, clt(b, loc, lo, x, false), cAnyNan(b, loc, x)),
+                             x, lo);
+              return selC(b, loc, orI(b, loc, clt(b, loc, m, hi, false), cAnyNan(b, loc, m)), m,
+                          hi);
           }}},
     };
     return registry;
@@ -2314,16 +2333,16 @@ std::mutex& jitMutex() {
 }
 } // namespace
 
-static void* jit_compile_ast_impl(void* ast, void** moduleHandleOut);
+static void* jit_compile_ast_impl(void* ast, void** moduleHandleOut, std::string* errorOut);
 
-void* jit_compile_ast(void* ast, void** moduleHandleOut) {
+void* jit_compile_ast(void* ast, void** moduleHandleOut, std::string* errorOut) {
     static const bool timeIt = getenv("CNUM_JIT_TIME") != nullptr;
     JitTimer timer;
     jitTimer = timeIt ? &timer : nullptr;
     void* fn;
     {
         std::lock_guard<std::mutex> lock(jitMutex());
-        fn = jit_compile_ast_impl(ast, moduleHandleOut);
+        fn = jit_compile_ast_impl(ast, moduleHandleOut, errorOut);
     }
     if (timeIt && !timer.line.empty())
         llvm::errs() << "jit:" << timer.line << "\n";
@@ -2331,7 +2350,7 @@ void* jit_compile_ast(void* ast, void** moduleHandleOut) {
     return fn;
 }
 
-static void* jit_compile_ast_impl(void* ast, void** moduleHandleOut) {
+static void* jit_compile_ast_impl(void* ast, void** moduleHandleOut, std::string* errorOut) {
     MLIRJitCompiler node_jit;
     node_jit.buildFromAST(ast);
     // Kernels take every array as a dynamic memref, so equal IR means an equal kernel.
@@ -2340,6 +2359,9 @@ static void* jit_compile_ast_impl(void* ast, void** moduleHandleOut) {
         llvm::raw_string_ostream os(key);
         node_jit.printModule(os);
     }
+    const std::string& error = node_jit.error();
+    if (!error.empty() && errorOut)
+        *errorOut = error;
     auto hit = kernelCache().find(key);
     if (hit != kernelCache().end()) {
         *moduleHandleOut = hit->second.first;
@@ -2347,7 +2369,7 @@ static void* jit_compile_ast_impl(void* ast, void** moduleHandleOut) {
     }
     jitMark("build");
 #if !defined(USE_AMD) && !defined(USE_INTEL)
-    std::string path = cachePath(key);
+    std::string path = error.empty() ? cachePath(key) : std::string();
     if (!path.empty()) {
         void* fn = loadCachedKernel(path, moduleHandleOut);
         if (fn) {
