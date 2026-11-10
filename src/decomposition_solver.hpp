@@ -509,11 +509,11 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                 }
                 for (auto [name, elems] : c.members) {
                     auto& meta = array_meta[name];
-                    if (c.anchor >= 0)
+                    bool too_many = detail::tile_count(meta.global_shape, meta.ndims, tile) >
+                                    std::max(max_tiles_for(meta), anchor_tiles);
+                    if (c.anchor >= 0 && (anchors.count(name) || !too_many || meta.tile == tile))
                         anchored.insert(name);
-                    if (anchors.count(name) || meta.tile == tile ||
-                        detail::tile_count(meta.global_shape, meta.ndims, tile) >
-                            std::max(max_tiles_for(meta), anchor_tiles))
+                    if (anchors.count(name) || too_many || meta.tile == tile)
                         continue;
                     meta.tile = tile;
                     changed = true;

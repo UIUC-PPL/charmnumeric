@@ -129,7 +129,7 @@ void ArrayDAGGroup::compute_decompositions(DAG* dag) {
         for (ASTNode* op : n->operands)
             stack.push_back(op);
     }
-    static const bool log = getenv("CNUM_DECOMP_LOG") != nullptr && CkMyPe() == 0;
+    static thread_local const bool log = getenv("CNUM_DECOMP_LOG") != nullptr && CkMyPe() == 0;
     std::unordered_set<int> was_final;
     for (auto& [name, meta] : sub)
         if (log && meta.decomp_final)
