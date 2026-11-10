@@ -1489,6 +1489,20 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                         result_decomp = meta_it->second.template decomp<N>();
                     else
                         result_decomp = out_decomp;
+                    // A shifted set_region kernel writes its kept results on its own grid;
+                    // a result whose layout was kept elsewhere (zero-offset) would be wrong.
+                    bool shifted = false, unit = true;
+                    for (int d = 0; d < N; ++d) {
+                        shifted |= r_out.start[d] != out_decomp.offset[d];
+                        unit &= r_out.step[d] == 1;
+                    }
+                    if (meta_it != array_meta.end() && lookup_name == result_name &&
+                        has_regions && shifted && unit && result_decomp.global_shape == out_gs &&
+                        (result_decomp.offset != r_out.start || result_decomp.tile != out_decomp.tile))
+                        CkAbort("array %d: a shifted set_region kernel writes this kept result "
+                                "off its zero-offset layout; needs the kernel-layout follow-up "
+                                "copies (#43/#44)",
+                                result_name);
                 }
                 partition->ensure_array(out_region, out_gs, result_name, outputRoots[i]->dtype,
                                         result_decomp, covered != volume);

@@ -402,6 +402,58 @@ inline int array_tile(const std::unordered_map<int, ArrayDAGGroup::ArrayMetadata
     return ct_min_tile(ndims);
 }
 
+/// TILE/DIAG receivers count source chares by array_meta; a piece that spans two of
+/// them means the sender's layout disagrees, so abort instead of waiting forever.
+template <int N>
+inline void check_transfer_piece(const std::unordered_map<int, ArrayDAGGroup::ArrayMetadata>& meta,
+                                 DAGNode* node, ArrayRegion<N> const& piece) {
+    if (node == nullptr)
+        return;
+    for (ASTNode* root : node->ast->roots) {
+        auto op = static_cast<Opcode>(root->opcode);
+        if ((op != Opcode::TILE && op != Opcode::DIAG) || root->operands.empty())
+            continue;
+        int src = root->operands[0]->result_name;
+        auto it = meta.find(src);
+        if (it == meta.end())
+            return;
+        int ns = it->second.ndims, tile = array_tile(meta, src, ns);
+        std::array<int, 3> lo{}, hi{};
+        if (op == Opcode::TILE) {
+            if (ns > N)
+                return;
+            for (int d = 0; d < ns; ++d) {
+                lo[d] = piece.start[d + N - ns];
+                hi[d] = piece.stop[d + N - ns];
+            }
+        } else {
+            int k = root->operands.size() >= 2 && root->operands[1]->is_scalar
+                        ? (int)root->operands[1]->scalar
+                        : 0;
+            if (ns == 1 && N == 2) {
+                lo[0] = piece.start[k >= 0 ? 0 : N - 1];
+                hi[0] = piece.stop[k >= 0 ? 0 : N - 1];
+            } else if (ns == 2 && N == 1) {
+                lo[0] = piece.start[0] + (k < 0 ? -k : 0);
+                lo[1] = piece.start[0] + (k > 0 ? k : 0);
+                hi[0] = lo[0] + piece.stop[0] - piece.start[0];
+                hi[1] = lo[1] + piece.stop[0] - piece.start[0];
+            } else {
+                return;
+            }
+        }
+        for (int d = 0; d < ns; ++d) {
+            int off = it->second.offset[d];
+            if (hi[d] > lo[d] && (lo[d] + off) / tile != (hi[d] - 1 + off) / tile)
+                CkAbort("array %d: TILE/DIAG piece [%d, %d) in dim %d spans two chares of "
+                        "its array_meta layout (offset %d, tile %d); sender and receiver "
+                        "disagree on the decomposition",
+                        src, lo[d], hi[d], d, off, tile);
+        }
+        return;
+    }
+}
+
 /// Array whose decomposition defines r_out of extract_regions_nd(): the last
 /// SET_REGION root's target if any, else the first non-temp output root.
 /// Do not substitute a fresh output's decomposition for a SET_REGION region.
