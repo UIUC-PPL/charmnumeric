@@ -175,3 +175,76 @@ def test_supervisor_kills_server_when_client_is_killed(tmp_path):
         time.sleep(0.2)
     else:
         pytest.fail("server process group survived its client")
+
+
+def test_log_root_is_resolved_and_mode_checked(env, tmp_path):
+    env.chdir(tmp_path)
+    env.setenv("CNUM_LOG_DIR", "rel/logs")
+    assert launcher._log_root() == (tmp_path / "rel" / "logs").resolve()
+    d = launcher._new_run_dir()
+    assert d.is_absolute()
+    os.chmod(launcher._log_root(), 0o777)
+    with pytest.raises(PermissionError, match="writable by others"):
+        launcher._new_run_dir()
+
+
+def test_extra_args_string_is_split(env, tmp_path):
+    p = plan(CPU, tmp_path, extra_args="+foo --bar=1")
+    assert "+foo" in p.cmd and "--bar=1" in p.cmd and "f" not in p.cmd
+
+
+def test_failed_connect_keeps_no_default_interface(env, monkeypatch):
+    from charmnumeric import interface
+    from charmtyles.interface import CCSInterface
+
+    def boom(self, *args, **kwargs):
+        raise ConnectionError("auth")
+
+    env.setattr(CCSInterface, "connect", boom)
+    env.setattr(interface, "_default_interface", None)
+    env.setattr(launcher, "_iface", None)
+    env.setattr(launcher, "_server", None)
+    with pytest.raises(ConnectionError):
+        launcher.connect("127.0.0.1", 1234, key=b"x" * 16)
+    assert interface._default_interface is None
+    assert launcher._live_iface() is None
+
+
+def test_connect_same_address_rehandshakes_external_server(env):
+    from charmnumeric import interface
+
+    made = []
+
+    class Fake:
+        def __init__(self):
+            made.append(self)
+            interface._default_interface = self
+            self.server = type("S", (), {"conn_info": type("C", (), {"host_ip": "127.0.0.1",
+                                                                    "host_port": 1234})()})()
+
+    env.setattr(launcher, "_new_interface", lambda *a, **k: Fake())
+    env.setattr(launcher, "_reset_frontend", lambda: setattr(interface, "_default_interface", None))
+    env.setattr(launcher, "_iface", None)
+    env.setattr(launcher, "_server", None)
+    first = launcher.connect("127.0.0.1", 1234)
+    second = launcher.connect("127.0.0.1", 1234)
+    assert second is made[1] and first is not second
+
+
+def test_fork_child_drops_parent_interface(env):
+    from charmnumeric import interface
+
+    sentinel = object()
+    env.setattr(interface, "_default_interface", sentinel)
+    env.setattr(launcher, "_iface", sentinel)
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            ok = interface._default_interface is None and launcher._iface is None
+            os.write(w, b"1" if ok else b"0")
+        finally:
+            os._exit(0)
+    os.waitpid(pid, 0)
+    assert os.read(r, 1) == b"1"
+    assert interface._default_interface is sentinel and launcher._iface is sentinel

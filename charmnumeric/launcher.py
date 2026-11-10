@@ -42,8 +42,23 @@ class ServerStartError(RuntimeError):
 def _log_root():
     root = os.environ.get("CNUM_LOG_DIR")
     if root:
-        return Path(root).expanduser()
-    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "charmnumeric"
+        return Path(root).expanduser().resolve()
+    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache").resolve() / "charmnumeric"
+
+
+def _check_safe(root):
+    """Refuse a log root others own or can write, or an ancestor others can rename entries in."""
+    st = root.stat()
+    if st.st_uid != os.getuid():
+        raise PermissionError(f"log directory {root} is not owned by you; set CNUM_LOG_DIR")
+    if st.st_mode & 0o022:
+        raise PermissionError(f"log directory {root} is writable by others; chmod go-w it "
+                              "or set CNUM_LOG_DIR")
+    for d in root.parents:
+        mode = d.stat().st_mode
+        if mode & 0o002 and not mode & 0o1000:
+            raise PermissionError(f"{d} (above the log directory {root}) is world-writable "
+                                  "without the sticky bit; set CNUM_LOG_DIR")
 
 
 def _prune(root, keep=_KEEP_RUN_DIRS, min_age=86400):
@@ -79,8 +94,7 @@ def _prune(root, keep=_KEEP_RUN_DIRS, min_age=86400):
 def _new_run_dir():
     root = _log_root()
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if root.stat().st_uid != os.getuid():
-        raise PermissionError(f"log directory {root} is not owned by you; set CNUM_LOG_DIR")
+    _check_safe(root)
     _prune(root)
     run_dir = root / f"server-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{secrets.token_hex(3)}"
     run_dir.mkdir(mode=0o700)
@@ -222,11 +236,14 @@ def _launch(npes=None, gpus=None, nodes=None, launcher="auto", extra_args=(), en
     child_env.update(plan.env)
     child_env.update(env or {})
     _write_private(run_dir / "command.txt", shlex.join(plan.cmd) + "\n")
-    proc = subprocess.Popen(
-        [sys.executable, "-I", str(_SUPERVISOR), str(_grace(plan)), str(run_dir)] + plan.cmd,
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        cwd=run_dir, env=child_env, start_new_session=True)
-    os.set_inheritable(proc.stdin.fileno(), False)
+    errlog = os.open(run_dir / "server.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-I", str(_SUPERVISOR), str(_grace(plan)), str(run_dir)] + plan.cmd,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errlog,
+            cwd=run_dir, env=child_env, start_new_session=True)
+    finally:
+        os.close(errlog)
     srv = Server(build, plan, run_dir, proc, odf, key, keyfile)
     try:
         srv._read_pid(min(timeout, 30))
@@ -256,7 +273,6 @@ def _launch(npes=None, gpus=None, nodes=None, launcher="auto", extra_args=(), en
 _lock = threading.RLock()
 _server = None
 _iface = None
-_atexit_registered = False
 
 
 def _default_odf(odf):
@@ -273,8 +289,15 @@ def _resolve(host):
 def _new_interface(host, port, odf, key=None):
     from .interface import CharmNumericInterface
 
+    from . import interface as interface_module
+
+    previous = interface_module._default_interface
     iface = CharmNumericInterface()
-    iface.connect(_resolve(host), int(port), _default_odf(odf), key=key)
+    try:
+        iface.connect(_resolve(host), int(port), _default_odf(odf), key=key)
+    except BaseException:
+        interface_module._default_interface = previous
+        raise
     return iface
 
 
@@ -323,6 +346,8 @@ def start(npes=None, gpus=None, nodes=None, launcher="auto", extra_args=(), env=
     raises: stop() first). With CNUM_HOST/CNUM_PORT set, connects there instead.
     """
     global _server, _iface
+    if isinstance(extra_args, str):
+        extra_args = shlex.split(extra_args)
     with _lock:
         iface = _live_iface()
         if iface is not None:
@@ -343,7 +368,6 @@ def start(npes=None, gpus=None, nodes=None, launcher="auto", extra_args=(), env=
             raise
         iface.local_server = srv
         _server, _iface = srv, iface
-        _register_handlers()
         if os.environ.get("CNUM_QUIET", "0") in ("", "0"):
             print(f"charmnumeric: started a server with {srv.describe()} at {srv.host}:{srv.port}; "
                   f"log: {srv.log_path}", file=sys.stderr, flush=True)
@@ -379,7 +403,7 @@ def connect(host="127.0.0.1", port=1234, odf=None, key=None):
         key = read_key(key if key is not None else os.environ.get("CNUM_CCS_KEY") or None)
         current = _live_iface()
         if current is not None:
-            if _iface_addr(current) == addr:
+            if _server is not None and _iface_addr(current) == addr:
                 return current
             if _server is not None:
                 raise RuntimeError(f"this process runs a charmnumeric server ({_server.host}:"
@@ -452,8 +476,9 @@ def auto_interface():
                                "(e.g. _cnum_connect.get_interface()) before using arrays")
         if os.environ.get("CNUM_AUTOSTART", "1").lower() in ("0", "false", "no", "off"):
             raise RuntimeError(
-                "no charmnumeric server is connected and CNUM_AUTOSTART=0; call "
-                "charmnumeric.start() or charmnumeric.connect(host, port), or set CNUM_HOST/CNUM_PORT")
+                "this operation needs a charmnumeric server and CNUM_AUTOSTART=0 stops one from "
+                "starting; create and connect a CharmNumericInterface, call charmnumeric.start() or "
+                "charmnumeric.connect(host, port), or set CNUM_HOST/CNUM_PORT")
         return start()
 
 
@@ -466,14 +491,22 @@ def _atexit():
 
 
 def _after_fork_in_child():
-    # The child must not keep the supervisor's pipe open (EOF signals the owner's exit).
+    # The child must not keep the supervisor's pipe open (EOF signals the owner's exit), nor use
+    # the parent's server (its epochs and CCS salt belong to the parent).
+    global _server, _iface
     if _server is not None:
         _server._close_pipes()
+    had_iface = _iface is not None or _server is not None
+    _server = _iface = None
+    interface_module = sys.modules.get(__package__ + ".interface")
+    if interface_module is not None:
+        had_iface = had_iface or interface_module._default_interface is not None
+        interface_module._default_interface = None
+    ast_module = sys.modules.get("charmtyles.ast")
+    if had_iface and ast_module is not None:
+        ast_module.execution_state = ast_module.ExecutionState()
 
 
-def _register_handlers():
-    global _atexit_registered
-    if not _atexit_registered:
-        atexit.register(_atexit)
-        os.register_at_fork(after_in_child=_after_fork_in_child)
-        _atexit_registered = True
+# Registered at import so it runs after (LIFO) any exit handler the user registers later.
+atexit.register(_atexit)
+os.register_at_fork(after_in_child=_after_fork_in_child)

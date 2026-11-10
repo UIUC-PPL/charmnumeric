@@ -71,6 +71,8 @@ class Plan:
 
 def make_plan(build, run_dir, npes=None, gpus=None, nodes=None, launcher="auto", extra_args=(),
               port=None, keyfile=None, env=None):
+    if isinstance(extra_args, str):
+        extra_args = shlex.split(extra_args)
     request = dict(npes=npes, gpus=gpus, nodes=nodes, launcher=launcher,
                    extra_args=tuple(extra_args), port=port, env=dict(env) if env else None)
     in_slurm = "SLURM_JOB_ID" in os.environ
