@@ -334,6 +334,7 @@ def _plan(x, items, mode="raise", newaxes=()):
     root, base, mult = _geometry(x)
 
     B = tuple(np.broadcast_shapes(*[tuple(items[d][1].shape) for d in arrays]))
+    EB = B or (1,)  # 0-d index arrays gather one element (the backend needs ndE >= 1)
     # key positions: one per dim of x, plus the newaxes (before dim n[i])
     toks = []
     for d in range(len(items) + 1):
@@ -347,7 +348,7 @@ def _plan(x, items, mode="raise", newaxes=()):
     pos = {t[1]: i for i, t in enumerate(toks) if t[0] == "x"}
     pre = [d for d in slices if pos[d] < first] if contiguous else []
     post = [d for d in slices if d not in pre]
-    E = tuple(items[d][3] for d in pre) + B + tuple(items[d][3] for d in post)
+    E = tuple(items[d][3] for d in pre) + EB + tuple(items[d][3] for d in post)
 
     def size(i):
         return 1 if toks[i][0] == "n" else items[toks[i][1]][3]
@@ -376,12 +377,16 @@ def _plan(x, items, mode="raise", newaxes=()):
     if int(np.prod(E)) == 0:
         return plan
 
-    host = np.zeros(B, dtype=np.int64) + base
+    host = np.zeros(EB, dtype=np.int64) + base
     devs = []
     for d in arrays:
         idx, trusted = items[d][1], items[d][2]
         if _is_array(idx):
-            if tuple(idx.shape) != B:
+            if not idx.shape:
+                idx = _reshape(idx, (1,) * len(EB))
+                if EB != idx.shape:
+                    idx = _broadcast_to(idx, EB)
+            if tuple(idx.shape) != EB:
                 raise NotImplementedError(
                     f"device index arrays must all have the same shape (got {tuple(idx.shape)} "
                     f"and {B})"
@@ -680,7 +685,15 @@ def take(a, indices, axis=None, out=None, mode="raise"):
             raise IndexError("arrays used as indices must be of integer type")
     else:
         _index_int64(indices)
-    if not _is_array(indices) and np.ndim(indices) == 0:
+    if isinstance(a, _NDBase) and axis is not None:
+        # >3-D: take along the middle dim of a (pre, n, post) reshape
+        shape = tuple(a.shape)
+        axis = _axis_index(axis, len(shape))
+        a3 = _reshape(a, (int(np.prod(shape[:axis])), shape[axis], int(np.prod(shape[axis + 1:]))))
+        ishape = tuple(indices.shape) if _is_array_nd(indices) else np.shape(indices)
+        result = _reshape(take(a3, indices, axis=1, mode=mode),
+                          shape[:axis] + ishape + shape[axis + 1:])
+    elif not _is_array(indices) and np.ndim(indices) == 0:
         # scalar index: the axis is dropped
         if axis is None:
             result = _reshape_copy(_flat_gather(a, np.asarray([indices]), mode), ())
@@ -779,6 +792,18 @@ def take_along_axis(arr, indices, axis):
     arr = asarray(arr)
     if axis is None:
         return _flat_gather(arr, indices, "raise")
+    if isinstance(arr, _NDBase):
+        # >3-D: along the middle dim of (pre, n, post) reshapes of arr and indices
+        shape = tuple(arr.shape)
+        axis = _axis_index(axis, len(shape))
+        ishape = tuple(indices.shape) if _is_array_nd(indices) else np.shape(indices)
+        if len(ishape) != len(shape):
+            raise ValueError("`indices` and `arr` must have the same number of dimensions")
+        pre, post = int(np.prod(shape[:axis])), int(np.prod(shape[axis + 1:]))
+        i3 = (pre, ishape[axis], post)
+        indices = _reshape(indices, i3) if _is_array_nd(indices) else np.reshape(indices, i3)
+        r = take_along_axis(_reshape(arr, (pre, shape[axis], post)), indices, 1)
+        return _reshape(r, ishape)
     root, L, E = _along_axis(arr, indices, axis)
     return _gather(root, L, E, 0, 0, [])
 
@@ -875,30 +900,32 @@ def choose(a, choices, out=None, mode="raise"):
         idx = a
         defer_error(ValueError, "invalid entry in choice array",
                     _compare(_clip(a, 0, n - 1), a, "not_equal"))
-    choices = [c if _is_array(c) else (_coerce_scalar(c) if _is_scalar_like(c) else asarray(c))
+    choices = [c if _is_array(c) or isinstance(c, np.generic)
+               else (_coerce_scalar(c) if _is_scalar_like(c) else asarray(c))
                for c in choices]
     arrays = [c for c in choices if _is_array(c)]
+    dtype = np.dtype(np.result_type(*[c.dtype if _is_array(c) else c for c in choices]))
     if all(c.dtype == idx.dtype for c in arrays):
         # a chain of selects, fused into one kernel
         result = choices[n - 1]
         for k in range(n - 2, -1, -1):
             result = _where(_compare(idx, k, "equal"), choices[k], result)
         if not _is_array(result):
-            result = full(tuple(idx.shape), result, dtype=idx.dtype)
+            result = full(tuple(idx.shape), result, dtype=dtype)
+        result = _cast_operand(result, dtype)
     else:
-        result = _choose_gather(idx, choices, arrays)
+        result = _choose_gather(idx, choices, dtype)
     if out is not None:
         out[...] = result
         return out
     return result
 
 
-def _choose_gather(idx, choices, arrays):
+def _choose_gather(idx, choices, dtype):
     """choose for choices of another dtype than the index: gather from the stacked choices."""
     shape = tuple(idx.shape)
     if len(shape) > 2:
         raise NotImplementedError("choose with mixed dtypes on 3-D arrays")
-    dtype = np.result_type(*[c.dtype for c in arrays])
     stacked = empty((len(choices),) + shape, dtype=dtype)
     for k, c in enumerate(choices):
         stacked[k] = c

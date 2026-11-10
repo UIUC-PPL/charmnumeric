@@ -510,7 +510,7 @@ def _parse_key(key, shape, ndims):
 def _is_indexing_key(key):
     """True if a key needs the gather/scatter path (index arrays or masks)."""
     for item in key if isinstance(key, tuple) else (key,):
-        if isinstance(item, (Array, ArrayView, list)):
+        if isinstance(item, (Array, ArrayView, list, bool, np.bool_)):
             return True
         if isinstance(item, np.ndarray) and (item.ndim > 0 or item.dtype == bool):
             return True
@@ -591,6 +591,7 @@ def _scalar_view_operand(value):
 
 def _size1_to_rank(value, nd):
     """A whole size-1 array of storage rank ``nd`` holding ``value`` (the backend hangs on a rank-mismatched size-1 operand)."""
+    _fresh(value)  # a refresh clears the cache (_wrote)
     root = value._root_parent if isinstance(value, ArrayView) else value
     cache = root.__dict__.setdefault("_rank_cache", {}) if root.size() == 1 else {}
     hit = cache.get(nd)
@@ -665,6 +666,13 @@ def _ew_operand(value):
     if isinstance(value, (bool, np.generic)):
         return value
     return _coerce_operand(value)
+
+
+def _strong_operand(value):
+    """_coerce_operand, keeping NumPy scalars typed."""
+    if isinstance(value, np.ndarray) and value.ndim == 0:
+        value = value[()]
+    return value if isinstance(value, np.generic) else _coerce_operand(value)
 
 
 def _np_operand(value):
@@ -844,14 +852,6 @@ def _scan(name, a, axis=None, dtype=None, out=None):
         a = _reshape(a, (-1,))
         axis = 0
     axis = _normalize_axis(axis, a.ndims)
-    if isinstance(a, _NDBase):
-        from .folded import along_last_dims
-
-        result = along_last_dims(a, axis, lambda b, ax: _scan(name, b, ax, dtype))
-        if out is not None:
-            out[...] = result
-            return out
-        return result
     if dtype is None:
         # NumPy's accumulation dtype (int64/uint64 for bool and small ints)
         dtype = getattr(np, name)(np.zeros(1, a.dtype)).dtype
@@ -861,6 +861,14 @@ def _scan(name, a, axis=None, dtype=None, out=None):
             # types out's dtype gives the same result modulo 2**bits
             ints = dtype.kind in "iu" and odt.kind in "iu"
             dtype = odt if ints else np.promote_types(dtype, odt)
+    if isinstance(a, _NDBase):
+        from .folded import along_last_dims
+
+        result = along_last_dims(a, axis, lambda b, ax: _scan(name, b, ax, dtype))
+        if out is not None:
+            out[...] = result
+            return out
+        return result
     dtype = _normalize_dtype(dtype)
     if a.dtype != dtype and not (dtype in _SCAN_WIDE and a.dtype in _SCAN_NARROW):
         a = _astype(a, dtype)  # SCAN casts the narrow integer inputs itself
@@ -880,7 +888,11 @@ def _scan(name, a, axis=None, dtype=None, out=None):
 
 
 def _sort(a, axis=-1, kind=None, order=None, arg=False):
-    """sort / argsort along one axis (stable, NaNs last: valid for every NumPy kind)."""
+    """sort / argsort along one axis (stable, NaNs last: valid for every NumPy kind).
+
+    Real sort values are decoded from radix keys: every NaN comes back as one canonical NaN,
+    and -0.0 sorts strictly before +0.0 (np.sort keeps their input order). Equal as floats.
+    """
     if order is not None:
         raise NotImplementedError("sort(order=...) needs structured dtypes")
     if kind is not None and not (isinstance(kind, str) and kind[:1].lower() in "qhms" and kind):
@@ -1093,10 +1105,15 @@ def _compare_scalar_out_of_range(x, value, name):
 
 
 def _compare(lhs, rhs, name):
-    lhs = _coerce_operand(lhs)
-    rhs = _coerce_operand(rhs)
+    lhs = _strong_operand(lhs)
+    rhs = _strong_operand(rhs)
     if not _is_array(lhs) and _is_array(rhs):
         lhs, rhs, name = rhs, lhs, _MIRRORED[name]
+    if _is_array(lhs) and isinstance(rhs, np.generic):
+        # NumPy scalars are strong (NEP 50); the kernel compares in the array's dtype
+        loop = _ufunc_dtypes(getattr(np, name), lhs, rhs)[0][0]
+        lhs = _astype(lhs, loop)
+        rhs = rhs.item()
     if _is_array(lhs) and not _is_array(rhs) and isinstance(rhs, numbers.Real):
         if lhs.dtype == _BOOL and rhs not in (0, 1):
             lhs = _astype(lhs, np.dtype(np.int64))
@@ -1181,12 +1198,14 @@ def _imag(x):
 
 
 def _power(base, exponent):
-    base = _coerce_operand(base)
-    exponent = _coerce_operand(exponent)
+    base = _ew_operand(base)
+    exponent = _ew_operand(exponent)
     if _is_array(base) and not _is_array(exponent) and isinstance(exponent, numbers.Real):
-        if _is_int_dtype(base.dtype) and isinstance(exponent, int) and exponent < 0:
+        if (_is_int_dtype(base.dtype) and isinstance(exponent, numbers.Integral)
+                and exponent < 0):
             raise ValueError("Integers to negative integer powers are not allowed.")
-        if exponent == 2 and base.dtype != _BOOL:
+        if (exponent == 2 and base.dtype != _BOOL
+                and _ufunc_dtypes(np.power, base, exponent)[1] == base.dtype):
             # same fast path as NumPy (x**2 -> square); pow(x, 2) == x*x exactly
             return _array_mul(base, base)
     return _ew_binary(base, exponent, ArrayOperation.power, "power")
@@ -1460,6 +1479,17 @@ def _batched_matmul(a, b):
     """NumPy matmul through einsum, for operands the 2-D/3-D-view path cannot take."""
     from .einsum import einsum
 
+    na, nb = len(a.shape), len(b.shape)
+    ka, kb = a.shape[-1], b.shape[-2] if nb >= 2 else b.shape[0]
+    if ka != kb:
+        raise ValueError(
+            "matmul: Input operand 1 has a mismatch in its core dimension 0, with gufunc "
+            f"signature (n?,k),(k,m?)->(n?,m?) (size {kb} is different from {ka})")
+    if na >= 3 and nb <= 2:
+        # (..., M, K) @ (K, N) or (K,): one 2-D matmul over the stacked rows
+        out = _matmul_2d(_reshape(a, (-1, a.shape[-1])), b)
+        return _reshape(out, tuple(a.shape[:-1]) + tuple(b.shape[1:]))
+
     la = "...ij" if a.ndims >= 2 else "j"
     lb = "...jk" if b.ndims >= 2 else "j"
     out = "..." + ("i" if a.ndims >= 2 else "") + ("k" if b.ndims >= 2 else "")
@@ -1467,8 +1497,7 @@ def _batched_matmul(a, b):
 
 
 def _needs_batched(x):
-    # 3-D operands with exactly one size-1 dim are matrices to SUMMA/matvec
-    return isinstance(x, _NDBase) or (x.ndims == 3 and sum(d == 1 for d in x.shape) != 1)
+    return isinstance(x, _NDBase) or len(x.shape) > 2
 
 
 def _array_matmul(self, other):
@@ -1477,8 +1506,13 @@ def _array_matmul(self, other):
         raise ValueError("matmul does not support scalar operands")
     if _needs_batched(self) or _needs_batched(other) or not (int(self.size) and int(other.size)):
         return _batched_matmul(self, other)
-    self, other, compute, result = _promote_operands(self, other)
-    out = _matmul_blas(self, other)
+    return _matmul_2d(self, other)
+
+
+def _matmul_2d(a, b):
+    """Internal matmul; a 3-D operand with exactly one size-1 dim is a matrix (SUMMA/matvec)."""
+    a, b, compute, result = _promote_operands(a, b)
+    out = _matmul_blas(a, b)
     return out if compute == result else _astype(out, result)
 
 
@@ -1730,6 +1764,7 @@ _TRANSPOSE_CACHE_MAX = 4
 def _cached_transpose(x):
     """Internal transpose for vecmat; cached until the root array is written."""
 
+    _fresh(x)  # a refresh clears the cache (_wrote)
     root = x._root_parent if isinstance(x, ArrayView) else x
     cache = root.__dict__.setdefault("_transpose_cache", {})
     region = x.region
@@ -1971,6 +2006,7 @@ class Array(FrontendObject, _ArrayMethods, _ElementwiseMethods, _HostConversions
         if rhs.__class__ is Array or rhs.__class__ is ArrayView:
             _fresh(rhs)
         result = super().set_region(region, rhs, **kwargs)
+        result.__dict__["_write_only"] = True
         _wrote(self)
         return result
 
@@ -2260,8 +2296,8 @@ def _basic_getitem(x, key):
         from .signal import flip, split_negative_steps
 
         pos, axes = split_negative_steps(plain, shape)
-        kept = tuple(slice(int(k) % n, int(k) % n + 1) if k.__class__ is not slice else k
-                     for k, n in zip(pos, shape))
+        kept = tuple(k if k.__class__ is slice else slice(i, i + 1)
+                     for k, i in zip(pos, _parse_key(pos, shape, x.ndims).start))
 
         def source():
             return flip(_view(x, _parse_key(kept, shape, x.ndims)), axes)
@@ -2286,7 +2322,7 @@ def _basic_getitem(x, key):
         return _lazy_copy(x, plain, source, out, view, vkey)
     result = _reshape_copy(view, out)
     if out:
-        result._view_of = (x, plain, source)
+        result._view_of = (x, items, source)
         result._seen = _version(x)
     return result
 
@@ -2299,6 +2335,11 @@ def _version(x):
 def _fresh(x):
     """Refresh a linked copy (see _basic_getitem), or the root of a view of one."""
     root = x._root_parent if x.__class__ is ArrayView else x
+    if root.__class__ is Array and root.__dict__.get("_write_only"):
+        raise RuntimeError(
+            "the object set_region() returns only stands for the write; the backend pools its "
+            "buffer, so it cannot be read"
+        )
     link = root.__dict__.get("_view_of") if root.__class__ is Array else None
     if link is None:
         return
@@ -2411,8 +2452,15 @@ def _setitem(self, key, rhs):
         if isinstance(rhs, (Array, ArrayView, np.ndarray, list, tuple)):
             if not isinstance(rhs, (Array, ArrayView)):
                 rhs = np.asarray(rhs)
-            # flipped dims of the target x[key] (ints dropped), aligned to the right of rhs
-            tdims = [d for d, k in enumerate(key) if k.__class__ is slice]
+            # key dim of each dim of x[key] (ints dropped, newaxis kept), aligned to the right of rhs
+            tdims, k = [], 0
+            for item in items:
+                if item is None:
+                    tdims.append(None)
+                    continue
+                if item.__class__ is slice:
+                    tdims.append(k)
+                k += 1
             lead = len(tdims) - rhs.ndim
             raxes = tuple(i - lead for i, d in enumerate(tdims)
                           if d in axes and i >= lead and rhs.shape[i - lead] > 1)
@@ -2465,6 +2513,8 @@ def _setitem(self, key, rhs):
         # a set_region whose only input is a broadcast writes nothing
         rhs = _expand_scalar_array(rhs, shape)
     if isinstance(rhs, (Array, ArrayView)) and int(rhs.size) != 1 and tuple(rhs.shape) != shape:
+        if vshape and tuple(rhs.shape) != vshape:
+            rhs = _fit_assignment(rhs, vshape)  # NumPy broadcasts against x[key]'s shape
         rhs = _fit_assignment(rhs, shape)
     self.set_region(region, rhs, shape=shape, dtype=self.dtype)
 
@@ -2661,19 +2711,23 @@ def _atleast(arys, fn):
 
 
 def atleast_1d(*arys):
-    return _atleast(arys, lambda a: a)
+    return _atleast(arys, lambda a: a if a.shape else _reshape(a, (1,)))
 
 
 def atleast_2d(*arys):
-    return _atleast(arys, lambda a: _reshape(a, (1,) + tuple(a.shape)) if a.ndim == 1 else a)
+    return _atleast(arys, lambda a: _reshape(a, (1,) * (2 - len(a.shape)) + tuple(a.shape))
+                    if len(a.shape) < 2 else a)
 
 
 def atleast_3d(*arys):
     def fn(a):
-        if a.ndim == 1:
-            return _reshape(a, (1,) + tuple(a.shape) + (1,))
-        if a.ndim == 2:
-            return _reshape(a, tuple(a.shape) + (1,))
+        shape = tuple(a.shape)
+        if not shape:
+            return _reshape(a, (1, 1, 1))
+        if len(shape) == 1:
+            return _reshape(a, (1,) + shape + (1,))
+        if len(shape) == 2:
+            return _reshape(a, shape + (1,))
         return a
 
     return _atleast(arys, fn)
@@ -2968,6 +3022,18 @@ def _axis_range(shape, axis, n, dtype, recipe=None):
     """out[..., i_axis, ...] = recipe(i_axis): an arange/linspace laid along `axis`."""
     if _shape_size(shape) == 0:
         return create_array(shape, dtype=dtype)
+    nd = len(shape)
+    if nd > 3:
+        # the folded 3-D storage merges shape[:-2] into its leading dim
+        from .folded import FoldedArray, fold_shape
+
+        if axis >= nd - 2:
+            faxis = axis - (nd - 3)
+        elif all(m == 1 for d, m in enumerate(shape[:-2]) if d != axis):
+            faxis = 0
+        else:
+            raise NotImplementedError("an index grid along a leading axis of a >3-D array")
+        return FoldedArray(_axis_range(fold_shape(shape), faxis, n, dtype, recipe), shape)
     if recipe is None:
         recipe = ("arange", dtype, n, dtype.type(0), dtype.type(1))
     if recipe[0] == "arange":

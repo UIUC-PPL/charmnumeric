@@ -18,13 +18,16 @@ void mem_tally(MemTally& t) {
             t.live_dev += arr->local_size() * arr->elem_size();
             t.live_host += arr->host_bytes();
         }
-        t.free_keys += p->free_arrays.size();
-        for (auto& [key, bucket] : p->free_arrays)
-            for (auto* arr : bucket) {
-                ++t.freed;
-                t.free_dev += arr->local_size() * arr->elem_size();
-                t.free_host += arr->host_bytes();
-            }
+        {
+            std::lock_guard<std::mutex> lock(p->free_mu);
+            t.free_keys += p->free_arrays.size();
+            for (auto& [key, bucket] : p->free_arrays)
+                for (auto* arr : bucket) {
+                    ++t.freed;
+                    t.free_dev += arr->local_size() * arr->elem_size();
+                    t.free_host += arr->host_bytes();
+                }
+        }
         auto* e = p->executor;
         t.states += e->pending.size() + e->red_state.size() + e->dot_state.size() +
                     e->la_state.size() + e->ix_state.size() + e->shape_state.size() +

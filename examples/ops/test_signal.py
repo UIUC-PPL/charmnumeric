@@ -248,7 +248,7 @@ def main():
             est = est * cnp.convolve(rel, pm, mode="same", method="fft")
             hconv = ref_convolve(h_est, hp.astype(np.float64), "same")
             h_est = h_est * ref_convolve(hi / hconv, np.flip(hp).astype(np.float64), "same")
-        chk.check("richardson-lucy x2", est, h_est, rtol=1e-4, atol=1e-5)
+        chk.check("richardson-lucy x2", est, h_est, rtol=1e-4, atol=1e-5, dtype=np.float32)
         X = rand((600, 7))
         hx = chk.fetch(X)
         r = cnp.flip(cnp.convolve(cnp.flip(X), X[:5, :3], mode="full")) + 1.0

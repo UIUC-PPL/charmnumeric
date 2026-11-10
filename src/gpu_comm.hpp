@@ -272,19 +272,23 @@ inline void gpu_ipc_retry() {
     }
 }
 
-/// Return a block to the arena; false if `ptr` is not an arena block.
+/// Return a block to the arena and start this PE's waiting sends; false if `ptr` is not an
+/// arena block. Do not call it under a lock that a waiting send's start takes.
 inline bool gpu_ipc_free(void* ptr) {
     auto& a = gpu_ipc_arena();
-    std::lock_guard<std::mutex> lock(a.mu);
-    auto it = a.live.find(ptr);
-    if (it == a.live.end())
-        return false;
-    gpu_ipc_release_locked(a, ptr);
-    if (a.closed)
-        return true;
-    auto [s, cls] = it->second;
-    gpu_ipc_release(a, s, static_cast<char*>(ptr) - a.slabs[s].base, cls);
-    a.live.erase(it);
+    {
+        std::lock_guard<std::mutex> lock(a.mu);
+        auto it = a.live.find(ptr);
+        if (it == a.live.end())
+            return false;
+        gpu_ipc_release_locked(a, ptr);
+        if (a.closed)
+            return true;
+        auto [s, cls] = it->second;
+        gpu_ipc_release(a, s, static_cast<char*>(ptr) - a.slabs[s].base, cls);
+        a.live.erase(it);
+    }
+    gpu_ipc_retry();
     return true;
 }
 
@@ -324,8 +328,11 @@ inline char* gpu_ipc_peer_slab(int node, int slab, const char* handle) {
         void* q = nullptr;
         cudaError_t err = cudaIpcOpenMemHandle(&q, h, cudaIpcMemLazyEnablePeerAccess);
         if (err != cudaSuccess)
-            CkAbort("CUDA IPC: cannot map a GPU buffer of process %d (%s); set CNUM_GPU_IPC=0",
-                    node, cudaGetErrorString(err));
+            CkAbort("CUDA IPC: cannot map IPC slab %d (%d MB) of process %d on process %d (%s), "
+                    "although the startup probe could map a small buffer; the device may be out "
+                    "of memory or the mapping limit reached. Rerun with CNUM_GPU_IPC=0",
+                    slab, 1 << (GpuIpcArena::kSlabClass - 20), node, CkMyNode(),
+                    cudaGetErrorString(err));
         p = static_cast<char*>(q);
     }
     return p;

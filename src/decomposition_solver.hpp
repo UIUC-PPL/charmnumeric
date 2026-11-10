@@ -1808,14 +1808,16 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                     if (it == array_meta.end() || it->second.decomp_final ||
                         it->second.ndims != nd)
                         continue;
-                    // zero-offset results are routed from tile 0 by their executors
-                    assert(!matmul_arrays.count(other->result_name));
-                    if (matmul_arrays.count(other->result_name))
-                        continue;
                     bool same_shape = true;
                     for (int d = 0; d < nd; ++d)
                         same_shape &= it->second.global_shape[d] == stop[d] - start[d];
                     if (!same_shape)
+                        continue;
+                    // Zero-offset results are routed from tile 0 by their executors, so
+                    // they keep their layout; the kernel still writes them on this grid
+                    // and the executor aborts. #43/#44 add the copy that fixes this.
+                    assert(!matmul_arrays.count(other->result_name));
+                    if (matmul_arrays.count(other->result_name))
                         continue;
                     for (int d = 0; d < nd; ++d)
                         it->second.offset[d] = target.offset[d] + start[d];
