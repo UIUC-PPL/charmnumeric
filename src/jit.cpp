@@ -86,6 +86,7 @@ namespace {
 struct JitModule {
     std::unique_ptr<mlir::ExecutionEngine> engine;
     std::unique_ptr<llvm::orc::LLJIT> jit;
+    std::vector<void*> cuModules; // loaded by jit_prewarm's constructors
 };
 
 bool jitCacheEnabled();
@@ -120,8 +121,12 @@ void touchCacheEntry(const std::string& path, std::time_t mtime = 0) {
     struct stat st;
     if (!mtime && stat(path.c_str(), &st) == 0)
         mtime = st.st_mtime;
-    if (mtime && std::time(nullptr) - mtime > 3600)
-        utimes(path.c_str(), nullptr);
+    if (!mtime || std::time(nullptr) - mtime <= 3600 || utimes(path.c_str(), nullptr) == 0)
+        return;
+    // Not ours to touch (a group-shared cache): replace it with a fresh copy we own.
+    std::string tmp = cacheTmpName(path);
+    if (llvm::sys::fs::copy_file(path, tmp) || rename(tmp.c_str(), path.c_str()) != 0)
+        unlink(tmp.c_str());
 }
 } // namespace
 
@@ -2542,7 +2547,7 @@ void* loadCachedKernel(const std::string& path, void** moduleOut, bool soft = fa
             unlink(path.c_str());
         return nullptr;
     }
-    *moduleOut = new JitModule{nullptr, std::move(*jit)};
+    *moduleOut = new JitModule{nullptr, std::move(*jit), std::move(sl.modules)};
     return fn->toPtr<void*>();
 }
 
@@ -2591,6 +2596,38 @@ std::unordered_map<std::string, PreloadedKernel>& preloadedKernels() {
     static std::unordered_map<std::string, PreloadedKernel> cache;
     return cache;
 }
+std::chrono::steady_clock::time_point& preloadTime() {
+    static std::chrono::steady_clock::time_point t;
+    return t;
+}
+/// Unloads pre-warmed kernels still unrequested after CNUM_JIT_PRELOAD_TTL_S seconds (default
+/// 300), so they do not hold their LLJIT and CUmodule for the life of the process.
+void releaseStalePreloaded() {
+    auto& pre = preloadedKernels();
+    if (pre.empty())
+        return;
+    static const double ttl = [] {
+        const char* e = getenv("CNUM_JIT_PRELOAD_TTL_S");
+        return e ? atof(e) : 300.0;
+    }();
+    if (std::chrono::duration<double>(std::chrono::steady_clock::now() - preloadTime()).count() <
+        ttl)
+        return;
+#ifdef USE_NVIDIA
+    CUcontext ctx = nullptr;
+    if (cuCtxGetCurrent(&ctx) != CUDA_SUCCESS || !ctx)
+        return;
+#endif
+    for (auto& [path, k] : pre) {
+        auto* jm = static_cast<JitModule*>(k.module);
+#ifdef USE_NVIDIA
+        for (void* m : jm->cuModules)
+            cuModuleUnload(static_cast<CUmodule>(m));
+#endif
+        delete jm;
+    }
+    pre.clear();
+}
 // The context and caches are per process; SMP PEs (threads) must not use them concurrently.
 std::mutex& jitMutex() {
     static std::mutex m;
@@ -2631,6 +2668,7 @@ static void* jit_compile_ast_impl(void* ast, void** moduleHandleOut) {
     }
     jitMark("build");
 #if !defined(USE_AMD) && !defined(USE_INTEL)
+    releaseStalePreloaded();
     std::string path = cachePath(key);
     if (!path.empty()) {
         void* fn = nullptr;
@@ -2723,6 +2761,7 @@ int jit_prewarm(double budget_ms) {
         }
         std::sort(files.rbegin(), files.rend());
         std::lock_guard<std::mutex> lock(jitMutex());
+        preloadTime() = std::chrono::steady_clock::now();
         for (const auto& [mtime, path] : files) {
             if (spent() >= budget_ms)
                 break;
