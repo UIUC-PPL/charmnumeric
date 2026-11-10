@@ -68,11 +68,11 @@ static void region_copy_typed(PartitionImpl<N>* partition, E* dst, const E* src,
         }
         in.dst0 = out.src0 = 0;
 #ifdef USE_KOKKOS
-        Kokkos::View<E*, DeviceSpace> tmp(
-            Kokkos::view_alloc(Kokkos::WithoutInitializing, "ct_copy_stage"), total);
-        region_copy_typed<N>(partition, tmp.data(), src, in);
-        region_copy_typed<N>(partition, dst, tmp.data(), out);
+        E* tmp = static_cast<E*>(comm_alloc(total * sizeof(E))); // pooled; evicts caches on OOM
+        region_copy_typed<N>(partition, tmp, src, in);
+        region_copy_typed<N>(partition, dst, tmp, out);
         CT_COMPUTE_EXEC(partition).fence("ct_copy_stage");
+        comm_free(tmp);
 #else
         std::vector<E> tmp(total);
         region_copy_typed<N>(partition, tmp.data(), src, in);
@@ -227,7 +227,7 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
         }
 
         // Compute row-major strides for target
-        std::array<int, N> tgt_strides;
+        std::array<int64_t, N> tgt_strides;
         tgt_strides[N - 1] = 1;
         for (int d = N - 2; d >= 0; --d)
             tgt_strides[d] = tgt_strides[d + 1] * target->region.size(d + 1);
@@ -250,7 +250,8 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
                 memcpy(&bits1, scalar_buf + 8, 8);
 
                 int64_t overlap_total = overlap.size();
-                int ol_start[N], ol_step[N], tgt_s[N], ol_sizes[N], tgt_cs_arr[N];
+                int ol_start[N], ol_step[N], ol_sizes[N], tgt_cs_arr[N];
+                int64_t tgt_s[N];
                 for (int d = 0; d < N; d++) {
                     ol_start[d] = overlap.start[d];
                     ol_step[d] = overlap.step[d];
@@ -260,14 +261,14 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
                 }
 
                 Kokkos::parallel_for(
-                    CT_COMPUTE_POLICY(partition, overlap_total), KOKKOS_LAMBDA(int flat_idx) {
-                        int remaining = flat_idx;
-                        int flat = 0;
+                    CT_COMPUTE_POLICY64(partition, overlap_total), KOKKOS_LAMBDA(int64_t flat_idx) {
+                        int64_t remaining = flat_idx;
+                        int64_t flat = 0;
                         for (int d = N - 1; d >= 0; --d) {
-                            int coord_d = remaining % ol_sizes[d];
+                            int coord_d = (int)(remaining % ol_sizes[d]);
                             remaining /= ol_sizes[d];
                             int global_d = ol_start[d] + coord_d * ol_step[d];
-                            flat += (global_d - tgt_cs_arr[d]) * tgt_s[d];
+                            flat += (int64_t)(global_d - tgt_cs_arr[d]) * tgt_s[d];
                         }
                         char* dst = tgt_device + flat * esz;
                         int64_t bits[2] = {bits0, bits1};
@@ -282,7 +283,7 @@ int ArrayDAGExecutorND<N>::ast_visitor(ASTNode* node, DType dtype) {
                 for (int d = 0; d < N; ++d)
                     idx[d] = overlap.start[d];
                 while (true) {
-                    int flat = 0;
+                    int64_t flat = 0;
                     for (int d = 0; d < N; ++d)
                         flat += (idx[d] - tgt_chare.start[d]) * tgt_strides[d];
                     memcpy(tgt_data + flat * esz, scalar_buf, esz);
