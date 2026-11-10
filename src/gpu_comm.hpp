@@ -268,19 +268,23 @@ inline void gpu_ipc_retry() {
     }
 }
 
-/// Return a block to the arena; false if `ptr` is not an arena block.
+/// Return a block to the arena and start this PE's waiting sends; false if `ptr` is not an
+/// arena block. Do not call it under a lock that a waiting send's start takes.
 inline bool gpu_ipc_free(void* ptr) {
     auto& a = gpu_ipc_arena();
-    std::lock_guard<std::mutex> lock(a.mu);
-    auto it = a.live.find(ptr);
-    if (it == a.live.end())
-        return false;
-    gpu_ipc_release_locked(a, ptr);
-    if (a.closed)
-        return true;
-    auto [s, cls] = it->second;
-    gpu_ipc_release(a, s, static_cast<char*>(ptr) - a.slabs[s].base, cls);
-    a.live.erase(it);
+    {
+        std::lock_guard<std::mutex> lock(a.mu);
+        auto it = a.live.find(ptr);
+        if (it == a.live.end())
+            return false;
+        gpu_ipc_release_locked(a, ptr);
+        if (a.closed)
+            return true;
+        auto [s, cls] = it->second;
+        gpu_ipc_release(a, s, static_cast<char*>(ptr) - a.slabs[s].base, cls);
+        a.live.erase(it);
+    }
+    gpu_ipc_retry();
     return true;
 }
 
