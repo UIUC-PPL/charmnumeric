@@ -29,6 +29,7 @@ from .charmnumeric import (
     _write_out,
     asarray,
     nonfusible_op,
+    zeros,
 )
 
 _LETTERS = string.ascii_letters
@@ -453,11 +454,17 @@ def einsum(*operands, out=None, dtype=None, order="K", casting="safe", optimize=
         return _write_out(np.einsum(subscripts, *ops, dtype=dtype), out)
     res_dtype = _normalize_dtype(res_dtype)
     if any(int(a.size) == 0 for a in arrays):
-        # nothing to multiply: zeros (empty sums) or an empty result, made on the host
-        host = [np.asarray(op) if _is_scalar_like(op) else np.zeros(s, dtype=d)
-                for op, s, d in zip(ops, shapes, dtypes)]
-        return _einsum_out(asarray(np.asarray(np.einsum(subscripts, *host)).astype(res_dtype)),
-                           out, casting)
+        # nothing to multiply: an empty result, or zeros when only contracted labels are empty
+        in_labels, out_labels = _parse(subscripts, shapes)
+        extent = {}
+        for labels, shape in zip(in_labels, shapes):
+            for l, n in zip(labels, shape):
+                n = int(n)
+                extent[l] = 0 if (n == 0 or extent.get(l) == 0) else max(extent.get(l, 1), n)
+        res_shape = tuple(extent[l] for l in out_labels)
+        if _prod(res_shape):
+            return _einsum_out(zeros(res_shape, dtype=res_dtype), out, casting)
+        return _einsum_out(asarray(np.zeros(res_shape, dtype=res_dtype)), out, casting)
 
     inputs, output = _parse(subscripts, shapes)
     sizes = {}
