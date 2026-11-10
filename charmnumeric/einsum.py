@@ -458,14 +458,17 @@ def einsum(*operands, out=None, dtype=None, order="K", casting="safe", optimize=
         return _write_out(np.einsum(subscripts, *ops, dtype=dtype), out)
     res_dtype = _normalize_dtype(res_dtype)
     if any(int(a.size) == 0 for a in arrays):
-        # nothing to multiply: zeros (empty sums) or an empty result
-        inputs, output = _parse(subscripts, shapes)
-        sizes = {}
-        for labels, shape in zip(inputs, shapes):
-            for l, s in zip(labels, shape):
-                if int(s) != 1 or l not in sizes:
-                    sizes[l] = int(s)
-        return _einsum_out(zeros(tuple(sizes[l] for l in output), dtype=res_dtype), out, casting)
+        # nothing to multiply: an empty result, or zeros when only contracted labels are empty
+        in_labels, out_labels = _parse(subscripts, shapes)
+        extent = {}
+        for labels, shape in zip(in_labels, shapes):
+            for l, n in zip(labels, shape):
+                n = int(n)
+                extent[l] = 0 if (n == 0 or extent.get(l) == 0) else max(extent.get(l, 1), n)
+        res_shape = tuple(extent[l] for l in out_labels)
+        if _prod(res_shape):
+            return _einsum_out(zeros(res_shape, dtype=res_dtype), out, casting)
+        return _einsum_out(asarray(np.zeros(res_shape, dtype=res_dtype)), out, casting)
 
     inputs, output = _parse(subscripts, shapes)
     sizes = {}

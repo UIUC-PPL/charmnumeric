@@ -38,6 +38,7 @@ from .charmnumeric import (
     _clip,
     _coerce_scalar,
     _compare,
+    defer_error,
     _fresh,
     _fresh_operands,
     _is_array,
@@ -80,11 +81,11 @@ _COUNT_CACHE_MAX = 8
 
 
 def _count(x, kind="nonzero"):
-    """count_nonzero(x), or sum(x) / amin(x) (kind "sum" / "min"), as an int, a blocking get; cached on x's
-    root until the root is written."""
-    from .reductions import amin, count_nonzero, sum as _sum
+    """count_nonzero(x), or sum(x) / amin(x) / amax(x) (kind "sum" / "min" / "max"), as an
+    int, a blocking get; cached on x's root until the root is written."""
+    from .reductions import amax, amin, count_nonzero, sum as _sum
 
-    fn = {"nonzero": count_nonzero, "sum": _sum, "min": amin}[kind]
+    fn = {"nonzero": count_nonzero, "sum": _sum, "min": amin, "max": amax}[kind]
     if x.__class__ is not Array and x.__class__ is not ArrayView:
         return _fetch_int(fn(x))
     _fresh(x)  # a linked copy may refresh (a write) first
@@ -181,10 +182,11 @@ def _index_int64(idx):
     return idx if idx.dtype == _INT64 else _cast_operand(idx, _INT64)
 
 
-def _wrap_device(idx, n, mode, oob=None):
+def _wrap_device(idx, n, mode, oob=None, axis=0):
     """int64 indices in [0, n); with mode 'raise' an out-of-range index becomes `oob`
     (default n), chosen by the caller so that its flat offset lies past the end of the
-    array: the backend drops it with a warning instead of writing a neighbour."""
+    array: the backend drops it instead of writing a neighbour, and the next get or sync
+    raises IndexError."""
     idx = _index_int64(idx)
     if mode == "wrap":
         return idx % n
@@ -192,7 +194,20 @@ def _wrap_device(idx, n, mode, oob=None):
         return _clip(idx, 0, n - 1)
     w = _where(_compare(idx, 0, "less"), idx + n, idx)
     oob = n if oob is None else oob
-    return _where(_compare(w, n, "greater_equal"), oob, _where(_compare(w, 0, "less"), oob, w))
+    w = _where(_compare(w, n, "greater_equal"), oob, _where(_compare(w, 0, "less"), oob, w))
+    defer_error(IndexError, f"a device index is out of bounds for axis {axis} with size {n}",
+                _compare(w, oob, "equal"))
+    return w
+
+
+def _check_bounds_device(idx, n, axis):
+    """IndexError like NumPy if a device index array has an entry outside [-n, n) (a
+    blocking get of its min and max)."""
+    if idx.dtype == _BOOL or not np.issubdtype(idx.dtype, np.integer) or idx.size == 0:
+        return
+    for v in (_count(idx, "max"), _count(idx, "min")):
+        if v >= n or v < -n:
+            raise IndexError(f"index {v} is out of bounds for axis {axis} with size {n}")
 
 
 def _nonzero_flat(x):
@@ -359,7 +374,8 @@ def _plan(x, items, mode="raise", newaxes=()):
         return None
     root, base, mult = _geometry(x)
     arrays, adv, slices, pre, post, B, plan_final = _layout(items, newaxes)
-    E = tuple(items[d][3] for d in pre) + B + tuple(items[d][3] for d in post)
+    EB = B or (1,)  # 0-d index arrays gather one element (the backend needs ndE >= 1)
+    E = tuple(items[d][3] for d in pre) + EB + tuple(items[d][3] for d in post)
     if len(E) > 3:
         raise NotImplementedError(f"indexing result would have {len(E)} > 3 dimensions")
     for d in slices:
@@ -380,18 +396,22 @@ def _plan(x, items, mode="raise", newaxes=()):
     if int(np.prod(E)) == 0:
         return plan
 
-    host = np.zeros(B, dtype=np.int64) + base
+    host = np.zeros(EB, dtype=np.int64) + base
     devs = []
     for d in arrays:
         idx, trusted = items[d][1], items[d][2]
         if _is_array(idx):
-            if tuple(idx.shape) != B:
+            if not idx.shape:
+                idx = _reshape(idx, (1,) * len(EB))
+                if EB != idx.shape:
+                    idx = _broadcast_to(idx, EB)
+            if tuple(idx.shape) != EB:
                 raise NotImplementedError(
                     f"device index arrays must all have the same shape (got {tuple(idx.shape)} "
                     f"and {B})"
                 )
             oob = root.size // mult[d] + 1  # oob * mult[d] > every offset into root
-            devs.append((idx if trusted else _wrap_device(idx, x.shape[d], mode, oob), mult[d]))
+            devs.append((idx if trusted else _wrap_device(idx, x.shape[d], mode, oob, d), mult[d]))
         else:
             host = host + _wrap_host(idx, x.shape[d], mode, d) * mult[d]
     if not devs:
@@ -630,6 +650,8 @@ def _folded_plan(x, key, mode="raise"):
                     f"device index arrays must all have the same shape (got {tuple(idx.shape)} "
                     f"and {B})"
                 )
+            if not trusted and mode == "raise":
+                _check_bounds_device(idx, shape[d], d)
             idx = _flat_index(idx, nB)
             oob = int(np.prod(shape)) // mult[d] + 1  # oob * mult[d] > every offset
             idx = idx if trusted else _wrap_device(idx, shape[d], mode, oob)
@@ -771,7 +793,15 @@ def take(a, indices, axis=None, out=None, mode="raise"):
             raise IndexError("arrays used as indices must be of integer type")
     else:
         _index_int64(indices)
-    if not _is_array(indices) and np.ndim(indices) == 0:
+    if isinstance(a, _NDBase) and axis is not None:
+        # >3-D: take along the middle dim of a (pre, n, post) reshape
+        shape = tuple(a.shape)
+        axis = _axis_index(axis, len(shape))
+        a3 = _reshape(a, (int(np.prod(shape[:axis])), shape[axis], int(np.prod(shape[axis + 1:]))))
+        ishape = tuple(indices.shape) if _is_array_nd(indices) else np.shape(indices)
+        result = _reshape(take(a3, indices, axis=1, mode=mode),
+                          shape[:axis] + ishape + shape[axis + 1:])
+    elif not _is_array(indices) and np.ndim(indices) == 0:
         # scalar index: the axis is dropped
         if axis is None:
             result = _reshape_copy(_flat_gather(a, np.asarray([indices]), mode), ())
@@ -856,7 +886,7 @@ def _along_axis(arr, indices, axis):
         return root, (asarray(np.ascontiguousarray(L)) if L.size else None), ishape
     if not np.issubdtype(indices.dtype, np.integer):
         raise IndexError("arrays used as indices must be of integer type")
-    L = _wrap_device(indices, n, "raise", root.size // mult[axis] + 1) * mult[axis]
+    L = _wrap_device(indices, n, "raise", root.size // mult[axis] + 1, axis) * mult[axis]
     for d in range(nd):
         if d != axis and ishape[d] > 1:
             L = L + _axis_range(ishape, d, ishape[d], _INT64) * mult[d]
@@ -870,6 +900,18 @@ def take_along_axis(arr, indices, axis):
     arr = asarray(arr)
     if axis is None:
         return _flat_gather(arr, indices, "raise")
+    if isinstance(arr, _NDBase):
+        # >3-D: along the middle dim of (pre, n, post) reshapes of arr and indices
+        shape = tuple(arr.shape)
+        axis = _axis_index(axis, len(shape))
+        ishape = tuple(indices.shape) if _is_array_nd(indices) else np.shape(indices)
+        if len(ishape) != len(shape):
+            raise ValueError("`indices` and `arr` must have the same number of dimensions")
+        pre, post = int(np.prod(shape[:axis])), int(np.prod(shape[axis + 1:]))
+        i3 = (pre, ishape[axis], post)
+        indices = _reshape(indices, i3) if _is_array_nd(indices) else np.reshape(indices, i3)
+        r = take_along_axis(_reshape(arr, (pre, shape[axis], post)), indices, 1)
+        return _reshape(r, ishape)
     root, L, E = _along_axis(arr, indices, axis)
     return _gather(root, L, E, 0, 0, [])
 
@@ -926,12 +968,15 @@ def repeat(a, repeats, axis=None):
             raise ValueError(f"operands could not be broadcast together with shape ({n},)")
         if repeats.shape[0] == 1 and n != 1:
             raise NotImplementedError("repeat with a size-1 device repeats array")
+        if not np.can_cast(repeats.dtype, _INT64, "safe"):
+            raise TypeError(f"Cannot cast array data from {repeats.dtype!r} to "
+                            f"{_INT64!r} according to the rule 'safe'")
         if _count(repeats, "min") < 0:
             raise ValueError("repeats may not contain negative values")
         total = _count(repeats, "sum")
         idx = _expand(repeats, True, total) if total else np.zeros(0, np.int64)
     elif np.ndim(repeats) == 0:
-        r = int(repeats)
+        r = int(np.asarray(repeats).astype(np.int64, casting="safe"))
         if r < 0:
             raise ValueError("negative dimensions are not allowed")
         if axis is None or a.ndims == 1:
@@ -970,7 +1015,7 @@ def _take_valid(a, idx, axis):
 
 
 def choose(a, choices, out=None, mode="raise"):
-    """numpy.choose (mode 'raise' does not check device indices)."""
+    """numpy.choose (mode 'raise': an invalid entry raises ValueError at the next get or sync)."""
     if mode not in ("raise", "wrap", "clip"):
         raise ValueError(f"clipmode must be one of 'clip', 'raise', or 'wrap' (got {mode!r})")
     n = len(choices)
@@ -983,30 +1028,34 @@ def choose(a, choices, out=None, mode="raise"):
         idx = _clip(a, 0, n - 1)
     else:
         idx = a
-    choices = [c if _is_array(c) else (_coerce_scalar(c) if _is_scalar_like(c) else asarray(c))
+        defer_error(ValueError, "invalid entry in choice array",
+                    _compare(_clip(a, 0, n - 1), a, "not_equal"))
+    choices = [c if _is_array(c) or isinstance(c, np.generic)
+               else (_coerce_scalar(c) if _is_scalar_like(c) else asarray(c))
                for c in choices]
     arrays = [c for c in choices if _is_array(c)]
+    dtype = np.dtype(np.result_type(*[c.dtype if _is_array(c) else c for c in choices]))
     if all(c.dtype == idx.dtype for c in arrays):
         # a chain of selects, fused into one kernel
         result = choices[n - 1]
         for k in range(n - 2, -1, -1):
             result = _where(_compare(idx, k, "equal"), choices[k], result)
         if not _is_array(result):
-            result = full(tuple(idx.shape), result, dtype=idx.dtype)
+            result = full(tuple(idx.shape), result, dtype=dtype)
+        result = _cast_operand(result, dtype)
     else:
-        result = _choose_gather(idx, choices, arrays)
+        result = _choose_gather(idx, choices, dtype)
     if out is not None:
         out[...] = result
         return out
     return result
 
 
-def _choose_gather(idx, choices, arrays):
+def _choose_gather(idx, choices, dtype):
     """choose for choices of another dtype than the index: gather from the stacked choices."""
     shape = tuple(idx.shape)
     if len(shape) > 2:
         raise NotImplementedError("choose with mixed dtypes on 3-D arrays")
-    dtype = np.result_type(*[c.dtype for c in arrays])
     stacked = empty((len(choices),) + shape, dtype=dtype)
     for k, c in enumerate(choices):
         stacked[k] = c

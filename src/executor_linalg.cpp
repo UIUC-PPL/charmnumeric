@@ -514,6 +514,8 @@ void la_compute(const LaSpec& s, LaProblem<T>& P) {
             Eigen::BDCSVD<Mat> svd(A);
             for (int i = 0; i < k; ++i)
                 P.out[i] = svd.singularValues()(i);
+            if (svd.info() != Eigen::Success)
+                fill_nan(P.out);
             break;
         }
         unsigned opts = full ? (Eigen::ComputeFullU | Eigen::ComputeFullV)
@@ -523,6 +525,8 @@ void la_compute(const LaSpec& s, LaProblem<T>& P) {
         for (int i = 0; i < k; ++i)
             P.at(m, i) = svd.singularValues()(i);
         put(P, m + 1, 0, Mat(svd.matrixV().adjoint()));
+        if (svd.info() != Eigen::Success)
+            fill_nan(P.out);
         break;
     }
     case LA_SOLVE_TRIANGULAR: {
@@ -580,6 +584,10 @@ void la_compute_real(const LaSpec& s, LaProblem<T>& P) {
         Mat X = svd.matrixV() * (inv.asDiagonal() * (svd.matrixU().transpose() * B));
         std::vector<T> x(X.data(), X.data() + X.size()), svh(sv.data(), sv.data() + k);
         lstsq_pack(P, x, svh, rank);
+        if (svd.info() != Eigen::Success) { // NaN x and s, rank 0 (as the device path)
+            fill_nan(P.out);
+            P.at(n + 1, 0) = T(0);
+        }
         break;
     }
     case LA_TSSVD: {
@@ -588,6 +596,8 @@ void la_compute_real(const LaSpec& s, LaProblem<T>& P) {
         std::vector<T> w(es.eigenvalues().data(), es.eigenvalues().data() + n);
         Mat V = es.eigenvectors();
         tssvd_pack(P, w, std::vector<T>(V.data(), V.data() + V.size()));
+        if (es.info() != Eigen::Success)
+            fill_nan(P.out);
         break;
     }
     }
@@ -987,7 +997,8 @@ enum LaDevKind : int {
     LA_DK_TSQ = 6,
     LA_DK_TSTOP = 7,
     LA_DK_TSSIGN = 8,
-    LA_DK_FLIP = 9
+    LA_DK_FLIP = 9,
+    LA_DK_SEED = 10
 };
 
 /// A factored tile Y_xk = L_xk^T (column-major, i.e. L_xk row-major) received in chunks.
@@ -1006,7 +1017,7 @@ struct LaDevRoot {
     bool dist = false, factored = false, status = false, failed = false;
     int ta = 0, tb = 0, nt = 0, t = 0, n = 0, applied = 0;
     bool upper = false, flipped = false; // upper: tile (a, b) ends as L_ba^T
-    int64_t flip_got = 0;
+    int64_t flip_got = 0, seed_got = 0; // seed: upper, a > b, A_ba^H from tile (b, a)
     std::map<std::pair<int, int>, LaPanel> pan; // (x, k) -> Y_xk
     // TSQR: this chare's block (reflectors in a, tau; rows [qr0, qr0 + qh)); root's R_i
     bool tsqr = false, tsq_wait = false, tsr_wait = false;
@@ -1045,7 +1056,6 @@ void* la_dalloc(size_t bytes, cudaStream_t st) {
     }
     if (cudaMallocAsync(&p, bytes, st) != cudaSuccess) {
         cudaGetLastError();
-        cudaDeviceSynchronize();
         release_device_caches();
         if (cudaMallocAsync(&p, bytes, st) != cudaSuccess)
             device_oom(static_cast<int64_t>(bytes));
@@ -1084,9 +1094,9 @@ void la_comm_after_compute(PartitionImpl<N>* p) {
 
 /// dst (h x w, column-major) = T(src[base + i * rs + j * cs]).
 template <int N, typename S, typename T>
-void la_k_pack(PartitionImpl<N>* p, T* dst, int h, int w, const S* src, int64_t base,
+void la_k_pack(PartitionImpl<N>* p, T* dst, int64_t h, int64_t w, const S* src, int64_t base,
                int64_t rs, int64_t cs) {
-    int64_t total = static_cast<int64_t>(h) * w;
+    int64_t total = h * w;
     Kokkos::parallel_for(
         CT_COMPUTE_POLICY(p, total), KOKKOS_LAMBDA(int64_t k) {
             int64_t i = k % h, j = k / h;
@@ -1915,9 +1925,9 @@ T* la_dev_compute(PartitionImpl<N>* p, const LaSpec& s, LaDevRoot* D, int64_t& l
         CT_CUDA_CHECK(cudaMemcpy2DAsync(out, R_ * sizeof(T), U, m * sizeof(T), m * sizeof(T), uc,
                                         cudaMemcpyDeviceToDevice, cs));
         la_k_from_real<N, T, R>(p, out + m, R_, S, k);
-        la_k_nan_if<N, T>(p, out + m, R_, 1, k, info, la_nan<T>());
         CT_CUDA_CHECK(cudaMemcpy2DAsync(out + m + 1, R_ * sizeof(T), VT, ldvt * sizeof(T),
                                         vr * sizeof(T), n, cudaMemcpyDeviceToDevice, cs));
+        la_k_nan_if<N, T>(p, out, R_, R_, C_, info, la_nan<T>()); // all-NaN factors
         return out;
     }
     case LA_LSTSQ: {
@@ -1930,11 +1940,13 @@ T* la_dev_compute(PartitionImpl<N>* p, const LaSpec& s, LaDevRoot* D, int64_t& l
             la_dev_svd<N, T>(p, A, lda, m, n, false, true, U, S, VT, ldvt, info, tmp);
             la_smark(cs, "gesvd");
             std::vector<T> sv(k), inv(k);
+            int hinfo = 0;
             CT_CUDA_CHECK(cudaMemcpyAsync(sv.data(), S, sizeof(T) * k, cudaMemcpyDeviceToHost, cs));
+            CT_CUDA_CHECK(cudaMemcpyAsync(&hinfo, info, sizeof(int), cudaMemcpyDeviceToHost, cs));
             CT_CUDA_CHECK(cudaStreamSynchronize(cs));
             T cut = static_cast<T>(s.p[0]) * (k > 0 ? sv[0] : T(0));
             int rank = 0;
-            for (int i = 0; i < k; ++i) {
+            for (int i = 0; i < k && hinfo == 0; ++i) {
                 inv[i] = sv[i] > cut ? T(1) / sv[i] : T(0);
                 rank += sv[i] > cut;
             }
@@ -1953,6 +1965,7 @@ T* la_dev_compute(PartitionImpl<N>* p, const LaSpec& s, LaDevRoot* D, int64_t& l
             CT_CUBLAS_CHECK(cula::gemm(h.blas, CUBLAS_OP_T, CUBLAS_OP_N, n, bn, k, VT, ldvt, t1, k,
                                        out, R_));
             la_k_from_real<N, T, T>(p, out + n, R_, S, k);
+            la_k_nan_if<N, T>(p, out, R_, n + 1, C_, info, la_nan<T>()); // gesvd did not converge
             la_k_set<N, T>(p, out + n + 1, static_cast<T>(rank));
             CT_CUDA_CHECK(cudaStreamSynchronize(cs)); // inv is pageable
             la_smark(cs, "lstsq");
@@ -1993,8 +2006,14 @@ T* la_dev_compute(PartitionImpl<N>* p, const LaSpec& s, LaDevRoot* D, int64_t& l
                                               cudaMemcpyDeviceToHost, cs));
                 CT_CUDA_CHECK(cudaMemcpyAsync(V.data(), G, sizeof(T) * V.size(),
                                               cudaMemcpyDeviceToHost, cs));
+                int hinfo = 0;
+                CT_CUDA_CHECK(cudaMemcpyAsync(&hinfo, info, sizeof(int), cudaMemcpyDeviceToHost,
+                                              cs));
                 CT_CUDA_CHECK(cudaStreamSynchronize(cs));
-                tssvd_pack(P, hw, V);
+                if (hinfo != 0) // syevd did not converge: NaNs, as the other LINALG failures
+                    std::fill(P.out.begin(), P.out.end(), std::numeric_limits<T>::quiet_NaN());
+                else
+                    tssvd_pack(P, hw, V);
                 T* out = static_cast<T*>(la_dalloc(sizeof(T) * P.out.size(), cs));
                 tmp.push_back(out);
                 CT_CUDA_CHECK(cudaMemcpyAsync(out, P.out.data(), sizeof(T) * P.out.size(),
@@ -2012,8 +2031,9 @@ T* la_dev_compute(PartitionImpl<N>* p, const LaSpec& s, LaDevRoot* D, int64_t& l
 // ---- Distributed cholesky (whole operand, result tiled like the operand) ----
 // Tile (a, b) works on Y_ab = L_ab^T, column-major, which is L_ab in the row-major tile:
 // Y_aa: potrf(upper); Y_ab: trsm by Y_bb^H after the updates Y_ab -= Y_bk^H Y_ak, k < b
-// (^H is ^T for real types). upper: then tile (a, b), a > b, sends L_ab^H to tile (b, a)
-// and diagonal tiles transpose in place.
+// (^H is ^T for real types). upper factors the Hermitian matrix of A's upper triangle: tile
+// (a, b), a >= b, starts as A_ba^H, and once factored tile (a, b), a > b, sends L_ab^H to
+// tile (b, a) and diagonal tiles transpose in place.
 
 bool la_use_dist(const LaSpec& s, ArrayDAGGroup* g, int& nt, int& t) {
     if (s.op != LA_CHOLESKY)
@@ -2059,12 +2079,13 @@ void la_chol_send(PartitionImpl<N>* p, ArrayDAGGroup* g, int node_id, int name, 
     if constexpr (N == 2) {
         cudaStream_t cs = p->compute_stream_raw;
         int64_t per = LA_CHUNK / sizeof(T);
-        for (int64_t lo = 0; lo < count; lo += per) {
+        for (int64_t lo = 0, chunk = 0; lo < count; lo += per, ++chunk) {
             int64_t hi = std::min(count, lo + per);
             int64_t bytes = (hi - lo) * sizeof(T);
             char* buf = static_cast<char*>(comm_alloc(bytes));
             CT_CUDA_CHECK(cudaMemcpyAsync(buf, Y + lo, bytes, cudaMemcpyDeviceToDevice, cs));
-            int rd[6] = {x, k, 0, static_cast<int>(lo), static_cast<int>(hi), 0};
+            // the wire format is 32-bit: send the chunk number, not the element offsets
+            int rd[6] = {x, k, 0, static_cast<int>(chunk), static_cast<int>(chunk + 1), 0};
             la_comm_after_compute(p);
             la_dev_send_to<2, 2>(p, g, ChareIndex<2>{{ti, tj}}, node_id, kind, name, rd, bytes,
                                  buf);
@@ -2077,17 +2098,19 @@ void la_chol_recv(PartitionImpl<N>* p, LaDevRoot* D, const LaDevChunk& c) {
     cudaStream_t cs = p->compute_stream_raw;
     LaPanel& P = D->pan[{c.r0, c.r1}];
     int64_t count = static_cast<int64_t>(la_tdim(D, c.r0)) * la_tdim(D, c.r1);
-    if (c.c0 == 0 && c.c1 == count) {
+    int64_t per = LA_CHUNK / sizeof(T), lo = static_cast<int64_t>(c.c0) * per;
+    int64_t hi = std::min(count, lo + per);
+    if (lo == 0 && hi == count) {
         P.p = c.buf;
         P.comm = true;
     } else {
         if (P.p == nullptr)
             P.p = static_cast<char*>(la_dalloc(count * sizeof(T), cs));
-        CT_CUDA_CHECK(cudaMemcpyAsync(P.p + c.c0 * sizeof(T), c.buf, (c.c1 - c.c0) * sizeof(T),
+        CT_CUDA_CHECK(cudaMemcpyAsync(P.p + lo * sizeof(T), c.buf, (hi - lo) * sizeof(T),
                                       cudaMemcpyDeviceToDevice, cs));
         la_free_after(p, std::vector<void*>{c.buf});
     }
-    P.got += c.c1 - c.c0;
+    P.got += hi - lo;
 }
 
 template <int N>
@@ -2118,6 +2141,8 @@ void la_chol_step(PartitionImpl<N>* p, ArrayDAGGroup* g, int node_id, const LaSp
         LaDevRoot* D = st.dev;
         la_cur_node = node_id;
         int a = D->ta, b = D->tb, ba = la_tdim(D, a), bb = la_tdim(D, b);
+        if (D->upper && a > b && D->seed_got < static_cast<int64_t>(ba) * bb)
+            return;
         T* Y = static_cast<T*>(p->arrays[s.out_name]->device_data_ptr());
         LaHandles& h = la_handles(cs);
         for (int k = 0; k < b && !D->factored; ++k) {
@@ -2185,22 +2210,51 @@ void la_chol_step(PartitionImpl<N>* p, ArrayDAGGroup* g, int node_id, const LaSp
     }
 }
 
-/// Chare (a, b) of the grid: the result tile starts as A's tile (zero above the diagonal).
+/// dst (cols x rows) = src^H for the row-major rows x cols tile src.
 template <int N, typename S, typename T>
-void la_chol_start(PartitionImpl<N>* p, const LaSpec& s, LaDevRoot* D) {
+void la_chol_ct(PartitionImpl<N>* p, T* dst, const S* src, int rows, int cols) {
+    if constexpr (std::is_same_v<S, T>) {
+        la_k_ct<N, T>(p, dst, rows, src, cols, rows, cols);
+    } else {
+        cudaStream_t cs = p->compute_stream_raw;
+        int64_t count = static_cast<int64_t>(rows) * cols;
+        T* X = static_cast<T*>(la_dalloc(count * sizeof(T), cs));
+        la_k_pack<N, S, T>(p, X, static_cast<int>(count), 1, src, 0, 1, 0);
+        la_k_ct<N, T>(p, dst, rows, X, cols, rows, cols);
+        la_dfree(X, cs);
+    }
+}
+
+/// Chare (a, b) of the grid: the result tile starts as A's tile (zero above the diagonal);
+/// upper: as A_ba^H, sent by tile (b, a) unless diagonal.
+template <int N, typename S, typename T>
+void la_chol_start(PartitionImpl<N>* p, ArrayDAGGroup* g, int node_id, const LaSpec& s,
+                   LaDevRoot* D) {
     cudaStream_t cs = p->compute_stream_raw;
     T* Y = static_cast<T*>(p->arrays[s.out_name]->device_data_ptr());
-    int64_t count = static_cast<int64_t>(la_tdim(D, D->ta)) * la_tdim(D, D->tb);
-    if (D->ta < D->tb) {
+    int a = D->ta, b = D->tb, ba = la_tdim(D, a), bb = la_tdim(D, b);
+    int64_t count = static_cast<int64_t>(ba) * bb;
+    const S* src = static_cast<const S*>(p->arrays[s.in[0].name]->device_data_ptr());
+    if (a < b) {
+        if (D->upper) {
+            T* X = static_cast<T*>(la_dalloc(count * sizeof(T), cs));
+            la_chol_ct<N, S, T>(p, X, src, ba, bb);
+            la_chol_send<N, T>(p, g, node_id, s.out_name, X, count, b, a, b, a, LA_DK_SEED);
+            la_dfree(X, cs);
+        }
         CT_CUDA_CHECK(cudaMemsetAsync(Y, 0, count * sizeof(T), cs));
         D->factored = true;
         return;
     }
-    const S* src = static_cast<const S*>(p->arrays[s.in[0].name]->device_data_ptr());
+    if (D->upper) {
+        if (a == b)
+            la_chol_ct<N, S, T>(p, Y, src, ba, bb);
+        return;
+    }
     if constexpr (std::is_same_v<S, T>)
         CT_CUDA_CHECK(cudaMemcpyAsync(Y, src, count * sizeof(T), cudaMemcpyDeviceToDevice, cs));
     else
-        la_k_pack<N, S, T>(p, Y, static_cast<int>(count), 1, src, 0, 1, 0);
+        la_k_pack<N, S, T>(p, Y, count, 1, src, 0, 1, 0);
 }
 
 /// upper, once factored: tile (a, b) becomes L_ba^H.
@@ -2232,10 +2286,13 @@ template <int N, typename T>
 void la_chol_flip_recv(PartitionImpl<N>* p, const LaSpec& s, LaDevRoot* D, const LaDevChunk& c) {
     cudaStream_t cs = p->compute_stream_raw;
     T* Y = static_cast<T*>(p->arrays[s.out_name]->device_data_ptr());
-    CT_CUDA_CHECK(cudaMemcpyAsync(Y + c.c0, c.buf, (c.c1 - c.c0) * sizeof(T),
+    int64_t count = static_cast<int64_t>(la_tdim(D, D->ta)) * la_tdim(D, D->tb);
+    int64_t per = LA_CHUNK / sizeof(T), lo = static_cast<int64_t>(c.c0) * per;
+    int64_t hi = std::min(count, lo + per);
+    CT_CUDA_CHECK(cudaMemcpyAsync(Y + lo, c.buf, (hi - lo) * sizeof(T),
                                   cudaMemcpyDeviceToDevice, cs));
     la_free_after(p, std::vector<void*>{c.buf});
-    D->flip_got += c.c1 - c.c0;
+    (c.kind == LA_DK_SEED ? D->seed_got : D->flip_got) += hi - lo;
 }
 
 } // namespace
@@ -2286,7 +2343,7 @@ static bool la_dev_progress(PartitionImpl<N>* p, ArrayDAGGroup* g, int node_id, 
         la_dispatch(s.dt, [&](auto tag) {
             using T = decltype(tag);
             for (auto& c : chunks) {
-                if (c.kind == LA_DK_FLIP)
+                if (c.kind == LA_DK_FLIP || c.kind == LA_DK_SEED)
                     la_chol_flip_recv<N, T>(p, s, D, c);
                 else
                     la_chol_recv<N, T>(p, D, c);
@@ -2382,7 +2439,7 @@ static void la_chol_execute(ArrayDAGExecutorND<N>* ex, PartitionImpl<N>* p, Arra
     D->upper = s.p[0] != 0;
     cn_dispatch(p->arrays[s.in[0].name]->dtype, [&](auto stag) {
         la_dispatch(s.dt, [&](auto ttag) {
-            la_chol_start<N, decltype(stag), decltype(ttag)>(p, s, D);
+            la_chol_start<N, decltype(stag), decltype(ttag)>(p, g, node->id, s, D);
         });
     });
     if (la_dev_progress<N>(p, g, node->id, s, st)) {

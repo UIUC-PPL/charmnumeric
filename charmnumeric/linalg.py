@@ -10,7 +10,8 @@ matrices with at least ``CNUM_LA_LU_MIN`` (server env, default 2048) rows are di
 instead: row panels are dealt cyclically to one worker per PE (``CNUM_LA_LU_NB`` rows,
 default 512 on NVIDIA, 128 on CPU), so each worker holds about 1/P of the matrix, and
 factored with partial pivoting (except for ``solve_triangular``). On NVIDIA, ``cholesky``
-of a matrix spanning several tiles is factored in place in the result tiles.
+of a whole (unsliced) square array spanning several tiles, with a result tiled the same
+way, is factored tile by tile in the result tiles (``CNUM_LA_DIST=0`` gathers instead).
 
 Deviations from NumPy:
 
@@ -18,8 +19,10 @@ Deviations from NumPy:
   inputs are factored in float64; float16 is rejected); lstsq, slogdet and tssvd are
   real-only;
 - failures do not raise: a non-positive-definite ``cholesky`` returns NaNs, a
-  singular ``solve``/``inv`` returns inf/NaN;
-- ``lstsq`` returns ``rank`` as a 0-d array, and residuals even when ``rank < N``.
+  singular ``solve``/``inv`` returns inf/NaN, and an ``lstsq`` whose SVD does not
+  converge returns NaN ``x`` and ``s`` with rank 0;
+- ``lstsq`` returns ``rank`` as a 0-d int32 array, and residuals even when ``rank < N``;
+- a failed SVD/tssvd/eigh returns all-NaN factors.
 """
 
 import builtins
@@ -141,7 +144,8 @@ def _block(P, r0, r1, c0, c1):
 
 
 def cholesky(a, /, *, upper=False):
-    """Cholesky factor L (A = L L^T) or, with upper=True, U (A = U^T U)."""
+    """Cholesky factor L (A = L L^H) from A's lower triangle or, with upper=True, U
+    (A = U^H U) from its upper triangle."""
     a = _matrix(a, square=True)
     n = a.shape[0]
     return _la(_LA_CHOLESKY, [a], (n, n), _result_dtype(a), (bool(upper),))
@@ -254,7 +258,7 @@ def lstsq(a, b, rcond=None):
     else:
         x = _block(P, 0, n, 0, nrhs)
     s = _vec(P, n, 0, k)
-    rank = _la(_LA_RESHAPE, [P[n + 1:n + 2, 0:1]], (), dt)
+    rank = _la(_LA_RESHAPE, [P[n + 1:n + 2, 0:1]], (), dt).astype(np.int32)
     if m <= n:
         residuals = np.empty((0,), dtype=dt)
     else:
@@ -279,7 +283,11 @@ def solve_triangular(a, b, trans=0, lower=False, unit_diagonal=False, overwrite_
 
 def tssvd(a):
     """Tall-skinny SVD (cuPyNumeric): eigh of A^T A (summed per-chare Gram matrices),
-    then U = A @ (V S^-1) as a distributed matmul. Returns u (M, N), s (N,), vh (N, N)."""
+    then U = A @ (V S^-1) as a distributed matmul. Returns u (M, N), s (N,), vh (N, N).
+
+    Not for rank-deficient or ill-conditioned input: squaring the condition number makes the
+    smallest singular values vanish (s = 0, then inf/NaN columns in u) once kappa(A) is about
+    7e7 for float64 or 3e3 for float32. Use svd for such matrices."""
     a = asarray(a)
     if a.ndim != 2 or a.size <= 1:
         raise ValueError(f"Invalid input shape for tssvd: {a.shape}")

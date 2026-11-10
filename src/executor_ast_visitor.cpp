@@ -68,11 +68,11 @@ static void region_copy_typed(PartitionImpl<N>* partition, E* dst, const E* src,
         }
         in.dst0 = out.src0 = 0;
 #ifdef USE_KOKKOS
-        Kokkos::View<E*, DeviceSpace> tmp(
-            Kokkos::view_alloc(Kokkos::WithoutInitializing, "ct_copy_stage"), total);
-        region_copy_typed<N>(partition, tmp.data(), src, in);
-        region_copy_typed<N>(partition, dst, tmp.data(), out);
+        E* tmp = static_cast<E*>(comm_alloc(total * sizeof(E))); // pooled; evicts caches on OOM
+        region_copy_typed<N>(partition, tmp, src, in);
+        region_copy_typed<N>(partition, dst, tmp, out);
         CT_COMPUTE_EXEC(partition).fence("ct_copy_stage");
+        comm_free(tmp);
 #else
         std::vector<E> tmp(total);
         region_copy_typed<N>(partition, tmp.data(), src, in);

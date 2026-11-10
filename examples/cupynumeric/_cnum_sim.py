@@ -494,7 +494,7 @@ def _reduction(kind, xv, axes, keepdims, ddof):
 
 def _store_result(obj, value):
     name = obj.name
-    _store[name] = value
+    _store[name] = np.array(value, copy=True)  # never a view of an input
     weakref.finalize(obj, _store.pop, name, None)
 
 
