@@ -107,6 +107,66 @@ DAG* make_single_node_dag(std::vector<ASTNode*> roots) {
     return dag;
 }
 
+ASTNode* make_create(int result_name, int size0) {
+    auto* node = new ASTNode(result_name, static_cast<int>(Opcode::CREATE), false, false, 0.0, 1);
+    node->region = make_region<1>({0}, {size0}, {1});
+    return node;
+}
+
+DAG* make_dag_chain(std::vector<std::vector<ASTNode*>> kernels) {
+    auto* dag = new DAG();
+    DAGNode* prev = nullptr;
+    for (int i = 0; i < (int)kernels.size(); ++i) {
+        auto* node = new DAGNode(i, new AST(std::move(kernels[i])));
+        if (prev == nullptr) {
+            dag->roots.push_back(node);
+        } else {
+            prev->children.push_back(node);
+            node->num_parents = 1;
+        }
+        dag->nodes[i] = node;
+        prev = node;
+    }
+    dag->num_nodes = (int)kernels.size();
+    return dag;
+}
+
+int div_up(int a, int b) {
+    return (a + b - 1) / b;
+}
+
+// The 1-D chare grid that arrays from earlier DAGs (final ones) already need.
+int prior_grid(MetaMap const& meta) {
+    int grid = 0;
+    for (auto const& [name, m] : meta)
+        if (m.decomp_final && m.tile > 0)
+            grid = std::max(grid, div_up(m.offset[0] + m.global_shape[0], m.tile));
+    return grid;
+}
+
+// Grows a 1-D chare grid the way the receive pass does and checks that it holds every
+// tile of every array, offset included.
+void expect_grid_covers(const std::string& label, MetaMap const& meta, DAG* dag, int grid) {
+    for (auto const& [id, node] : dag->nodes)
+        for (ASTNode* root : node->ast->roots) {
+            std::array<int, 3> ext = {0, 0, 0};
+            int tile = 0;
+            if (decomposition_solver::chare_cover(meta, root, ext, tile) == 1)
+                grid = std::max(grid, div_up(ext[0], tile));
+        }
+    for (auto const& [name, m] : meta) {
+        if (m.global_shape[0] <= 0)
+            continue;
+        expect_true(label + ": array " + std::to_string(name) + " has a tile", m.tile > 0);
+        expect_true(label + ": array " + std::to_string(name) + " has a negative offset",
+                    m.offset[0] >= 0);
+        int need = div_up(m.offset[0] + m.global_shape[0], m.tile);
+        if (need > grid)
+            fail(label + ": array " + std::to_string(name) + " needs " + std::to_string(need) +
+                 " chares, grid has " + std::to_string(grid));
+    }
+}
+
 TestArrayMetadata make_meta(int ndims, int size0, int offset0, int tile, bool final) {
     TestArrayMetadata meta;
     meta.ndims = ndims;
@@ -645,6 +705,119 @@ void test_set_region_kept_result_takes_target_layout() {
 
     delete dag;
 }
+void test_shifted_creation_results_get_chares() {
+    std::cout << "=== test_shifted_creation_results_get_chares ===" << std::endl;
+
+    constexpr int X = 1;
+    constexpr int U = 2;
+    constexpr int W = 3;
+    constexpr int T = 4;
+    constexpr int SET_U = 5;
+    constexpr int SET_W = 6;
+
+    // X from an earlier DAG; u = zeros(210), w = zeros(200), then one kernel writes
+    // u[5:205] = t and w[:] = t: w is shifted by a whole tile, u by 59
+    MetaMap meta;
+    meta[X] = make_meta(1, 200, 0, 64, /*final=*/true);
+    meta[U] = make_meta(1, 210, 0, 0, false);
+    meta[W] = make_meta(1, 200, 0, 0, false);
+    ASTNode* t = make_add(T, make_leaf(X), nullptr, make_leaf(X), nullptr, /*is_temp=*/true);
+    ASTNode* set_u = make_set_region(SET_U, make_leaf(U), make_region<1>({5}, {205}, {1}), t);
+    ASTNode* set_w = make_set_region(SET_W, make_leaf(W), make_region<1>({0}, {200}, {1}), t);
+    DAG* dag = make_dag_chain({{make_create(U, 210), make_create(W, 200)}, {t, set_u, set_w}});
+
+    int grid = prior_grid(meta);
+    decomposition_solver::compute_decompositions(meta, dag, /*odf=*/4, /*num_pes=*/1);
+
+    expect_eq("U.offset + 5", meta.at(U).offset[0] + 5, meta.at(W).offset[0]);
+    expect_grid_covers("shifted creation", meta, dag, grid);
+    std::array<int, 3> ext = {0, 0, 0};
+    int tile = 0;
+    decomposition_solver::chare_cover(meta, dag->nodes[0]->ast->roots[1], ext, tile);
+    expect_eq("W chare extent", ext[0], meta.at(W).offset[0] + 200);
+
+    delete dag;
+}
+
+// Random 1-D DAGs of creations, fused kernels with kept results and set_regions, and
+// arrays from earlier DAGs: every array must fit in the chare grid.
+void test_fuzz_grid_covers_offsets() {
+    std::cout << "=== test_fuzz_grid_covers_offsets ===" << std::endl;
+
+    uint64_t state = 0x9e3779b97f4a7c15ull;
+    auto rnd = [&](int n) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        return (int)(state % (uint64_t)n);
+    };
+    int shifted = 0;
+    for (int iter = 0; iter < 3000; ++iter) {
+        MetaMap meta;
+        std::vector<int> arrays;
+        int next = 1;
+        int prior = 1 + rnd(3);
+        for (int i = 0; i < prior; ++i) {
+            int size = 1 + rnd(400);
+            meta[next] = make_meta(1, size, rnd(4) == 0 ? rnd(64) : 0, 64, /*final=*/true);
+            arrays.push_back(next++);
+        }
+        std::vector<std::vector<ASTNode*>> kernels;
+        std::vector<ASTNode*> creates;
+        int ncreate = 1 + rnd(3);
+        for (int i = 0; i < ncreate; ++i) {
+            int size = 1 + rnd(400);
+            meta[next] = make_meta(1, size, 0, 0, false);
+            creates.push_back(make_create(next, size));
+            arrays.push_back(next++);
+        }
+        kernels.push_back(creates);
+        int nkernels = 1 + rnd(3);
+        for (int k = 0; k < nkernels; ++k) {
+            int src = arrays[rnd((int)arrays.size())];
+            int len = 1 + rnd(meta.at(src).global_shape[0]);
+            int a = rnd(meta.at(src).global_shape[0] - len + 1);
+            std::vector<ASTNode*> roots;
+            int t_name = next++;
+            ASTNode* t = make_add(t_name, make_leaf(src), make_region<1>({a}, {a + len}, {1}),
+                                  make_leaf(src), make_region<1>({a}, {a + len}, {1}),
+                                  /*is_temp=*/true);
+            roots.push_back(t);
+            int nkept = rnd(3);
+            std::vector<int> kept;
+            for (int i = 0; i < nkept; ++i) {
+                int b = rnd(meta.at(src).global_shape[0] - len + 1);
+                meta[next] = make_meta(1, len, 0, 0, false);
+                roots.push_back(make_add(next, make_leaf(src),
+                                         make_region<1>({b}, {b + len}, {1}), t, nullptr));
+                kept.push_back(next++);
+            }
+            int nset = rnd(3);
+            for (int i = 0; i < nset; ++i) {
+                int dst = arrays[rnd((int)arrays.size())];
+                int dsize = meta.at(dst).global_shape[0];
+                if (dsize < len)
+                    continue;
+                int c = rnd(dsize - len + 1);
+                roots.push_back(make_set_region(next++, make_leaf(dst),
+                                                make_region<1>({c}, {c + len}, {1}), t));
+            }
+            for (int n : kept)
+                arrays.push_back(n);
+            kernels.push_back(roots);
+        }
+        DAG* dag = make_dag_chain(kernels);
+        int num_pes = 1 + rnd(4);
+        int grid = prior_grid(meta);
+        decomposition_solver::compute_decompositions(meta, dag, /*odf=*/4, num_pes);
+        for (int name : arrays)
+            if (name > prior && meta.at(name).offset[0] >= meta.at(name).tile)
+                ++shifted;
+        expect_grid_covers("fuzz iteration " + std::to_string(iter), meta, dag, grid);
+        delete dag;
+    }
+    expect_true("some arrays were shifted by a whole tile", shifted > 0);
+}
 } // namespace
 
 int main() {
@@ -664,6 +837,8 @@ int main() {
         test_small_class_member_keeps_own_tile();
         test_fused_kept_results_share_layout();
         test_set_region_kept_result_takes_target_layout();
+        test_shifted_creation_results_get_chares();
+        test_fuzz_grid_covers_offsets();
     } catch (const std::exception& ex) {
         std::cerr << "test_compute_decompositions failed: " << ex.what() << std::endl;
         return 1;

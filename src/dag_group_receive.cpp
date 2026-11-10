@@ -2,6 +2,7 @@
 #include <memory>
 #include "backend.hpp"
 #include "dag_group_internal.hpp"
+#include "decomposition_solver.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -537,176 +538,41 @@ void ArrayDAGGroup::receive_dag_now(int epoch, int size, char* serialized_dag) {
         }
     });
 
-    // Pass 2: expand partitions now that tile sizes have been assigned.
+    // Pass 2: expand partitions now that tile sizes have been assigned. Shifted results
+    // need chares over [0, offset + shape).
     dag_group_for_each_node_topo(dag, [&](DAGNode* dag_node) {
         for (ASTNode* ast_node : dag_node->ast->roots) {
-            Opcode op = static_cast<Opcode>(ast_node->opcode);
-
-            if (is_creation(op) && ast_node->region) {
-                int nd = ast_node->ndims;
-                int tile = array_meta[ast_node->result_name].tile;
-                if (partition_grid[nd].start_epoch < 0)
-                    partition_grid[nd].start_epoch = epoch;
-                switch (nd) {
-                case 1:
-                    expand_partition_nd<1>(thisProxy, partition_proxy_1, partition_grid[nd].grid,
-                                           ast_node->region, tile);
-                    break;
-                case 2:
-                    expand_partition_nd<2>(thisProxy, partition_proxy_2, partition_grid[nd].grid,
-                                           ast_node->region, tile);
-                    break;
-                case 3:
-                    expand_partition_nd<3>(thisProxy, partition_proxy_3, partition_grid[nd].grid,
-                                           ast_node->region, tile);
-                    break;
-                default:
-                    CkAbort("Unsupported ndims=%d in expansion pass", nd);
-                }
-            } else if (op == Opcode::MATMUL) {
-                auto res_it = array_meta.find(ast_node->result_name);
-                if (res_it != array_meta.end()) {
-                    int mat_rows = res_it->second.global_shape[0];
-                    int tile_1d = res_it->second.tile;
-                    std::array<int, 1> s = {0}, e = {mat_rows}, st = {1};
-                    ArrayRegion<1> result_region(s, e, st);
-                    // New chares must start at this epoch; set it before inserting,
-                    // since a local insert constructs the chare immediately.
-                    if (partition_grid[1].start_epoch < 0)
-                        partition_grid[1].start_epoch = epoch;
-                    expand_partition_nd<1>(thisProxy, partition_proxy_1, partition_grid[1].grid,
-                                           &result_region, tile_1d);
-                }
-            } else if (op == Opcode::MATMATMUL) {
-                auto res_it = array_meta.find(ast_node->result_name);
-                if (res_it != array_meta.end()) {
-                    int M = res_it->second.global_shape[0];
-                    int N_cols = res_it->second.global_shape[1];
-                    int tile_2d = res_it->second.tile;
-                    std::array<int, 2> s = {0, 0}, e = {M, N_cols}, st = {1, 1};
-                    ArrayRegion<2> result_region(s, e, st);
-                    // Without a start epoch, new chares start at -1 and never run this DAG.
-                    if (partition_grid[2].start_epoch < 0)
-                        partition_grid[2].start_epoch = epoch;
-                    expand_partition_nd<2>(thisProxy, partition_proxy_2, partition_grid[2].grid,
-                                           &result_region, tile_2d);
-                }
-            } else if (op == Opcode::DIAG) {
-                auto res_it = array_meta.find(ast_node->result_name);
-                if (res_it != array_meta.end()) {
-                    int res_nd = res_it->second.ndims;
-                    int tile = res_it->second.tile;
-                    if (res_nd == 2) {
-                        int n = res_it->second.global_shape[0];
-                        std::array<int, 2> s = {0, 0}, e = {n, n}, st = {1, 1};
-                        ArrayRegion<2> result_region(s, e, st);
-                        if (partition_grid[2].start_epoch < 0)
-                            partition_grid[2].start_epoch = epoch;
-                        expand_partition_nd<2>(thisProxy, partition_proxy_2, partition_grid[2].grid,
-                                               &result_region, tile);
-                    } else {
-                        int diag_len = res_it->second.global_shape[0];
-                        std::array<int, 1> s = {0}, e = {diag_len}, st = {1};
-                        ArrayRegion<1> result_region(s, e, st);
-                        if (partition_grid[1].start_epoch < 0)
-                            partition_grid[1].start_epoch = epoch;
-                        expand_partition_nd<1>(thisProxy, partition_proxy_1, partition_grid[1].grid,
-                                               &result_region, tile);
-                    }
-                }
-            } else if (op == Opcode::TILE || is_reduction_op(op) || op == Opcode::LINALG ||
-                       is_shape_op(op) || is_signal_op(op) || op == Opcode::GATHER ||
-                       op == Opcode::EXPAND || op == Opcode::COMPRESS) {
-                auto res_it = array_meta.find(ast_node->result_name);
-                if (res_it != array_meta.end()) {
-                    int res_nd = res_it->second.ndims;
-                    int tile = res_it->second.tile;
-                    auto& sh = res_it->second.global_shape;
-                    if (partition_grid[res_nd].start_epoch < 0)
-                        partition_grid[res_nd].start_epoch = epoch;
-                    switch (res_nd) {
-                    case 1: {
-                        std::array<int, 1> s = {0}, e = {sh[0]}, st = {1};
-                        ArrayRegion<1> result_region(s, e, st);
-                        expand_partition_nd<1>(thisProxy, partition_proxy_1,
-                                               partition_grid[res_nd].grid, &result_region, tile);
-                        break;
-                    }
-                    case 2: {
-                        std::array<int, 2> s = {0, 0}, e = {sh[0], sh[1]}, st = {1, 1};
-                        ArrayRegion<2> result_region(s, e, st);
-                        expand_partition_nd<2>(thisProxy, partition_proxy_2,
-                                               partition_grid[res_nd].grid, &result_region, tile);
-                        break;
-                    }
-                    case 3: {
-                        std::array<int, 3> s = {0, 0, 0}, e = {sh[0], sh[1], sh[2]}, st = {1, 1, 1};
-                        ArrayRegion<3> result_region(s, e, st);
-                        expand_partition_nd<3>(thisProxy, partition_proxy_3,
-                                               partition_grid[res_nd].grid, &result_region, tile);
-                        break;
-                    }
-                    }
-                }
-            } else if (op == Opcode::TRANSPOSE) {
-                // result may have a nonzero offset: cover [0, offset + shape)
-                auto res_it = array_meta.find(ast_node->result_name);
-                if (res_it != array_meta.end()) {
-                    int nd = res_it->second.ndims;
-                    int tile = res_it->second.tile;
-                    std::array<int, 3> ext = {0, 0, 0};
-                    for (int d = 0; d < nd; ++d)
-                        ext[d] = res_it->second.offset[d] + res_it->second.global_shape[d];
-                    if (partition_grid[nd].start_epoch < 0)
-                        partition_grid[nd].start_epoch = epoch;
-                    if (nd == 2) {
-                        std::array<int, 2> s = {0, 0}, e = {ext[0], ext[1]}, st = {1, 1};
-                        ArrayRegion<2> region(s, e, st);
-                        expand_partition_nd<2>(thisProxy, partition_proxy_2,
-                                               partition_grid[nd].grid, &region, tile);
-                    } else if (nd == 3) {
-                        std::array<int, 3> s = {0, 0, 0}, e = {ext[0], ext[1], ext[2]},
-                                           st = {1, 1, 1};
-                        ArrayRegion<3> region(s, e, st);
-                        expand_partition_nd<3>(thisProxy, partition_proxy_3,
-                                               partition_grid[nd].grid, &region, tile);
-                    }
-                }
-            } else if (is_elementwise(op) || op == Opcode::COPY || is_castscansort(op)) {
-                auto res_it = array_meta.find(ast_node->result_name);
-                if (res_it != array_meta.end() && res_it->second.global_shape[0] > 0) {
-                    int nd = res_it->second.ndims;
-                    int tile = res_it->second.tile;
-                    // a nonzero decomposition offset shifts the tiles: cover [0, offset + shape)
-                    std::array<int, 3> sh = res_it->second.global_shape;
-                    for (int d = 0; d < nd; ++d)
-                        sh[d] += res_it->second.offset[d];
-                    if (partition_grid[nd].start_epoch < 0)
-                        partition_grid[nd].start_epoch = epoch;
-                    switch (nd) {
-                    case 1: {
-                        std::array<int, 1> s = {0}, e = {sh[0]}, st = {1};
-                        ArrayRegion<1> region(s, e, st);
-                        expand_partition_nd<1>(thisProxy, partition_proxy_1, partition_grid[nd].grid,
-                                               &region, tile);
-                        break;
-                    }
-                    case 2: {
-                        std::array<int, 2> s = {0, 0}, e = {sh[0], sh[1]}, st = {1, 1};
-                        ArrayRegion<2> region(s, e, st);
-                        expand_partition_nd<2>(thisProxy, partition_proxy_2, partition_grid[nd].grid,
-                                               &region, tile);
-                        break;
-                    }
-                    case 3: {
-                        std::array<int, 3> s = {0, 0, 0}, e = {sh[0], sh[1], sh[2]}, st = {1, 1, 1};
-                        ArrayRegion<3> region(s, e, st);
-                        expand_partition_nd<3>(thisProxy, partition_proxy_3, partition_grid[nd].grid,
-                                               &region, tile);
-                        break;
-                    }
-                    }
-                }
+            std::array<int, 3> ext = {0, 0, 0};
+            int tile = 0;
+            int nd = decomposition_solver::chare_cover(array_meta, ast_node, ext, tile);
+            if (nd == 0)
+                continue;
+            // New chares must start at this epoch; set it before inserting,
+            // since a local insert constructs the chare immediately.
+            if (partition_grid[nd].start_epoch < 0)
+                partition_grid[nd].start_epoch = epoch;
+            switch (nd) {
+            case 1: {
+                std::array<int, 1> s = {0}, e = {ext[0]}, st = {1};
+                ArrayRegion<1> region(s, e, st);
+                expand_partition_nd<1>(thisProxy, partition_proxy_1, partition_grid[nd].grid,
+                                       &region, tile);
+                break;
+            }
+            case 2: {
+                std::array<int, 2> s = {0, 0}, e = {ext[0], ext[1]}, st = {1, 1};
+                ArrayRegion<2> region(s, e, st);
+                expand_partition_nd<2>(thisProxy, partition_proxy_2, partition_grid[nd].grid,
+                                       &region, tile);
+                break;
+            }
+            case 3: {
+                std::array<int, 3> s = {0, 0, 0}, e = {ext[0], ext[1], ext[2]}, st = {1, 1, 1};
+                ArrayRegion<3> region(s, e, st);
+                expand_partition_nd<3>(thisProxy, partition_proxy_3, partition_grid[nd].grid,
+                                       &region, tile);
+                break;
+            }
             }
         }
     });

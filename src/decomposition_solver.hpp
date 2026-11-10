@@ -457,6 +457,47 @@ void tie_kernel_layouts(ArrayMetaMap& meta, DAG* dag, std::unordered_set<int> co
 
 } // namespace detail
 
+/// Chares the receive pass inserts for `root`'s result: the box [0, ext) of array indices,
+/// which includes the decomposition offset. Returns its rank, or 0 for none.
+template <typename ArrayMetaMap>
+int chare_cover(ArrayMetaMap const& meta, ASTNode* root, std::array<int, 3>& ext, int& tile) {
+    auto op = static_cast<Opcode>(root->opcode);
+    auto it = meta.find(root->result_name);
+    if (it == meta.end())
+        return 0;
+    auto const& m = it->second;
+    int nd = m.ndims;
+    std::array<int, 3> shape = m.global_shape;
+    if (is_creation(op)) {
+        if (root->region == nullptr)
+            return 0;
+        nd = root->ndims;
+        shape = detail::region_box(root->region, nd, m.global_shape).extent;
+    } else if (op == Opcode::MATMUL) {
+        nd = 1;
+    } else if (op == Opcode::MATMATMUL) {
+        nd = 2;
+    } else if (op == Opcode::DIAG) {
+        shape[1] = shape[0];
+    } else if (op == Opcode::TRANSPOSE) {
+        if (nd < 2)
+            return 0;
+    } else if (is_elementwise(op) || op == Opcode::COPY || is_castscansort(op)) {
+        if (shape[0] <= 0)
+            return 0;
+    } else if (!(op == Opcode::TILE || is_reduction_op(op) || op == Opcode::LINALG ||
+                 is_shape_op(op) || is_signal_op(op) || op == Opcode::GATHER ||
+                 op == Opcode::EXPAND || op == Opcode::COMPRESS)) {
+        return 0;
+    }
+    if (nd < 1 || nd > 3)
+        return 0;
+    tile = m.tile;
+    for (int d = 0; d < nd; ++d)
+        ext[d] = m.offset[d] + shape[d];
+    return nd;
+}
+
 template <typename ArrayMetaMap>
 void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num_pes) {
     using ArrayMetadata = typename ArrayMetaMap::mapped_type;
