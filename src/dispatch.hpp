@@ -16,10 +16,19 @@
     Kokkos::RangePolicy<Kokkos::Cuda>((partition)->compute_exec, 0, (n))
 #define CT_COMM_POLICY(partition, n)                                                               \
     Kokkos::RangePolicy<Kokkos::Cuda>((partition)->comm_exec, 0, (n))
+#define CT_COMPUTE_POLICY64(partition, n)                                                          \
+    Kokkos::RangePolicy<Kokkos::Cuda, Kokkos::IndexType<int64_t>>((partition)->compute_exec, 0,    \
+                                                                  (int64_t)(n))
+#define CT_COMM_POLICY64(partition, n)                                                             \
+    Kokkos::RangePolicy<Kokkos::Cuda, Kokkos::IndexType<int64_t>>((partition)->comm_exec, 0,       \
+                                                                  (int64_t)(n))
 #define CT_COMPUTE_EXEC(partition) ((partition)->compute_exec)
 #else
 #define CT_COMPUTE_POLICY(partition, n) Kokkos::RangePolicy<>(0, (n))
 #define CT_COMM_POLICY(partition, n) Kokkos::RangePolicy<>(0, (n))
+#define CT_COMPUTE_POLICY64(partition, n)                                                          \
+    Kokkos::RangePolicy<Kokkos::IndexType<int64_t>>(0, (int64_t)(n))
+#define CT_COMM_POLICY64(partition, n) CT_COMPUTE_POLICY64(partition, n)
 #define CT_COMPUTE_EXEC(partition) Kokkos::DefaultExecutionSpace()
 #endif
 #endif

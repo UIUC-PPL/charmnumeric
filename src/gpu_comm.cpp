@@ -112,6 +112,8 @@ void ArrayDAGGroup::ipc_probe_exports(int n, char* data) {
             for (int i = 0; i < count; ++i)
                 sharers += same_host(recs[i], *me) && std::strcmp(recs[i].pci, me->pci) == 0;
             gpu_sharers().store(std::max(sharers, 1));
+            if (sharers > 1)
+                trim_device_caches();
         }
         for (int i = 0; i < count; ++i)
             for (int j = 0; CkMyPe() == 0 && j < count; ++j)

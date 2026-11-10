@@ -1,4 +1,4 @@
-# Codemap: Charmnumeric (`example/charmnumeric/`)
+# Codemap: Charmnumeric (repository root)
 
 Distributed N-dimensional array DSL built on charmtyles. The backend stores 1-3D tile-decomposed arrays; arrays with more than 3 dims are folded into 3-D storage by the frontend (`folded.py`). Python `Array`/`ArrayView` classes extend `FrontendObject`; C++ backend uses Charm++ chare arrays (`Partition<N>`) with optional MLIR JIT and GPU (Kokkos) support.
 
@@ -125,7 +125,7 @@ Bit-exact NumPy mirror of `src/creation_kernels.hpp` (Philox4x32-10, software lo
 ### Array creation in `charmnumeric/charmnumeric.py`
 `_creation_op()` builds UPLOAD (50) / RANDOM (51) / IOTA (52) nodes: `[region, (hi, lo) scalar word pairs..., InlineData]`. `_upload()` (bulk host data), `arange`, `linspace`, `indices`, `meshgrid`, `eye` (all native).
 
-## C++ Backend (`example/charmnumeric/src/`)
+## C++ Backend (`src/`)
 
 ### `backend.hpp` — Core backend types (673 lines)
 | Symbol | Line | Description |
@@ -247,14 +247,14 @@ Started from `set_proxies`, off the CCS-ready path: rank 0 of each process expor
 | `executor_transfer.cpp` | Cross-partition data transfer |
 | `executor_transpose.cpp` | TRANSPOSE (2-D/3-D axis permutation of an array or view): point-to-point pack/send, `transpose_place` receive side |
 | `executor_castscansort.cpp` | SCAN (cumsum/cumprod/nan*; opcode 81): each chare sends its line totals to the later chares along the axis, then scans its tile once with the folded carry (CUB single-pass scan per long line on NVIDIA); narrow int/bool inputs are cast in the kernel. SORT/ARGSORT (82-83) of other shapes: local per-line sort when the axis is not split across chares, else a gather to one chare (complex, split axis) |
-| `executor_sort.cpp` | 1-D SORT/ARGSORT of real types: sample sort over the chares (pooled samples -> splitters on (key, index), stable multi-way split, buckets exchanged by pointer on the same PE or as device messages, CUB radix sort per bucket, then the sorted runs moved to the result tiles). SELECT (190): order statistics by radix selection (histogram rounds of the top key bits, coordinated by the first chare, then a gather of the few candidates); `receive_sort_msg` carries the control messages. Radix keys order like NumPy (NaNs last) |
+| `executor_sort.cpp` | 1-D SORT/ARGSORT of real types: sample sort over the chares (pooled samples -> splitters on (key, index), stable multi-way split, buckets exchanged by pointer on the same PE or as device messages, CUB radix sort per bucket, then the sorted runs moved to the result tiles). SELECT (190): order statistics by radix selection (histogram rounds of the top key bits, coordinated by the first chare, then a gather of the few candidates); `receive_sort_msg` carries the control messages. Radix keys order like NumPy (NaNs last); sorted values are decoded from the keys, so NaNs come back canonical and -0.0 sorts before +0.0 (documented in `_sort`) |
 | `executor_incremental.cpp` | Incremental computation |
 | `executor_ast_visitor.cpp` | AST visitor for elementwise node execution |
 | `partition_lifecycle.cpp` | `init()`, `create()`, `run()`, destructor |
 | `partition_comm.cpp` | `receive_data()` inter-chare communication; `receive_ipc()`/`receive_staged()` copy into a device buffer on the comm stream, then deliver as `receive_data()` |
 | `big_msg.hpp` | Payloads over `ct_msg_max_bytes()` (1 GiB; `CNUM_MSG_MAX_BYTES` lowers it for tests) go as `receive_frag` fragments, reassembled by the target chare (`PartitionImpl::receive_frag`, partition_comm.cpp) and delivered to the entry of their `MsgKind`: Charm++ marshalled messages hold less than 2 GiB. Senders: `ct_send_bytes` (linalg, index, shape, reduction partials, upload tiles), `ct_send_data` (host `receive_data`, CPU builds), staged GPU sends |
 | `partition_get.cpp` | `process_get()` — gather results to PE 0 (rows cut into `ct_msg_max_bytes()` pieces); gets over 512 MiB reach the client in chunks (`Server::send_fetch_reply`, `get_chunk`) |
-| `executor_signal.cpp` | CONVOLVE/FLIP: each result chare receives the input window (halo of the filter size) and the filter, or its mirrored tile, point-to-point; direct sum or per-chare FFT (host mixed radix, cuFFT on NVIDIA). BATCHED_MATMUL: each result chare cuts its batch range and K at the operands' chare boundaries and the batch further into chunks, so a (chunk, k panel) block is at most 64 MB (`CNUM_BMM_MSG_KB`); blocks arrive as one message per source chare (its own parts are read in place) and each chunk's GEMMs run in panel order as blocks complete (`on_signal_receive`), accumulating into C (cuBLAS `gemmStridedBatched` for float/complex on NVIDIA, Eigen on CPU, a Kokkos kernel for ints). `copy_box` is one cudaMemcpy2D/3D for unit-stride boxes |
+| `executor_signal.cpp` | CONVOLVE/FLIP: each result chare receives the input window (halo of the filter size) and the filter, or its mirrored tile, point-to-point; direct sum or per-chare FFT (host mixed radix, cuFFT on NVIDIA). BATCHED_MATMUL: each result chare cuts its batch range and K at the operands' chare boundaries and the batch further into chunks, so a (chunk, k panel) block is at most 64 MB (`CNUM_BMM_MSG_KB`); blocks arrive as one message per source chare (its own parts are read in place) and each chunk's GEMMs run in panel order as blocks complete (`on_signal_receive`), accumulating into C (cuBLAS `gemmStridedBatched` for float/complex on NVIDIA, Eigen on CPU, a naive Kokkos kernel for ints on NVIDIA and for every dtype on other Kokkos backends). `copy_box` is one cudaMemcpy2D/3D for unit-stride boxes |
 | `executor_shape.cpp` | RESHAPE/BROADCAST (opcodes 140-141): source chares send row runs (reshape) or the projected block (broadcast) to each result chare (`receive_shape`, host-staged); broadcast blocks are expanded on the device |
 | `executor_linalg.cpp` | LINALG: operand blocks gathered to chare 0 of the result partition (`receive_linalg`), factored there (Eigen on CPU, cuSOLVER/cuBLAS on NVIDIA), result tiles scattered back |
 | `executor_indexing.cpp` | GATHER/SCATTER: an entry (one L value) plus a box of slice coordinates addresses a box of data elements; all per-element work in device kernels. GATHER: L chares send each result chare its L values, the result chare groups entries by data chare and requests each slice piece; data chares copy straight into the result tile in-process, else reply (CUDA IPC slab or host, parts of `CNUM_GX_CHUNK_MB`). SCATTER: L chares send entry buckets to the destination chares, which keep the last write per element (atomic max) and fill a scalar or pull values from v's chares. EXPAND: device scan of each x block, row offsets from one coordinator, positions routed in runs like COMPRESS. COMPRESS/MASK_SCATTER: device scan of each x block's mask, row offsets from one coordinator, compacted runs sent in bulk to the result tiles (or pulled from v's chares) |
@@ -264,7 +264,7 @@ Started from `set_proxies`, off the CCS-ready path: rank 0 of each process expor
 | `creation_kernels.hpp` | Host/device element functions: Philox RNG, Box-Muller with software log/cos, arange/linspace/indices/eye |
 | `jit.cpp` | MLIRJitCompiler implementation — buildFromAST (per-leaf element types), emitOp (per-op compute dtype, `convertValue`), registries |
 
-## Standalone C++ Tests (`example/charmnumeric/tests/`)
+## Standalone C++ Tests (`tests/`)
 
 ### `test_compute_decompositions.cpp` — Standalone decomposition coverage (416 lines)
 | Symbol | Line | Description |

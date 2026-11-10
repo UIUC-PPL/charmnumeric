@@ -26,6 +26,11 @@ void PartitionImpl<N>::init(typename PartitionTraits<N>::ProxyType proxy, std::a
     auto* dag_group = static_cast<ArrayDAGGroup*>(dag_proxy_.ckLocalBranch());
     executor = new ArrayDAGExecutorND<N>(dag_group, this);
     local_partitions<N>().push_back(this);
+    {
+        auto& reg = process_partitions<N>();
+        std::lock_guard<std::mutex> lock(reg.mu);
+        reg.parts.push_back(this);
+    }
     // Skip to the epoch where this partition was first created.
     // start_epoch - 1 so that next_epoch() advances to start_epoch.
     int se = dag_group->partition_grid[N].start_epoch;
@@ -41,6 +46,11 @@ template <int N>
 PartitionImpl<N>::~PartitionImpl() {
     auto& parts = local_partitions<N>();
     parts.erase(std::remove(parts.begin(), parts.end(), this), parts.end());
+    {
+        auto& reg = process_partitions<N>();
+        std::lock_guard<std::mutex> lock(reg.mu);
+        reg.parts.erase(std::remove(reg.parts.begin(), reg.parts.end(), this), reg.parts.end());
+    }
     delete executor;
     for (auto& [name, arr] : arrays)
         delete arr;
