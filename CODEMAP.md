@@ -1,4 +1,4 @@
-# Codemap: Charmnumeric (`example/charmnumeric/`)
+# Codemap: Charmnumeric (repository root)
 
 Distributed N-dimensional array DSL built on charmtyles. The backend stores 1-3D tile-decomposed arrays; arrays with more than 3 dims are folded into 3-D storage by the frontend (`folded.py`). Python `Array`/`ArrayView` classes extend `FrontendObject`; C++ backend uses Charm++ chare arrays (`Partition<N>`) with optional MLIR JIT and GPU (Kokkos) support.
 
@@ -124,7 +124,7 @@ Bit-exact NumPy mirror of `src/creation_kernels.hpp` (Philox4x32-10, software lo
 ### Array creation in `charmnumeric/charmnumeric.py`
 `_creation_op()` builds UPLOAD (50) / RANDOM (51) / IOTA (52) nodes: `[region, (hi, lo) scalar word pairs..., InlineData]`. `_upload()` (bulk host data), `arange`, `linspace`, `indices`, `meshgrid`, `eye` (all native).
 
-## C++ Backend (`example/charmnumeric/src/`)
+## C++ Backend (`src/`)
 
 ### `backend.hpp` — Core backend types (673 lines)
 | Symbol | Line | Description |
@@ -251,7 +251,7 @@ Started from `set_proxies`, off the CCS-ready path: rank 0 of each process expor
 | `partition_lifecycle.cpp` | `init()`, `create()`, `run()`, destructor |
 | `partition_comm.cpp` | `receive_data()` inter-chare communication; `receive_ipc()`/`receive_staged()` copy into a device buffer on the comm stream, then deliver as `receive_data()` |
 | `partition_get.cpp` | `process_get()` — gather results to PE 0 |
-| `executor_signal.cpp` | CONVOLVE/FLIP: each result chare receives the input window (halo of the filter size) and the filter, or its mirrored tile, point-to-point; direct sum or per-chare FFT (host mixed radix, cuFFT on NVIDIA). BATCHED_MATMUL: each result chare receives its (batch, m, all k) / (batch, all k, n) operand boxes (read in place when it holds them already) and runs one strided batched GEMM (cuBLAS `gemmStridedBatched` for float/complex on NVIDIA, Eigen on CPU, a Kokkos kernel for ints) |
+| `executor_signal.cpp` | CONVOLVE/FLIP: each result chare receives the input window (halo of the filter size) and the filter, or its mirrored tile, point-to-point; direct sum or per-chare FFT (host mixed radix, cuFFT on NVIDIA). BATCHED_MATMUL: each result chare receives its (batch, m, all k) / (batch, all k, n) operand boxes (read in place when it holds them already) and runs one strided batched GEMM (cuBLAS `gemmStridedBatched` for float/complex on NVIDIA, Eigen on CPU, a naive Kokkos kernel for ints on NVIDIA and for every dtype on other Kokkos backends) |
 | `executor_shape.cpp` | RESHAPE/BROADCAST (opcodes 140-141): source chares send row runs (reshape) or the projected block (broadcast) to each result chare (`receive_shape`, host-staged); broadcast blocks are expanded on the device |
 | `executor_linalg.cpp` | LINALG: operand blocks gathered to chare 0 of the result partition (`receive_linalg`), factored there (Eigen on CPU, cuSOLVER/cuBLAS on NVIDIA), result tiles scattered back |
 | `executor_indexing.cpp` | GATHER/SCATTER/EXPAND: index chares send request lists to the data chares, which send value lists to the target chares (`receive_index_msg`); EXPAND scans segment counts on one coordinator chare. COMPRESS/MASK_SCATTER: device scan of each x block's mask, row offsets from one coordinator, compacted runs sent in bulk to the result tiles (or pulled from v's chares) |
@@ -259,7 +259,7 @@ Started from `set_proxies`, off the CCS-ready path: rank 0 of each process expor
 | `creation_kernels.hpp` | Host/device element functions: Philox RNG, Box-Muller with software log/cos, arange/linspace/indices/eye |
 | `jit.cpp` | MLIRJitCompiler implementation — buildFromAST (per-leaf element types), emitOp (per-op compute dtype, `convertValue`), registries |
 
-## Standalone C++ Tests (`example/charmnumeric/tests/`)
+## Standalone C++ Tests (`tests/`)
 
 ### `test_compute_decompositions.cpp` — Standalone decomposition coverage (416 lines)
 | Symbol | Line | Description |
