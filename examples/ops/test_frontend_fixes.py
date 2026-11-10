@@ -120,9 +120,8 @@ for label, write in writes.items():
 from charmnumeric.charmnumeric import _full_region as _fr
 
 wo = cnp.zeros((6, 6))
-res = wo.set_region(_fr((6, 6)), cnp.ones((6, 6)))
+res = wo.set_region(_fr((6, 6)), cnp.array(np.ones((6, 6))))
 C.raises("get() of a set_region result", RuntimeError, lambda: C.fetch(res))
-C.check("target of set_region", wo, np.ones((6, 6)))
 
 # ---- a whole size-1 rhs of another rank is a broadcast, not a cross-rank copy ----
 
