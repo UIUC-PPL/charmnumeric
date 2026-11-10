@@ -2,8 +2,8 @@
 sign and clip), empty arrays, GPU launch shapes (extents over 65535 off the
 contiguous dim, tile boundaries), and an op without a kernel for its dtype
 (an error at the next fetch, not a server abort). CNUM_BIG_SHAPES=1 adds
-8e7-element shapes and a scalar fill of a 3.2 GB array (one tile over 2 GiB
-with CNUM_ODF=1 at +p1)."""
+8e7-element shapes; CNUM_BIG_FILL=1 adds a scalar fill of a 3.2 GB array (one
+tile over 2 GiB with CNUM_ODF=1 at +p1)."""
 
 import os
 
@@ -116,7 +116,7 @@ for n in (1, 255, 256, 257, 1023, 1025, 65537):
     hb[:, 1:n + 1] = hb[:, 1:n + 1] * 2.0 + 5.0
     C.check(f"b[:, 1:{n + 1}] = 2b + 5", b, hb)
 
-if BIG:
+if os.environ.get("CNUM_BIG_FILL", "") not in ("", "0"):
     big = cnp.zeros((20000, 20000))
     big.fill(1.0)
     C.check("fill 20000^2: sum", cnp.sum(big), np.float64(4e8))
