@@ -141,6 +141,9 @@ void PartitionImpl<N>::receive_data(int node_id, int input_index, int name, int 
         step[d] = region_data[d * 3 + 2];
     }
     ArrayRegion<N> region(start, stop, step);
+    if (comm.node != nullptr)
+        check_transfer_piece<N>(static_cast<ArrayDAGGroup*>(dag_proxy.ckLocalBranch())->array_meta,
+                                comm.node, region);
 
     comm.remote_buffers[input_index].push_back({buf, region, size});
 
