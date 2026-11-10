@@ -446,6 +446,8 @@ void la_compute(const LaSpec& s, LaProblem<T>& P) {
             Eigen::BDCSVD<Mat> svd(A);
             for (int i = 0; i < k; ++i)
                 P.out[i] = svd.singularValues()(i);
+            if (svd.info() != Eigen::Success)
+                fill_nan(P.out);
             break;
         }
         unsigned opts = full ? (Eigen::ComputeFullU | Eigen::ComputeFullV)
@@ -455,6 +457,8 @@ void la_compute(const LaSpec& s, LaProblem<T>& P) {
         for (int i = 0; i < k; ++i)
             P.at(m, i) = svd.singularValues()(i);
         put(P, m + 1, 0, Mat(svd.matrixV().adjoint()));
+        if (svd.info() != Eigen::Success)
+            fill_nan(P.out);
         break;
     }
     case LA_SOLVE_TRIANGULAR: {
@@ -512,6 +516,8 @@ void la_compute_real(const LaSpec& s, LaProblem<T>& P) {
         Mat X = svd.matrixV() * (inv.asDiagonal() * (svd.matrixU().transpose() * B));
         std::vector<T> x(X.data(), X.data() + X.size()), svh(sv.data(), sv.data() + k);
         lstsq_pack(P, x, svh, rank);
+        if (svd.info() != Eigen::Success)
+            fill_nan(P.out);
         break;
     }
     case LA_TSSVD: {
@@ -520,6 +526,8 @@ void la_compute_real(const LaSpec& s, LaProblem<T>& P) {
         std::vector<T> w(es.eigenvalues().data(), es.eigenvalues().data() + n);
         Mat V = es.eigenvectors();
         tssvd_pack(P, w, std::vector<T>(V.data(), V.data() + V.size()));
+        if (es.info() != Eigen::Success)
+            fill_nan(P.out);
         break;
     }
     }
@@ -791,12 +799,17 @@ void gpu_svd(LaHandles& h, cudaStream_t st, const std::vector<T>& A, int m, int 
     CT_CUSOLVER_CHECK(cula::gesvd(h.solver, ju, jv, mm, nn, dA.p, mm, dS.p, dU.p, mm, dVT.p, nn,
                                   dW.p, lw, dRW.p, dInfo.p));
     sv = dS.download();
-    if (la_info(dInfo) != 0)
+    bool failed = la_info(dInfo) != 0;
+    if (failed)
         fill_nan(sv);
     if (!uv)
         return;
     int uc = full ? mm : k;
     std::vector<T> Ud = dU.download(static_cast<size_t>(mm) * uc), Vd = dVT.download();
+    if (failed) {
+        fill_nan(Ud);
+        fill_nan(Vd);
+    }
     if (!tr) {
         U = std::move(Ud);
         VT = std::move(Vd);
@@ -930,6 +943,8 @@ void la_compute(const LaSpec& s, LaProblem<T>& P, PartitionImpl<N>* partition) {
         if constexpr (!cn_is_complex_v<T>)
             if (s.op == LA_TSSVD) {
                 tssvd_pack(P, w, V);
+                if (la_info(dInfo) != 0)
+                    fill_nan(P.out);
                 break;
             }
         for (int i = 0; i < n; ++i)
