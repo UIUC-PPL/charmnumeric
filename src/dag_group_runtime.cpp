@@ -21,6 +21,11 @@ ArrayDAGGroup::ArrayDAGGroup() {
             Kokkos::initialize();
     });
     ++kokkos_users;
+#ifdef USE_NVIDIA
+    // SMP: each PE thread uses the device Kokkos chose for this process
+    if (cudaSetDevice(Kokkos::device_id()) != cudaSuccess)
+        CkAbort("PE %d: cudaSetDevice(%d) failed", CkMyPe(), Kokkos::device_id());
+#endif
 #endif
     if (CkMyPe() == 0) {
         partition_proxy_1 = CProxy_Partition1D::ckNew();

@@ -36,6 +36,7 @@
 #include <numeric>
 #include "mlir/Target/LLVM/NVVM/Target.h"
 #include "mlir/Target/LLVMIR/Dialect/GPU/GPUToLLVMIRTranslation.h"
+#include <cuda_runtime_api.h>
 #endif
 
 namespace {
@@ -1101,9 +1102,10 @@ extern "C" void cn_mgpuMemFree(void* ptr, CUstream s) {
     }
 }
 
-// Modules load and kernels launch in the calling thread's current context (the
-// chare's device). The MLIR wrappers would use device 0's primary context, which
-// differs once Kokkos picks a device per local rank (e.g. SLURM_LOCALID under srun).
+// Modules load and kernels launch in the calling thread's current context, else
+// the primary context of its runtime device (the chare's device, set per PE). The
+// MLIR wrappers would use device 0's, which differs once Kokkos picks a device per
+// local rank (e.g. SLURM_LOCALID under srun).
 void cnCheck(CUresult r, const char* what) {
     if (r != CUDA_SUCCESS)
         llvm::report_fatal_error(llvm::Twine(what) + " failed: " + llvm::Twine(r));
@@ -1112,9 +1114,12 @@ void cnEnsureContext() {
     CUcontext ctx = nullptr;
     if (cuCtxGetCurrent(&ctx) == CUDA_SUCCESS && ctx)
         return;
+    int ordinal = 0;
+    if (cudaGetDevice(&ordinal) != cudaSuccess)
+        llvm::report_fatal_error("cudaGetDevice failed");
     CUdevice dev;
     cnCheck(cuInit(0), "cuInit");
-    cnCheck(cuDeviceGet(&dev, 0), "cuDeviceGet");
+    cnCheck(cuDeviceGet(&dev, ordinal), "cuDeviceGet");
     cnCheck(cuDevicePrimaryCtxRetain(&ctx, dev), "cuDevicePrimaryCtxRetain");
     cnCheck(cuCtxSetCurrent(ctx), "cuCtxSetCurrent");
 }
