@@ -96,7 +96,8 @@ def main():
             est = est * cnp.convolve(img / conv, pm, mode="same", method="fft")
             hconv = ref_convolve(h_est, hp.astype(np.float64), "same")
             h_est = h_est * ref_convolve(hi / hconv, np.flip(hp).astype(np.float64), "same")
-        chk.check("richardson-lucy x2 (150,140,130)", est, h_est, rtol=2e-4, atol=1e-5)
+        chk.check("richardson-lucy x2 (150,140,130)", est, h_est, rtol=2e-4, atol=1e-5,
+                  dtype=np.float32)
 
     if on("bin"):
         print("bincount: many x chares")

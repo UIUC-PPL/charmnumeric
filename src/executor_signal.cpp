@@ -1588,7 +1588,8 @@ void conv_fft_blocks(PartitionImpl<N>* partition, T* out, const T* w, const int6
         nbt *= nb[d];
     }
     // a PE's chares queue their batches without a host wait: they share the budget
-    static const int64_t budget = device_budget("CNUM_CONV_FFT_MB", 8);
+    static BudgetKnob conv_fft_knob{"CNUM_CONV_FFT_MB", 8};
+    const int64_t budget = device_budget(conv_fft_knob);
     const int64_t chunk = std::min(kConvChunkBytes, budget / 2 / std::max(1, local));
     const int64_t q =
         std::max<int64_t>(1, std::min<int64_t>(nbt, chunk / (cb.lvol * (int64_t)sizeof(T))));
