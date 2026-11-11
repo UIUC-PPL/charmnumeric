@@ -106,7 +106,7 @@ def main():
         chk.check(f"dot {n}", cnp.array(hx).dot(cnp.array(hy)), hx @ hy, rtol=rt, atol=at)
     hx = host(1000000, "float32")
     chk.check("dot f32", cnp.array(hx).dot(cnp.array(hx)), hx.astype(np.float64) @ hx,
-              rtol=1e-5, atol=0)
+              rtol=1e-5, atol=0, dtype=np.float32)
     hm, hv = host((1500, 1300)), host(1300)
     M, v = cnp.array(hm), cnp.array(hv)
     chk.check("M[100:900, 50:600] @ v[50:600]", M[100:900, 50:600] @ v[50:600],
