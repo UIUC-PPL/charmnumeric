@@ -269,7 +269,7 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
                         ArrayDecomp<2> out_decomp =
                             dag_group->array_meta[result_name].template decomp<2>();
                         partition->arrays[result_name] = partition->allocate_or_reuse(
-                            out_region, {M, N_cols}, result_name, dt, out_decomp);
+                            out_region, {M, N_cols}, result_name, dt, out_decomp, false);
                     }
                     CTArrayBase<2>* A = ai->second;
                     CTArrayBase<2>* B = bi->second;

@@ -87,12 +87,14 @@ enum class Opcode {
     BITWISE_XOR = 166,
     INVERT = 167, // ~x; logical not on bool
     LEFT_SHIFT = 168,
-    RIGHT_SHIFT = 169 // arithmetic for signed ints
+    RIGHT_SHIFT = 169, // arithmetic for signed ints
+    // 170-179: batched matmul (executor_signal.cpp).
+    BATCHED_MATMUL = 170 // (a, b, dims of a: batch m k, dims of b: batch n k, shape[3])
 };
 
 /// Returns true for the ops handled by execute_signal_node.
 inline bool is_signal_op(Opcode op) {
-    return op == Opcode::CONVOLVE || op == Opcode::FLIP;
+    return op == Opcode::CONVOLVE || op == Opcode::FLIP || op == Opcode::BATCHED_MATMUL;
 }
 
 /// Returns true for the boolean-mask ops (execute_mask_node).

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <mutex>
 #include <deque>
@@ -116,6 +118,7 @@ using HostSpace = Kokkos::HostSpace;
 #ifdef USE_NVIDIA
 #include "hapi.h"
 #include <cuda_runtime.h>
+#include "gpu_comm.hpp"
 #endif
 
 /// Device message buffers, cached by power-of-two size class: cudaMalloc/cudaFree per
@@ -160,6 +163,10 @@ inline void comm_free(void* ptr) {
     std::lock_guard<std::mutex> lock(pool.mu);
     auto it = pool.live.find(ptr);
     if (it == pool.live.end()) {
+#ifdef USE_NVIDIA
+        if (gpu_ipc_free(ptr))
+            return;
+#endif
         Kokkos::kokkos_free<DeviceSpace>(ptr);
         return;
     }
@@ -207,9 +214,10 @@ class Array : public CTArrayBase<N> {
     T* data; // host pointer (always allocated, used for gather/get)
 #endif
 
-    /// Construct from a local region + global shape + decomposition.
+    /// Construct from a local region + global shape + decomposition; zero-filled unless
+    /// `zero` is false (the caller overwrites every element).
     Array(ArrayRegion<N> region_, std::array<int, N> global_shape_, int name_,
-          ArrayDecomp<N> decomp_) {
+          ArrayDecomp<N> decomp_, bool zero = true) {
         this->name = name_;
         this->region = region_;
         this->global_shape = global_shape_;
@@ -221,11 +229,16 @@ class Array : public CTArrayBase<N> {
             this->global_size *= global_shape_[d];
         int n = this->region.size();
 #ifdef USE_KOKKOS
-        d_view = Kokkos::View<T*, DeviceSpace>("array_device", n);
+        if (zero)
+            d_view = Kokkos::View<T*, DeviceSpace>("array_device", n);
+        else
+            d_view = Kokkos::View<T*, DeviceSpace>(
+                Kokkos::view_alloc(Kokkos::WithoutInitializing, "array_device"), n);
 #else
         data = new T[n];
-        for (int i = 0; i < n; i++)
-            data[i] = T(0);
+        if (zero)
+            for (int i = 0; i < n; i++)
+                data[i] = T(0);
 #endif
     }
 
@@ -507,6 +520,12 @@ class ArrayDAGGroup : public CBase_ArrayDAGGroup {
     void proxies_ready();
     // After the server is ready: BLAS handles and cached JIT kernels (see CODEMAP)
     void prewarm();
+#ifdef USE_KOKKOS
+    // Which process pairs of a host can use CUDA IPC (gpu_comm.cpp)
+    void ipc_probe_start();
+    void ipc_probe_exports(int n, char* data);
+    void ipc_probe_results(int n, char* data);
+#endif
 
     // Unified DAG handling — dispatches to all relevant partition types
     void receive_dag(int epoch, int size, char* serialized_dag);
@@ -729,14 +748,43 @@ class PartitionImpl {
         return arr;
     }
 
+    /// CNUM_POISON_UNINIT=1 (debug): fill buffers allocated without zero-fill with 0xFF
+    /// bytes (NaN for floats), so elements the op fails to write show up in tests.
+    template <typename T>
+    void poison_uninit(Array<N, T>* arr) {
+        static const bool on = [] {
+            const char* e = getenv("CNUM_POISON_UNINIT");
+            return e != nullptr && *e != '\0' && *e != '0';
+        }();
+        int64_t bytes = arr->local_size() * (int64_t)sizeof(T);
+        if (!on || bytes == 0)
+            return;
+#if defined(USE_NVIDIA)
+        cudaMemsetAsync(arr->d_view.data(), 0xFF, bytes, compute_stream_raw);
+#elif defined(USE_KOKKOS)
+        Kokkos::deep_copy(Kokkos::View<unsigned char*, DeviceSpace, Kokkos::MemoryTraits<
+                              Kokkos::Unmanaged>>(
+                              reinterpret_cast<unsigned char*>(arr->d_view.data()), bytes),
+                          (unsigned char)0xFF);
+#else
+        memset(arr->data, 0xFF, bytes);
+#endif
+    }
+
+    /// `zero` false: the caller overwrites every element, so the buffer is not zero-filled.
     template <typename T>
     Array<N, T>* allocate_or_reuse_typed(const ArrayRegion<N>& region,
                                          const std::array<int, N>& global_shape,
                                          int name,
-                                         const ArrayDecomp<N>& decomp) {
+                                         const ArrayDecomp<N>& decomp,
+                                         bool zero = true) {
         CTArrayBase<N>* reused = try_reuse(dtype_of<T>(), region, global_shape, decomp);
-        if (reused == nullptr)
-            return new Array<N, T>(region, global_shape, name, decomp);
+        if (reused == nullptr) {
+            auto* arr = new Array<N, T>(region, global_shape, name, decomp, zero);
+            if (!zero)
+                poison_uninit(arr);
+            return arr;
+        }
 
         auto* arr = static_cast<Array<N, T>*>(reused);
         arr->name = name;
@@ -750,13 +798,22 @@ class PartitionImpl {
         arr->dtype = dtype_of<T>();
 
 #ifdef USE_KOKKOS
-        Kokkos::deep_copy(arr->d_view, T(0));
+        if (zero)
+            Kokkos::deep_copy(arr->d_view, T(0));
+#ifdef USE_NVIDIA
+        else
+            compute_after_others(); // e.g. a pack of the retired array on the comm stream
+#endif
         arr->h_view = {};
 #else
-        T* data = static_cast<T*>(arr->data_ptr());
-        for (int64_t i = 0; i < arr->local_size(); ++i)
-            data[i] = T(0);
+        if (zero) {
+            T* data = static_cast<T*>(arr->data_ptr());
+            for (int64_t i = 0; i < arr->local_size(); ++i)
+                data[i] = T(0);
+        }
 #endif
+        if (!zero)
+            poison_uninit(arr);
         return arr;
     }
 
@@ -764,10 +821,11 @@ class PartitionImpl {
                                       const std::array<int, N>& global_shape,
                                       int name,
                                       DType dtype,
-                                      const ArrayDecomp<N>& decomp) {
+                                      const ArrayDecomp<N>& decomp,
+                                      bool zero = true) {
         CTArrayBase<N>* arr = nullptr;
         cn_dispatch(dtype, [&](auto tag) {
-            arr = allocate_or_reuse_typed<decltype(tag)>(region, global_shape, name, decomp);
+            arr = allocate_or_reuse_typed<decltype(tag)>(region, global_shape, name, decomp, zero);
         });
         return arr;
     }
@@ -790,10 +848,11 @@ class PartitionImpl {
                                  const std::array<int, N>& global_shape,
                                  int name,
                                  DType dtype,
-                                 const ArrayDecomp<N>& decomp) {
+                                 const ArrayDecomp<N>& decomp,
+                                 bool zero = true) {
         auto it = arrays.find(name);
         if (it == arrays.end()) {
-            auto* arr = allocate_or_reuse(region, global_shape, name, dtype, decomp);
+            auto* arr = allocate_or_reuse(region, global_shape, name, dtype, decomp, zero);
             arrays[name] = arr;
             return arr;
         }
@@ -809,6 +868,10 @@ class PartitionImpl {
     cudaStream_t comm_stream_raw;
     Kokkos::Cuda compute_exec;
     Kokkos::Cuda comm_exec;
+    cudaEvent_t join_event;
+    void join_streams();
+    void compute_after_others();
+    void default_after_compute();
 #endif
 #endif
 
@@ -833,6 +896,11 @@ class PartitionImpl {
     void receive_data(int& node_id, int& input_index, int& name, int& ndims, int*& region_data,
                       int64_t& size, char*& data, CkDeviceBufferPost* devicePost);
     void send_complete(int send_id);
+    void receive_ipc(int node_id, int input_index, int name, int ndims, int* region_data,
+                     int64_t size, int src_node, int slab, int64_t offset, const char* handle,
+                     const CkCallback& done);
+    void receive_staged(int node_id, int input_index, int name, int ndims, int* region_data,
+                        int64_t size, char* data);
 #endif
     void comm_done(int node_id);
     void reduce_result(int node_id, int64_t size, char* data);
@@ -872,6 +940,16 @@ class Partition1D : public CBase_Partition1D {
     void send_complete(CkDataMsg* msg) {
         impl.send_complete(CkGetRefNum(msg));
         CkFreeMsg(msg);
+    }
+    void receive_ipc(int node_id, int input_index, int name, int ndims, int* region_data,
+                     int64_t size, int src_node, int slab, int64_t offset, int hsize,
+                     char* handle, CkCallback done) {
+        impl.receive_ipc(node_id, input_index, name, ndims, region_data, size, src_node, slab,
+                         offset, handle, done);
+    }
+    void receive_staged(int node_id, int input_index, int name, int ndims, int* region_data,
+                        int64_t size, char* data) {
+        impl.receive_staged(node_id, input_index, name, ndims, region_data, size, data);
     }
 #endif
     void comm_done(int node_id) { impl.comm_done(node_id); }
@@ -922,6 +1000,16 @@ class Partition2D : public CBase_Partition2D {
         impl.send_complete(CkGetRefNum(msg));
         CkFreeMsg(msg);
     }
+    void receive_ipc(int node_id, int input_index, int name, int ndims, int* region_data,
+                     int64_t size, int src_node, int slab, int64_t offset, int hsize,
+                     char* handle, CkCallback done) {
+        impl.receive_ipc(node_id, input_index, name, ndims, region_data, size, src_node, slab,
+                         offset, handle, done);
+    }
+    void receive_staged(int node_id, int input_index, int name, int ndims, int* region_data,
+                        int64_t size, char* data) {
+        impl.receive_staged(node_id, input_index, name, ndims, region_data, size, data);
+    }
 #endif
     void comm_done(int node_id) { impl.comm_done(node_id); }
     void reduce_result(int node_id, int64_t size, char* data) {
@@ -970,6 +1058,16 @@ class Partition3D : public CBase_Partition3D {
     void send_complete(CkDataMsg* msg) {
         impl.send_complete(CkGetRefNum(msg));
         CkFreeMsg(msg);
+    }
+    void receive_ipc(int node_id, int input_index, int name, int ndims, int* region_data,
+                     int64_t size, int src_node, int slab, int64_t offset, int hsize,
+                     char* handle, CkCallback done) {
+        impl.receive_ipc(node_id, input_index, name, ndims, region_data, size, src_node, slab,
+                         offset, handle, done);
+    }
+    void receive_staged(int node_id, int input_index, int name, int ndims, int* region_data,
+                        int64_t size, char* data) {
+        impl.receive_staged(node_id, input_index, name, ndims, region_data, size, data);
     }
 #endif
     void comm_done(int node_id) { impl.comm_done(node_id); }

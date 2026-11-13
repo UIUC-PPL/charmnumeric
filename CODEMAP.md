@@ -8,7 +8,7 @@ Distributed N-dimensional array DSL built on charmtyles. The backend stores 1-3D
 | Symbol | Line | Description |
 |--------|------|-------------|
 | `DType` | 39 | Wire dtype codes — FLOAT32=0, FLOAT64=1, INT32=2, INT64=3, BOOL=4, INT8=5, INT16=6, UINT8..UINT64=7-10, FLOAT16=11, COMPLEX64=12, COMPLEX128=13; `from_numpy()`, `to_numpy()` |
-| `ArrayOperation` | 139 | Opcodes: add=0, sub=1, mul=2, div=3, matmul=4, tanh=5, exp=6, tile=7, reduce=8, matmatmul=9, diag=10; elementwise math/comparisons/where/clip 20-49; creation upload=50, random=51, iota=52; reduction=60, bincount=61; transpose=70; scan=81, sort=82, argsort=83; linalg=100; gather=120, scatter=121, expand=122, compress=123, mask_scatter=124; reshape=140, broadcast=141; convolve=150, flip=151; convert (fused astype)=160, real=161, imag=162, conj=163, bitwise_and/or/xor=164-166, invert=167, left_shift=168, right_shift=169 |
+| `ArrayOperation` | 139 | Opcodes: add=0, sub=1, mul=2, div=3, matmul=4, tanh=5, exp=6, tile=7, reduce=8, matmatmul=9, diag=10; elementwise math/comparisons/where/clip 20-49; creation upload=50, random=51, iota=52; reduction=60, bincount=61; transpose=70; scan=81, sort=82, argsort=83; linalg=100; gather=120, scatter=121, expand=122, compress=123, mask_scatter=124; reshape=140, broadcast=141; convolve=150, flip=151; convert (fused astype)=160, real=161, imag=162, conj=163, bitwise_and/or/xor=164-166, invert=167, left_shift=168, right_shift=169; batched_matmul=170 |
 | `ArrayRegion` | 153 | N-D region with start/stop/step per dim — `serialize()`:194, `shape()`:209, `compose()`:212, `overlaps()`:232, `covers()`:239, `intersect()`:246 |
 | `Array(FrontendObject)` | 618 | Main array class — `wire_dtype()`:639, `get()`:683, `get_region()`/`__getitem__()`:690/697, `__setitem__()`:708, `dot()`:724, `matvec()`:727, `copy()`:730, `fill()`:735, `astype()`:738; operators: +,-,*,/,@ at 713-722 |
 | `ArrayView(FrontendObjectView)` | 747 | View with same ops as Array — `get()`:796, `__getitem__()`:801, `__setitem__()`:812, `dot()`:828 |
@@ -29,7 +29,7 @@ Distributed N-dimensional array DSL built on charmtyles. The backend stores 1-3D
 | `_matvec()` | 536 | Matrix-vector multiply |
 | `_matmatmul()` | 595 | Matrix-matrix multiply (SUMMA) |
 | `_unstrided()` | — | Copies a stepped view before matvec/SUMMA (the executors ignore view steps) |
-| `_batched_matmul()` | — | N-D / FoldedArray / non-squeezable 3-D matmul via `einsum("...ij,...jk->...ik")` |
+| `_batched_matmul()` | — | N-D / FoldedArray / non-squeezable 3-D matmul via `einsum("...ij,...jk->...ik")` (one BATCHED_MATMUL node) |
 | `create_array()` | 851 | Array creation factory |
 | `empty/zeros/ones/full()` | 931-971 | Array constructors |
 | `empty_like/zeros_like/ones_like/full_like()` | 975-994 | Like-constructors |
@@ -100,7 +100,8 @@ Distributed N-dimensional array DSL built on charmtyles. The backend stores 1-3D
 | `einsum()` / `einsum_path()` | `numpy.einsum` (string or sublist form, `out=`, `dtype=`, `optimize=`); path from `numpy.einsum_path` on shape-only dummies |
 | `_parse()` / `_from_sublists()` | Ellipsis expansion and implicit output; sublist form to subscripts |
 | `_drop_broadcast()` / `_diagonals()` / `_sum_out()` | Per operand: size-1 broadcast dims, repeated labels (DIAG for 2-D, else permute + RESHAPE + strided view), single-operand sums (REDUCTION) |
-| `_fold()` / `_contract_pair()` | Pairwise contraction (smallest intermediate first within a path step): label-space or grouped broadcast multiply + sum, native dot/matvec, SUMMA, or one SUMMA per batch element on 3-D singleton views |
+| `_fold()` / `_contract_pair()` | Pairwise contraction (smallest intermediate first within a path step): label-space or grouped broadcast multiply + sum, native dot/matvec, SUMMA, or with batch labels one BATCHED_MATMUL node |
+| `_bmm()` / `bmm_reference()` | BATCHED_MATMUL (opcode 170) node: operands `a, b, dims of a holding (batch, m, k), dims of b holding (batch, n, k), result shape`; any layout with the batch dim not last needs no transpose; NumPy model for the simulator |
 | `permute()` | Any-rank transpose: drops size-1 axes, coalesces adjacent axes, >3-D via grouped 3-D transposes; `cnp.transpose`/`FoldedArray.T` use it |
 | `tensordot()` / `inner()` / `outer()` | NumPy API on top of `einsum` |
 
@@ -191,9 +192,10 @@ Bit-exact NumPy mirror of `src/creation_kernels.hpp` (Philox4x32-10, software lo
 | `UnaryOpEntry` | 87 | Registry: same bodies as BinaryOpEntry |
 | `TernaryOpEntry` | 94 | Registry for 3-input ops (where, clip); `emitGenericNaryOp` builds the N-input linalg.generic |
 | `MLIRJitCompiler` | 101 | AST → MLIR → executable — `buildFromAST()`, `optimizeAndFuse()`, `generateCPU()`, `loadCPU()`, `generateNVIDIA/AMD/Intel()` |
-| kernel caches (jit.cpp) | — | In-process map keyed by the kernel IR, then a persistent object-file cache: `$CNUM_JIT_CACHE_DIR` (default `${XDG_CACHE_HOME:-~/.cache}/charmnumeric/jit`)/`<server build id>`/`<GPU target>-<host CPU>`/`<sha256(IR, target)>.o`, loaded with an LLJIT (`loadCachedKernel`); NVIDIA cubins in `cubin/`, keyed by PTX, arch and driver; `CNUM_JIT_CACHE=0` disables it, `CNUM_JIT_TIME=1` prints compile phases |
+| kernel caches (jit.cpp) | — | In-process map keyed by the kernel IR, then a persistent object-file cache: `$CNUM_JIT_CACHE_DIR` (default `${XDG_CACHE_HOME:-~/.cache}/charmnumeric/jit`)/`<server build id>`/`<GPU target>[-<device sm>]-d<driver>-<host CPU>`/`<sha256(IR, target)>.o`, one file per kernel, loaded with an LLJIT (`loadCachedKernel`). NVIDIA objects embed the cubin (PTX assembled by the driver's JIT at compile time, `generateNVIDIAHost`), so the key also has the device's sm and driver version; `cubin/` (PTX-keyed cubins) is only used for kernels whose cubin could not be embedded. `CNUM_JIT_CACHE=0` disables it, `CNUM_JIT_TIME=1` prints compile phases and one `jit batch:` line per batch with misses |
+| `jit_compile_batch()` (jit.cpp), `ArrayDAGGroup::compile()` | — | All new fusible nodes of a DAG compile as one batch. Misses compile in parallel on `CompilePool` threads (`CNUM_JIT_THREADS`, default min(8, CPUs of the process at startup); the threads run on all of those CPUs even if Charm++ pins the PE thread; 1 GiB stacks; one MLIR context per thread). Servers sharing the cache compile each kernel once: a compiler holds `<entry>.o.lock` (O_EXCL; host and pid inside; mtime refreshed every 2 s) and claims at most a pool's worth at a time, the others load the published entry. Waiters poll (opening files, 10-200 ms backoff), break a claim whose holder died (or is exiting or a zombie) on the same host or whose mtime stood still for 30 s (6 s for a holder on the same host or an empty lock, 5 s if it is 2 min old), and compile without a claim after `CNUM_JIT_WAIT_S` (600) s or when a published entry does not load here (loads never abort; invalid entries are removed and recompiled) |
 | `jit_prewarm()` (jit.cpp), `ArrayDAGGroup::prewarm()` | — | Broadcast after "CCS server ready" (the line still marks readiness): every PE creates its cuBLAS/cuSOLVER handles and runs a first GEMM (GPU; skipped below 1 GiB free or when the thread's device is not Kokkos's), then loads the most recently used kernels of its target's cache. `CNUM_PREWARM_MS` (default 250) bounds the whole pre-warm: the BLAS part (~75 ms on an A100, not interruptible) counts against it and kernels load while budget remains (at least a fifth of it); both are skipped without the device or 1 GiB free; 0 skips both, as does `CNUM_PREWARM=0`. Failures are skipped. CCS requests that arrive meanwhile, including the first one, queue behind it on PE 0 |
-| `jit_cache_maintain()` (jit.cpp) | — | PE 0 at startup, in a background thread, one completed pass an hour per cache (`.last-evict`; `.evict-lock` while a pass runs, taken over after 10 min if its server exited first): removes the entries of build/target directories unused for `CNUM_JIT_CACHE_DAYS` (7), `*.tmp` older than an hour and pre-target-directory `*.o`, then the oldest entries (`.o`, `.cubin`) over `CNUM_JIT_CACHE_MAX_FILES` (5000). Runs only on a root marked `.cnum-jit-cache` (written when the root is new or empty, has exactly the cache layout, or with `CNUM_JIT_CACHE_ADOPT=1`; never `/` or `$HOME`; an unmarked root is reported once), enters only build-id/target-tag directories and `cubin/` (removed once unused for the age limit), deletes only cache files (`<sha256>.o`/`.cubin` and their `cacheTmpName` temporaries, the latter once an hour old) and removes directories only once empty; `CNUM_JIT_CACHE_EVICT=0` skips it. The root is normalized (absolute, no trailing separator); the `/tmp/cnum-jit-<uid>` fallback is made 0700. Cache hits refresh an entry's mtime (`.o` and `.cubin`) at most hourly. Pre-warm load failures remove an entry only when it is invalid (bad object, `INVALID_IMAGE`/`NO_BINARY_FOR_GPU`/`INVALID_PTX`/`INVALID_SOURCE`/`UNSUPPORTED_PTX_VERSION`), not on e.g. out of memory |
+| `jit_cache_maintain()` (jit.cpp) | — | PE 0 at startup, in a background thread, one completed pass an hour per cache (`.last-evict`; `.evict-lock` while a pass runs, taken over after 10 min if its server exited first): removes the entries of build/target directories unused for `CNUM_JIT_CACHE_DAYS` (7), `*.tmp` older than an hour and pre-target-directory `*.o`, then the oldest entries (`.o`, `.cubin`) over `CNUM_JIT_CACHE_MAX_FILES` (5000). Runs only on a root marked `.cnum-jit-cache` (written when the root is new or empty, has exactly the cache layout, or with `CNUM_JIT_CACHE_ADOPT=1`; never `/` or `$HOME`; an unmarked root is reported once), enters only build-id/target-tag directories and `cubin/` (removed once unused for the age limit), deletes only cache files (`<sha256>.o`/`.cubin`, their `cacheTmpName` temporaries and `.o.lock` claims, the last two once an hour old) and removes directories only once empty; `CNUM_JIT_CACHE_EVICT=0` skips it. The root is normalized (absolute, no trailing separator); the `/tmp/cnum-jit-<uid>` fallback is made 0700. Cache hits refresh an entry's mtime (`.o` and `.cubin`) at most hourly. Pre-warm load failures remove an entry only when it is invalid (bad object, `INVALID_IMAGE`/`NO_BINARY_FOR_GPU`/`INVALID_PTX`/`INVALID_SOURCE`/`UNSUPPORTED_PTX_VERSION`), not on e.g. out of memory |
 | `cn_mgpu*` (jit.cpp, NVIDIA) | — | Overrides of the MLIR CUDA runtime wrappers: stream/alloc calls use the chare's stream, module load and launch use the current context |
 
 ### `dtypes.hpp` / `dtype_info.hpp` — Element types and dtype dispatch
@@ -211,14 +213,27 @@ Bit-exact NumPy mirror of `src/creation_kernels.hpp` (Philox4x32-10, software lo
 | `CT_COMPUTE_POLICY/CT_COMM_POLICY` | 11-19 | Kokkos execution policies |
 | `dispatch_kernel<N,T>()` | 138 | Dispatch JIT kernel with memref descriptors |
 | `compute_done_cb<N>()` | 42 | (GPU) HAPI callback for compute completion |
-| `deferred_send_cb<N_sender,N_target>()` | 83 | (GPU) HAPI callback for deferred send |
+| `deferred_send_cb<N_sender,N_target>()` | 92 | (GPU) HAPI callback for deferred send: `receive_ipc` (same host), `receive_staged` (other host) or `receive_data` with a `CkDeviceBuffer` (same process, or fallback) |
+| `device_pack_send<N_sender,N_target>()` | 129 | (GPU) Picks the transport by the target's process and host, queues the IPC / pinned copy on the comm stream |
+
+### `gpu_comm.hpp` — GPU messages between processes (NVIDIA)
+| Symbol | Description |
+|--------|-------------|
+| `gpu_ipc_peer()` | IPC only to processes that passed the startup probe (`peer_ok`); everything else is staged |
+| `gpu_ipc_alloc()` / `gpu_ipc_free()` | Send blocks in lazily created 256 MB `cudaMalloc` slabs with CUDA IPC handles (`CNUM_GPU_IPC=0` disables, `CNUM_GPU_IPC_MB` bounds them, default 1024): free blocks of larger classes are split, alignment gaps go to smaller classes, a failed slab allocation is not retried, one warning on the first fallback; `comm_free()` returns arena blocks here |
+| `gpu_ipc_peer_slab()` | Receiver: maps a peer slab once (`cudaIpcOpenMemHandle`) and caches it |
+| `pinned_alloc()` / `pinned_free()` | Pinned host pool by size class for cross-host messages (`CNUM_GPU_STAGE=0` disables, `CNUM_GPU_STAGE_MB` caps the cached blocks, default 512); released from the stream callback after the copy |
+| `gpu_comm_shutdown()` | Before `Kokkos::finalize`: no new IPC sends or mappings, late frees become no-ops; slabs, mappings and pinned blocks are left to process exit (a peer may still be copying) |
+
+### `gpu_comm.cpp` — CUDA IPC probe (`ArrayDAGGroup::ipc_probe_*`)
+Started from `set_proxies`, off the CCS-ready path: rank 0 of each process exports a 4 KB buffer; processes with the same hostname and `/proc/sys/kernel/random/boot_id` map and read each peer's buffer; the working (sender, receiver) pairs are gathered into `peer_ok`. Never aborts; PE 0 prints `gpu ipc: k of n same-host process pairs use CUDA IPC`. `CNUM_GPU_IPC_PROBE_FAIL="src-dst,..."` injects failures (testing).
 
 ### Key C++ source files
 | File | Description |
 |------|-------------|
 | `server.cpp` | Main chare, creates ArrayDAGGroup |
 | `dag_group_runtime.cpp` | ArrayDAGGroup constructor, `compute_decompositions()`, set_proxies, receive_get_request, gather |
-| `dag_group_compile.cpp` | JIT compilation orchestration |
+| `dag_group_compile.cpp` | JIT compilation orchestration (one `jit_compile_batch` per DAG) |
 | `dag_group_receive.cpp` | DAG reception and dispatch |
 | `execute_node.cpp` | `execute_node_nd<N,T>()` — dispatches JIT kernels, handles MATMUL/REDUCE/TILE/DIAG |
 | `execute_node_regions.cpp` | Region extraction from AST |
@@ -234,9 +249,9 @@ Bit-exact NumPy mirror of `src/creation_kernels.hpp` (Philox4x32-10, software lo
 | `executor_incremental.cpp` | Incremental computation |
 | `executor_ast_visitor.cpp` | AST visitor for elementwise node execution |
 | `partition_lifecycle.cpp` | `init()`, `create()`, `run()`, destructor |
-| `partition_comm.cpp` | `receive_data()` inter-chare communication |
+| `partition_comm.cpp` | `receive_data()` inter-chare communication; `receive_ipc()`/`receive_staged()` copy into a device buffer on the comm stream, then deliver as `receive_data()` |
 | `partition_get.cpp` | `process_get()` — gather results to PE 0 |
-| `executor_signal.cpp` | CONVOLVE/FLIP: each result chare receives the input window (halo of the filter size) and the filter, or its mirrored tile, point-to-point; direct sum or per-chare FFT (host mixed radix, cuFFT on NVIDIA) |
+| `executor_signal.cpp` | CONVOLVE/FLIP: each result chare receives the input window (halo of the filter size) and the filter, or its mirrored tile, point-to-point; direct sum or per-chare FFT (host mixed radix, cuFFT on NVIDIA). BATCHED_MATMUL: each result chare receives its (batch, m, all k) / (batch, all k, n) operand boxes (read in place when it holds them already) and runs one strided batched GEMM (cuBLAS `gemmStridedBatched` for float/complex on NVIDIA, Eigen on CPU, a naive Kokkos kernel for ints on NVIDIA and for every dtype on other Kokkos backends) |
 | `executor_shape.cpp` | RESHAPE/BROADCAST (opcodes 140-141): source chares send row runs (reshape) or the projected block (broadcast) to each result chare (`receive_shape`, host-staged); broadcast blocks are expanded on the device |
 | `executor_linalg.cpp` | LINALG: operand blocks gathered to chare 0 of the result partition (`receive_linalg`), factored there (Eigen on CPU, cuSOLVER/cuBLAS on NVIDIA), result tiles scattered back |
 | `executor_indexing.cpp` | GATHER/SCATTER/EXPAND: index chares send request lists to the data chares, which send value lists to the target chares (`receive_index_msg`); EXPAND scans segment counts on one coordinator chare. COMPRESS/MASK_SCATTER: device scan of each x block's mask, row offsets from one coordinator, compacted runs sent in bulk to the result tiles (or pulled from v's chares) |
@@ -257,4 +272,4 @@ Bit-exact NumPy mirror of `src/creation_kernels.hpp` (Philox4x32-10, software lo
 | `test_strided_copy_reduces_tile_and_sets_offset()` | 374 | Stride-2 access regression: tile reduction and absolute offset lifting |
 
 ### `backend.ci` — Charm++ interface (86 lines)
-Module `charmnumeric` (depends on `charmtyles`). Mainchare `Main`. Group `ArrayDAGGroup : DAGGroup` with entries: `set_proxies()`, `proxies_ready()` [reduction], `receive_dag()`, `receive_get_request()`, `gather()`. Arrays `Partition1D/2D/3D` with entries: `run()`, `receive_data()` [nocopy/nocopydevice], `send_complete()`, `comm_done()`, `reduce_result()`, `receive_reduce_partial()`, `receive_linalg()`, `receive_shape()`.
+Module `charmnumeric` (depends on `charmtyles`). Mainchare `Main`. Group `ArrayDAGGroup : DAGGroup` with entries: `set_proxies()`, `proxies_ready()` [reduction], `receive_dag()`, `receive_get_request()`, `gather()`. Arrays `Partition1D/2D/3D` with entries: `run()`, `receive_data()` [nocopy/nocopydevice], `send_complete()`, `receive_ipc()`, `receive_staged()` (GPU), `comm_done()`, `reduce_result()`, `receive_reduce_partial()`, `receive_linalg()`, `receive_shape()`.

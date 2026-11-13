@@ -1,56 +1,9 @@
 #include "backend.hpp"
 #include "jit_api.hpp"
 
-#include <pthread.h>
-
-#if !defined(USE_NVIDIA) && !defined(USE_AMD) && !defined(USE_INTEL)
-namespace {
-// LLVM codegen recursion grows with loop count and can overflow the 8 MB main
-// stack. CPU builds compile on a large-stack helper thread. GPU builds stay on
-// the calling thread, which owns the device context.
-constexpr size_t JIT_COMPILE_STACK_BYTES = size_t(1) << 30;
-
-struct JitCompileJob {
-    void* ast;
-    void* module_handle;
-    void* func_ptr;
-    std::string* error;
-};
-
-void* jit_compile_thread(void* arg) {
-    auto* job = static_cast<JitCompileJob*>(arg);
-    job->func_ptr = jit_compile_ast(job->ast, &job->module_handle, job->error);
-    return nullptr;
-}
-
-void* jit_compile_ast_big_stack(void* ast, void** moduleHandle, std::string* error) {
-    JitCompileJob job{ast, nullptr, nullptr, error};
-    pthread_attr_t attr;
-    pthread_t thread;
-    bool ran = false;
-    if (pthread_attr_init(&attr) == 0) {
-        if (pthread_attr_setstacksize(&attr, JIT_COMPILE_STACK_BYTES) == 0 &&
-            pthread_create(&thread, &attr, jit_compile_thread, &job) == 0) {
-            pthread_join(thread, nullptr);
-            ran = true;
-        }
-        pthread_attr_destroy(&attr);
-    }
-    if (!ran)
-        jit_compile_thread(&job);
-    *moduleHandle = job.module_handle;
-    return job.func_ptr;
-}
-} // namespace
-#endif
-
 void* ArrayDAGGroup::compile_node(DAGNode* node, std::string& error) {
     void* moduleHandle = nullptr;
-#if !defined(USE_NVIDIA) && !defined(USE_AMD) && !defined(USE_INTEL)
-    void* funcPtr = jit_compile_ast_big_stack(node->ast, &moduleHandle, &error);
-#else
     void* funcPtr = jit_compile_ast(node->ast, &moduleHandle, &error);
-#endif
     if (!funcPtr)
         return nullptr;
     module_cache[node->identifier] = moduleHandle;
@@ -68,7 +21,8 @@ static bool is_cross_ndims_set_region(DAGNode* node) {
 }
 
 void ArrayDAGGroup::compile(DAG* dag) {
-    int newly_compiled = 0;
+    std::vector<DAGNode*> todo;
+    std::vector<void*> asts;
     for (auto& [id, node] : dag->nodes) {
         auto it = compile_cache.find(node->identifier);
         if (it == compile_cache.end() && node->fusible) {
@@ -76,17 +30,31 @@ void ArrayDAGGroup::compile(DAG* dag) {
                 compile_cache[node->identifier] = nullptr;
                 continue;
             }
-            newly_compiled++;
-            std::string error;
-            void* compiled_fn = compile_node(node, error);
-            compile_cache[node->identifier] = compiled_fn;
-            if (!error.empty())
-                compile_errors[node->identifier] = error;
+            compile_cache[node->identifier] = nullptr; // compiled below, once per identifier
+            todo.push_back(node);
+            asts.push_back(node->ast);
         }
-        auto err = compile_errors.find(node->identifier);
-        if (err != compile_errors.end() && CkMyPe() == 0 && client_error.empty())
-            client_error = err->second;
     }
+    std::vector<void*> fns(todo.size()), handles(todo.size());
+    std::vector<std::string> errors(todo.size());
+    if (!todo.empty())
+        jit_compile_batch(asts.data(), (int)todo.size(), fns.data(), handles.data(),
+                          errors.data());
+    for (size_t i = 0; i < todo.size(); ++i) {
+        compile_cache[todo[i]->identifier] = fns[i];
+        if (fns[i])
+            module_cache[todo[i]->identifier] = handles[i];
+        if (!errors[i].empty())
+            compile_errors[todo[i]->identifier] = errors[i];
+    }
+    if (CkMyPe() == 0 && client_error.empty() && !compile_errors.empty())
+        for (auto& [id, node] : dag->nodes) {
+            auto err = compile_errors.find(node->identifier);
+            if (err != compile_errors.end()) {
+                client_error = err->second;
+                break;
+            }
+        }
     DBG_PRINT("[PE %d] compile: %d new kernels, %d cached kernels total\n",
-              CkMyPe(), newly_compiled, (int)compile_cache.size());
+              CkMyPe(), (int)todo.size(), (int)compile_cache.size());
 }
