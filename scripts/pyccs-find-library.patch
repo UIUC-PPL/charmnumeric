@@ -1,0 +1,52 @@
+diff --git a/pyccs/server.py b/pyccs/server.py
+index 5b35e92..55ad816 100644
+--- a/pyccs/server.py
++++ b/pyccs/server.py
+@@ -41,17 +41,17 @@ def _find_library() -> str:
+     import sys
+     import platform
+ 
+-    local_dir = os.path.join(sys.prefix, 'lib')
+-    this_system = platform.system().lower()
+-    try:
+-        if this_system == "darwin":
+-            lib_path = os.path.join(local_dir, 'libccs-client.dylib')
+-        else:
+-            lib_path = os.path.join(local_dir, 'libccs-client.so')
+-        assert os.path.exists(lib_path)
+-        return lib_path
+-    except:
+-        raise
++    name = 'libccs-client.dylib' if platform.system().lower() == "darwin" else 'libccs-client.so'
++    candidates = [os.environ.get('PYCCS_LIBRARY', ''),
++                  os.path.join(os.path.dirname(os.path.abspath(__file__)), name),
++                  os.path.join(sys.prefix, 'lib', name)]
++    if os.environ.get('CHARM_HOME'):
++        candidates.append(os.path.join(os.environ['CHARM_HOME'], 'lib_so', name))
++    for lib_path in candidates:
++        if lib_path and os.path.exists(lib_path):
++            return lib_path
++    raise FileNotFoundError(f"{name} not found (looked in: {', '.join(c for c in candidates if c)}); "
++                            "set PYCCS_LIBRARY to its path")
+ 
+ @dataclass
+ class ConnectionInfo:
+diff --git a/setup.py b/setup.py
+index 2d24a01..1623e26 100644
+--- a/setup.py
++++ b/setup.py
+@@ -28,10 +28,14 @@ else:
+         print("ERROR: Library file 'charm_src/charm/lib_so/libccs-client.so' not found!")
+         raise
+ 
++# Also ship the library inside the package, so it is found from any environment.
++copyfile(f'charm_src/charm/lib_so/libccs-client{lib_ext}', f'pyccs/libccs-client{lib_ext}')
++
+ setup(
+     name="PyCCS",
+     version="0.01",
+     packages = ['pyccs'],
++    package_data = {'pyccs': [f'libccs-client{lib_ext}']},
+     install_requires = [""],
+     extras_require={'tests': ['pytest']},
+     author = "Zane Fink",
