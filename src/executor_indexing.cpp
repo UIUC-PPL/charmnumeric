@@ -18,8 +18,8 @@
 // section at the end of this file.
 //
 // EXPAND writes the flat position i of every element of a view count(x[i])
-// times, in order (count = x != 0, or x itself): nonzero and repeat; see the
-// EXPAND section.
+// times, in order (count = x != 0, or x itself): nonzero and repeat; or every
+// element itself r times (repeat by a scalar); see the EXPAND section.
 
 #ifdef USE_KOKKOS
 #define CT_IX_FN KOKKOS_INLINE_FUNCTION
@@ -28,17 +28,6 @@
 #endif
 
 namespace {
-
-enum IxKind : int32_t { IX_VAL = 1, IX_SEG = 2, IX_SEGOFF = 3 };
-
-/// Header of a receive_index_msg payload, followed by count * width int64 words.
-struct IxHdr {
-    int32_t kind;
-    int32_t width;
-    int32_t from[3]; // sender chare index (EXPAND segment lists)
-    int32_t pad;
-    int64_t count;
-};
 
 /// An operand: root array name/rank and the viewed region (array coordinates).
 struct IxView {
@@ -62,7 +51,8 @@ struct IxSpec {
     int64_t sstart[3] = {0, 0, 0}; // per slice dim: root coordinate at s = 0
     int out_name = -1;
     DType dt = DType::FLOAT64; // element type of the moved values
-    int mode = 0;              // EXPAND: 0 counts x != 0, 1 counts x
+    int mode = 0;              // EXPAND: 0 counts x != 0, 1 counts x, 2 repeats x rep times
+    int64_t rep = 1;
     int64_t total = 0;         // EXPAND output length
 };
 
@@ -109,7 +99,7 @@ int64_t scalar_at(ASTNode* root, int i) {
 /// Decode a GATHER/SCATTER/EXPAND root. Operands:
 ///   GATHER  [src, L, npre, npost, ndE, E..., strides..., sdims..., sstarts...]
 ///   SCATTER [dst, L, v, npre, npost, ndE, E..., strides..., sdims..., sstarts...]
-///   EXPAND  [x, mode, total]
+///   EXPAND  [x, mode, total] or [x, 2, total, rep]
 ///   COMPRESS [x, mask, total], MASK_SCATTER [x, mask, v, total]
 /// Only depends on the AST and array metadata (also used by the receive pass).
 IxSpec parse_index(ASTNode* root, const MetaMap& meta) {
@@ -133,6 +123,10 @@ IxSpec parse_index(ASTNode* root, const MetaMap& meta) {
         s.mode = (int)scalar_at(root, 1);
         s.total = scalar_at(root, 2);
         s.dt = DType::INT64;
+        if (s.mode == 2) {
+            s.rep = scalar_at(root, 3);
+            s.dt = root->dtype;
+        }
         s.ndE = 1;
         s.E[0] = s.total;
         return s;
@@ -281,16 +275,6 @@ T from_bits(int64_t b) {
     return v;
 }
 
-// ---- device kernels (functors: nvcc cannot take KOKKOS_LAMBDA in generic lambdas) ----
-
-template <typename T>
-struct IxGatherFn {
-    const T* src;
-    const int64_t* off;
-    T* out;
-    CT_IX_FN void operator()(const int64_t i) const { out[i] = src[off[i]]; }
-};
-
 #ifdef USE_KOKKOS
 template <int N, typename D, typename S>
 void ix_copy(PartitionImpl<N>* p, const D& dst, const S& src) {
@@ -305,49 +289,6 @@ void ix_copy(PartitionImpl<N>* p, const D& dst, const S& src) {
 template <typename T>
 using HostUnmanaged = Kokkos::View<T*, HostSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
 #endif
-
-/// out[i] = data[off[i]] for a tile on the device (or host).
-template <int N, typename T>
-std::vector<T> gather_tile(PartitionImpl<N>* p, CTArrayBase<N>* arr,
-                           const std::vector<int64_t>& off) {
-    int64_t n = (int64_t)off.size();
-    std::vector<T> out(n);
-    if (n == 0)
-        return out;
-    const T* src = static_cast<const T*>(arr->device_data_ptr());
-#ifdef USE_KOKKOS
-    Kokkos::View<int64_t*, DeviceSpace> d_off(
-        Kokkos::view_alloc(Kokkos::WithoutInitializing, "ix_off"), n);
-    Kokkos::View<T*, DeviceSpace> d_out(
-        Kokkos::view_alloc(Kokkos::WithoutInitializing, "ix_vals"), n);
-    ix_copy(p, d_off, HostUnmanaged<const int64_t>(off.data(), n));
-    Kokkos::parallel_for("ct_ix_gather", CT_COMPUTE_POLICY(p, n),
-                         IxGatherFn<T>{src, d_off.data(), d_out.data()});
-    ix_copy(p, HostUnmanaged<T>(out.data(), n), d_out);
-    compute_fence(p);
-#else
-    (void)p;
-    IxGatherFn<T> f{src, off.data(), out.data()};
-    for (int64_t i = 0; i < n; ++i)
-        f(i);
-#endif
-    return out;
-}
-
-std::vector<char> make_msg(int32_t kind, int32_t width, const int from[3],
-                           const std::vector<int64_t>& words) {
-    IxHdr h = {};
-    h.kind = kind;
-    h.width = width;
-    for (int d = 0; d < 3; ++d)
-        h.from[d] = from ? from[d] : 0;
-    h.count = width > 0 ? (int64_t)words.size() / width : 0;
-    std::vector<char> buf(sizeof(h) + words.size() * sizeof(int64_t));
-    memcpy(buf.data(), &h, sizeof(h));
-    if (!words.empty())
-        memcpy(buf.data() + sizeof(h), words.data(), words.size() * sizeof(int64_t));
-    return buf;
-}
 
 void send_msg(ArrayDAGGroup* g, int nd, const int ci[3], int node_id, std::vector<char>& buf) {
     int64_t size = (int64_t)buf.size();
@@ -437,52 +378,18 @@ CTArrayBase<N>* local_array(PartitionImpl<N>* p, int name) {
     return it->second;
 }
 
-/// EXPAND coordinator: order every segment by its flat start, give each one
-/// its exclusive prefix count and send the offsets back to the drivers.
-template <int N>
-void answer_segments(ArrayDAGGroup* g, IndexState<N>& st, const IxCtx& c, int node_id) {
-    struct Seg {
-        int64_t flat, count;
-        int msg;
-        int64_t idx;
-    };
-    std::vector<Seg> segs;
-    std::vector<IxHdr> hdrs(st.segs.size());
-    for (size_t m = 0; m < st.segs.size(); ++m) {
-        memcpy(&hdrs[m], st.segs[m].data(), sizeof(IxHdr));
-        const auto* w = reinterpret_cast<const int64_t*>(st.segs[m].data() + sizeof(IxHdr));
-        for (int64_t i = 0; i < hdrs[m].count; ++i)
-            segs.push_back({w[2 * i], w[2 * i + 1], (int)m, i});
-    }
-    std::sort(segs.begin(), segs.end(), [](const Seg& a, const Seg& b) { return a.flat < b.flat; });
-    std::vector<std::vector<int64_t>> offs(st.segs.size());
-    for (size_t m = 0; m < st.segs.size(); ++m)
-        offs[m].resize(hdrs[m].count);
-    int64_t pos = 0;
-    for (auto& sg : segs) {
-        offs[sg.msg][sg.idx] = pos;
-        pos += sg.count;
-    }
-    if (pos != c.s.total)
-        CkAbort("EXPAND: counts add up to %lld, expected %lld", (long long)pos,
-                (long long)c.s.total);
-    for (size_t m = 0; m < st.segs.size(); ++m) {
-        auto buf = make_msg(IX_SEGOFF, 1, nullptr, offs[m]);
-        send_msg(g, c.s.L.nd, hdrs[m].from, node_id, buf);
-    }
-    st.segs.clear();
-}
-
 } // namespace
 
 // ---- COMPRESS / MASK_SCATTER: x[mask] and x[mask] = v, mask of x's view shape ----
 //
 // The chares holding a block of x ("x chares") scan their mask block on the
-// device and send the per-row counts to the first x chare, which answers with
-// each row's output offset (row-major over the view). COMPRESS then compacts
-// the block and sends the runs in bulk to the result tiles; MASK_SCATTER pulls
+// device and find each block row's output offset (row-major over the view)
+// with a scan of the tile grid (see "Row offsets"). COMPRESS then compacts the
+// block and sends the runs in bulk to the result tiles; MASK_SCATTER pulls
 // each row's run of v from v's chares, then writes the selected elements. A
-// mask laid out differently from x is first moved onto x's blocks.
+// mask laid out differently from x is first moved onto x's blocks: each mask
+// chare packs the box it shares with an x block on the device and sends it as
+// a device message (IX_DEV_INPUT), unpacked into the x chare's device block.
 
 namespace {
 
@@ -502,12 +409,12 @@ void dispatch_elem(DType dt, F&& f) {
     }
 }
 
-enum MxKind : int32_t { MX_MASK = 10, MX_SEG = 11, MX_SEGOFF = 12, MX_DATA = 13, MX_REQ = 14, MX_VAL = 15 };
+enum MxKind : int32_t { MX_MASK = 10, MX_DATA = 13, MX_REQ = 14, MX_VAL = 15 };
 
 /// Header of a mask-op message: `nruns` runs of `width` int64 words, then
 /// `count` elements (inline, or in device buffer `dbuf` of process `src_node`).
 struct MxHdr {
-    int32_t kind; // first, as in IxHdr
+    int32_t kind; // first in every index-op message
     int32_t width;
     int32_t from[3];
     int32_t src_node;
@@ -515,7 +422,13 @@ struct MxHdr {
     int64_t nruns;
     int64_t count;
     int64_t dbuf;
+    int64_t ipc_ptr, ipc_off; // elements in an IPC slab of the sender (same host)
+    int32_t ipc_slab, snd_nd;
+    int32_t snd[3], pad;      // sending chare (returns the IPC block)
+    char ipc_handle[64];
 };
+
+void ix_send_ipc_free(ArrayDAGGroup* g, int nd, const int dest[3], int64_t ptr);
 
 /// Block of a view on one chare, right-aligned to 3 dims: element (i0, i1, i2)
 /// is at base + sum i_k * str[k] in the chare's tile.
@@ -659,6 +572,35 @@ void mx_to_host(PartitionImpl<N>* p, char* dst, const char* src, int64_t bytes) 
 #endif
 }
 
+/// dst[dbase + sum i_k * dstr[k]] = src[sbase + sum i_k * sstr[k]] over a box of n[3] bytes.
+struct MxBoxFn {
+    uint8_t* dst;
+    const uint8_t* src;
+    int64_t dbase, d0, d1, d2, sbase, s0, s1, s2, n1, n2;
+    CT_IX_FN void operator()(const int64_t q) const {
+        int64_t k = q % n2, r = q / n2, j = r % n1, i = r / n1;
+        dst[dbase + i * d0 + j * d1 + k * d2] = src[sbase + i * s0 + j * s1 + k * s2];
+    }
+};
+
+/// Queues f over a box on the compute stream (runs it on the CPU).
+template <int N>
+void mx_box(PartitionImpl<N>* p, const MxBoxFn& f, int64_t n) {
+#ifdef USE_KOKKOS
+    Kokkos::parallel_for("ct_mx_box", CT_COMPUTE_POLICY(p, n), f);
+#else
+    (void)p;
+    int64_t n0 = n / std::max<int64_t>(f.n1 * f.n2, 1);
+    for (int64_t i = 0; i < n0; ++i)
+        for (int64_t j = 0; j < f.n1; ++j) {
+            uint8_t* d = f.dst + f.dbase + i * f.d0 + j * f.d1;
+            const uint8_t* s = f.src + f.sbase + i * f.s0 + j * f.s1;
+            for (int64_t k = 0; k < f.n2; ++k)
+                d[k * f.d2] = s[k * f.s2];
+        }
+#endif
+}
+
 /// Runs f once the kernels queued so far on the compute stream have run (at once on the CPU).
 template <int N>
 void ix_after_compute(PartitionImpl<N>* p, std::function<void()> f) {
@@ -758,16 +700,46 @@ int64_t mx_scan(PartitionImpl<N>* p, const uint8_t* m, const MxBlock& mb, T* x, 
     return total;
 }
 
+/// PE of chare c of the nd-D partition (partitions never migrate: the array map's PE).
+int mx_chare_pe(ArrayDAGGroup* g, int nd, const int c[3]) {
+    if (nd == 1)
+        return g->partition_proxy_1.ckLocalBranch()->procNum(CkArrayIndex1D(c[0]));
+    if (nd == 2)
+        return g->partition_proxy_2.ckLocalBranch()->procNum(CkArrayIndex2D(c[0], c[1]));
+    return g->partition_proxy_3.ckLocalBranch()->procNum(CkArrayIndex3D(c[0], c[1], c[2]));
+}
+
 /// Process currently holding chare c of the nd-D partition.
 int mx_chare_node(ArrayDAGGroup* g, int nd, const int c[3]) {
-    int pe;
-    if (nd == 1)
-        pe = g->partition_proxy_1.ckLocalBranch()->lastKnown(CkArrayIndex1D(c[0]));
-    else if (nd == 2)
-        pe = g->partition_proxy_2.ckLocalBranch()->lastKnown(CkArrayIndex2D(c[0], c[1]));
-    else
-        pe = g->partition_proxy_3.ckLocalBranch()->lastKnown(CkArrayIndex3D(c[0], c[1], c[2]));
-    return CkNodeOf(pe);
+    return CkNodeOf(mx_chare_pe(g, nd, c));
+}
+
+/// A block of a CUDA IPC slab (recorded in h) for `bytes` of elements going to chare dest
+/// when it is another process on this host, else nullptr.
+char* mx_ipc_buf(ArrayDAGGroup* g, int nd, const int dest[3], int64_t bytes, MxHdr& h) {
+#ifdef USE_NVIDIA
+    int pe = mx_chare_pe(g, nd, dest);
+    if (bytes > 0 && CkNodeOf(pe) != CkMyNode() && gpu_ipc_peer(pe)) {
+        int slab;
+        int64_t off;
+        if (void* blk = gpu_ipc_alloc(bytes, slab, off)) {
+            static_assert(sizeof(cudaIpcMemHandle_t) <= sizeof(h.ipc_handle), "IPC handle size");
+            h.ipc_ptr = reinterpret_cast<int64_t>(blk);
+            h.ipc_off = off;
+            h.ipc_slab = slab;
+            cudaIpcMemHandle_t hd = gpu_ipc_handle(slab);
+            memcpy(h.ipc_handle, &hd, sizeof(hd));
+            return static_cast<char*>(blk);
+        }
+    }
+#else
+    (void)g;
+    (void)nd;
+    (void)dest;
+    (void)bytes;
+    (void)h;
+#endif
+    return nullptr;
 }
 
 /// Sends h + runs + `count` elements of `elems` (taken over: a device buffer in
@@ -777,19 +749,27 @@ void mx_send(PartitionImpl<N>* p, ArrayDAGGroup* g, int nd, const int dest[3], i
              MxHdr h, const std::vector<int64_t>& runs, char* elems, int64_t ebytes) {
     h.nruns = h.width > 0 ? (int64_t)runs.size() / h.width : 0;
     h.src_node = CkMyNode();
+    h.snd_nd = N;
+    for (int d = 0; d < 3; ++d)
+        h.snd[d] = d < N ? p->index[d] : 0;
     size_t head = sizeof(h) + runs.size() * sizeof(int64_t);
     int64_t bytes = h.count * ebytes;
     bool inline_data = true;
 #ifdef USE_KOKKOS
     inline_data = elems == nullptr || mx_chare_node(g, nd, dest) != CkMyNode();
 #endif
+    bool ipc = h.ipc_ptr != 0;
+    if (ipc) {
+        inline_data = false;
+        elems = nullptr; // the receiver returns the IPC block
+    }
     std::vector<char> buf(head + (inline_data && elems != nullptr ? bytes : 0));
     if (elems != nullptr && !inline_data)
         h.dbuf = reinterpret_cast<int64_t>(elems);
     memcpy(buf.data(), &h, sizeof(h));
     if (!runs.empty())
         memcpy(buf.data() + sizeof(h), runs.data(), runs.size() * sizeof(int64_t));
-    if (elems == nullptr) {
+    if (elems == nullptr && !ipc) {
         send_msg(g, nd, dest, node_id, buf);
     } else if (inline_data) {
         ix_send_staged(p, g, nd, dest, node_id, std::move(buf), elems, bytes);
@@ -810,6 +790,14 @@ const char* mx_elems(PartitionImpl<N>* p, const std::vector<char>& msg, const Mx
                      int64_t ebytes, char** owned) {
     const char* data = msg.data() + sizeof(h) + h.nruns * h.width * sizeof(int64_t);
     *owned = nullptr;
+#ifdef USE_NVIDIA
+    if (h.ipc_ptr != 0) {
+        char* base = gpu_ipc_peer_slab(h.src_node, h.ipc_slab, h.ipc_handle);
+        if (base == nullptr)
+            CkAbort("mask op: IPC slab of process %d is gone", h.src_node);
+        return base + h.ipc_off;
+    }
+#endif
 #ifdef USE_KOKKOS
     if (h.dbuf != 0) {
         if (h.src_node != CkMyNode())
@@ -827,6 +815,18 @@ const char* mx_elems(PartitionImpl<N>* p, const std::vector<char>& msg, const Mx
     (void)ebytes;
 #endif
     return data;
+}
+
+/// Once the kernels reading a received message's elements have run: return the sender's
+/// IPC block.
+template <int N>
+void mx_release(PartitionImpl<N>* p, ArrayDAGGroup* g, const MxHdr& h) {
+    if (h.ipc_ptr == 0)
+        return;
+    std::array<int, 3> to = {h.snd[0], h.snd[1], h.snd[2]};
+    int nd = h.snd_nd;
+    int64_t ptr = h.ipc_ptr;
+    ix_after_compute(p, [g, nd, to, ptr]() { ix_send_ipc_free(g, nd, to.data(), ptr); });
 }
 
 struct MxCtx {
@@ -866,6 +866,248 @@ MxCtx make_mx_ctx(DAGNode* node, ArrayDAGGroup* g) {
     return c;
 }
 
+// ---- Row offsets (EXPAND / COMPRESS / MASK_SCATTER) ----
+//
+// The output is row-major over the view: a block row's offset counts the
+// selected elements of every row before it, plus those of the same row in x
+// chares to its left. Rows (dims 0, 1 of the view right-aligned to 3 dims) are
+// shared by the x chares of one tile row (t0, t1), and the dim-0 rows by the
+// tile rows of one t0. Up: every x chare sends its row counts to its tile
+// row's first chare (row leader), which sends per-dim-0-row sums to its t0's
+// first chare (group leader), which sends its total to the first x chare
+// (root). Down: the root sends each group its base, a group leader each tile
+// row its dim-0-row bases, a row leader each chare its row offsets.
+
+enum RsKind : int32_t { RS_ROWS = 30, RS_SUMS = 31, RS_TOT = 32, RS_BASE = 33, RS_RBASE = 34, RS_OFFS = 35 };
+
+struct RsHdr {
+    int32_t kind; // first, as in MxHdr
+    int32_t from[3];
+    int64_t count;
+};
+
+using Ci3 = std::array<int, 3>;
+
+struct RsState {
+    int nd = 1;
+    int64_t total = 0, n0 = 1, n1 = 1; // expected sum; this block's rows: n0 x n1
+    Ci3 me{}, leader{}, gleader{}, root{};
+    int members = 0, leaders = 0, gleaders = 0; // inputs of this chare's roles (0: not its role)
+    int pending = 0;                            // roles not yet answered
+    std::map<int, std::pair<Ci3, std::vector<int64_t>>> rows, sums; // by t2 / by t1
+    std::map<int, std::pair<Ci3, int64_t>> tots;                    // by t0
+    std::vector<int64_t> rt, u; // row leader: row totals; group leader: dim-0-row totals
+    bool ready = false, used = false;
+    std::vector<int64_t> offs; // this block's row offsets
+};
+
+Ci3 rs_tile(const Ci3& ci, int nd) {
+    Ci3 t = {0, 0, 0};
+    for (int d = 0; d < nd; ++d)
+        t[3 - nd + d] = ci[d];
+    return t;
+}
+
+/// Scan state of x chare `me` (one of xs, row-major) with an n0 x n1-row block.
+std::shared_ptr<RsState> rs_make(const std::vector<Ci3>& xs, int nd, const int me[3],
+                                 int64_t total, int64_t n0, int64_t n1) {
+    auto r = std::make_shared<RsState>();
+    r->nd = nd;
+    r->total = total;
+    r->n0 = n0;
+    r->n1 = n1;
+    r->me = {me[0], me[1], me[2]};
+    r->root = xs[0];
+    Ci3 mt = rs_tile(r->me, nd), prev{};
+    int members = 0, leaders = 0, gleaders = 0;
+    for (size_t k = 0; k < xs.size(); ++k) {
+        Ci3 t = rs_tile(xs[k], nd);
+        bool new_t0 = k == 0 || t[0] != prev[0];
+        bool new_row = new_t0 || t[1] != prev[1];
+        gleaders += new_t0;
+        if (t[0] == mt[0]) {
+            if (new_t0)
+                r->gleader = xs[k];
+            leaders += new_row;
+            if (t[1] == mt[1]) {
+                if (new_row)
+                    r->leader = xs[k];
+                ++members;
+            }
+        }
+        prev = t;
+    }
+    if (r->leader == r->me) {
+        r->members = members;
+        ++r->pending;
+    }
+    if (r->gleader == r->me) {
+        r->leaders = leaders;
+        ++r->pending;
+    }
+    if (r->root == r->me) {
+        r->gleaders = gleaders;
+        ++r->pending;
+    }
+    return r;
+}
+
+void rs_on(ArrayDAGGroup* g, RsState& r, int node_id, int32_t kind, const Ci3& from,
+           std::vector<int64_t> w);
+
+void rs_send(ArrayDAGGroup* g, RsState& r, int node_id, const Ci3& to, int32_t kind,
+             std::vector<int64_t> w) {
+    if (to == r.me) {
+        rs_on(g, r, node_id, kind, r.me, std::move(w));
+        return;
+    }
+    RsHdr h = {};
+    h.kind = kind;
+    for (int d = 0; d < 3; ++d)
+        h.from[d] = r.me[d];
+    h.count = (int64_t)w.size();
+    std::vector<char> buf(sizeof(h) + w.size() * sizeof(int64_t));
+    memcpy(buf.data(), &h, sizeof(h));
+    if (!w.empty())
+        memcpy(buf.data() + sizeof(h), w.data(), w.size() * sizeof(int64_t));
+    send_msg(g, r.nd, to.data(), node_id, buf);
+}
+
+void rs_on(ArrayDAGGroup* g, RsState& r, int node_id, int32_t kind, const Ci3& from,
+           std::vector<int64_t> w) {
+    Ci3 t = rs_tile(from, r.nd);
+    int64_t nr = r.n0 * r.n1;
+    switch (kind) {
+    case RS_ROWS: {
+        if ((int64_t)w.size() != nr)
+            CkAbort("index op: %lld row counts, expected %lld", (long long)w.size(), (long long)nr);
+        r.rows[t[2]] = {from, std::move(w)};
+        if ((int)r.rows.size() < r.members)
+            return;
+        r.rt.assign(nr, 0);
+        for (auto& e : r.rows)
+            for (int64_t i = 0; i < nr; ++i)
+                r.rt[i] += e.second.second[i];
+        std::vector<int64_t> S(r.n0, 0);
+        for (int64_t i = 0; i < nr; ++i)
+            S[i / r.n1] += r.rt[i];
+        rs_send(g, r, node_id, r.gleader, RS_SUMS, std::move(S));
+        return;
+    }
+    case RS_SUMS: {
+        r.sums[t[1]] = {from, std::move(w)};
+        if ((int)r.sums.size() < r.leaders)
+            return;
+        r.u.assign(r.n0, 0);
+        int64_t tot = 0;
+        for (auto& e : r.sums)
+            for (int64_t a = 0; a < r.n0; ++a) {
+                r.u[a] += e.second.second[a];
+                tot += e.second.second[a];
+            }
+        rs_send(g, r, node_id, r.root, RS_TOT, {tot});
+        return;
+    }
+    case RS_TOT: {
+        r.tots[t[0]] = {from, w[0]};
+        if ((int)r.tots.size() < r.gleaders)
+            return;
+        auto tots = std::move(r.tots);
+        r.tots.clear();
+        --r.pending;
+        int64_t pos = 0;
+        for (auto& e : tots)
+            pos += e.second.second;
+        if (pos != r.total)
+            CkAbort("index op: the counts add up to %lld, expected %lld", (long long)pos,
+                    (long long)r.total);
+        pos = 0;
+        for (auto& e : tots) {
+            rs_send(g, r, node_id, e.second.first, RS_BASE, {pos});
+            pos += e.second.second;
+        }
+        return;
+    }
+    case RS_BASE: {
+        std::vector<int64_t> G(r.n0);
+        int64_t pos = w[0];
+        for (int64_t a = 0; a < r.n0; ++a) {
+            G[a] = pos;
+            pos += r.u[a];
+        }
+        auto sums = std::move(r.sums);
+        r.sums.clear();
+        --r.pending;
+        for (auto& e : sums) {
+            rs_send(g, r, node_id, e.second.first, RS_RBASE, G);
+            for (int64_t a = 0; a < r.n0; ++a)
+                G[a] += e.second.second[a];
+        }
+        return;
+    }
+    case RS_RBASE: {
+        std::vector<int64_t> start(nr);
+        for (int64_t a = 0; a < r.n0; ++a) {
+            int64_t pos = w[a];
+            for (int64_t b = 0; b < r.n1; ++b) {
+                start[a * r.n1 + b] = pos;
+                pos += r.rt[a * r.n1 + b];
+            }
+        }
+        auto rows = std::move(r.rows);
+        r.rows.clear();
+        --r.pending;
+        for (auto& e : rows) {
+            rs_send(g, r, node_id, e.second.first, RS_OFFS, start);
+            for (int64_t i = 0; i < nr; ++i)
+                start[i] += e.second.second[i];
+        }
+        return;
+    }
+    case RS_OFFS:
+        r.offs = std::move(w);
+        r.ready = true;
+        return;
+    default:
+        CkAbort("index op: unexpected scan message kind %d", kind);
+    }
+}
+
+/// Handles a received scan message.
+void rs_recv(ArrayDAGGroup* g, RsState* r, int node_id, const std::vector<char>& m) {
+    if (r == nullptr)
+        CkAbort("index op: scan message for a chare without a block");
+    RsHdr h;
+    memcpy(&h, m.data(), sizeof(h));
+    const auto* w = reinterpret_cast<const int64_t*>(m.data() + sizeof(h));
+    rs_on(g, *r, node_id, h.kind, {h.from[0], h.from[1], h.from[2]},
+          std::vector<int64_t>(w, w + h.count));
+}
+
+bool is_rs_kind(int32_t k) { return k >= RS_ROWS && k <= RS_OFFS; }
+
+/// This block's row offsets once known and not yet taken, else nullptr.
+const int64_t* rs_take(const std::shared_ptr<void>& p) {
+    auto* r = static_cast<RsState*>(p.get());
+    if (r == nullptr || !r->ready || r->used)
+        return nullptr;
+    r->used = true;
+    return r->offs.data();
+}
+
+/// True while this chare still has to answer scan messages.
+bool rs_busy(const std::shared_ptr<void>& p) {
+    auto* r = static_cast<RsState*>(p.get());
+    return r != nullptr && r->pending > 0;
+}
+
+/// Starts the scan with this block's row counts.
+void rs_start(ArrayDAGGroup* g, const std::shared_ptr<void>& p, int node_id,
+              std::vector<int64_t> counts) {
+    auto* r = static_cast<RsState*>(p.get());
+    rs_send(g, *r, node_id, r->leader, RS_ROWS, std::move(counts));
+}
+
 /// Mask chare (unaligned case): send each x chare the part of its block held here.
 template <int N>
 void mx_send_mask(PartitionImpl<N>* p, ArrayDAGGroup* g, const MxCtx& c, int node_id,
@@ -874,59 +1116,116 @@ void mx_send_mask(PartitionImpl<N>* p, ArrayDAGGroup* g, const MxCtx& c, int nod
     int64_t m0[3], mn[3];
     if (!view_block(s.L, c.m_l, me, m0, mn))
         return;
-    CTArrayBase<N>* arr = local_array(p, s.L.name);
-    int64_t tsize[3] = {1, 1, 1};
-    for (int d = 0; d < s.L.nd; ++d)
-        tsize[d] = c.m_l.hi(d, me[d]) - c.m_l.lo(d, me[d]);
+    const auto* src = static_cast<const uint8_t*>(local_array(p, s.L.name)->device_data_ptr());
+    // view element v is at tile offset base + sum v_d * tstr[d]
+    int64_t tstr[3] = {0, 0, 0}, base = 0, ts = 1;
+    for (int d = s.L.nd - 1; d >= 0; --d) {
+        int64_t lo = c.m_l.lo(d, me[d]);
+        tstr[d] = s.L.step[d] * ts;
+        base += (s.L.start[d] - lo) * ts;
+        ts *= c.m_l.hi(d, me[d]) - lo;
+    }
+    struct Part {
+        const std::array<int, 3>* to;
+        int region[9];
+        int64_t count;
+        char* buf;
+    };
+    std::vector<Part> parts;
+#ifdef USE_NVIDIA
+    p->compute_after_others();
+#endif
     for (const auto& xc : c.xs) {
-        int64_t x0[3], xn[3];
+        int64_t x0[3], xn[3], b0[3], bn[3], count = 1;
         view_block(s.data, c.x_l, xc.data(), x0, xn);
+        for (int d = 0; d < 3; ++d) {
+            b0[d] = std::max(m0[d], x0[d]);
+            bn[d] = std::max<int64_t>(0, std::min(m0[d] + mn[d], x0[d] + xn[d]) - b0[d]);
+            count *= bn[d];
+        }
+        if (count == 0)
+            continue;
+        Part pt{&xc, {}, count, nullptr};
+        for (int d = 0; d < 3; ++d) {
+            pt.region[3 * d] = (int)b0[d];
+            pt.region[3 * d + 1] = (int)(b0[d] + bn[d]);
+            pt.region[3 * d + 2] = 1;
+        }
+#ifdef USE_KOKKOS
+        pt.buf = static_cast<char*>(comm_alloc(count));
+        auto* dst = reinterpret_cast<uint8_t*>(pt.buf);
+#else
         MxHdr h = {};
         h.kind = MX_MASK;
-        h.count = 1;
+        h.count = count;
         for (int d = 0; d < 3; ++d) {
-            h.start[d] = std::max(m0[d], x0[d]);
-            h.stop[d] = std::min(m0[d] + mn[d], x0[d] + xn[d]);
-            h.count *= std::max<int64_t>(0, h.stop[d] - h.start[d]);
+            h.start[d] = b0[d];
+            h.stop[d] = b0[d] + bn[d];
         }
-        if (h.count == 0)
-            continue;
-        // tile offsets of the box (row-major)
-        std::vector<int64_t> offs;
-        offs.reserve(h.count);
-        for (int64_t i = h.start[0]; i < h.stop[0]; ++i)
-            for (int64_t j = h.start[1]; j < h.stop[1]; ++j)
-                for (int64_t k = h.start[2]; k < h.stop[2]; ++k) {
-                    int64_t v[3] = {i, j, k}, o = 0;
-                    for (int d = 0; d < s.L.nd; ++d)
-                        o = o * tsize[d] + s.L.start[d] + v[d] * s.L.step[d] - c.m_l.lo(d, me[d]);
-                    offs.push_back(o);
-                }
-        std::vector<uint8_t> vals = gather_tile<N, uint8_t>(p, arr, offs);
-        std::vector<char> buf(sizeof(h) + vals.size());
-        memcpy(buf.data(), &h, sizeof(h));
-        memcpy(buf.data() + sizeof(h), vals.data(), vals.size());
-        send_msg(g, s.data.nd, xc.data(), node_id, buf);
+        std::vector<char> msg(sizeof(h) + count);
+        memcpy(msg.data(), &h, sizeof(h));
+        auto* dst = reinterpret_cast<uint8_t*>(msg.data() + sizeof(h));
+#endif
+        int64_t sb = base;
+        for (int d = 0; d < 3; ++d)
+            sb += b0[d] * tstr[d];
+        mx_box(p, MxBoxFn{dst, src, 0, bn[1] * bn[2], bn[2], 1, sb, tstr[0], tstr[1], tstr[2], bn[1], bn[2]},
+               count);
+#ifdef USE_KOKKOS
+        parts.push_back(pt);
+#else
+        send_msg(g, s.data.nd, xc.data(), node_id, msg);
+#endif
     }
+#ifdef USE_KOKKOS
+    if (parts.empty())
+        return;
+    comm_after_compute(p); // the sends below leave from the comm stream
+    for (auto& pt : parts) {
+        const auto& t = *pt.to;
+        if (s.data.nd == 1)
+            device_pack_send<N, 1>(p, g->partition_proxy_1, ChareIndex<1>{{t[0]}}, node_id,
+                                   IX_DEV_INPUT, 0, pt.region, pt.count, pt.buf);
+        else if (s.data.nd == 2)
+            device_pack_send<N, 2>(p, g->partition_proxy_2, ChareIndex<2>{{t[0], t[1]}}, node_id,
+                                   IX_DEV_INPUT, 0, pt.region, pt.count, pt.buf);
+        else
+            device_pack_send<N, 3>(p, g->partition_proxy_3, ChareIndex<3>{{t[0], t[1], t[2]}},
+                                   node_id, IX_DEV_INPUT, 0, pt.region, pt.count, pt.buf);
+    }
+#else
+    (void)parts;
+#endif
 }
 
-/// x chare: place a received part of the mask block.
+/// x chare: place a received part of the mask block (a device buffer in GPU builds).
 template <int N>
-void mx_place_mask(IndexState<N>& st, const MxCtx& c, const int me[3], const std::vector<char>& msg) {
+void mx_place_mask(PartitionImpl<N>* p, IndexState<N>& st, const MxCtx& c, const int me[3],
+                   const std::vector<char>& msg) {
     MxHdr h;
     memcpy(&h, msg.data(), sizeof(h));
-    int64_t x0[3], xn[3];
+    int64_t x0[3], xn[3], bn[3], db = 0;
     view_block(c.s.data, c.x_l, me, x0, xn);
-    const uint8_t* src = reinterpret_cast<const uint8_t*>(msg.data() + sizeof(h));
-    for (int64_t i = h.start[0]; i < h.stop[0]; ++i)
-        for (int64_t j = h.start[1]; j < h.stop[1]; ++j)
-            for (int64_t k = h.start[2]; k < h.stop[2]; ++k)
-                st.mblock[((i - x0[0]) * xn[1] + (j - x0[1])) * xn[2] + (k - x0[2])] = *src++;
+    for (int d = 0; d < 3; ++d)
+        bn[d] = h.stop[d] - h.start[d];
+    db = ((h.start[0] - x0[0]) * xn[1] + (h.start[1] - x0[1])) * xn[2] + (h.start[2] - x0[2]);
+#ifdef USE_KOKKOS
+    auto* dst = reinterpret_cast<uint8_t*>(st.dmblock);
+    auto* src = reinterpret_cast<const uint8_t*>(h.dbuf);
+#else
+    uint8_t* dst = st.mblock.data();
+    auto* src = reinterpret_cast<const uint8_t*>(msg.data() + sizeof(h));
+#endif
+    mx_box(p, MxBoxFn{dst, src, db, xn[1] * xn[2], xn[2], 1, 0, bn[1] * bn[2], bn[2], 1, bn[1], bn[2]},
+           h.count);
+#ifdef USE_KOKKOS
+    free_after_compute(p, reinterpret_cast<char*>(h.dbuf));
+#endif
     st.m_covered += h.count;
 }
 
 /// x chare: count the selected elements of every block row (COMPRESS: also
-/// compact them into st.cbuf) and send the row counts to the coordinator.
+/// compact them into st.cbuf) and start the row offset scan.
 template <int N, typename T>
 void mx_scan_block(PartitionImpl<N>* p, ArrayDAGGroup* g, IndexState<N>& st, const MxCtx& c,
                    int node_id, const int me[3]) {
@@ -941,11 +1240,15 @@ void mx_scan_block(PartitionImpl<N>* p, ArrayDAGGroup* g, IndexState<N>& st, con
     } else {
         mb = xb;
         mb.contiguous();
-        mtmp = mx_alloc(xb.size());
-        mx_to_device(p, mtmp, reinterpret_cast<const char*>(st.mblock.data()), xb.size());
-        if (s.opc == Opcode::COMPRESS)
-            std::vector<uint8_t>().swap(st.mblock);
-        m = reinterpret_cast<const uint8_t*>(mtmp);
+#ifdef USE_KOKKOS
+        m = reinterpret_cast<const uint8_t*>(st.dmblock);
+        if (s.opc == Opcode::COMPRESS) {
+            mtmp = st.dmblock;
+            st.dmblock = nullptr;
+        }
+#else
+        m = st.mblock.data();
+#endif
     }
     T* x = static_cast<T*>(local_array(p, s.data.name)->device_data_ptr());
     int64_t nrows = xb.rows();
@@ -964,66 +1267,20 @@ void mx_scan_block(PartitionImpl<N>* p, ArrayDAGGroup* g, IndexState<N>& st, con
     mx_to_host(p, reinterpret_cast<char*>(st.rowpos.data()), drow, nrows * sizeof(int64_t));
 #endif
     free_buffer(p, drow);
+#ifdef USE_KOKKOS
     if (mtmp)
-        free_buffer(p, mtmp);
+        free_after_compute(p, mtmp);
+#else
+    (void)mtmp;
+    if (s.opc == Opcode::COMPRESS)
+        std::vector<uint8_t>().swap(st.mblock);
+#endif
     st.rowpos[nrows] = total;
     st.mx_scanned = true;
-
-    // (view flat index, count) per row
-    int sh = 3 - s.data.nd;
-    int64_t vs[3] = {1, 1, 1};
-    for (int d = 0; d < s.data.nd; ++d)
-        vs[d + sh] = s.data.shape[d];
-    std::vector<int64_t> words(2 * nrows);
-    for (int64_t r = 0; r < nrows; ++r) {
-        int64_t i0 = r / xb.cnt[1], i1 = r % xb.cnt[1];
-        words[2 * r] = ((xb.k0[0] + i0) * vs[1] + xb.k0[1] + i1) * vs[2] + xb.k0[2];
-        words[2 * r + 1] = st.rowpos[r + 1] - st.rowpos[r];
-    }
-    MxHdr h = {};
-    h.kind = MX_SEG;
-    h.width = 2;
-    for (int d = 0; d < 3; ++d)
-        h.from[d] = me[d];
-    mx_send(p, g, s.data.nd, c.xs[0].data(), node_id, h, words, nullptr, 0);
-}
-
-/// Coordinator: every row's output offset, in view row-major order.
-template <int N>
-void mx_answer(PartitionImpl<N>* p, ArrayDAGGroup* g, IndexState<N>& st, const MxCtx& c,
-               int node_id) {
-    struct Seg {
-        int64_t flat, count;
-        int msg;
-        int64_t idx;
-    };
-    std::vector<Seg> segs;
-    std::vector<MxHdr> hdrs(st.segs.size());
-    for (size_t k = 0; k < st.segs.size(); ++k) {
-        memcpy(&hdrs[k], st.segs[k].data(), sizeof(MxHdr));
-        const auto* w = reinterpret_cast<const int64_t*>(st.segs[k].data() + sizeof(MxHdr));
-        for (int64_t i = 0; i < hdrs[k].nruns; ++i)
-            segs.push_back({w[2 * i], w[2 * i + 1], (int)k, i});
-    }
-    std::sort(segs.begin(), segs.end(), [](const Seg& a, const Seg& b) { return a.flat < b.flat; });
-    std::vector<std::vector<int64_t>> offs(st.segs.size());
-    for (size_t k = 0; k < st.segs.size(); ++k)
-        offs[k].resize(hdrs[k].nruns);
-    int64_t pos = 0;
-    for (auto& sg : segs) {
-        offs[sg.msg][sg.idx] = pos;
-        pos += sg.count;
-    }
-    if (pos != c.s.total)
-        CkAbort("mask op: the mask selects %lld elements, expected %lld", (long long)pos,
-                (long long)c.s.total);
-    for (size_t k = 0; k < st.segs.size(); ++k) {
-        MxHdr h = {};
-        h.kind = MX_SEGOFF;
-        h.width = 1;
-        mx_send(p, g, c.s.data.nd, hdrs[k].from, node_id, h, offs[k], nullptr, 0);
-    }
-    st.segs.clear();
+    std::vector<int64_t> counts(nrows);
+    for (int64_t r = 0; r < nrows; ++r)
+        counts[r] = st.rowpos[r + 1] - st.rowpos[r];
+    rs_start(g, st.rs, node_id, std::move(counts));
 }
 
 /// COMPRESS x chare: send the compacted rows to the result tiles.
@@ -1056,29 +1313,35 @@ void mx_route(PartitionImpl<N>* p, ArrayDAGGroup* g, IndexState<N>& st, const Mx
         }
     }
     T* buf = reinterpret_cast<T*>(st.cbuf);
-    std::vector<std::pair<int, char*>> bufs;
+    std::vector<std::pair<MxHdr, char*>> bufs;
     bool whole = plans.size() == 1 && plans.begin()->second.gather.len.size() == 1 &&
                  plans.begin()->second.gather.ib[0] == 0;
-    for (auto& [ch, pl] : plans) {
-        if (whole) {
-            bufs.emplace_back(ch, st.cbuf);
-            break;
-        }
-        char* d = mx_alloc(pl.gather.total * sizeof(T));
-        mx_copy_runs<N, T>(p, reinterpret_cast<T*>(d), buf, 1, pl.gather);
-        bufs.emplace_back(ch, d);
-    }
-    if (!whole)
-        free_buffer(p, st.cbuf);
-    st.cbuf = nullptr;
-    size_t k = 0;
+    bool gave = false; // st.cbuf itself is sent
     for (auto& [ch, pl] : plans) {
         MxHdr h = {};
         h.kind = MX_DATA;
         h.width = 2;
         h.count = pl.gather.total;
         int dest[3] = {ch, 0, 0};
-        mx_send(p, g, 1, dest, node_id, h, pl.runs, bufs[k++].second, sizeof(T));
+        char* d = mx_ipc_buf(g, 1, dest, pl.gather.total * (int64_t)sizeof(T), h);
+        if (d == nullptr && whole) {
+            d = st.cbuf;
+            gave = true;
+        } else {
+            if (d == nullptr)
+                d = mx_alloc(pl.gather.total * sizeof(T));
+            mx_copy_runs<N, T>(p, reinterpret_cast<T*>(d), buf, 1, pl.gather);
+        }
+        bufs.emplace_back(h, d);
+    }
+    if (!gave)
+        free_buffer(p, st.cbuf);
+    st.cbuf = nullptr;
+    size_t k = 0;
+    for (auto& [ch, pl] : plans) {
+        int dest[3] = {ch, 0, 0};
+        mx_send(p, g, 1, dest, node_id, bufs[k].first, pl.runs, bufs[k].second, sizeof(T));
+        ++k;
     }
 }
 
@@ -1136,14 +1399,19 @@ void mx_serve(PartitionImpl<N>* p, ArrayDAGGroup* g, IndexState<N>& st, const Mx
             runs.add(runs.total, v.start[0] + w[3 * k] * v.step[0] - lo, w[3 * k + 1], v.step[0]);
             back.insert(back.end(), {w[3 * k + 2], w[3 * k + 1]});
         }
-        char* d = runs.total ? mx_alloc(runs.total * sizeof(T)) : nullptr;
-        if (d)
-            mx_copy_runs<N, T>(p, reinterpret_cast<T*>(d), src, v.step[0], runs);
         MxHdr h = {};
         h.kind = MX_VAL;
         h.width = 2;
         h.count = runs.total;
         memcpy(h.from, rq.from, sizeof(h.from));
+        char* d = nullptr;
+        if (runs.total) {
+            d = mx_ipc_buf(g, c.s.data.nd, rq.from, runs.total * (int64_t)sizeof(T), h);
+            if (d == nullptr)
+                d = mx_alloc(runs.total * sizeof(T));
+        }
+        if (d)
+            mx_copy_runs<N, T>(p, reinterpret_cast<T*>(d), src, v.step[0], runs);
         replies.emplace_back(h, std::move(back));
         bufs.push_back(d);
     }
@@ -1155,7 +1423,8 @@ void mx_serve(PartitionImpl<N>* p, ArrayDAGGroup* g, IndexState<N>& st, const Mx
 
 /// MASK_SCATTER x chare: place one reply's values into st.cbuf.
 template <int N, typename T>
-void mx_take_values(PartitionImpl<N>* p, IndexState<N>& st, const std::vector<char>& msg) {
+void mx_take_values(PartitionImpl<N>* p, ArrayDAGGroup* g, IndexState<N>& st,
+                    const std::vector<char>& msg) {
     MxHdr h;
     memcpy(&h, msg.data(), sizeof(h));
     if (h.count == 0)
@@ -1172,6 +1441,7 @@ void mx_take_values(PartitionImpl<N>* p, IndexState<N>& st, const std::vector<ch
     mx_copy_runs<N, T>(p, reinterpret_cast<T*>(st.cbuf), data, 1, runs);
     if (owned)
         free_buffer(p, owned);
+    mx_release(p, g, h);
 }
 
 /// MASK_SCATTER x chare: write the gathered values into the selected elements.
@@ -1188,21 +1458,27 @@ void mx_write(PartitionImpl<N>* p, IndexState<N>& st, const MxCtx& c, const int 
     } else {
         mb = xb;
         mb.contiguous();
-        mtmp = mx_alloc(xb.size());
-        mx_to_device(p, mtmp, reinterpret_cast<const char*>(st.mblock.data()), xb.size());
+#ifdef USE_KOKKOS
+        mtmp = st.dmblock;
+        st.dmblock = nullptr;
         m = reinterpret_cast<const uint8_t*>(mtmp);
+#else
+        m = st.mblock.data();
+#endif
     }
     T* x = static_cast<T*>(local_array(p, s.data.name)->device_data_ptr());
     mx_scan<N, T, 2>(p, m, mb, x, xb, reinterpret_cast<T*>(st.cbuf), nullptr);
+#ifdef USE_KOKKOS
     if (mtmp)
-        free_buffer(p, mtmp);
+        free_after_compute(p, mtmp);
+#endif
     free_buffer(p, st.cbuf);
     st.cbuf = nullptr;
 }
 
 /// COMPRESS result chare: place one message's runs into the result tile.
 template <int N, typename T>
-void mx_place_data(PartitionImpl<N>* p, IndexState<N>& st, const MxCtx& c,
+void mx_place_data(PartitionImpl<N>* p, ArrayDAGGroup* g, IndexState<N>& st, const MxCtx& c,
                    const std::vector<char>& msg) {
     MxHdr h;
     memcpy(&h, msg.data(), sizeof(h));
@@ -1219,6 +1495,7 @@ void mx_place_data(PartitionImpl<N>* p, IndexState<N>& st, const MxCtx& c,
     mx_copy_runs<N, T>(p, out, data, 1, runs);
     if (owned)
         free_buffer(p, owned);
+    mx_release(p, g, h);
     st.out_covered += h.count;
 }
 
@@ -1249,14 +1526,17 @@ void ArrayDAGExecutorND<N>::execute_mask_node(DAGNode* node) {
     if (s.opc == Opcode::MASK_SCATTER && N == s.V.nd &&
         std::find(c.vs.begin(), c.vs.end(), mine) != c.vs.end())
         st.req_left = (int)c.xs.size();
-    if (N == s.data.nd && !c.xs.empty() && c.xs[0] == mine)
-        st.seg_left = (int)c.xs.size();
     MxBlock xb;
     if (N == s.data.nd && mx_block(s.data, c.x_l, me, xb)) {
         st.mx_pending = true;
+        st.rs = rs_make(c.xs, s.data.nd, me, s.total, xb.cnt[0], xb.cnt[1]);
         if (!c.aligned) {
             st.m_expected = xb.size();
+#ifdef USE_KOKKOS
+            st.dmblock = static_cast<char*>(comm_alloc(xb.size()));
+#else
             st.mblock.assign(xb.size(), 0);
+#endif
         }
     }
     if (!c.aligned && N == s.L.nd)
@@ -1275,33 +1555,19 @@ void ArrayDAGExecutorND<N>::mask_progress(int node_id) {
     std::vector<std::vector<char>> msgs;
     msgs.swap(st.stash);
     for (auto& m : msgs) {
-        MxHdr h;
-        memcpy(&h, m.data(), sizeof(h));
-        switch (h.kind) {
-        case MX_MASK:
-            mx_place_mask(st, c, me, m);
-            break;
-        case MX_SEG:
-            st.segs.push_back(std::move(m));
-            if (--st.seg_left == 0)
-                mx_answer(partition, g, st, c, node_id);
-            break;
-        case MX_SEGOFF: {
-            const auto* offs = reinterpret_cast<const int64_t*>(m.data() + sizeof(h));
-            dispatch_elem(c.s.dt, [&](auto tag) {
-                using T = decltype(tag);
-                if (c.s.opc == Opcode::COMPRESS) {
-                    mx_route<N, T>(partition, g, st, c, node_id, offs);
-                    st.mx_pending = false;
-                } else {
-                    mx_request<N, T>(partition, g, st, c, node_id, me, offs);
-                }
-            });
-            break;
+        int32_t kind;
+        memcpy(&kind, m.data(), sizeof(kind));
+        if (is_rs_kind(kind)) {
+            rs_recv(g, static_cast<RsState*>(st.rs.get()), node_id, m);
+            continue;
         }
+        switch (kind) {
+        case MX_MASK:
+            mx_place_mask(partition, st, c, me, m);
+            break;
         case MX_DATA:
             dispatch_elem(c.s.dt, [&](auto tag) {
-                mx_place_data<N, decltype(tag)>(partition, st, c, m);
+                mx_place_data<N, decltype(tag)>(partition, g, st, c, m);
             });
             break;
         case MX_REQ:
@@ -1314,7 +1580,7 @@ void ArrayDAGExecutorND<N>::mask_progress(int node_id) {
         case MX_VAL:
             dispatch_elem(c.s.dt, [&](auto tag) {
                 using T = decltype(tag);
-                mx_take_values<N, T>(partition, st, m);
+                mx_take_values<N, T>(partition, g, st, m);
                 if (--st.val_left == 0) {
                     mx_write<N, T>(partition, st, c, me);
                     st.mx_pending = false;
@@ -1322,14 +1588,24 @@ void ArrayDAGExecutorND<N>::mask_progress(int node_id) {
             });
             break;
         default:
-            CkAbort("mask op: unexpected message kind %d", h.kind);
+            CkAbort("mask op: unexpected message kind %d", kind);
         }
     }
     if (st.mx_pending && !st.mx_scanned && st.m_covered == st.m_expected)
         dispatch_elem(c.s.dt, [&](auto tag) {
             mx_scan_block<N, decltype(tag)>(partition, g, st, c, node_id, me);
         });
-    if (!st.mx_pending && st.seg_left == 0 && st.req_left == 0 && st.val_left == 0 &&
+    if (const int64_t* offs = rs_take(st.rs))
+        dispatch_elem(c.s.dt, [&](auto tag) {
+            using T = decltype(tag);
+            if (c.s.opc == Opcode::COMPRESS) {
+                mx_route<N, T>(partition, g, st, c, node_id, offs);
+                st.mx_pending = false;
+            } else {
+                mx_request<N, T>(partition, g, st, c, node_id, me, offs);
+            }
+        });
+    if (!st.mx_pending && !rs_busy(st.rs) && st.req_left == 0 && st.val_left == 0 &&
         st.out_covered == st.out_expected) {
         ix_state.erase(node_id);
 #ifdef USE_NVIDIA
@@ -1366,9 +1642,9 @@ void ArrayDAGExecutorND<N>::mask_progress(int node_id) {
 
 namespace {
 
-// Message kinds of one index node share receive_index_msg: IxKind 1-3 (EXPAND),
-// MxKind 10-15 (COMPRESS / MASK_SCATTER), GxKind 20-29; GX_FREE is handled
-// before any node state.
+// Message kinds of one index node share receive_index_msg: MxKind 10-15
+// (COMPRESS / MASK_SCATTER, EXPAND data), GxKind 20-29, RsKind 30-35 (row
+// offset scan); GX_FREE is handled before any node state.
 enum GxKind : int32_t {
     GX_LPIECE = 20,
     GX_BUCKET = 21,
@@ -1379,7 +1655,7 @@ enum GxKind : int32_t {
 };
 
 struct GxHdr {
-    int32_t kind; // first, as in IxHdr
+    int32_t kind; // first, as in MxHdr
     int32_t src_node;
     int32_t from[3];
     int32_t owned;  // the receiver frees dbuf
@@ -1397,6 +1673,15 @@ struct GxHdr {
     char ipc_handle[64];
     int64_t units; // share of the receiver's expected total carried by this part
 };
+
+void ix_send_ipc_free(ArrayDAGGroup* g, int nd, const int dest[3], int64_t ptr) {
+    GxHdr f = {};
+    f.kind = GX_FREE;
+    f.ipc_ptr = ptr;
+    std::vector<char> buf(sizeof(f));
+    memcpy(buf.data(), &f, sizeof(f));
+    send_msg(g, nd, dest, 0, buf);
+}
 
 /// Requests and scatter buckets each count kGxUnits, split among their parts.
 constexpr int64_t kGxUnits = int64_t(1) << 30;
@@ -2905,10 +3190,11 @@ void ArrayDAGExecutorND<N>::gx_progress(int node_id) {
 //
 // Each chare holding a block of x scans it on the device: the count of every
 // element (x != 0, or max(x, 0)), every block row's exclusive prefix and the
-// flat positions, each repeated count times. The row counts go to the first x
-// chare, which answers with every row's output offset (row-major over the
-// view); the positions then move in runs to the result tiles, as for COMPRESS.
-// Limit: a block's positions are one device buffer (its whole output count).
+// flat positions, each repeated count times. The row offsets (row-major over
+// the view) come from the scan of the tile grid, as for COMPRESS; the
+// positions then move in runs to the result tiles. Mode 2 repeats every
+// element itself rep times: row offsets are flat positions times rep.
+// Limit: a block's output is one device buffer.
 
 namespace {
 
@@ -2986,7 +3272,14 @@ int64_t ex_scan(PartitionImpl<N>* p, ExScanFn<T, COUNT, false> f, int64_t n, cha
     return total;
 }
 
-/// x chare: positions of the block into st.cbuf, row counts to the coordinator.
+MxCtx ex_mx_ctx(const IxCtx& c) {
+    MxCtx m;
+    m.s = c.s;
+    m.out_l = c.out_l;
+    return m;
+}
+
+/// x chare: positions of the block into st.cbuf, then the row offset scan.
 template <int N, typename T>
 void ex_scan_block(PartitionImpl<N>* p, ArrayDAGGroup* g, IndexState<N>& st, const IxCtx& c,
                    int node_id, const int me[3]) {
@@ -3022,21 +3315,50 @@ void ex_scan_block(PartitionImpl<N>* p, ArrayDAGGroup* g, IndexState<N>& st, con
 #endif
     free_buffer(p, drow);
     st.rowpos[nrows] = total;
-    std::vector<int64_t> words(2 * nrows);
-    for (int64_t r = 0; r < nrows; ++r) {
-        int64_t i0 = r / xb.cnt[1], i1 = r % xb.cnt[1];
-        words[2 * r] = f0 + i0 * vs[1] * vs[2] + i1 * vs[2];
-        words[2 * r + 1] = st.rowpos[r + 1] - st.rowpos[r];
-    }
-    auto buf = make_msg(IX_SEG, 2, me, words);
-    send_msg(g, s.L.nd, c.drivers[0].data(), node_id, buf);
+    std::vector<int64_t> counts(nrows);
+    for (int64_t r = 0; r < nrows; ++r)
+        counts[r] = st.rowpos[r + 1] - st.rowpos[r];
+    rs_start(g, st.rs, node_id, std::move(counts));
 }
 
-MxCtx ex_mx_ctx(const IxCtx& c) {
-    MxCtx m;
-    m.s = c.s;
-    m.out_l = c.out_l;
-    return m;
+/// out[j] = x[element j / rep of the block] (the block's elements in row-major order).
+template <typename T>
+struct ExRepFn {
+    const T* x;
+    int64_t xbase, xs0, xs1, xs2, c1, c2, rep;
+    T* out;
+    CT_IX_FN void operator()(const int64_t j) const {
+        int64_t e = j / rep, i2 = e % c2, r = e / c2;
+        out[j] = x[xbase + (r / c1) * xs0 + (r % c1) * xs1 + i2 * xs2];
+    }
+};
+
+/// Mode 2 x chare: the block's elements, each repeated, to the result tiles.
+template <int N, typename T>
+void ex_repeat_block(PartitionImpl<N>* p, ArrayDAGGroup* g, IndexState<N>& st, const IxCtx& c,
+                     int node_id, const int me[3]) {
+    const IxSpec& s = c.s;
+    MxBlock xb;
+    mx_block(s.L, c.L_l, me, xb);
+    int sh = 3 - s.L.nd;
+    int64_t vs[3] = {1, 1, 1};
+    for (int d = 0; d < s.L.nd; ++d)
+        vs[d + sh] = s.L.shape[d];
+    int64_t nrows = xb.rows(), rlen = xb.cnt[2] * s.rep, n = xb.size() * s.rep;
+    const T* x = static_cast<const T*>(local_array(p, s.L.name)->device_data_ptr());
+    st.cbuf = mx_alloc(n * sizeof(T));
+    gx_for(p, n,
+           ExRepFn<T>{x, xb.base, xb.str[0], xb.str[1], xb.str[2], xb.cnt[1], xb.cnt[2], s.rep,
+                      reinterpret_cast<T*>(st.cbuf)});
+    st.rowpos.resize(nrows + 1);
+    std::vector<int64_t> offs(nrows);
+    for (int64_t r = 0; r <= nrows; ++r)
+        st.rowpos[r] = r * rlen;
+    for (int64_t r = 0; r < nrows; ++r) {
+        int64_t i0 = r / xb.cnt[1], i1 = r % xb.cnt[1];
+        offs[r] = (((xb.k0[0] + i0) * vs[1] + xb.k0[1] + i1) * vs[2] + xb.k0[2]) * s.rep;
+    }
+    mx_route<N, T>(p, g, st, ex_mx_ctx(c), node_id, offs.data());
 }
 
 } // namespace
@@ -3075,15 +3397,19 @@ void ArrayDAGExecutorND<N>::execute_index_node(DAGNode* node) {
         partition->ensure_array(ArrayRegion<N>(zeros, sizes, ones), gs, s.out_name, s.dt, decomp);
         st.out_expected = c.out_l.hi(0, me[0]) - c.out_l.lo(0, me[0]);
     }
-    if (N == s.L.nd && !c.drivers.empty() && c.drivers[0] == std::array<int, 3>{me[0], me[1], me[2]})
-        st.seg_left = (int)c.drivers.size();
-    int64_t k0[3], cnt[3];
-    if (N == s.L.nd && view_block(s.L, c.L_l, me, k0, cnt)) {
-        st.wait_offsets = true;
-        cn_dispatch(s.L.name >= 0 ? local_array(partition, s.L.name)->dtype : DType::INT64,
-                    [&](auto tag) {
-                        ex_scan_block<N, decltype(tag)>(partition, g, st, c, node->id, me);
-                    });
+    MxBlock xb;
+    if (N == s.L.nd && mx_block(s.L, c.L_l, me, xb)) {
+        if (s.mode == 2) {
+            dispatch_elem(s.dt, [&](auto tag) {
+                ex_repeat_block<N, decltype(tag)>(partition, g, st, c, node->id, me);
+            });
+        } else {
+            st.wait_offsets = true;
+            st.rs = rs_make(c.drivers, s.L.nd, me, s.total, xb.cnt[0], xb.cnt[1]);
+            cn_dispatch(local_array(partition, s.L.name)->dtype, [&](auto tag) {
+                ex_scan_block<N, decltype(tag)>(partition, g, st, c, node->id, me);
+            });
+        }
     }
     index_progress(node->id);
 }
@@ -3101,6 +3427,25 @@ void ArrayDAGExecutorND<N>::on_index_msg(int node_id, char* data, int64_t size) 
         return;
     }
     ix_state[node_id].stash.emplace_back(data, data + size);
+    index_progress(node_id);
+}
+
+/// A moved mask part (mx_send_mask), kept as an MX_MASK message holding the device buffer.
+template <int N>
+void ArrayDAGExecutorND<N>::on_index_device(int node_id, const int* region, char* buf,
+                                            int64_t size) {
+    MxHdr h = {};
+    h.kind = MX_MASK;
+    h.src_node = CkMyNode();
+    h.count = size;
+    h.dbuf = reinterpret_cast<int64_t>(buf);
+    for (int d = 0; d < 3; ++d) {
+        h.start[d] = d < N ? region[3 * d] : 0;
+        h.stop[d] = d < N ? region[3 * d + 1] : 1;
+    }
+    std::vector<char> m(sizeof(h));
+    memcpy(m.data(), &h, sizeof(h));
+    ix_state[node_id].stash.push_back(std::move(m));
     index_progress(node_id);
 }
 
@@ -3128,25 +3473,20 @@ void ArrayDAGExecutorND<N>::index_progress(int node_id) {
     for (auto& m : msgs) {
         int32_t kind;
         memcpy(&kind, m.data(), sizeof(kind));
-        switch (kind) {
-        case IX_SEG:
-            st.segs.push_back(std::move(m));
-            if (--st.seg_left == 0)
-                answer_segments(g, st, c, node_id);
-            break;
-        case IX_SEGOFF:
-            mx_route<N, int64_t>(partition, g, st, ex_mx_ctx(c), node_id,
-                                 reinterpret_cast<const int64_t*>(m.data() + sizeof(IxHdr)));
-            st.wait_offsets = false;
-            break;
-        case MX_DATA:
-            mx_place_data<N, int64_t>(partition, st, ex_mx_ctx(c), m);
-            break;
-        default:
+        if (is_rs_kind(kind))
+            rs_recv(g, static_cast<RsState*>(st.rs.get()), node_id, m);
+        else if (kind == MX_DATA)
+            dispatch_elem(c.s.dt, [&](auto tag) {
+                mx_place_data<N, decltype(tag)>(partition, g, st, ex_mx_ctx(c), m);
+            });
+        else
             CkAbort("EXPAND: unexpected message kind %d", kind);
-        }
     }
-    if (st.seg_left == 0 && !st.wait_offsets && st.out_covered == st.out_expected) {
+    if (const int64_t* offs = rs_take(st.rs)) {
+        mx_route<N, int64_t>(partition, g, st, ex_mx_ctx(c), node_id, offs);
+        st.wait_offsets = false;
+    }
+    if (!rs_busy(st.rs) && !st.wait_offsets && st.out_covered == st.out_expected) {
         ix_state.erase(node_id);
 #ifdef USE_NVIDIA
         auto* p = new ComputeDoneParam<N>{partition, node_id};
@@ -3171,6 +3511,10 @@ template void ArrayDAGExecutorND<3>::execute_index_node(DAGNode*);
 template void ArrayDAGExecutorND<1>::execute_mask_node(DAGNode*);
 template void ArrayDAGExecutorND<2>::execute_mask_node(DAGNode*);
 template void ArrayDAGExecutorND<3>::execute_mask_node(DAGNode*);
+
+template void ArrayDAGExecutorND<1>::on_index_device(int, const int*, char*, int64_t);
+template void ArrayDAGExecutorND<2>::on_index_device(int, const int*, char*, int64_t);
+template void ArrayDAGExecutorND<3>::on_index_device(int, const int*, char*, int64_t);
 
 template void ArrayDAGExecutorND<1>::on_index_msg(int, char*, int64_t);
 template void ArrayDAGExecutorND<2>::on_index_msg(int, char*, int64_t);

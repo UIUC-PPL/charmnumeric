@@ -427,8 +427,11 @@ def _eval(obj):
         return
 
     if op == AO.expand:
-        x, mode, _total = ops
+        x, mode, _total = ops[:3]
         xv = np.asarray(_value(x)).reshape(-1)
+        if int(mode) == 2:
+            _store_result(obj, _fit(np.repeat(xv, int(ops[3])), obj))
+            return
         counts = (xv != 0).astype(np.int64) if int(mode) == 0 else np.maximum(xv.astype(np.int64), 0)
         _store_result(obj, _fit(np.repeat(np.arange(xv.size), counts), obj))
         return
