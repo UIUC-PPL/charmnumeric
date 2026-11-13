@@ -135,6 +135,34 @@ static void deferred_send_cb(void* param, void* msg) {
 
 #endif
 
+#ifdef USE_NVIDIA
+/// Copy a packed send to pinned host memory (or leave it to CkDeviceBuffer), then send it
+/// from the stream callback.
+template <int N_sender, int N_target>
+static void staged_send_start(DeferredSendParam<N_sender, N_target>* ds) {
+    cudaStream_t st = ds->partition->comm_stream_raw;
+    if ((ds->host_buf = pinned_alloc(ds->byte_size)))
+        hapiCheck(cudaMemcpyAsync(ds->host_buf, ds->send_buf, ds->byte_size,
+                                  cudaMemcpyDeviceToHost, st));
+    CkCallback hapi_cb(deferred_send_cb<N_sender, N_target>, ds);
+    hapiAddCallback(st, &hapi_cb);
+}
+
+/// Copy a packed send into IPC block `buf`, then send it from the stream callback.
+template <int N_sender, int N_target>
+static void ipc_send_start(DeferredSendParam<N_sender, N_target>* ds, void* buf, int slab,
+                           int64_t offset) {
+    ds->ipc_buf = buf;
+    ds->ipc_slab = slab;
+    ds->ipc_offset = offset;
+    cudaStream_t st = ds->partition->comm_stream_raw;
+    hapiCheck(cudaMemcpyAsync(buf, ds->send_buf, ds->byte_size, cudaMemcpyDeviceToDevice, st));
+    ds->partition->pending_sends[ds->send_id] = buf;
+    CkCallback hapi_cb(deferred_send_cb<N_sender, N_target>, ds);
+    hapiAddCallback(st, &hapi_cb);
+}
+#endif
+
 #ifdef USE_KOKKOS
 /// Helper: complete a device-side pack-and-send after a parallel_for on comm_stream.
 /// On NVIDIA: defers the send via hapiAddCallback on comm_stream.
@@ -165,13 +193,26 @@ static void device_pack_send(PartitionImpl<N_sender>* partition,
     // partitions do not migrate: lastKnown is the target's PE
     int target_pe = target.ckLocalBranch()->lastKnown(target.ckGetIndex());
     if (CmiNodeOf(target_pe) != CkMyNode()) {
-        if (gpu_ipc_peer(target_pe))
-            ds->ipc_buf = gpu_ipc_alloc(byte_size, ds->ipc_slab, ds->ipc_offset);
-        if (ds->ipc_buf) {
-            hapiCheck(cudaMemcpyAsync(ds->ipc_buf, send_buf, byte_size,
-                                      cudaMemcpyDeviceToDevice, partition->comm_stream_raw));
-            pending[ds->send_id] = ds->ipc_buf;
-        } else if ((ds->host_buf = pinned_alloc(byte_size))) {
+        if (gpu_ipc_peer(target_pe)) {
+            int slab;
+            int64_t offset;
+            if (void* buf = gpu_ipc_alloc(byte_size, slab, offset, true)) {
+                ipc_send_start<N_sender, N_target>(ds, buf, slab, offset);
+                return;
+            }
+            // arena full, or earlier sends waiting: queue behind them rather than stage
+            if (gpu_ipc_wait(
+                    byte_size, partition,
+                    [ds](void* buf, int slab, int64_t offset) {
+                        if (buf)
+                            ipc_send_start<N_sender, N_target>(ds, buf, slab, offset);
+                        else
+                            staged_send_start<N_sender, N_target>(ds);
+                    },
+                    [ds] { delete ds; }))
+                return;
+        }
+        if ((ds->host_buf = pinned_alloc(byte_size))) {
             hapiCheck(cudaMemcpyAsync(ds->host_buf, send_buf, byte_size, cudaMemcpyDeviceToHost,
                                       partition->comm_stream_raw));
         }
