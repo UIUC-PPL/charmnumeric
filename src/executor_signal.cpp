@@ -660,8 +660,8 @@ void send_input(PartitionImpl<N>* partition, int node_id, const SigGeom<N>& s, i
         device_pack_send<N, N>(partition, partition->thisProxy, target, node_id, i, v.name,
                                region_data, bytes, buf);
 #else
-        proxy_at<N>(partition->thisProxy, target)
-            .receive_data(node_id, i, v.name, N, region_data, bytes, buf);
+        ct_send_data(proxy_at<N>(partition->thisProxy, target), node_id, i, v.name, N,
+                     region_data, bytes, buf);
         delete[] buf;
 #endif
 
@@ -1010,8 +1010,8 @@ void send_bmm_input(PartitionImpl<N>* partition, int node_id, const SigGeom<N>& 
             device_pack_send<N, N>(partition, partition->thisProxy, m.target, node_id, i, v.name,
                                    m.region_data, m.bytes, m.buf);
 #else
-            proxy_at<N>(partition->thisProxy, m.target)
-                .receive_data(node_id, i, v.name, N, m.region_data, m.bytes, m.buf);
+            ct_send_data(proxy_at<N>(partition->thisProxy, m.target), node_id, i, v.name, N,
+                         m.region_data, m.bytes, m.buf);
             free_buffer(m.buf);
 #endif
         }

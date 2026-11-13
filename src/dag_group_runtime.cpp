@@ -146,11 +146,11 @@ void ArrayDAGGroup::compute_decompositions(DAG* dag) {
     }
 }
 
-void ArrayDAGGroup::receive_get_request(int ndims, int epoch, int name, int size, int dtype) {
+void ArrayDAGGroup::receive_get_request(int ndims, int epoch, int name, int64_t size, int dtype) {
     epoch_arrived(epoch, [=] { receive_get_request_now(ndims, epoch, name, size, dtype); });
 }
 
-void ArrayDAGGroup::receive_get_request_now(int ndims, int epoch, int name, int size,
+void ArrayDAGGroup::receive_get_request_now(int ndims, int epoch, int name, int64_t size,
                                             int dtype) {
     if (name == kBarrierName) {
         int64_t chares = 0;
@@ -190,7 +190,7 @@ void ArrayDAGGroup::receive_get_request_now(int ndims, int epoch, int name, int 
     // Only PE 0 allocates the gather buffer for assembly
     // size is element count; convert to bytes using the wire dtype
     int elem_size = dtype_size(static_cast<DType>(dtype));
-    int64_t byte_size = (int64_t)size * elem_size;
+    int64_t byte_size = size * elem_size;
     if (CkMyPe() == 0) {
         gather_buffers[epoch] = new char[byte_size];
         gather_total[epoch] = byte_size;
@@ -206,10 +206,9 @@ void ArrayDAGGroup::receive_get_request_now(int ndims, int epoch, int name, int 
             }
             gather_early.erase(early_it);
             if (gather_counts[epoch] >= gather_total[epoch]) {
-                reply_to_client(epoch, byte_size, gather_buffers[epoch]);
+                reply_to_client(epoch, byte_size, gather_buffers[epoch], /*fetch=*/true);
                 gather_counts.erase(epoch);
                 gather_total.erase(epoch);
-                delete[] gather_buffers[epoch];
                 gather_buffers.erase(epoch);
             }
         }
@@ -220,11 +219,16 @@ void ArrayDAGGroup::mem_report(int epoch) {
     mem_stats_report(this, epoch);
 }
 
-void ArrayDAGGroup::reply_to_client(int epoch, int64_t byte_size, char* data) {
+void ArrayDAGGroup::reply_to_client(int epoch, int64_t byte_size, char* data, bool fetch) {
     if (client_error.empty()) {
-        Server<CProxy_ArrayDAGGroup>::send_reply(epoch, byte_size, data);
+        if (fetch)
+            Server<CProxy_ArrayDAGGroup>::send_fetch_reply(epoch, byte_size, data);
+        else
+            Server<CProxy_ArrayDAGGroup>::send_reply(epoch, byte_size, data);
         return;
     }
+    if (fetch)
+        delete[] data;
     std::string msg = std::string(kClientErrorTag, kClientErrorTagLen) + client_error;
     client_error.clear();
     Server<CProxy_ArrayDAGGroup>::send_reply(epoch, (int64_t)msg.size(), &msg[0]);
@@ -253,10 +257,9 @@ void ArrayDAGGroup::gather(int epoch, int name, int64_t offset, int64_t size, ch
     memcpy(gather_buffers[epoch] + offset, data, size);
     gather_counts[epoch] += size;
     if (gather_counts[epoch] >= gather_total[epoch]) {
-        reply_to_client(epoch, gather_total[epoch], gather_buffers[epoch]);
+        reply_to_client(epoch, gather_total[epoch], gather_buffers[epoch], /*fetch=*/true);
         gather_counts.erase(epoch);
         gather_total.erase(epoch);
-        delete[] gather_buffers[epoch];
         gather_buffers.erase(epoch);
     }
 }
