@@ -251,6 +251,8 @@ def main(chk):
         eq(f"bincount {dt} n={n}", cnp.bincount(L, minlength=13), np.bincount(lv, minlength=13))
         eq(f"bincount {dt} minlength>max", cnp.bincount(L, minlength=20),
            np.bincount(lv, minlength=20))
+        eq(f"bincount {dt} minlength>>max", cnp.bincount(L, minlength=3_000_000),
+           np.bincount(lv, minlength=3_000_000))
         eq(f"bincount {dt} interface", cnp.bincount(L, interface=iface), np.bincount(lv))
         eq(f"bincount {dt} view", cnp.bincount(L[3:n:5], minlength=13),
            np.bincount(lv[3:n:5], minlength=13))
