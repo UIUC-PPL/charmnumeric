@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""solve/inv/det/slogdet against NumPy, for the distributed LU path.
+"""solve/inv/det/slogdet/solve_triangular against NumPy, for the distributed LU path.
 
 Matrices of at least CNUM_LA_LU_MIN rows (server env, read once, default 2048) use the
 distributed LU, so against an already running server (CNUM_HOST, CNUM_PORT, CNUM_ODF) only
@@ -88,6 +88,27 @@ def check(chk, n, dt, shift=None):
               [sn, ldn / max(1.0, abs(ldn))], t)
 
 
+def check_tri(chk, n, dt):
+    a = mat(n, dt, float(n))
+    rdt = np.dtype(dt).type(0).real.dtype
+    b1 = cnp.random.rand(n, dtype=rdt).astype(dt)
+    b2 = cnp.random.rand(n, 3, dtype=rdt).astype(dt)
+    ah, b1h, b2h = (get(x).astype(np.complex128) for x in (a, b1, b2))
+    for trans in (0, 1):
+        for lower in (False, True):
+            for unit in (False, True):
+                t = np.tril(ah) if lower else np.triu(ah)
+                if unit:
+                    np.fill_diagonal(t, 1.0)
+                op = t.T if trans else t
+                for b, bh in ((b1, b1h), (b2, b2h)):
+                    x = cnp.linalg.solve_triangular(a, b, trans=trans, lower=lower,
+                                                    unit_diagonal=unit)
+                    close(chk, f"solve_triangular n={n} {np.dtype(dt)} trans={trans} lower={lower} "
+                          f"unit={unit} b{b.ndim}d", get(x), np.linalg.solve(op, bh),
+                          tol(dt) * max(1, n // 100))
+
+
 def start_server(path):
     env = dict(os.environ, CNUM_LA_LU_MIN="1")
     env.setdefault("CNUM_LA_LU_NB", "32")
@@ -138,6 +159,9 @@ def run():
     for n in (9, 70):
         check(chk, n, np.complex128)
         check(chk, n, np.complex64)
+    for n, dt in ((1, np.float64), (40, np.float64), (130, np.float64), (60, np.float32),
+                  (50, np.complex128)):
+        check_tri(chk, n, dt)
     # pivoting matters: no diagonal shift
     check(chk, 120, np.float64, shift=0.0)
     # strided views and an int64 matrix
