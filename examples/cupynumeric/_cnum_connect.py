@@ -2,7 +2,8 @@
 
 Environment variables:
     CNUM_HOST        backend host            (default 127.0.0.1)
-    CNUM_PORT        backend CCS port        (default 1234)
+    CNUM_PORT        backend CCS port        (default 1234; with neither set,
+                     a local server is started: charmnumeric.start())
     CNUM_ODF         over-decomposition fac. (default 4)
     CNUM_AUTO_FLUSH  pending ops per automatic async flush (charmnumeric/interface.py)
     CNUM_SIM         if set to a non-empty value other than "0", do not
@@ -24,6 +25,9 @@ def get_interface():
         from _cnum_sim import SimInterface
 
         return SimInterface()
+
+    if "CNUM_HOST" not in os.environ and "CNUM_PORT" not in os.environ:
+        return cnp.start()
 
     host = os.environ.get("CNUM_HOST", "127.0.0.1")
     port = int(os.environ.get("CNUM_PORT", "1234"))
