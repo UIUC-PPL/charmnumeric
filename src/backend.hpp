@@ -599,7 +599,11 @@ struct ReductionState {
     std::vector<double> weights; // BINCOUNT weights for x's block, by view index - w_base
     int64_t w_base = 0;
     int64_t w_got = 0;
+    bool device = false; // finalized pieces arrive as device messages (RED_FINAL_INPUT)
 };
+
+/// receive_data input index of finalized REDUCTION pieces (not a node input).
+constexpr int RED_FINAL_INPUT = -100;
 
 /// REDUCE (dot) state on chare 0; partials are summed as they arrive.
 struct DotState {
@@ -876,6 +880,7 @@ class ArrayDAGExecutorND : public DAGExecutor {
     void execute_tile_node(DAGNode* node);
     void execute_reduction_node(DAGNode* node);
     void on_reduce_partial(int node_id, char* data, int64_t size);
+    void on_reduce_final(int node_id);
     void execute_linalg_node(DAGNode* node);
     void on_linalg_msg(int node_id, char* data, int64_t size);
     void on_linalg_device(int node_id, int kind, const int* region, char* buf);

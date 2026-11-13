@@ -276,6 +276,26 @@ def main(chk):
     eq("kmeans bincount(labels, w)", cnp.bincount(labels, weights=feat, minlength=7),
        np.bincount(np.argmin(dv, axis=1), weights=fv, minlength=7), rtol=1e-12, atol=1e-9)
 
+    # ---- axis reductions over arrays split across many chares (offset outputs) ----
+    big = make((3000001, 5), "float64", 103)
+    bv = big.get(iface)
+    for key in ((slice(None), slice(None)), (slice(100, None), slice(None)),
+                (slice(7, 2900000, 3), slice(1, 4))):
+        for name, f, g in (("argmin", cnp.argmin, np.argmin), ("amax", cnp.amax, np.amax),
+                           ("mean", cnp.mean, np.mean)):
+            eq(f"big {name} axis1 {key}", f(big[key], axis=1), g(bv[key], axis=1), rtol=1e-12)
+    eq("big amin axis1 keepdims", cnp.amin(big, axis=1, keepdims=True),
+       np.amin(bv, axis=1, keepdims=True))
+    wide = make((5, 2000003), "float32", 104)
+    wv = wide.get(iface)
+    eq("wide sum axis0", cnp.sum(wide, axis=0), np.sum(wv.astype(np.float64), axis=0), rtol=1e-5)
+    eq("wide argmax axis0 view", cnp.argmax(wide[1:, 3:], axis=0), np.argmax(wv[1:, 3:], axis=0))
+    cube = make((4, 3, 300007), "float64", 105)
+    cv = cube.get(iface)
+    eq("cube sum axis1", cnp.sum(cube, axis=1), np.sum(cv, axis=1), rtol=1e-12)
+    eq("cube max axis1 keepdims", cnp.amax(cube[:, :, 5:], axis=1, keepdims=True),
+       np.amax(cv[:, :, 5:], axis=1, keepdims=True))
+
     # ---- small host-uploaded arrays with hand-checked ties ----
     h = np.array([[3, 1, 3, 2], [0, 3, 3, -1], [3, 0, 0, 3]], dtype=np.int32)
     H = cnp.array(h)
