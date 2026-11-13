@@ -1109,7 +1109,7 @@ static void send_bincount_pieces(ArrayDAGGroup* dag_group, int node_id, const Re
         if (piece.size() <= 0)
             continue;
         int64_t a = std::max<int64_t>(piece.start[0], lo);
-        int64_t b = std::min<int64_t>(piece.stop[0], hi);
+        int64_t b = std::max(a, std::min<int64_t>(piece.stop[0], hi));
         while (a < b && hist[a - lo] == A(0))
             ++a;
         while (b > a && hist[b - 1 - lo] == A(0))
