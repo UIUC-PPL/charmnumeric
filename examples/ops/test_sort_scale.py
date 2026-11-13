@@ -96,7 +96,7 @@ def main(chk):
         same("sort feeds elementwise", cnp.sort(a) * 2.0 + 1.0, np.sort(h) * 2.0 + 1.0)
         c = (rng.standard_normal(5000) + 1j * rng.integers(0, 3, 5000)).astype(np.complex64)
         c[17] = complex(np.nan, 1)
-        same("sort complex64 (gather path)", cnp.sort(cnp.asarray(c)), np.sort(c))
+        same("sort complex64", cnp.sort(cnp.asarray(c)), np.sort(c))
         try:
             cnp.sort(a, kind="bogus")
             chk.true("bad kind raises", False)
