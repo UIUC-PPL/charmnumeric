@@ -1,0 +1,222 @@
+#!/usr/bin/env python
+
+# Copyright 2024 NVIDIA Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# Derived from https://github.com/bryancatanzaro/kmeans
+
+import argparse
+
+from _benchmark import (
+    benchmark_info,
+    get_benchmark_info,
+    format_dtype,
+    parse_with_harness,
+)
+
+
+def initialize(np, N, D, C, T):
+    # Uncomment this if we want execution to be deterministic with
+    # original numpy np.random.seed(0)
+    data = np.random.random((N, D)).astype(T)
+    # Since points are random, we'll just generate some random centers
+    centroids = np.random.random((C, D)).astype(T)
+    return data, centroids
+
+
+def calculate_distances(np, data, centroids, data_dots):
+    centroid_dots = np.square(np.linalg.norm(centroids, ord=2, axis=1))
+    pairwise_distances = (
+        data_dots[:, np.newaxis] + centroid_dots[np.newaxis, :]
+    )
+    # ||x-y||^2 = ||x||^2 + ||y||^2 - 2 x . y
+    # pairwise_distances has ||x||^2 + ||y||^2, so beta = 1
+    # The gemm calculates x.y for all x and y, so alpha = -2.0
+    pairwise_distances -= 2.0 * np.dot(data, centroids.T)
+    return pairwise_distances
+
+
+def relabel(np, pairwise_distances):
+    return np.argmin(pairwise_distances, axis=1)
+
+
+def find_centroids(
+    np, centroids, data, labels, pairwise_distances, zero_point, C
+):
+    # Get the number of points associated with each centroid
+    counts = np.bincount(labels, minlength=C)
+
+    # more bincounts using the positions as weights produce the unnormalized
+    #  updated centroid locations (have to do each dimension separately since
+    #  a weight cannot be a vector)
+    for idx in range(data.shape[1]):
+        centroids[:, idx] = np.bincount(
+            labels, weights=data[:, idx], minlength=C
+        )
+
+    # would have been nice if numpy offered a combined amin/argmin to avoid
+    #  iterating over pairwise_distances twice
+    distance_sum = np.sum(np.amin(pairwise_distances, axis=1))
+
+    # To avoid introducing divide by zero errors
+    # If a centroid has no weight, we'll do no normalization
+    # This will keep its coordinates defined.
+    counts = np.maximum(counts, np.ones((1,), dtype=np.uint64))
+    centroids /= counts[:, np.newaxis]
+    return distance_sum
+
+
+@benchmark_info(formats={"T": format_dtype})
+def run_kmeans(np, C, D, T, I, N, S, *, timer, benchmarking=False):  # noqa: E741
+    print("Running kmeans...")
+    print("Number of data points: " + str(N))
+    print("Number of dimensions: " + str(D))
+    print("Number of centroids: " + str(C))
+    print("Max iterations: " + str(I))
+    timer.start()
+    data, centroids = initialize(np, N, D, C, T)
+
+    data_dots = np.square(np.linalg.norm(data, ord=2, axis=1))
+    zero_point = np.zeros((1, data.shape[1]), dtype=data.dtype)
+
+    labels = None
+    iteration = 0
+    prior_distance_sum = None
+    # We run for max iterations or until we converge
+    # We only test convergence every S iterations
+    while iteration < I:
+        pairwise_distances = calculate_distances(
+            np, data, centroids, data_dots
+        )
+
+        new_labels = relabel(np, pairwise_distances)
+
+        distance_sum = find_centroids(
+            np, centroids, data, new_labels, pairwise_distances, zero_point, C
+        )
+
+        if iteration > 0 and iteration % S == 0:
+            changes = np.not_equal(labels, new_labels)
+            total_changes = np.sum(changes)
+            delta = distance_sum / prior_distance_sum
+            print(
+                "Iteration "
+                + str(iteration)
+                + " produced "
+                + str(total_changes)
+                + " changes, and total distance is "
+                + str(distance_sum)
+            )
+            # We ignore the result of the threshold test in the case
+            # that we are running performance benchmarks to measure
+            # performance for a certain number of iterations
+            if delta > 1 - 0.000001 and not benchmarking:
+                print("Threshold triggered, terminating iterations early")
+                break
+        prior_distance_sum = distance_sum
+        labels = new_labels
+        iteration += 1
+    # This final distance sum also synchronizes the results
+    print(
+        "Final distance sum at iteration "
+        + str(iteration)
+        + ": "
+        + str(prior_distance_sum)
+    )
+    total = timer.stop()
+    print("Elapsed Time: " + str(total) + " ms")
+    return total
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--centers", type=int, default=10, dest="C", help="number of centroids"
+    )
+    parser.add_argument(
+        "-d",
+        "--dims",
+        type=int,
+        nargs="+",
+        default=[2],
+        dest="D",
+        help="number of dimensions for each input data point",
+    )
+    parser.add_argument(
+        "-m",
+        "--max-iters",
+        type=int,
+        default=1000,
+        dest="I",
+        help="maximum number of iterations to run the algorithm for",
+    )
+    parser.add_argument(
+        "-n",
+        "--num",
+        type=int,
+        nargs="+",
+        default=[10],
+        dest="N",
+        help="number of elements in the data set in thousands",
+    )
+    parser.add_argument(
+        "--precision",
+        type=int,
+        default=32,
+        dest="P",
+        help="precision of the computation in bits",
+    )
+    parser.add_argument(
+        "-s",
+        "--sample",
+        type=int,
+        default=25,
+        dest="S",
+        help="number of iterations between sampling the log likelihood",
+    )
+
+    args, harness = parse_with_harness(parser)
+    np = harness.np
+
+    name = None
+    dtype = None
+    if args.P == 16:
+        name = "KMEANS(H)"
+        dtype = np.float16
+    elif args.P == 32:
+        name = "KMEANS(S)"
+        dtype = np.float32
+    elif args.P == 64:
+        name = "KMEANS(D)"
+        dtype = np.float64
+    else:
+        raise TypeError("Precision must be one of 16, 32, or 64")
+
+    N = [n * 1000 for n in args.N]
+
+    info = get_benchmark_info(run_kmeans).replace(name=name)
+    harness.run_timed_with_info(
+        info,
+        run_kmeans,
+        np,
+        args.C,
+        args.D,
+        dtype,
+        args.I,
+        N,
+        args.S,
+        benchmarking=(harness.repeat > 0),
+        timer=harness.timer,
+    )

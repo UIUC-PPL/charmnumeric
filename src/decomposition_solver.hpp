@@ -104,8 +104,17 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
         return count;
     };
 
+    // Tiles are square, so a skinny matrix gets many tiny tiles; also cap the count by
+    // size so each 2-D tile holds at least a quarter of a minimum square tile.
     auto clamp_tile_for_max_count = [&](ArrayMetadata& m) {
-        int max_tiles = std::max(1, odf) * std::max(1, num_pes);
+        int64_t elems = 1, min_elems = 1;
+        for (int d = 0; d < m.ndims; d++) {
+            elems *= std::max(1, m.global_shape[d]);
+            min_elems *= detail::ct_min_tile(m.ndims);
+        }
+        int64_t by_size = m.ndims == 2 ? std::max<int64_t>(1, 4 * elems / min_elems)
+                                       : std::numeric_limits<int>::max();
+        int max_tiles = (int)std::min<int64_t>(std::max(1, odf) * std::max(1, num_pes), by_size);
         while (compute_tile_count(m) > max_tiles)
             m.tile *= 2;
     };
@@ -248,9 +257,12 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
             return try_assign_tile(array_name, candidate_tile);
         };
 
+        // Each temp is expanded once per walk: fused chains reuse temps, and
+        // re-expanding per use is exponential in chain length.
         auto collect_tile_candidates =
             [&](auto&& self, int array_name, int ndims, ASTNode* node, Region* carried_region,
-                const std::unordered_map<int, ASTNode*>& temp_defs) -> bool {
+                const std::unordered_map<int, ASTNode*>& temp_defs,
+                std::unordered_set<int>& visited_temps) -> bool {
             if (node == nullptr || node->is_scalar || node->is_broadcast)
                 return false;
 
@@ -265,11 +277,14 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
             if (node->operands.empty()) {
                 auto def_it = temp_defs.find(node->result_name);
                 if (def_it != temp_defs.end()) {
+                    if (!visited_temps.insert(node->result_name).second)
+                        return false;
                     ASTNode* def_root = def_it->second;
                     bool changed = false;
                     for (int i = 0; i < (int)def_root->operands.size(); ++i) {
                         changed = self(self, array_name, ndims, def_root->operands[i],
-                                       def_root->get_operand_region(i), temp_defs) ||
+                                       def_root->get_operand_region(i), temp_defs,
+                                       visited_temps) ||
                                   changed;
                     }
                     return changed;
@@ -280,7 +295,7 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
             bool changed = false;
             for (int child_idx = 0; child_idx < (int)node->operands.size(); ++child_idx) {
                 changed = self(self, array_name, ndims, node->operands[child_idx],
-                               node->get_operand_region(child_idx), temp_defs) ||
+                               node->get_operand_region(child_idx), temp_defs, visited_temps) ||
                           changed;
             }
             return changed;
@@ -320,12 +335,13 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                         if (region_is_dense(ast_node->region, dst_it->second.ndims)) {
                             for (int op_idx = 1; op_idx < (int)ast_node->operands.size();
                                  ++op_idx) {
+                                std::unordered_set<int> visited_temps;
                                 tiles_changed =
                                     collect_tile_candidates(collect_tile_candidates, dst_name,
                                                             dst_it->second.ndims,
                                                             ast_node->operands[op_idx],
                                                             ast_node->get_operand_region(op_idx),
-                                                            temp_defs) ||
+                                                            temp_defs, visited_temps) ||
                                     tiles_changed;
                             }
                         }
@@ -360,13 +376,14 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                             continue;
 
                         for (int op_idx = 0; op_idx < (int)ast_node->operands.size(); ++op_idx) {
+                            std::unordered_set<int> visited_temps;
                             tiles_changed =
                                 collect_tile_candidates(collect_tile_candidates,
                                                         ast_node->result_name,
                                                         out_it->second.ndims,
                                                         ast_node->operands[op_idx],
                                                         ast_node->get_operand_region(op_idx),
-                                                        temp_defs) ||
+                                                        temp_defs, visited_temps) ||
                                 tiles_changed;
                         }
                     }
@@ -507,9 +524,12 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
         std::unordered_set<int> source_arrays;
 
         detail::for_each_node_topo(dag, [&](DAGNode* dag_node) {
-            for (ASTNode* ast_node : dag_node->ast->roots)
-                if (static_cast<Opcode>(ast_node->opcode) == Opcode::CREATE)
+            for (ASTNode* ast_node : dag_node->ast->roots) {
+                Opcode op = static_cast<Opcode>(ast_node->opcode);
+                // TRANSPOSE results get a fixed offset (align_transpose_results)
+                if (is_creation(op) || op == Opcode::TRANSPOSE)
                     source_arrays.insert(ast_node->result_name);
+            }
         });
 
         auto collect_unionable_nonfixed_leaves = [&](auto&& self, ASTNode* node, int out_name,
@@ -560,7 +580,7 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
             for (ASTNode* ast_node : dag_node->ast->roots) {
                 Opcode op = static_cast<Opcode>(ast_node->opcode);
 
-                if (op == Opcode::CREATE) {
+                if (is_creation(op)) {
                     continue;
                 }
 
@@ -593,8 +613,55 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                             matmul_arrays.insert(operand->result_name);
                     matmul_arrays.insert(ast_node->result_name);
                 }
+
+                // These results are routed by a zero-offset decomposition; BINCOUNT
+                // also needs x and weights laid out identically.
+                if (is_reduction_op(op) || op == Opcode::LINALG || is_shape_op(op) ||
+                    is_signal_op(op) || op == Opcode::GATHER || op == Opcode::EXPAND ||
+                    op == Opcode::COMPRESS) {
+                    matmul_arrays.insert(ast_node->result_name);
+                    if (op == Opcode::BINCOUNT)
+                        for (ASTNode* operand : ast_node->operands)
+                            if (operand != nullptr && !operand->is_scalar)
+                                matmul_arrays.insert(operand->result_name);
+                }
             }
         });
+
+        // TRANSPOSE result: source tile, permuted (source offset + view start),
+        // so source tiles map 1:1 onto result tiles. Matmul operands stay at 0.
+        auto align_transpose_results = [&]() {
+            detail::for_each_node_topo(dag, [&](DAGNode* dag_node) {
+                for (ASTNode* ast_node : dag_node->ast->roots) {
+                    if (static_cast<Opcode>(ast_node->opcode) != Opcode::TRANSPOSE ||
+                        ast_node->operands.empty())
+                        continue;
+                    auto in_it = array_meta.find(ast_node->operands[0]->result_name);
+                    auto out_it = array_meta.find(ast_node->result_name);
+                    if (in_it == array_meta.end() || out_it == array_meta.end() ||
+                        out_it->second.decomp_final)
+                        continue;
+                    auto& in = in_it->second;
+                    auto& out = out_it->second;
+                    int nd = out.ndims;
+                    if (in.ndims != nd || (int)ast_node->operands.size() < nd + 1)
+                        continue;
+                    Region* view = ast_node->get_operand_region(0);
+                    auto vstart = extract_region_start(view, nd);
+                    auto vstep = extract_region_step(view, nd);
+                    out.tile = in.tile;
+                    out.offset = zero_offset;
+                    if (!matmul_arrays.count(ast_node->result_name)) {
+                        for (int k = 0; k < nd; ++k) {
+                            int d = (int)ast_node->operands[k + 1]->scalar;
+                            if (vstep[d] == 1)
+                                out.offset[k] = positive_mod(in.offset[d] + vstart[d], in.tile);
+                        }
+                    }
+                }
+            });
+        };
+        align_transpose_results();
 
         struct ClassInfo {
             int tile = 0;
@@ -1702,11 +1769,66 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
             }
         }
 
+        // sources' offsets may have moved since
+        align_transpose_results();
+
         for (int name : matmul_arrays) {
             auto meta_it = array_meta.find(name);
             if (meta_it != array_meta.end() && !meta_it->second.decomp_final)
                 meta_it->second.offset = zero_offset;
         }
+
+        // The executor allocates a fused kernel's other kept results at the
+        // shifted set_region shape, so place them to match.
+        detail::for_each_node_topo(dag, [&](DAGNode* dag_node) {
+            for (ASTNode* root : dag_node->ast->roots) {
+                if (static_cast<Opcode>(root->opcode) != Opcode::SET_REGION ||
+                    root->operands.empty() || root->region == nullptr || root->region->is_global)
+                    continue;
+                auto target_it = array_meta.find(root->operands[0]->result_name);
+                if (target_it == array_meta.end())
+                    continue;
+                const auto& target = target_it->second;
+                int nd = target.ndims;
+                auto start = extract_region_start(root->region, nd);
+                auto step = extract_region_step(root->region, nd);
+                auto stop = extract_region_stop(root->region, nd, target.global_shape);
+                bool shifted = false, unit = true;
+                for (int d = 0; d < nd; ++d) {
+                    shifted |= start[d] != 0;
+                    unit &= step[d] == 1;
+                }
+                if (!shifted || !unit)
+                    continue;
+                for (ASTNode* other : dag_node->ast->roots) {
+                    if (other == root || other->is_temp ||
+                        static_cast<Opcode>(other->opcode) == Opcode::SET_REGION)
+                        continue;
+                    auto it = array_meta.find(other->result_name);
+                    if (it == array_meta.end() || it->second.decomp_final ||
+                        it->second.ndims != nd)
+                        continue;
+                    bool same_shape = true;
+                    for (int d = 0; d < nd; ++d)
+                        same_shape &= it->second.global_shape[d] == stop[d] - start[d];
+                    if (!same_shape)
+                        continue;
+                    for (int d = 0; d < nd; ++d)
+                        it->second.offset[d] = target.offset[d] + start[d];
+                    it->second.tile = target.tile;
+                }
+            }
+        });
+    }
+
+    // Chare indices are global / tile, so a negative offset (from a view that
+    // starts left of its anchor) moves to the same tile phase in [0, tile).
+    for (auto& [name, meta] : array_meta) {
+        if (meta.decomp_final || meta.tile <= 0)
+            continue;
+        for (int d = 0; d < meta.ndims; ++d)
+            if (meta.offset[d] < 0)
+                meta.offset[d] = ((meta.offset[d] % meta.tile) + meta.tile) % meta.tile;
     }
 
     for (auto& [name, meta] : array_meta)

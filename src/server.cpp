@@ -1,5 +1,3 @@
-#include <cmath>
-
 #include <charmtyles/core/server.hpp>
 
 #include "backend.hpp"

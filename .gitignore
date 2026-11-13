@@ -44,3 +44,8 @@ cmake-build-*/
 *.swp
 *.swo
 .DS_Store
+
+# Local build trees, logs and crash dumps
+src/build-*/
+*.log
+core.*

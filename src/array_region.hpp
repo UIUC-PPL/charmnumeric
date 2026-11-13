@@ -110,8 +110,8 @@ class ArrayRegion : public Region {
     int size(int d) const { return (stop[d] - start[d] + step[d] - 1) / step[d]; }
 
     /// Total number of elements across all dimensions
-    int size() const {
-        int total = 1;
+    int64_t size() const {
+        int64_t total = 1;
         for (int d = 0; d < N; ++d)
             total *= size(d);
         return total;
@@ -353,9 +353,6 @@ class ArrayDecomp {
         return (gstop + tile - 1) / tile - gstart / tile;
     }
 
-    /// Chare index that owns global coordinate g along dimension d.
-    int owning_chare(int d, int global_coord) const { return global_coord / tile; }
-
     /// Global-space region owned by chare ci (clipped to this array's extent).
     ArrayRegion<N> chare_region_global(std::array<int, N> const& ci) const {
         ArrayRegion<N> r;
@@ -377,12 +374,16 @@ class ArrayDecomp {
         return std::max(ci_d * tile, offset[d]);
     }
 
-    /// Whether this is a default (offset=0) decomposition.
-    bool is_default() const {
-        for (int d = 0; d < N; ++d)
-            if (offset[d] != 0)
-                return false;
-        return true;
+    /// Index range [lo, hi) along axis d of the view (vstart, vstep, vsize; vstart in
+    /// decomposition-global coords) that chare c holds; false if it is empty.
+    bool view_block(int d, int c, int vstart, int vstep, int vsize, int& lo, int& hi) const {
+        int cs = chare_start_global(d, c);
+        int ce = std::min((c + 1) * tile, offset[d] + global_shape[d]);
+        int a = cs - vstart;
+        int b = ce - vstart;
+        lo = a <= 0 ? 0 : (a + vstep - 1) / vstep;
+        hi = b <= 0 ? 0 : std::min(vsize, (b + vstep - 1) / vstep);
+        return lo < hi;
     }
 };
 

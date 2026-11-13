@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import subprocess
 import time
@@ -9,9 +10,55 @@ import numpy as np
 from charmtyles.interface import CCSInterface
 
 
+_default_interface = None
+
+
+def default_interface():
+    """The most recently created interface (ops with data-dependent sizes sync on it)."""
+    if _default_interface is None:
+        raise RuntimeError(
+            "this operation has a data-dependent result size and needs a "
+            "CharmNumericInterface; create (and connect) one first"
+        )
+    return _default_interface
+
+
+_BARRIER_NAME = -1  # kBarrierName in src/backend.hpp
+_ERROR_TAG = b"\x00charmnumeric-error\x00"  # kClientErrorTag in src/backend.hpp
+
+
+def synchronize(interface=None):
+    """Block until the backend has finished every operation recorded so far."""
+    from charmtyles.core import execute
+
+    interface = interface or default_interface()
+    execute(interface)
+    interface.get(1, _BARRIER_NAME, 0, dtype=np.bool_)
+
+# Pending ops that trigger an async flush, so the backend runs while the program
+# records more and DAGs stay small (CNUM_AUTO_FLUSH; 0 disables).
+_AUTO_FLUSH = int(os.environ.get("CNUM_AUTO_FLUSH", "256"))
+
+
 class CharmNumericInterface(CCSInterface):
     def __init__(self, *args, **kwargs):
+        global _default_interface
         super().__init__(*args, **kwargs)
+        _default_interface = self
+
+    def connect(self, server_ip, server_port, odf):
+        super().connect(server_ip, server_port, odf)
+        from charmtyles.core import set_auto_flush
+
+        set_auto_flush(self, _AUTO_FLUSH if _AUTO_FLUSH > 0 else None)
+
+    def send_command_raw_var(self, handler, msg):
+        # A GET reply may instead carry an error from an earlier operation.
+        reply = super().send_command_raw_var(handler, msg)
+        if bytes(reply[:len(_ERROR_TAG)]) == _ERROR_TAG:
+            detail = bytes(reply[len(_ERROR_TAG):]).decode(errors="replace")
+            raise RuntimeError(f"charmnumeric server: {detail}")
+        return reply
 
     def from_bytes(self, payload, **kwargs):
         reply_type = kwargs.pop("reply_type", "array")
