@@ -13,6 +13,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -713,6 +714,8 @@ struct DsState {
     int64_t nb = 0, G = -1;    // bucket size, global rank of its first element
     std::vector<int64_t> nbs;  // first chare: bucket sizes
     int nbs_got = 0;
+    std::vector<int> owner;    // participant rank holding each bucket
+    int bucket = -1;           // the bucket this chare holds, if any
     std::vector<Piece> pieces; // phase 0, by source
     bool sorted = false;
     std::vector<Piece> rebal; // phase 1
@@ -824,6 +827,7 @@ void sort_single(PartitionImpl<1>* p, DsState& s, const T* in, void* outp, int64
 }
 
 constexpr int kSamplesPerTile = 1024;
+constexpr int kAllBuckets = 64, kMaxBuckets = 256;
 
 template <typename T>
 void sort_send_samples(PartitionImpl<1>* p, DsState& s, const T* in, int64_t n) {
@@ -877,17 +881,48 @@ void sort_make_splitters(PartitionImpl<1>* p, DsState& s) {
     }
     s.samples.clear();
     std::sort(all.begin(), all.end());
+    // Every chare holds a bucket when there are few; else the first chare of each PE
+    // (at most kMaxBuckets), so the exchange is O(P * buckets) messages, not O(P^2).
+    // Bucket j starts at sorted position upto[j]: the owners' tile starts, or with one
+    // bucket per PE, that PE's cumulative share of the elements (evenly past kMaxBuckets PEs).
+    std::vector<int64_t> owner, upto;
     int64_t S = (int64_t)all.size(), n = s.pstart[s.P];
-    std::vector<int64_t> sg(s.P - 1);
-    std::vector<K> sk(s.P - 1);
-    for (int j = 1; j < s.P; ++j) {
-        int64_t idx = std::min<int64_t>(S - 1, (int64_t)((double)s.pstart[j] / n * S));
+    if (s.P <= kAllBuckets) {
+        for (int i = 0; i < s.P; ++i) {
+            owner.push_back(i);
+            upto.push_back(s.pstart[i]);
+        }
+    } else {
+        std::unordered_map<int, int> bucket_of_pe;
+        for (int i = 0; i < s.P && (int)owner.size() < kMaxBuckets; ++i)
+            if (bucket_of_pe.emplace(pe_of(p, s.first + i), (int)owner.size()).second)
+                owner.push_back(i);
+        int B = (int)owner.size();
+        std::vector<int64_t> share(B, 0);
+        bool all_pes = true;
+        for (int i = 0; i < s.P && all_pes; ++i) {
+            auto it = bucket_of_pe.find(pe_of(p, s.first + i));
+            all_pes = it != bucket_of_pe.end();
+            if (all_pes)
+                share[it->second] += s.pstart[i + 1] - s.pstart[i];
+        }
+        upto.assign(B, 0);
+        for (int j = 1; j < B; ++j)
+            upto[j] = all_pes ? upto[j - 1] + share[j - 1] : (int64_t)((double)n * j / B);
+    }
+    int B = (int)owner.size();
+    std::vector<int64_t> sg(B - 1);
+    std::vector<K> sk(B - 1);
+    for (int j = 1; j < B; ++j) {
+        double f = (double)upto[j] / n;
+        int64_t idx = std::min<int64_t>(S - 1, (int64_t)(f * S));
         sk[j - 1] = all[idx].first;
         sg[j - 1] = all[idx].second;
     }
-    auto msg = make_msg(Hdr{S_SPLIT, s.rank, 0, 0, s.P - 1, 0, 0, 0});
-    put(msg, sg.data(), s.P - 1);
-    put(msg, sk.data(), s.P - 1);
+    auto msg = make_msg(Hdr{S_SPLIT, s.rank, 0, 0, B - 1, 0, 0, 0});
+    put(msg, sg.data(), B - 1);
+    put(msg, sk.data(), B - 1);
+    put(msg, owner.data(), B);
     for (int i = 0; i < s.P; ++i)
         send_ctrl(p, s.first + i, s.node->id, msg);
 }
@@ -899,9 +934,15 @@ void sort_partition(PartitionImpl<1>* p, DsState& s, const T* in, int64_t n,
     using K = typename Key<T>::K;
     Hdr h;
     memcpy(&h, m.data(), sizeof(h));
-    int nspl = (int)h.a, P = s.P;
+    int nspl = (int)h.a, P = nspl + 1; // buckets
     const int64_t* hsg = reinterpret_cast<const int64_t*>(m.data() + sizeof(h));
     const K* hsk = reinterpret_cast<const K*>(m.data() + sizeof(h) + 8 * nspl);
+    std::vector<int64_t> how(P);
+    memcpy(how.data(), m.data() + sizeof(h) + (8 + sizeof(K)) * nspl, 8 * P);
+    s.owner.assign(how.begin(), how.end());
+    for (int b = 0; b < P; ++b)
+        if (s.owner[b] == s.rank)
+            s.bucket = b;
     int64_t g0 = s.pstart[s.rank];
     std::vector<int64_t> cnt(P, 0);
     std::vector<char*> bufs(P, nullptr);
@@ -924,7 +965,7 @@ void sort_partition(PartitionImpl<1>* p, DsState& s, const T* in, int64_t n,
         for (int b = 0; b < P; ++b)
             cnt[b] = (b + 1 < P ? hb[b + 1] : n) - hb[b];
         for (int b = 0; b < P; ++b) {
-            bufs[b] = ds_alloc(cnt[b] * esize, pe_of(p, s.first + b) != CkMyPe());
+            bufs[b] = ds_alloc(cnt[b] * esize, pe_of(p, s.first + s.owner[b]) != CkMyPe());
             pk[b] = reinterpret_cast<K*>(bufs[b] + (s.arg ? 8 * cnt[b] : 0));
             pg[b] = reinterpret_cast<int64_t*>(bufs[b]);
         }
@@ -1043,14 +1084,15 @@ void sort_partition(PartitionImpl<1>* p, DsState& s, const T* in, int64_t n,
     }
 #endif
     for (int b = 0; b < P; ++b)
-        send_ctrl(p, s.first + b, s.node->id, make_msg(Hdr{S_COUNTS, s.rank, 0, 0, cnt[b]}));
+        send_ctrl(p, s.first + s.owner[b], s.node->id,
+                  make_msg(Hdr{S_COUNTS, s.rank, 0, 0, cnt[b]}));
     for (int b = 0; b < P; ++b) {
-        if (b == s.rank) {
-            s.pieces[b] = DsState::Piece{0, b, 0, cnt[b], bufs[b]};
+        if (b == s.bucket) {
+            s.pieces[s.rank] = DsState::Piece{0, s.rank, 0, cnt[b], bufs[b]};
             continue;
         }
         if (cnt[b] > 0)
-            send_piece(p, s.first + b, s.node->id, 0, s.rank, 0, cnt[b], bufs[b],
+            send_piece(p, s.first + s.owner[b], s.node->id, 0, s.rank, 0, cnt[b], bufs[b],
                        cnt[b] * esize);
         else
             ds_free(bufs[b]);
@@ -1577,16 +1619,29 @@ void ArrayDAGExecutorND<N>::on_ds_msg(int node_id, char* data, int64_t size) {
             s.col[h.src] = h.a;
             s.nb += h.a;
             if (++s.ncol == s.P)
-                send_ctrl(partition, s.first, node_id, make_msg(Hdr{S_NB, s.rank, 0, 0, s.nb}));
+                send_ctrl(partition, s.first, node_id,
+                          make_msg(Hdr{S_NB, s.rank, s.bucket, 0, s.nb}));
             return;
         case S_NB:
-            s.nbs[h.src] = h.a;
-            if (++s.nbs_got == s.P) {
+            s.nbs[h.phase] = h.a;
+            if (++s.nbs_got == (int)s.owner.size()) {
+                static const bool dbg = getenv("CNUM_SORT_DEBUG") != nullptr;
+                if (dbg) {
+                    int64_t tot = 0, big = 0;
+                    for (size_t j = 0; j < s.owner.size(); ++j) {
+                        tot += s.nbs[j];
+                        big = std::max<int64_t>(big, s.nbs[j]);
+                    }
+                    CkPrintf("sort node %d: %d chares, %d buckets, largest %lld of %lld "
+                             "(%.2f%%, even %.2f%%)\n",
+                             node_id, s.P, (int)s.owner.size(), (long long)big, (long long)tot,
+                             tot ? 100.0 * big / tot : 0.0, 100.0 / s.owner.size());
+                }
                 int64_t G = 0;
-                for (int i = 0; i < s.P; ++i) {
-                    send_ctrl(partition, s.first + i, node_id,
+                for (size_t j = 0; j < s.owner.size(); ++j) {
+                    send_ctrl(partition, s.first + s.owner[j], node_id,
                               make_msg(Hdr{S_G, s.rank, 0, 0, G}));
-                    G += s.nbs[i];
+                    G += s.nbs[j];
                 }
             }
             return;
@@ -1605,10 +1660,10 @@ void ArrayDAGExecutorND<N>::ds_sort_progress(int node_id) {
     if constexpr (N == 1) {
         auto keep = ds_state.at(node_id);
         DsState& s = *keep;
-        if (!s.split_done || s.G < 0)
+        if (!s.split_done || (s.bucket >= 0 && s.G < 0))
             return;
         int P = s.P, me = s.rank;
-        if (!s.sorted) {
+        if (s.bucket >= 0 && !s.sorted) {
             for (int i = 0; i < P; ++i)
                 if (s.col[i] > 0 && s.pieces[i].buf == nullptr)
                     return;
@@ -1622,7 +1677,8 @@ void ArrayDAGExecutorND<N>::ds_sort_progress(int node_id) {
         // elements of my tile that other buckets hold
         int64_t G = s.G, nb = s.nb;
         int64_t t0 = s.pstart[me], t1 = s.pstart[me + 1];
-        int64_t own = std::max<int64_t>(0, std::min(G + nb, t1) - std::max(G, t0));
+        int64_t own = s.bucket < 0 ? 0
+                                   : std::max<int64_t>(0, std::min(G + nb, t1) - std::max(G, t0));
         if (s.rebal_got < (t1 - t0) - own)
             return;
         CTArrayBase<1>* out = partition->arrays.at(s.out_name);
