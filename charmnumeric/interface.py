@@ -31,7 +31,11 @@ def synchronize(interface=None):
     """Block until the backend has finished every operation recorded so far."""
     from charmtyles.core import execute
 
+    from .charmnumeric import _DEFERRED_ERRORS, raise_deferred_errors
+
     interface = interface or default_interface()
+    if _DEFERRED_ERRORS:
+        raise_deferred_errors(interface)
     execute(interface)
     interface.get(1, _BARRIER_NAME, 0, dtype=np.bool_)
 
