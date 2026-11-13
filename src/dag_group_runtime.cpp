@@ -152,6 +152,51 @@ void ArrayDAGGroup::compute_decompositions(DAG* dag) {
                      meta.tile, meta.offset[0], meta.offset[1], meta.offset[2]);
 }
 
+// Copies a piece of one chare's tile into the row-major result. meta (from process_get):
+// [nouter, row bytes, piece offset in the tile, tile offset in the result,
+//  outer extents[nouter], outer byte strides[nouter]].
+static void gather_scatter(char* out, const int64_t* meta, int64_t size, const char* src) {
+    int nouter = static_cast<int>(meta[0]);
+    int64_t row_bytes = meta[1], pos = meta[2], base = meta[3];
+    const int64_t* extent = meta + 4;
+    const int64_t* stride = meta + 4 + nouter;
+    if (row_bytes <= 0)
+        return;
+    int64_t row = pos / row_bytes, in_row = pos % row_bytes;
+    int64_t idx[3] = {0, 0, 0};
+    for (int d = nouter - 1; d >= 0; --d) {
+        idx[d] = row % extent[d];
+        row /= extent[d];
+    }
+    char* run = nullptr;
+    int64_t run_len = 0;
+    const char* run_src = src;
+    for (int64_t done = 0; done < size;) {
+        int64_t dst = base + in_row;
+        for (int d = 0; d < nouter; ++d)
+            dst += idx[d] * stride[d];
+        int64_t n = std::min(row_bytes - in_row, size - done);
+        if (run != nullptr && out + dst == run + run_len) {
+            run_len += n;
+        } else {
+            if (run != nullptr)
+                memcpy(run, run_src, run_len);
+            run = out + dst;
+            run_src = src + done;
+            run_len = n;
+        }
+        done += n;
+        in_row = 0;
+        for (int d = nouter - 1; d >= 0; --d) {
+            if (++idx[d] < extent[d])
+                break;
+            idx[d] = 0;
+        }
+    }
+    if (run != nullptr)
+        memcpy(run, run_src, run_len);
+}
+
 void ArrayDAGGroup::receive_get_request(int ndims, int epoch, int name, int64_t size, int dtype) {
     epoch_arrived(epoch, [=] { receive_get_request_now(ndims, epoch, name, size, dtype); });
 }
@@ -207,7 +252,7 @@ void ArrayDAGGroup::receive_get_request_now(int ndims, int epoch, int name, int6
         auto early_it = gather_early.find(epoch);
         if (early_it != gather_early.end()) {
             for (auto& frag : early_it->second) {
-                memcpy(gather_buffers[epoch] + frag.offset, frag.data, frag.size);
+                gather_scatter(gather_buffers[epoch], frag.meta.data(), frag.size, frag.data);
                 delete[] frag.data;
             }
             gather_early.erase(early_it);
@@ -250,17 +295,17 @@ void ArrayDAGGroup::barrier_arrive(int epoch) {
     reply_to_client(epoch, 1, &none); // CCS needs a non-empty reply
 }
 
-void ArrayDAGGroup::gather(int epoch, int name, int64_t offset, int64_t size, char* data) {
-    // offset and size are in bytes
+void ArrayDAGGroup::gather(int epoch, int name, int nmeta, int64_t* meta, int64_t size,
+                           char* data) {
     if (gather_buffers.find(epoch) == gather_buffers.end()) {
         char* buf = new char[size];
         memcpy(buf, data, size);
-        gather_early[epoch].push_back({offset, size, buf});
+        gather_early[epoch].push_back({std::vector<int64_t>(meta, meta + nmeta), size, buf});
         gather_counts[epoch] += size;
         return;
     }
 
-    memcpy(gather_buffers[epoch] + offset, data, size);
+    gather_scatter(gather_buffers[epoch], meta, size, data);
     gather_counts[epoch] += size;
     if (gather_counts[epoch] >= gather_total[epoch]) {
         reply_to_client(epoch, gather_total[epoch], gather_buffers[epoch], /*fetch=*/true);
