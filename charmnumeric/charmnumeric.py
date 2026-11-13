@@ -571,10 +571,28 @@ class _HostConversions(object):
         return int(_size1_value(self))
 
     def __str__(self):
-        return str(self.__array__())
+        from ._display import values_str
+
+        return values_str(self)
 
     def __format__(self, spec):
-        return format(self.__array__(), spec)
+        return str(self) if not spec else format(self.__array__(), spec)
+
+    def _repr_mimebundle_(self, include=None, exclude=None):
+        from ._display import mimebundle
+
+        return mimebundle(self)
+
+    def to_numpy(self):
+        """A host copy; matplotlib converts through this (one fetch, not one per element)."""
+        return self.__array__()
+
+    def block_until_ready(self):
+        """Wait until the server has computed everything recorded so far; returns self."""
+        from .interface import default_interface, synchronize
+
+        synchronize(default_interface())
+        return self
 
 
 def _scalar_view_operand(value):
