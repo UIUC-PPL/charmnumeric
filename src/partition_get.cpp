@@ -19,7 +19,7 @@ void mem_tally(MemTally& t) {
             t.live_host += arr->host_bytes();
         }
         {
-            std::lock_guard<std::mutex> lock(p->free_mu);
+            std::lock_guard<std::mutex> lock(free_lists_mutex());
             t.free_keys += p->free_arrays.size();
             for (auto& [key, bucket] : p->free_arrays)
                 for (auto* arr : bucket) {
