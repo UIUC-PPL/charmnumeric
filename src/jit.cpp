@@ -830,9 +830,84 @@ bool canFuse(mlir::scf::ParallelOp a, mlir::scf::ParallelOp b) {
     return !conflicts(accA, accB);
 }
 
+/// Kernel parameter bytes of loops fused into one: each array it captures once host scalar
+/// code is sunk is a (3 + 2 * rank) * 8 byte descriptor, each scalar at most 8 bytes.
+/// Temporaries used only by these loops become thread-local and cost nothing.
+int64_t paramBytes(llvm::ArrayRef<mlir::scf::ParallelOp> loops) {
+    using namespace mlir;
+    auto inside = [&](Operation* op) {
+        return llvm::any_of(loops, [&](scf::ParallelOp l) { return l->isAncestor(op); });
+    };
+    llvm::SetVector<Value> vals;
+    for (scf::ParallelOp l : loops)
+        l->walk([&](Operation* op) {
+            for (Value v : op->getOperands())
+                if (!inside(v.getDefiningOp() ? v.getDefiningOp()
+                                              : v.getParentBlock()->getParentOp()))
+                    vals.insert(v);
+        });
+    int64_t bytes = 0;
+    for (size_t i = 0; i < vals.size(); ++i) {
+        Value v = vals[i];
+        Operation* d = v.getDefiningOp();
+        if (auto t = dyn_cast<MemRefType>(v.getType())) {
+            bool local = d && isa<memref::AllocOp, memref::AllocaOp>(d) &&
+                         llvm::all_of(v.getUsers(), [&](Operation* u) {
+                             return inside(u) || isa<memref::DeallocOp>(u);
+                         });
+            if (!local)
+                bytes += (3 + 2 * t.getRank()) * 8;
+        } else if (d && d->getNumRegions() == 0 &&
+                   (isMemoryEffectFree(d) || isa<func::CallOp>(d))) {
+            vals.insert(d->operand_begin(), d->operand_end());
+        } else {
+            bytes += 8;
+        }
+    }
+    return bytes;
+}
+
+/// Moves each loop that copies a temporary into an output right after the loop that last
+/// writes the temporary, so a kernel split between them needs no extra array.
+void hoistOutputCopies(mlir::Block& body) {
+    using namespace mlir;
+    SmallVector<scf::ParallelOp> loops;
+    for (Operation& op : body)
+        if (auto l = dyn_cast<scf::ParallelOp>(op))
+            loops.push_back(l);
+    for (scf::ParallelOp c : loops) {
+        Block* b = c.getBody();
+        if (b->getOperations().size() != 3)
+            continue;
+        auto ld = dyn_cast<memref::LoadOp>(b->front());
+        auto st = dyn_cast<memref::StoreOp>(*std::next(b->begin()));
+        if (!ld || !st || st.getValueToStore() != ld.getResult() ||
+            !isa<BlockArgument>(st.getMemRef()) || !ld.getMemRef().getDefiningOp<memref::AllocOp>())
+            continue;
+        Value src = ld.getMemRef(), dst = st.getMemRef();
+        for (Operation* p = c->getPrevNode(); p; p = p->getPrevNode()) {
+            auto l = dyn_cast<scf::ParallelOp>(p);
+            SmallVector<MemAccess> acc;
+            if (!l || !collectAccesses(l, acc) ||
+                llvm::any_of(acc, [&](const MemAccess& m) { return memrefRoot(m.mem) == dst; }))
+                break;
+            if (llvm::any_of(acc, [&](const MemAccess& m) {
+                    return m.write && memrefRoot(m.mem) == src;
+                })) {
+                if (p != c->getPrevNode() && llvm::equal(l.getLowerBound(), c.getLowerBound()) &&
+                    llvm::equal(l.getUpperBound(), c.getUpperBound()) &&
+                    llvm::equal(l.getStep(), c.getStep()))
+                    c->moveAfter(l);
+                break;
+            }
+        }
+    }
+}
+
 /// Fuse the elementwise loops of the kernel function into as few loops as
-/// possible and drop the temporaries that fusion makes thread-local.
-void fuseElementwiseLoops(mlir::func::FuncOp f) {
+/// possible, each passing at most maxParamBytes of kernel parameters, and drop
+/// the temporaries that fusion makes thread-local.
+void fuseElementwiseLoops(mlir::func::FuncOp f, int64_t maxParamBytes) {
     using namespace mlir;
     Block& body = f.getBody().front();
 
@@ -855,13 +930,14 @@ void fuseElementwiseLoops(mlir::func::FuncOp f) {
         if (llvm::all_of(op.getOperands(), definedAbove))
             op.moveBefore(first);
     }
+    hoistOutputCopies(body);
 
     for (Operation& op : body) {
         auto a = dyn_cast<scf::ParallelOp>(op);
         if (!a)
             continue;
         while (auto b = dyn_cast_or_null<scf::ParallelOp>(a->getNextNode())) {
-            if (!canFuse(a, b))
+            if (!canFuse(a, b) || paramBytes({a, b}) > maxParamBytes)
                 break;
             for (auto [ivB, ivA] : llvm::zip(b.getInductionVars(), a.getInductionVars()))
                 ivB.replaceAllUsesWith(ivA);
@@ -963,6 +1039,21 @@ NvTarget nvTarget() {
     cachedDev = dev;
     return t;
 }
+
+/// Kernel parameter bytes a fused loop may use: ptxas allows 4352 below PTX ISA 8.1 or
+/// sm_70 and 32764 otherwise, less a margin for launch bounds. CNUM_JIT_MAX_PARAM_BYTES
+/// overrides it.
+int64_t paramBudget() {
+    static const int64_t env = [] {
+        const char* e = getenv("CNUM_JIT_MAX_PARAM_BYTES");
+        return e && *e ? std::max(0LL, atoll(e)) : -1LL;
+    }();
+    if (env >= 0)
+        return env;
+    NvTarget t = nvTarget();
+    int ptx = atoi(t.features.c_str() + 4), sm = atoi(t.chip.c_str() + 3);
+    return (ptx >= 81 && sm >= 70 ? 32764 : 4352) - 128;
+}
 } // namespace
 
 bool MLIRJitCompiler::lowerToNVIDIAHost() {
@@ -988,7 +1079,7 @@ bool MLIRJitCompiler::lowerToNVIDIAHost() {
     pm1.addPass(createCSEPass());
     if (failed(pm1.run(*module)))
         return false;
-    fuseElementwiseLoops(kernelFn);
+    fuseElementwiseLoops(kernelFn, fuseLoops ? paramBudget() : 0);
     IRRewriter rewriter(&context);
     for (Operation& op : llvm::make_early_inc_range(kernelFn.getBody().front())) {
         auto loop = dyn_cast<scf::ParallelOp>(op);
@@ -1086,7 +1177,28 @@ bool MLIRJitCompiler::lowerToNVIDIAHost() {
         }
         op->erase();
     }
+    // Free each temporary after its last user (launches are stream-ordered), not at the end,
+    // so a chain of unfused kernels holds only its live temporaries.
     for (memref::DeallocOp op : deallocs) {
+        Block* blk = op->getBlock();
+        Operation* last = nullptr;
+        SmallVector<Value> work{op.getMemref()};
+        while (!work.empty()) {
+            Value v = work.pop_back_val();
+            for (Operation* u : v.getUsers()) {
+                if (u == op.getOperation())
+                    continue;
+                for (Value r : u->getResults())
+                    if (isa<BaseMemRefType>(r.getType()))
+                        work.push_back(r);
+                Operation* a = blk->findAncestorOpInBlock(*u);
+                if (!a || (last && a->isBeforeInBlock(last)))
+                    continue;
+                last = a;
+            }
+        }
+        if (last && last->isBeforeInBlock(op))
+            op->moveAfter(last);
         b.setInsertionPoint(op);
         emitDealloc(op.getLoc(), op.getMemref());
         op.erase();
@@ -1331,8 +1443,9 @@ std::unique_ptr<mlir::ExecutionEngine> MLIRJitCompiler::generateNVIDIAHost() {
         llvm::errs() << "generateNVIDIAHost: GPU lowering failed\n";
         return nullptr;
     }
-    // Embed cubins instead of PTX, so loading does not run the driver's JIT. A failure
-    // keeps the PTX (mgpuModuleLoadJIT then reports it).
+    // Embed cubins instead of PTX, so loading does not run the driver's JIT. A kernel
+    // ptxas rejects fails the compile instead of aborting at load.
+    bool assembled = true;
     module->walk([&](mlir::gpu::BinaryOp bin) {
         llvm::SmallVector<mlir::Attribute> objects;
         for (mlir::Attribute a : bin.getObjectsAttr()) {
@@ -1342,16 +1455,23 @@ std::unique_ptr<mlir::ExecutionEngine> MLIRJitCompiler::generateNVIDIAHost() {
             if (auto props = obj ? obj.getProperties() : nullptr)
                 if (auto o = mlir::dyn_cast_or_null<mlir::IntegerAttr>(props.get("O")))
                     opt = o.getInt();
-            if (obj && obj.getFormat() == mlir::gpu::CompilationTarget::Assembly &&
-                cnPtxToCubin(obj.getObject().getValue(), opt, cubin, log) == CUDA_SUCCESS)
+            if (obj && obj.getFormat() == mlir::gpu::CompilationTarget::Assembly) {
+                if (cnPtxToCubin(obj.getObject().getValue(), opt, cubin, log) != CUDA_SUCCESS) {
+                    llvm::errs() << "generateNVIDIAHost: ptxas failed: " << log << "\n";
+                    assembled = false;
+                    continue;
+                }
                 a = mlir::gpu::ObjectAttr::get(&context, obj.getTarget(),
                                                mlir::gpu::CompilationTarget::Binary,
                                                mlir::StringAttr::get(&context, cubin),
                                                obj.getProperties(), obj.getKernels());
+            }
             objects.push_back(a);
         }
         bin.setObjectsAttr(mlir::ArrayAttr::get(&context, objects));
     });
+    if (!assembled)
+        return nullptr;
     jitMark("cubin");
 
     llvm::InitializeNativeTarget();
@@ -2494,7 +2614,8 @@ std::string cachePath(const std::string& ir) {
     h.update(ir);
 #ifdef USE_NVIDIA
     NvTarget target = nvTarget();
-    h.update("nvidia " + target.chip + " " + target.features + " cubin " + target.device);
+    h.update("nvidia " + target.chip + " " + target.features + " cubin " + target.device +
+             " params " + std::to_string(paramBudget()));
 #endif
     static const std::string host = [] {
         std::vector<std::string> features;
@@ -2740,8 +2861,16 @@ void* compileKernel(void* ast, const std::string& path, void** moduleHandleOut) 
 
 #if defined(USE_NVIDIA)
     auto engine = node_jit.generateNVIDIAHost();
-    if (!engine)
-        return nullptr;
+    if (!engine) {
+        MLIRJitCompiler unfused;
+        unfused.fuseLoops = false;
+        unfused.buildFromAST(ast);
+        unfused.optimizeAndFuse();
+        engine = unfused.generateNVIDIAHost();
+        if (!engine)
+            return nullptr;
+        llvm::errs() << "JIT: fused kernel failed to compile; running it as one kernel per op\n";
+    }
     if (!node_jit.loadCPU(engine, "fused_kernel", &moduleHandle, &funcPtr))
         return nullptr;
 #elif defined(USE_AMD)
