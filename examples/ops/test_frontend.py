@@ -5,6 +5,7 @@ Inputs are generated natively and fetched with .get(); the NumPy reference uses 
 Env: CNUM_HOST / CNUM_PORT / CNUM_ODF select the server; CNUM_SIM=1 uses the simulator.
 """
 
+import contextlib
 import itertools
 import os
 import sys
@@ -79,6 +80,26 @@ def raises(label, exc, fn):
     except exc:
         return
     raise AssertionError(f"{label}: expected {exc.__name__}")
+
+
+class Deadlock(Exception):
+    """A reply did not arrive in time; the connection is left mid-request."""
+
+
+@contextlib.contextmanager
+def deadline(seconds):
+    """Bound each backend reply (the CCS receive blocks in C, so no signal can cut it)."""
+    seconds = int(os.environ.get("CNUM_TEST_DEADLINE", seconds))
+    old = getattr(iface, "reply_timeout", None)
+    if old is not None:
+        iface.reply_timeout = min(old, seconds)
+    try:
+        yield
+    except TimeoutError as exc:
+        raise Deadlock(f"{exc} (backend deadlock?)") from exc
+    finally:
+        if old is not None:
+            iface.reply_timeout = old
 
 
 # ---------------------------------------------------------------------------
@@ -869,6 +890,136 @@ def dot_after_partition_growth():
     check("inner float32 view", get(cnp.inner(v, v)), np.inner(h32[0:524289:2], h32[0:524289:2]))
 
 
+@case
+def tile_diag_at_offsets():
+    with deadline(300):
+        _tile_diag_at_offsets()
+
+
+def _tile_diag_at_offsets():
+    # TILE/DIAG results written into a shifted region, and inputs placed at an offset
+    n = 600
+    h, v, A = data((1, n)), data((n,), seed=1), data((n, n), seed=2)
+    hh, vh, Ah = made(h, v, A)
+    Z = cnp.zeros((40, 2 * n + 37))
+    Z[:, n + 30:2 * n + 30] = cnp.tile(h, (40, 1))
+    Zh = np.zeros((40, 2 * n + 37))
+    Zh[:, n + 30:2 * n + 30] = np.tile(hh, (40, 1))
+    check("Z[:, s] = tile(h)", get(Z), Zh)
+    Z = cnp.zeros((40, 2 * n + 37))
+    Z[:, n + 30:2 * n + 30] = cnp.tile(v, (40, 1))
+    Zh[:, n + 30:2 * n + 30] = np.tile(vh, (40, 1))
+    check("Z[:, s] = tile(v)", get(Z), Zh)
+    s3 = data((1, 3, 70), seed=3)
+    s3h = made(s3)
+    Y = cnp.zeros((4, 7, 300))
+    Y[1:3, 1:7, 140:280] = cnp.tile(s3, (2, 2, 2))
+    Yh = np.zeros((4, 7, 300))
+    Yh[1:3, 1:7, 140:280] = np.tile(s3h, (2, 2, 2))
+    check("Y[s] = tile(s3)", get(Y), Yh)
+    z = cnp.zeros((2 * n + 9,))
+    z[n + 5:2 * n + 5] = cnp.diag(A)
+    zh = np.zeros((2 * n + 9,))
+    zh[n + 5:2 * n + 5] = np.diag(Ah)
+    check("z[s] = diag(A)", get(z), zh)
+    Z = cnp.zeros((n, 2 * n + 9))
+    Z[:, n + 5:2 * n + 5] = cnp.diag(v)
+    Zh = np.zeros((n, 2 * n + 9))
+    Zh[:, n + 5:2 * n + 5] = np.diag(vh)
+    check("Z[:, s] = diag(v)", get(Z), Zh)
+    y = h + 1.0
+    W = cnp.zeros((5, 2 * n + 37))
+    W[2:3, n + 30:2 * n + 30] = y
+    t = cnp.tile(y, (3, 2))
+    y2 = A + 1.0
+    Z = cnp.zeros((n, 2 * n + 9))
+    Z[:, n + 5:2 * n + 5] = y2
+    d = cnp.diag(y2)
+    check("tile of a shifted input", get(t), np.tile(hh + 1.0, (3, 2)))
+    check("diag of a shifted input", get(d), np.diag(Ah + 1.0))
+    Wh = np.zeros((5, 2 * n + 37))
+    Wh[2:3, n + 30:2 * n + 30] = hh + 1.0
+    check("W after shifted tile input", get(W), Wh)
+
+
+@case
+def tile_diag_offsets_wide():
+    with deadline(300):
+        _tile_diag_offsets_wide()
+
+
+def _tile_diag_offsets_wide():
+    # 1-D above the CPU 1-D tile: tile of a multi-chare vector, and of one placed at an offset
+    m = 300001
+    v = data((m,), seed=4)
+    vh = made(v)
+    z = cnp.zeros((3 * m + 77,))
+    z[50:50 + 3 * m] = cnp.tile(v, 3)
+    zh = np.zeros((3 * m + 77,))
+    zh[50:50 + 3 * m] = np.tile(vh, 3)
+    y = v + 1.0
+    w = cnp.zeros((m + 1000,))
+    w[1000:] = y
+    t = cnp.tile(y, 2)
+    check("z[s] = tile(v, 3)", get(z), zh)
+    check("tile of a shifted 1-D input", get(t), np.tile(vh + 1.0, 2))
+    # diag with k != 0, shifted inputs and targets (1-D multi-chare under small CT_MIN_TILE_*)
+    n = 600
+    A, u = data((n, n), seed=5), data((n,), seed=6)
+    Ah, uh = made(A, u)
+    for k in (3, -3):
+        y2 = A + 1.0
+        Z = cnp.zeros((n, 2 * n + 9))
+        Z[:, n + 5:2 * n + 5] = y2
+        z = cnp.zeros((2 * n,))
+        z[n - 7:2 * n - 10] = cnp.diag(y2, k)
+        zh = np.zeros((2 * n,))
+        zh[n - 7:2 * n - 10] = np.diag(Ah + 1.0, k)
+        check(f"z[s] = diag(shifted A, {k})", get(z), zh)
+        y1 = u + 1.0
+        W = cnp.zeros((2 * n + 9,))
+        W[n + 5:2 * n + 5] = y1
+        Z = cnp.zeros((n + 3, 2 * n + 40))
+        Z[:, n + 30:2 * n + 33] = cnp.diag(y1, k)
+        Zh = np.zeros((n + 3, 2 * n + 40))
+        Zh[:, n + 30:2 * n + 33] = np.diag(uh + 1.0, k)
+        check(f"Z[:, s] = diag(shifted v, {k})", get(Z), Zh)
+    # tile of an input offset in the first dim, and in a later one
+    B, C = data((600, 70), seed=7), data((5, 600), seed=8)
+    Bh, Ch = made(B, C)
+    yb = B + 1.0
+    P = cnp.zeros((1400, 70))
+    P[700:1300] = yb
+    tb = cnp.tile(yb, (2, 3))
+    yc = C + 1.0
+    Q = cnp.zeros((5, 1400))
+    Q[:, 650:1250] = yc
+    tc = cnp.tile(yc, (2, 2))
+    check("tile of an input shifted in dim 0", get(tb), np.tile(Bh + 1.0, (2, 3)))
+    check("tile of an input shifted in dim 1", get(tc), np.tile(Ch + 1.0, (2, 2)))
+    # 1-D -> 3-D and 2-D -> 3-D into shifted 3-D targets
+    r, M = data((70,), seed=9), data((3, 70), seed=10)
+    rh, Mh = made(r, M)
+    Y = cnp.zeros((4, 7, 300))
+    Y[1:3, 2:5, 100:240] = cnp.tile(r, (2, 3, 2))
+    Yh = np.zeros((4, 7, 300))
+    Yh[1:3, 2:5, 100:240] = np.tile(rh, (2, 3, 2))
+    check("Y[s] = tile(1-D, 3-D reps)", get(Y), Yh)
+    Y = cnp.zeros((4, 7, 300))
+    Y[1:3, 1:7, 140:280] = cnp.tile(M, (2, 2, 2))
+    Yh = np.zeros((4, 7, 300))
+    Yh[1:3, 1:7, 140:280] = np.tile(Mh, (2, 2, 2))
+    check("Y[s] = tile(2-D, 3-D reps)", get(Y), Yh)
+    # a fused consumer of the tile
+    h = data((1, n), seed=11)
+    hh = made(h)
+    Z = cnp.zeros((40, 2 * n + 37))
+    Z[:, n + 30:2 * n + 30] = cnp.tile(h, (40, 1)) + 1.0
+    Zh = np.zeros((40, 2 * n + 37))
+    Zh[:, n + 30:2 * n + 30] = np.tile(hh, (40, 1)) + 1.0
+    check("Z[:, s] = tile(h) + 1", get(Z), Zh)
+
+
 def main():
     global iface
     iface = connect()
@@ -885,6 +1036,8 @@ def main():
             msg = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
             print(f"  FAIL {fn.__name__}: {msg}", flush=True)
             failures.append(f"{fn.__name__}: {msg}")
+            if isinstance(exc, Deadlock):
+                break
     print(f"[test_frontend] names used up to {ct_core.next_name} (max {ct_core.max_name})")
     if failures:
         print("FAIL test_frontend: " + "; ".join(failures))

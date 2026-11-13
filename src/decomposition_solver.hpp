@@ -618,7 +618,7 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                 // also needs x and weights laid out identically.
                 if (is_reduction_op(op) || op == Opcode::LINALG || is_shape_op(op) ||
                     is_signal_op(op) || op == Opcode::GATHER || op == Opcode::EXPAND ||
-                    op == Opcode::COMPRESS) {
+                    op == Opcode::COMPRESS || op == Opcode::TILE || op == Opcode::DIAG) {
                     matmul_arrays.insert(ast_node->result_name);
                     if (op == Opcode::BINCOUNT)
                         for (ASTNode* operand : ast_node->operands)
@@ -1812,6 +1812,12 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                     for (int d = 0; d < nd; ++d)
                         same_shape &= it->second.global_shape[d] == stop[d] - start[d];
                     if (!same_shape)
+                        continue;
+                    // Zero-offset results are routed from tile 0 by their executors, so
+                    // they keep their layout; the kernel still writes them on this grid
+                    // and the executor aborts. #43/#44 add the copy that fixes this.
+                    assert(!matmul_arrays.count(other->result_name));
+                    if (matmul_arrays.count(other->result_name))
                         continue;
                     for (int d = 0; d < nd; ++d)
                         it->second.offset[d] = target.offset[d] + start[d];
