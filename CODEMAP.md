@@ -8,7 +8,7 @@ Distributed N-dimensional array DSL built on charmtyles. The backend stores 1-3D
 | Symbol | Line | Description |
 |--------|------|-------------|
 | `DType` | 39 | Wire dtype codes — FLOAT32=0, FLOAT64=1, INT32=2, INT64=3, BOOL=4, INT8=5, INT16=6, UINT8..UINT64=7-10, FLOAT16=11, COMPLEX64=12, COMPLEX128=13; `from_numpy()`, `to_numpy()` |
-| `ArrayOperation` | 139 | Opcodes: add=0, sub=1, mul=2, div=3, matmul=4, tanh=5, exp=6, tile=7, reduce=8, matmatmul=9, diag=10; elementwise math/comparisons/where/clip 20-49; creation upload=50, random=51, iota=52; reduction=60, bincount=61; transpose=70; scan=81, sort=82, argsort=83; linalg=100; gather=120, scatter=121, expand=122, compress=123, mask_scatter=124; reshape=140, broadcast=141; convolve=150, flip=151; convert (fused astype)=160, real=161, imag=162, conj=163, bitwise_and/or/xor=164-166, invert=167, left_shift=168, right_shift=169; batched_matmul=170 |
+| `ArrayOperation` | 139 | Opcodes: add=0, sub=1, mul=2, div=3, matmul=4, tanh=5, exp=6, tile=7, reduce=8, matmatmul=9, diag=10; elementwise math/comparisons/where/clip 20-49; creation upload=50, random=51, iota=52; reduction=60, bincount=61; transpose=70; scan=81, sort=82, argsort=83; select=190; linalg=100; gather=120, scatter=121, expand=122, compress=123, mask_scatter=124; reshape=140, broadcast=141; convolve=150, flip=151; convert (fused astype)=160, real=161, imag=162, conj=163, bitwise_and/or/xor=164-166, invert=167, left_shift=168, right_shift=169; batched_matmul=170 |
 | `ArrayRegion` | 153 | N-D region with start/stop/step per dim — `serialize()`:194, `shape()`:209, `compose()`:212, `overlaps()`:232, `covers()`:239, `intersect()`:246 |
 | `Array(FrontendObject)` | 618 | Main array class — `wire_dtype()`:639, `get()`:683, `get_region()`/`__getitem__()`:690/697, `__setitem__()`:708, `dot()`:724, `matvec()`:727, `copy()`:730, `fill()`:735, `astype()`:738; operators: +,-,*,/,@ at 713-722 |
 | `ArrayView(FrontendObjectView)` | 747 | View with same ops as Array — `get()`:796, `__getitem__()`:801, `__setitem__()`:812, `dot()`:828 |
@@ -58,6 +58,7 @@ Distributed N-dimensional array DSL built on charmtyles. The backend stores 1-3D
 | `_reduce()` | Builds a REDUCTION (opcode 60) node: operands `x, kind, axis_mask, keepdims, ddof, in_dtype` |
 | `sum/prod/mean/var/std/amax/amin/argmax/argmin/count_nonzero/all/any` | NumPy-style API (`axis`, `keepdims`, `dtype`, `out`); also installed as `Array`/`ArrayView` methods |
 | `bincount()` | BINCOUNT (opcode 61) node; needs `minlength` or `interface=` |
+| `quantile()` / `percentile()` | 1-D (or axis=None) with up to 256 needed ranks: one SELECT node (`_select`), no sort; otherwise sort + take |
 | `norm()` | `cnp.linalg.norm` subset (vector 2/1/inf/-inf/0, matrix fro/inf/-inf/1/-1, axis) |
 
 ### `charmnumeric/linalg.py` — Dense linear algebra (`cnp.linalg`)
@@ -245,7 +246,8 @@ Started from `set_proxies`, off the CCS-ready path: rank 0 of each process expor
 | `executor_reducer.cpp` | `determine_dtype<N>()` (dtype of a node from its AST or arrays) |
 | `executor_transfer.cpp` | Cross-partition data transfer |
 | `executor_transpose.cpp` | TRANSPOSE (2-D/3-D axis permutation of an array or view): point-to-point pack/send, `transpose_place` receive side |
-| `executor_castscansort.cpp` | SCAN (cumsum/cumprod/nan*), SORT/ARGSORT executors (opcodes 81-83) |
+| `executor_castscansort.cpp` | SCAN (cumsum/cumprod/nan*; opcode 81): each chare sends its line totals to the later chares along the axis, then scans its tile once with the folded carry (CUB single-pass scan per long line on NVIDIA); narrow int/bool inputs are cast in the kernel. SORT/ARGSORT (82-83) of other shapes: local per-line sort when the axis is not split across chares, else a gather to one chare (complex, split axis) |
+| `executor_sort.cpp` | 1-D SORT/ARGSORT of real types: sample sort over the chares (pooled samples -> splitters on (key, index), stable multi-way split, buckets exchanged by pointer on the same PE or as device messages, CUB radix sort per bucket, then the sorted runs moved to the result tiles). SELECT (190): order statistics by radix selection (histogram rounds of the top key bits, coordinated by the first chare, then a gather of the few candidates); `receive_sort_msg` carries the control messages. Radix keys order like NumPy (NaNs last); sorted values are decoded from the keys, so NaNs come back canonical and -0.0 sorts before +0.0 (documented in `_sort`) |
 | `executor_incremental.cpp` | Incremental computation |
 | `executor_ast_visitor.cpp` | AST visitor for elementwise node execution |
 | `partition_lifecycle.cpp` | `init()`, `create()`, `run()`, destructor |
@@ -272,4 +274,4 @@ Started from `set_proxies`, off the CCS-ready path: rank 0 of each process expor
 | `test_strided_copy_reduces_tile_and_sets_offset()` | 374 | Stride-2 access regression: tile reduction and absolute offset lifting |
 
 ### `backend.ci` — Charm++ interface (86 lines)
-Module `charmnumeric` (depends on `charmtyles`). Mainchare `Main`. Group `ArrayDAGGroup : DAGGroup` with entries: `set_proxies()`, `proxies_ready()` [reduction], `receive_dag()`, `receive_get_request()`, `gather()`. Arrays `Partition1D/2D/3D` with entries: `run()`, `receive_data()` [nocopy/nocopydevice], `send_complete()`, `receive_ipc()`, `receive_staged()` (GPU), `comm_done()`, `reduce_result()`, `receive_reduce_partial()`, `receive_linalg()`, `receive_shape()`.
+Module `charmnumeric` (depends on `charmtyles`). Mainchare `Main`. Group `ArrayDAGGroup : DAGGroup` with entries: `set_proxies()`, `proxies_ready()` [reduction], `receive_dag()`, `receive_get_request()`, `gather()`. Arrays `Partition1D/2D/3D` with entries: `run()`, `receive_data()` [nocopy/nocopydevice], `send_complete()`, `receive_ipc()`, `receive_staged()` (GPU), `comm_done()`, `reduce_result()`, `receive_reduce_partial()`, `receive_linalg()`, `receive_shape()`, `receive_sort_msg()` (Partition1D).

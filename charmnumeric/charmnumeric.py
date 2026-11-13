@@ -217,6 +217,7 @@ class ArrayOperation(Operation):
     scan = 81
     sort = 82
     argsort = 83
+    select = 190  # order statistics of a 1-D array (quantile; src/executor_sort.cpp)
     linalg = 100  # factorizations and solves (charmnumeric/linalg.py)
     # Data-dependent indexing (120-139, src/executor_indexing.cpp)
     gather = 120
@@ -837,6 +838,9 @@ def _axis_index(axis, ndim):
 
 
 _SCAN_KINDS = {"cumsum": 0, "cumprod": 1, "nancumsum": 2, "nancumprod": 3}
+_SCAN_WIDE = (np.dtype(np.int64), np.dtype(np.uint64))
+_SCAN_NARROW = tuple(np.dtype(t) for t in (np.bool_, np.int8, np.int16, np.int32, np.uint8,
+                                            np.uint16, np.uint32))
 
 
 def _scan(name, a, axis=None, dtype=None, out=None):
@@ -846,6 +850,15 @@ def _scan(name, a, axis=None, dtype=None, out=None):
         a = _reshape(a, (-1,))
         axis = 0
     axis = _normalize_axis(axis, a.ndims)
+    if dtype is None:
+        # NumPy's accumulation dtype (int64/uint64 for bool and small ints)
+        dtype = getattr(np, name)(np.zeros(1, a.dtype)).dtype
+        odt = np.dtype(out.dtype) if _is_array_nd(out) else None
+        if odt is not None:
+            # NumPy accumulates in promote_types(default, out.dtype); for two integer
+            # types out's dtype gives the same result modulo 2**bits
+            ints = dtype.kind in "iu" and odt.kind in "iu"
+            dtype = odt if ints else np.promote_types(dtype, odt)
     if isinstance(a, _NDBase):
         from .folded import along_last_dims
 
@@ -854,11 +867,10 @@ def _scan(name, a, axis=None, dtype=None, out=None):
             out[...] = result
             return out
         return result
-    if dtype is None:
-        # NumPy's accumulation dtype (int64/uint64 for bool and small ints)
-        dtype = getattr(np, name)(np.zeros(1, a.dtype)).dtype
     dtype = _normalize_dtype(dtype)
-    src = _materialize(_astype(a, dtype))
+    if a.dtype != dtype and not (dtype in _SCAN_WIDE and a.dtype in _SCAN_NARROW):
+        a = _astype(a, dtype)  # SCAN casts the narrow integer inputs itself
+    src = _materialize(a)
     result = nonfusible_op(
         src,
         axis,
@@ -874,9 +886,15 @@ def _scan(name, a, axis=None, dtype=None, out=None):
 
 
 def _sort(a, axis=-1, kind=None, order=None, arg=False):
-    """sort / argsort along one axis; gathers on one chare (not scalable). NaNs last, stable."""
+    """sort / argsort along one axis (stable, NaNs last: valid for every NumPy kind).
+
+    Real sort values are decoded from radix keys: every NaN comes back as one canonical NaN,
+    and -0.0 sorts strictly before +0.0 (np.sort keeps their input order). Equal as floats.
+    """
     if order is not None:
         raise NotImplementedError("sort(order=...) needs structured dtypes")
+    if kind is not None and not (isinstance(kind, str) and kind[:1].lower() in "qhms" and kind):
+        raise ValueError(f"sort kind must be one of 'quick', 'heap', or 'stable' (got {kind!r})")
     a = asarray(a)
     if axis is None:
         a = _reshape(a, (-1,))
