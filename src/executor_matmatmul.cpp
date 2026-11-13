@@ -288,7 +288,7 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
                                       K, T(0)
 #ifdef USE_NVIDIA
                                       ,
-                                      partition->compute_stream_raw
+                                      partition->compute_exec
 #endif
                         );
                     });
@@ -513,7 +513,7 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
                                                          c_data, c_rows2, sub_cols2, c_lr, c_lc
 #ifdef USE_NVIDIA
                                                          ,
-                                                         partition->compute_stream_raw
+                                                         partition->compute_exec
 #endif
                                 );
                             }
