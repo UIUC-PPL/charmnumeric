@@ -266,6 +266,7 @@ struct CommPool {
     std::multimap<int64_t, FreeBlock> free_large;
     std::map<uint64_t, std::multimap<int64_t, FreeBlock>::iterator> by_age; // stamp -> block
     int64_t large_cached = 0;
+    std::unordered_map<void*, int> shared; // block -> comm_free calls left (comm_share)
     std::mutex mu; // shared by the PEs of a process (SMP)
 };
 
@@ -360,9 +361,26 @@ inline void* comm_alloc(int64_t bytes) {
     return ptr;
 }
 
+/// Makes the next `users` comm_free calls on ptr release it only once, at the last one.
+inline void comm_share(void* ptr, int users) {
+    if (users <= 1)
+        return;
+    auto& pool = comm_pool();
+    std::lock_guard<std::mutex> lock(pool.mu);
+    pool.shared[ptr] = users;
+}
+
 inline void comm_free(void* ptr) {
     auto& pool = comm_pool();
     std::unique_lock<std::mutex> lock(pool.mu);
+    if (!pool.shared.empty()) {
+        auto sh = pool.shared.find(ptr);
+        if (sh != pool.shared.end()) {
+            if (--sh->second > 0)
+                return;
+            pool.shared.erase(sh);
+        }
+    }
     auto it = pool.live.find(ptr);
     if (it == pool.live.end()) {
         auto lt = pool.live_large.find(ptr);
@@ -559,6 +577,7 @@ struct PendingComm {
     std::vector<ArrayRegion<N>> my_inputs;
     std::unordered_map<int, std::vector<RemoteBuffer<N>>> remote_buffers;
     bool incremental = false; // When true, compute as panels arrive
+    int conv_filter_left = 0; // CONVOLVE leader: filter pieces still to arrive
 
     void clear_remote_buffers() {
 #ifdef USE_KOKKOS
@@ -590,7 +609,11 @@ struct ReductionState {
     DAGNode* node = nullptr;
     bool started = false;
     bool receiving = false; // owns part of the result
-    bool sending = false;   // BINCOUNT: waiting for weights moved onto x's layout
+    bool sending = false;   // BINCOUNT: the histogram waits for moved weights or its bin range
+    bool bin_moved = false;      // BINCOUNT: weights moved onto x's layout (weights)
+    bool bin_range_wait = false; // BINCOUNT: block's bin range on its way (MSG_BIN_RANGE)
+    bool bin_range = false;      // BINCOUNT: [bin_lo, bin_hi] known
+    int64_t bin_lo = 0, bin_hi = -1;
     std::vector<std::vector<char>> stash;
     ArrayRegion<N> mine;    // output elements owned by this chare (output array coords)
     std::vector<char> acc;  // one accumulator per element of `mine`
@@ -619,6 +642,9 @@ struct DotState {
 
 /// receive_data input_index of LINALG device chunks: LA_DEV_INPUT + chunk kind.
 constexpr int LA_DEV_INPUT = 1 << 24;
+
+/// receive_data input index of BINCOUNT pieces (a PE's histogram slice for an output chare).
+constexpr int BIN_DEV_INPUT = -1500;
 
 /// A LINALG device chunk: rows [r0, r1) x cols [c0, c1) of an operand or result.
 struct LaDevChunk {
@@ -911,6 +937,7 @@ class ArrayDAGExecutorND : public DAGExecutor {
     void execute_signal_node(DAGNode* node);
     void finish_signal_node(PendingComm<N>& comm);
     void on_signal_receive(int node_id, int input_index);
+    void on_conv_filter(int node_id);
     void execute_index_node(DAGNode* node);
     void on_index_msg(int node_id, char* data, int64_t size);
     void index_progress(int node_id);
@@ -1253,6 +1280,7 @@ class PartitionImpl {
                         int64_t size, char* data);
 #endif
     void comm_done(int node_id);
+    void conv_ready(int node_id);
     void reduce_result(int node_id, int64_t size, char* data);
     void receive_reduce_partial(int node_id, int64_t size, char* data);
     void receive_linalg(int node_id, int64_t size, char* data);
@@ -1428,6 +1456,7 @@ class Partition1D : public CBase_Partition1D {
     }
 #endif
     void comm_done(int node_id) { impl.comm_done(node_id); }
+    void conv_ready(int node_id) { impl.conv_ready(node_id); }
     void reduce_result(int node_id, int64_t size, char* data) {
         impl.reduce_result(node_id, size, data);
     }
@@ -1494,6 +1523,7 @@ class Partition2D : public CBase_Partition2D {
     }
 #endif
     void comm_done(int node_id) { impl.comm_done(node_id); }
+    void conv_ready(int node_id) { impl.conv_ready(node_id); }
     void reduce_result(int node_id, int64_t size, char* data) {
         impl.reduce_result(node_id, size, data);
     }
@@ -1560,6 +1590,7 @@ class Partition3D : public CBase_Partition3D {
     }
 #endif
     void comm_done(int node_id) { impl.comm_done(node_id); }
+    void conv_ready(int node_id) { impl.conv_ready(node_id); }
     void reduce_result(int node_id, int64_t size, char* data) {
         impl.reduce_result(node_id, size, data);
     }

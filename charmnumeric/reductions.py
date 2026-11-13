@@ -301,6 +301,9 @@ def bincount(x, weights=None, minlength=0, interface=None):
 
     Length is ``minlength``, or ``max(minlength, max(x) + 1)`` when ``interface``
     is given. Values outside ``[0, length)`` are ignored.
+
+    Weighted float sums are not bit-reproducible from run to run: device atomics and
+    merging per-PE histograms in arrival order change the rounding order.
     """
 
     x = asarray(x)
