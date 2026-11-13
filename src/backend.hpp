@@ -605,6 +605,10 @@ struct ReductionState {
 /// receive_data input index of finalized REDUCTION pieces (not a node input).
 constexpr int RED_FINAL_INPUT = -100;
 
+/// receive_data input index of RESHAPE/BROADCAST elements sent as device messages; the region
+/// data carry the sending chare.
+constexpr int SHAPE_DEV_INPUT = -101;
+
 /// REDUCE (dot) state on chare 0; partials are summed as they arrive.
 struct DotState {
     std::vector<char> acc;   // ReduceContrib: metadata of the first partial, summed value
@@ -682,6 +686,7 @@ struct ShapeState {
     int64_t expected = 0;
     std::vector<char> block; // BROADCAST: the source block this chare expands
     char* d_block = nullptr; // its device copy (GPU builds)
+    std::map<std::array<int, 3>, char*> payloads; // device messages by sending chare
 };
 
 // ---- ArrayDAGGroup ----
@@ -890,6 +895,7 @@ class ArrayDAGExecutorND : public DAGExecutor {
     void execute_transpose_node(DAGNode* node);
     void execute_shape_node(DAGNode* node);
     void on_shape_msg(int node_id, char* data, int64_t size);
+    void on_shape_payload(int node_id, const int* from, char* buf);
     void execute_castscansort_node(DAGNode* node);
     void finish_castscansort_node(PendingComm<N>& comm);
     void execute_ds_node(DAGNode* node);
