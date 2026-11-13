@@ -72,6 +72,10 @@ template <>
 struct UIntOf<8> {
     using type = uint64_t;
 };
+template <>
+struct UIntOf<16> {
+    using type = unsigned __int128;
+};
 
 template <typename K, typename T>
 DS_FN K to_bits(const T& x) {
@@ -126,6 +130,44 @@ struct Key {
     }
 };
 
+/// Complex: (real, imag) keys side by side; NaN parts take the top high words, so the
+/// order is R+Rj < R+nanj (by real) < nan+Rj (by imag) < nan+nanj, as in NumPy. Zero
+/// parts are always canonical (-0.0 must tie with 0.0 for the next part to decide).
+template <typename F>
+struct Key<cn_complex<F>> {
+    using KF = Key<F>;
+    using H = typename KF::K;
+    using K = typename UIntOf<2 * sizeof(F)>::type;
+    static constexpr int W = 2 * KF::W;
+    static constexpr H TOP = H(~H(0));
+
+    static DS_FN K join(H hi, H lo) { return K(K(hi) << KF::W) | K(lo); }
+
+    static DS_FN K enc(const cn_complex<F>& x, bool) {
+        F re = x.real(), im = x.imag();
+        bool rn = re != re, in = im != im;
+        if (rn && in)
+            return join(TOP, TOP);
+        if (rn)
+            return join(H(TOP - 1), KF::enc(im, true));
+        if (in)
+            return join(H(TOP - 2), KF::enc(re, true));
+        return join(KF::enc(re, true), KF::enc(im, true));
+    }
+
+    static DS_FN cn_complex<F> dec(K k) {
+        H hi = H(k >> KF::W), lo = H(k);
+        F nan = KF::dec(TOP);
+        if (hi == TOP)
+            return cn_complex<F>(nan, nan);
+        if (hi == H(TOP - 1))
+            return cn_complex<F>(nan, KF::dec(lo));
+        if (hi == H(TOP - 2))
+            return cn_complex<F>(KF::dec(lo), nan);
+        return cn_complex<F>(KF::dec(hi), KF::dec(lo));
+    }
+};
+
 template <typename K>
 DS_FN int bucket_of(K k, int64_t g, const K* sk, const int64_t* sg, int nspl) {
     int lo = 0, hi = nspl;
@@ -156,6 +198,11 @@ DS_FN int group_of(K k, int W, int depth, const K* grp, int G) {
             hi = mid - 1;
     }
     return -1;
+}
+
+/// Byte offset of n keys stored after n int64 values (16-byte keys stay aligned).
+DS_FN int64_t keys_after(int64_t n) {
+    return (8 * n + 15) / 16 * 16;
 }
 
 DS_FN uint64_t mix64(uint64_t x) {
@@ -373,7 +420,7 @@ template <typename K>
 __device__ void load_splitters(char* smem, const K* spk, const int64_t* spg, int nspl,
                                K*& sk, int64_t*& sg) {
     sg = reinterpret_cast<int64_t*>(smem);
-    sk = reinterpret_cast<K*>(smem + 8 * (size_t)nspl);
+    sk = reinterpret_cast<K*>(smem + keys_after(nspl));
     for (int i = threadIdx.x; i < nspl; i += blockDim.x) {
         sg[i] = spg[i];
         sk[i] = spk[i];
@@ -381,7 +428,7 @@ __device__ void load_splitters(char* smem, const K* spk, const int64_t* spg, int
 }
 
 DS_FN size_t split_smem(int nspl, int ksize) {
-    return ((size_t)nspl * (8 + ksize) + 7) / 8 * 8;
+    return ((size_t)keys_after(nspl) + (size_t)nspl * ksize + 7) / 8 * 8;
 }
 
 /// hist[b * nblocks + block] = elements of the block going to bucket b.
@@ -690,7 +737,7 @@ struct DsState {
     struct Piece {
         int phase = 0, src = 0;
         int64_t start = 0, count = 0;
-        char* buf = nullptr; // keys, then index values (ARGSORT); phase 1: output values
+        char* buf = nullptr; // index values (ARGSORT), then keys; phase 1: output values
     };
     DAGNode* node = nullptr;
     bool started = false;
@@ -843,9 +890,9 @@ void sort_send_samples(PartitionImpl<1>* p, DsState& s, const T* in, int64_t n) 
     std::vector<K> hk(ns);
     std::vector<int64_t> hg(ns);
 #ifdef USE_NVIDIA
-    char* d = ds_alloc((int64_t)ns * (sizeof(K) + 8));
+    char* d = ds_alloc(keys_after(ns) + (int64_t)ns * sizeof(K));
     int64_t* dg = reinterpret_cast<int64_t*>(d);
-    K* dk = reinterpret_cast<K*>(d + 8 * (int64_t)ns);
+    K* dk = reinterpret_cast<K*>(d + keys_after(ns));
     ds_sample_kernel<T><<<grid_for(ns), 256, 0, ds_stream(p)>>>(in, n, g0, seed, ns, s.arg, dk,
                                                                dg);
     DS_LAUNCHED();
@@ -874,8 +921,10 @@ void sort_make_splitters(PartitionImpl<1>* p, DsState& s) {
     for (auto& m : s.samples) {
         Hdr h;
         memcpy(&h, m.data(), sizeof(h));
-        const int64_t* g = reinterpret_cast<const int64_t*>(m.data() + sizeof(h));
-        const K* k = reinterpret_cast<const K*>(m.data() + sizeof(h) + 8 * h.a);
+        std::vector<int64_t> g(h.a);
+        std::vector<K> k(h.a);
+        memcpy(g.data(), m.data() + sizeof(h), 8 * h.a);
+        memcpy(k.data(), m.data() + sizeof(h) + 8 * h.a, sizeof(K) * h.a);
         for (int64_t i = 0; i < h.a; ++i)
             all.push_back({k[i], g[i]});
     }
@@ -935,8 +984,10 @@ void sort_partition(PartitionImpl<1>* p, DsState& s, const T* in, int64_t n,
     Hdr h;
     memcpy(&h, m.data(), sizeof(h));
     int nspl = (int)h.a, P = nspl + 1; // buckets
-    const int64_t* hsg = reinterpret_cast<const int64_t*>(m.data() + sizeof(h));
-    const K* hsk = reinterpret_cast<const K*>(m.data() + sizeof(h) + 8 * nspl);
+    std::vector<int64_t> vsg(nspl);
+    std::vector<K> vsk(nspl);
+    memcpy(vsg.data(), m.data() + sizeof(h), 8 * nspl);
+    memcpy(vsk.data(), m.data() + sizeof(h) + 8 * nspl, sizeof(K) * nspl);
     std::vector<int64_t> how(P);
     memcpy(how.data(), m.data() + sizeof(h) + (8 + sizeof(K)) * nspl, 8 * P);
     s.owner.assign(how.begin(), how.end());
@@ -946,11 +997,11 @@ void sort_partition(PartitionImpl<1>* p, DsState& s, const T* in, int64_t n,
     int64_t g0 = s.pstart[s.rank];
     std::vector<int64_t> cnt(P, 0);
     std::vector<char*> bufs(P, nullptr);
-    int64_t esize = sizeof(K) + (s.arg ? 8 : 0);
+    // bucket buffers: index values (ARGSORT), then keys at koff(count)
+    auto koff = [&](int64_t c) { return s.arg ? keys_after(c) : 0; };
+    auto pbytes = [&](int64_t c) { return koff(c) + c * (int64_t)sizeof(K); };
 #ifdef USE_NVIDIA
     cudaStream_t st = ds_stream(p);
-    std::vector<int64_t> vsg(hsg, hsg + nspl);
-    std::vector<K> vsk(hsk, hsk + nspl);
     int64_t* dsg = ds_upload(p, vsg);
     K* dsk = ds_upload(p, vsk);
     size_t sm1 = split_smem(nspl, sizeof(K)) + P * sizeof(unsigned);
@@ -965,8 +1016,8 @@ void sort_partition(PartitionImpl<1>* p, DsState& s, const T* in, int64_t n,
         for (int b = 0; b < P; ++b)
             cnt[b] = (b + 1 < P ? hb[b + 1] : n) - hb[b];
         for (int b = 0; b < P; ++b) {
-            bufs[b] = ds_alloc(cnt[b] * esize, pe_of(p, s.first + s.owner[b]) != CkMyPe());
-            pk[b] = reinterpret_cast<K*>(bufs[b] + (s.arg ? 8 * cnt[b] : 0));
+            bufs[b] = ds_alloc(pbytes(cnt[b]), pe_of(p, s.first + s.owner[b]) != CkMyPe());
+            pk[b] = reinterpret_cast<K*>(bufs[b] + koff(cnt[b]));
             pg[b] = reinterpret_cast<int64_t*>(bufs[b]);
         }
     };
@@ -1067,17 +1118,16 @@ void sort_partition(PartitionImpl<1>* p, DsState& s, const T* in, int64_t n,
     (void)p;
     std::vector<int> bk(n);
     for (int64_t i = 0; i < n; ++i) {
-        bk[i] = bucket_of<K>(Key<T>::enc(in[i], s.arg), g0 + i, hsk, hsg, nspl);
+        bk[i] = bucket_of<K>(Key<T>::enc(in[i], s.arg), g0 + i, vsk.data(), vsg.data(), nspl);
         cnt[bk[i]]++;
     }
     std::vector<int64_t> pos(P, 0);
     for (int b = 0; b < P; ++b)
-        bufs[b] = ds_alloc(cnt[b] * esize);
+        bufs[b] = ds_alloc(pbytes(cnt[b]));
     for (int64_t i = 0; i < n; ++i) {
         int b = bk[i];
         char* base = bufs[b];
-        K* k = reinterpret_cast<K*>(base + (s.arg ? 8 * cnt[b] : 0));
-        k[pos[b]] = Key<T>::enc(in[i], s.arg);
+        reinterpret_cast<K*>(base + koff(cnt[b]))[pos[b]] = Key<T>::enc(in[i], s.arg);
         if (s.arg)
             reinterpret_cast<int64_t*>(base)[pos[b]] = g0 + i;
         pos[b]++;
@@ -1093,7 +1143,7 @@ void sort_partition(PartitionImpl<1>* p, DsState& s, const T* in, int64_t n,
         }
         if (cnt[b] > 0)
             send_piece(p, s.first + s.owner[b], s.node->id, 0, s.rank, 0, cnt[b], bufs[b],
-                       cnt[b] * esize);
+                       pbytes(cnt[b]));
         else
             ds_free(bufs[b]);
     }
@@ -1115,8 +1165,8 @@ void sort_bucket(PartitionImpl<1>* p, DsState& s, void* outp) {
     for (int i = 0; i < P; ++i) {
         auto& pc = s.pieces[i];
         if (pc.count > 0) {
-            const char* kp = pc.buf + (s.arg ? 8 * pc.count : 0);
-            ds_copy(p, k + at, kp, pc.count * sizeof(K));
+            ds_copy(p, k + at, pc.buf + (s.arg ? keys_after(pc.count) : 0),
+                    pc.count * sizeof(K));
             if (s.arg)
                 ds_copy(p, g + at, pc.buf, pc.count * 8);
             at += pc.count;
@@ -1411,12 +1461,13 @@ ASTNode* ds_root(DAGNode* node) {
 
 } // namespace
 
-/// Used by execute_castscansort_node: 1-D SORT/ARGSORT of real types and SELECT.
+/// Used by execute_castscansort_node: 1-D SORT/ARGSORT and SELECT.
 bool ds_handles(ASTNode* root, DType dt, int ndims) {
+    (void)dt;
     Opcode op = static_cast<Opcode>(root->opcode);
     if (op == Opcode::SELECT)
         return true;
-    if (ndims != 1 || dt == DType::COMPLEX64 || dt == DType::COMPLEX128)
+    if (ndims != 1)
         return false;
 #if defined(USE_KOKKOS) && !defined(USE_NVIDIA)
     return false;
@@ -1498,13 +1549,13 @@ void ArrayDAGExecutorND<N>::ds_progress_start(int node_id) {
             in = partition->arrays.at(s.in_name);
         cn_dispatch(s.dt, [&](auto tag) {
             using T = decltype(tag);
-            if constexpr (cn_is_complex_v<T>) {
-                CkAbort("sort/select: complex dtype");
-            } else {
+            {
                 const T* ip = in ? static_cast<const T*>(in->device_data_ptr()) : nullptr;
                 int64_t n = in ? in->local_size() : 0;
                 if (s.op == Opcode::SELECT) {
-                    if (s.rank >= 0) {
+                    if constexpr (cn_is_complex_v<T>) {
+                        CkAbort("select: complex dtype");
+                    } else if (s.rank >= 0) {
 #if defined(USE_KOKKOS) && !defined(USE_NVIDIA)
                         s.host_in.resize(n * sizeof(T));
                         Kokkos::deep_copy(
@@ -1597,9 +1648,7 @@ void ArrayDAGExecutorND<N>::on_ds_msg(int node_id, char* data, int64_t size) {
             s.samples.emplace_back(data, data + size);
             if (++s.samples_got == s.P)
                 cn_dispatch(s.dt, [&](auto tag) {
-                    using T = decltype(tag);
-                    if constexpr (!cn_is_complex_v<T>)
-                        sort_make_splitters<T>(partition, s);
+                    sort_make_splitters<decltype(tag)>(partition, s);
                 });
             return;
         case S_SPLIT: {
@@ -1607,9 +1656,8 @@ void ArrayDAGExecutorND<N>::on_ds_msg(int node_id, char* data, int64_t size) {
             CTArrayBase<1>* in = partition->arrays.at(s.in_name);
             cn_dispatch(s.dt, [&](auto tag) {
                 using T = decltype(tag);
-                if constexpr (!cn_is_complex_v<T>)
-                    sort_partition<T>(partition, s, static_cast<const T*>(in->device_data_ptr()),
-                                      in->local_size(), m);
+                sort_partition<T>(partition, s, static_cast<const T*>(in->device_data_ptr()),
+                                  in->local_size(), m);
             });
             s.split_done = true;
             ds_sort_progress(node_id);
@@ -1668,11 +1716,7 @@ void ArrayDAGExecutorND<N>::ds_sort_progress(int node_id) {
                 if (s.col[i] > 0 && s.pieces[i].buf == nullptr)
                     return;
             void* outp = partition->arrays.at(s.out_name)->device_data_ptr();
-            cn_dispatch(s.dt, [&](auto tag) {
-                using T = decltype(tag);
-                if constexpr (!cn_is_complex_v<T>)
-                    sort_bucket<T>(partition, s, outp);
-            });
+            cn_dispatch(s.dt, [&](auto tag) { sort_bucket<decltype(tag)>(partition, s, outp); });
         }
         // elements of my tile that other buckets hold
         int64_t G = s.G, nb = s.nb;
