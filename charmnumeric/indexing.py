@@ -38,6 +38,7 @@ from .charmnumeric import (
     _clip,
     _coerce_scalar,
     _compare,
+    _fresh,
     _fresh_operands,
     _is_array,
     _is_array_nd,
@@ -45,6 +46,7 @@ from .charmnumeric import (
     _full_region,
     _is_scalar_like,
     _reshape_copy,
+    _version,
     _where,
     _wrote,
     arange,
@@ -72,6 +74,32 @@ def _check_itemsize(x):
 def _fetch_int(x):
     """Value of a size-1 backend array (a blocking get)."""
     return int(x.get(default_interface()).reshape(-1)[0])
+
+
+_COUNT_CACHE_MAX = 8
+
+
+def _count(x, kind="nonzero"):
+    """count_nonzero(x) or (kind "sum") sum(x) as an int, a blocking get; cached on x's
+    root until the root is written."""
+    from .reductions import count_nonzero, sum as _sum
+
+    fn = count_nonzero if kind == "nonzero" else _sum
+    if x.__class__ is not Array and x.__class__ is not ArrayView:
+        return _fetch_int(fn(x))
+    _fresh(x)  # a linked copy may refresh (a write) first
+    root = x._root_parent if x.__class__ is ArrayView else x
+    key = (kind, x.region, x.dtype)
+    version = _version(root)
+    cache = root.__dict__.setdefault("_count_cache", {})
+    hit = cache.get(key)
+    if hit is not None and hit[0] == version:
+        return hit[1]
+    cnt = _fetch_int(fn(x))
+    if key not in cache and len(cache) >= _COUNT_CACHE_MAX:
+        cache.pop(next(iter(cache)))
+    cache[key] = (version, cnt)
+    return cnt
 
 
 def _geometry(x):
@@ -152,11 +180,9 @@ def _wrap_device(idx, n, mode):
 
 def _nonzero_flat(x):
     """Flat (row-major) positions of the nonzero elements of x, or None if none."""
-    from .reductions import count_nonzero
-
     if x.dtype.itemsize > 8:
         x = _compare(x, 0, "not_equal")
-    cnt = _fetch_int(count_nonzero(x))
+    cnt = _count(x)
     return _expand(x, False, cnt) if cnt else None
 
 
@@ -388,9 +414,7 @@ def _lead_mask(x, key):
 def _mask_count(k):
     """(count of k, k as a backend array)."""
     if _is_array(k):
-        from .reductions import count_nonzero
-
-        return _fetch_int(count_nonzero(k)), k
+        return _count(k), k
     return int(np.count_nonzero(k)), asarray(np.ascontiguousarray(k))
 
 
@@ -797,9 +821,7 @@ def repeat(a, repeats, axis=None):
             raise ValueError(f"operands could not be broadcast together with shape ({n},)")
         if repeats.shape[0] == 1 and n != 1:
             raise NotImplementedError("repeat with a size-1 device repeats array")
-        from .reductions import sum as _sum
-
-        total = _fetch_int(_sum(repeats))
+        total = _count(repeats, "sum")
         idx = _expand(repeats, True, total) if total else np.zeros(0, np.int64)
     elif np.ndim(repeats) == 0:
         r = int(repeats)
