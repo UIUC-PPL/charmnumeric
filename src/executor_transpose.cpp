@@ -6,6 +6,52 @@
 // TRANSPOSE: result axis k reads source axis perm[k]. Source chares send permuted
 // blocks to each overlapping result chare; any tiles/offsets work.
 
+#ifdef USE_KOKKOS
+/// dst[obase + c.ostr] = src[sbase + c.sstr] for every c in the row-major box ext; the
+/// coordinate decode uses I (32-bit unless the box exceeds 2^31 elements).
+template <int N, typename T, typename I, typename Policy>
+static void box_copy_as(const Policy& policy, T* dst, int64_t obase, const int64_t* ostr,
+                        const T* src, int64_t sbase, const int64_t* sstr, const int* ext) {
+    I e[N];
+    int64_t os[N], ss[N];
+    for (int k = 0; k < N; ++k) {
+        e[k] = ext[k];
+        os[k] = ostr[k];
+        ss[k] = sstr[k];
+    }
+    Kokkos::parallel_for(
+        policy, KOKKOS_LAMBDA(int64_t flat) {
+            I rem = (I)flat;
+            int64_t o = obase, s = sbase;
+            for (int k = N - 1; k >= 0; --k) {
+                I c = rem % e[k];
+                rem /= e[k];
+                o += (int64_t)c * os[k];
+                s += (int64_t)c * ss[k];
+            }
+            dst[o] = src[s];
+        });
+}
+
+template <int N, typename T, typename Policy>
+static void box_copy(const Policy& policy, int64_t total, T* dst, int64_t obase,
+                     const int64_t* ostr, const T* src, int64_t sbase, const int64_t* sstr,
+                     const int* ext) {
+    if (total <= INT32_MAX)
+        box_copy_as<N, T, int>(policy, dst, obase, ostr, src, sbase, sstr, ext);
+    else
+        box_copy_as<N, T, int64_t>(policy, dst, obase, ostr, src, sbase, sstr, ext);
+}
+
+/// Row-major strides of the box ext.
+template <int N>
+static void packed_strides(const int* ext, int64_t* str) {
+    str[N - 1] = 1;
+    for (int k = N - 2; k >= 0; --k)
+        str[k] = str[k + 1] * ext[k + 1];
+}
+#endif
+
 template <int N>
 struct TransposeGeom {
     ArrayDecomp<N> src;        // source array decomposition
@@ -90,19 +136,12 @@ static void transpose_pack_send(PartitionImpl<N>* partition, Array<N, T>* src, D
 #ifdef USE_KOKKOS
     T* send_buf = static_cast<T*>(comm_alloc(byte_size));
     T* src_device = static_cast<T*>(src->device_data_ptr());
-    int64_t ss[N];
+    int64_t ss[N], ps[N];
     for (int k = 0; k < N; ++k)
         ss[k] = sstride[k];
-    Kokkos::parallel_for(
-        CT_COMM_POLICY(partition, total), KOKKOS_LAMBDA(int flat) {
-            int rem = flat;
-            int64_t s = src_base;
-            for (int k = N - 1; k >= 0; --k) {
-                s += (int64_t)(rem % ext[k]) * ss[k];
-                rem /= ext[k];
-            }
-            send_buf[flat] = src_device[s];
-        });
+    packed_strides<N>(ext, ps);
+    box_copy<N, T>(CT_COMM_POLICY(partition, total), total, send_buf, 0, ps, src_device, src_base,
+                   ss, ext);
     device_pack_send<N, N>(partition, partition->thisProxy, target, node->id, 0, input_name,
                            region_data, byte_size, send_buf);
 #else
@@ -318,16 +357,10 @@ void transpose_place(ArrayDAGGroup* dag_group, PartitionImpl<N>* partition, ASTN
         const T* received = reinterpret_cast<const T*>(rb.data);
 #ifdef USE_KOKKOS
         T* out_device = static_cast<T*>(out->device_data_ptr());
-        Kokkos::parallel_for(
-            CT_COMPUTE_POLICY(partition, total), KOKKOS_LAMBDA(int flat) {
-                int rem = flat;
-                int64_t o = base;
-                for (int k = N - 1; k >= 0; --k) {
-                    o += (int64_t)(rem % ext[k]) * ostride[k];
-                    rem /= ext[k];
-                }
-                out_device[o] = received[flat];
-            });
+        int64_t ps[N];
+        packed_strides<N>(ext, ps);
+        box_copy<N, T>(CT_COMPUTE_POLICY(partition, total), total, out_device, base, ostride,
+                       received, 0, ps, ext);
 #else
         T* out_data = static_cast<T*>(out->data_ptr());
         int inner = ext[N - 1];

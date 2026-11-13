@@ -10,27 +10,42 @@
 // Under USE_NVIDIA: Kokkos::Cuda exec space instances bound to per-chare streams.
 // Under USE_KOKKOS without USE_NVIDIA: default execution space + Kokkos::fence().
 
+// 64-bit indices: a chare's tile can hold more than 2^31 elements.
 #ifdef USE_KOKKOS
 #ifdef USE_NVIDIA
 #define CT_COMPUTE_POLICY(partition, n)                                                            \
-    Kokkos::RangePolicy<Kokkos::Cuda>((partition)->compute_exec, 0, (n))
-#define CT_COMM_POLICY(partition, n)                                                               \
-    Kokkos::RangePolicy<Kokkos::Cuda>((partition)->comm_exec, 0, (n))
-#define CT_COMPUTE_POLICY64(partition, n)                                                          \
     Kokkos::RangePolicy<Kokkos::Cuda, Kokkos::IndexType<int64_t>>((partition)->compute_exec, 0,    \
                                                                   (int64_t)(n))
-#define CT_COMM_POLICY64(partition, n)                                                             \
+#define CT_COMM_POLICY(partition, n)                                                               \
     Kokkos::RangePolicy<Kokkos::Cuda, Kokkos::IndexType<int64_t>>((partition)->comm_exec, 0,       \
                                                                   (int64_t)(n))
+#define CT_COMPUTE_POLICY64(partition, n) CT_COMPUTE_POLICY(partition, n)
+#define CT_COMM_POLICY64(partition, n) CT_COMM_POLICY(partition, n)
 #define CT_COMPUTE_EXEC(partition) ((partition)->compute_exec)
 #else
-#define CT_COMPUTE_POLICY(partition, n) Kokkos::RangePolicy<>(0, (n))
-#define CT_COMM_POLICY(partition, n) Kokkos::RangePolicy<>(0, (n))
-#define CT_COMPUTE_POLICY64(partition, n)                                                          \
+#define CT_COMPUTE_POLICY(partition, n)                                                            \
     Kokkos::RangePolicy<Kokkos::IndexType<int64_t>>(0, (int64_t)(n))
-#define CT_COMM_POLICY64(partition, n) CT_COMPUTE_POLICY64(partition, n)
+#define CT_COMM_POLICY(partition, n) Kokkos::RangePolicy<Kokkos::IndexType<int64_t>>(0, (int64_t)(n))
+#define CT_COMPUTE_POLICY64(partition, n) CT_COMPUTE_POLICY(partition, n)
+#define CT_COMM_POLICY64(partition, n) CT_COMM_POLICY(partition, n)
 #define CT_COMPUTE_EXEC(partition) Kokkos::DefaultExecutionSpace()
 #endif
+#endif
+
+#ifdef USE_KOKKOS
+/// a /= b and returns the old a % b, in 32 bits when both fit (64-bit division is slow on GPUs).
+KOKKOS_INLINE_FUNCTION int64_t ct_divmod(int64_t& a, int64_t b) {
+    if (((uint64_t)a | (uint64_t)b) <= 0xFFFFFFFFull) {
+        uint32_t q = (uint32_t)a / (uint32_t)b;
+        int64_t r = (uint32_t)a - q * (uint32_t)b;
+        a = q;
+        return r;
+    }
+    int64_t q = a / b;
+    int64_t r = a - q * b;
+    a = q;
+    return r;
+}
 #endif
 
 // Helper: fence Kokkos on non-NVIDIA GPU builds (no-op on CPU-only and NVIDIA).

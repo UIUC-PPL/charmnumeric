@@ -26,9 +26,10 @@ Distributed N-dimensional array DSL built on charmtyles. The backend stores 1-3D
 | `_NDBase` / `_nd_aware()` | — | Marker of FoldedArray; wrapper that lets elementwise functions take >3-D operands |
 | `_ElementwiseMethods` | 863 | Mixin for Array/ArrayView: round/clip and old-backend methods (sqrt, log(base), where, max(other), ...) |
 | `_array_matmul()` | 492 | Matrix multiply dispatch (dot for 1D×1D, matvec for 2D×1D, matmatmul for 2D×2D) |
-| `_matvec()` | 536 | Matrix-vector multiply |
+| `_matvec()` | 536 | Matrix-vector multiply (a 2-D row-stepped matrix view is read in place) |
+| `_vecmat()` | — | `vec @ mat` for a 2-D matrix: MATMUL with a third operand 1 (transposed GEMV, no transposed copy) |
 | `_matmatmul()` | 595 | Matrix-matrix multiply (SUMMA) |
-| `_unstrided()` | — | Copies a stepped view before matvec/SUMMA (the executors ignore view steps) |
+| `_unstrided()` | — | Copies a stepped view before matvec/SUMMA where the executor cannot read the step (column steps, 3-D, SUMMA) |
 | `_batched_matmul()` | — | N-D / FoldedArray / non-squeezable 3-D matmul via `einsum("...ij,...jk->...ik")` (one BATCHED_MATMUL node) |
 | `create_array()` | 851 | Array creation factory |
 | `empty/zeros/ones/full()` | 931-971 | Array constructors |
@@ -152,7 +153,7 @@ Bit-exact NumPy mirror of `src/creation_kernels.hpp` (Philox4x32-10, software lo
 ### `backend_internal.hpp` — Compute kernels & helpers (491 lines)
 | Symbol | Line | Description |
 |--------|------|-------------|
-| `eigen_gemv/gemv_sub/gemv_sub_3d()` | 15/28/48 | Eigen GEMV kernels |
+| `eigen_gemv_sub/gemv_t_sub/gemv_sub_3d()` | 15/28/48 | Eigen GEMV kernels |
 | `eigen_dot()` | 88 | Dot product |
 | `eigen_gemm/gemm_sub()` | 98/114 | Eigen GEMM kernels |
 | `ct_min_tile()` | 151 | Min tile by dimension |
