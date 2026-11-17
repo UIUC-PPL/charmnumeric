@@ -355,7 +355,9 @@ inline PinnedPool& pinned_pool() {
 }
 
 /// Staged sends on unless CNUM_GPU_STAGE=0. CNUM_GPU_STAGE_MB caps only the blocks cached
-/// for reuse (default 512), not those in flight. nullptr: use the CkDeviceBuffer path.
+/// for reuse (default 4096), not those in flight: it has to cover one operation's burst of
+/// messages, or every block past it costs a cudaMallocHost and a cudaFreeHost (~35 ms per
+/// 64 MB). nullptr: use the CkDeviceBuffer path.
 inline void* pinned_alloc(int64_t bytes) {
     auto& pool = pinned_pool();
     int cls = PinnedPool::kMinClass;
@@ -366,7 +368,7 @@ inline void* pinned_alloc(int64_t bytes) {
         std::lock_guard<std::mutex> lock(pool.mu);
         if (pool.limit < 0) {
             pool.on = gpu_comm_env("CNUM_GPU_STAGE", 1, 0, 1) != 0;
-            pool.limit = gpu_comm_env("CNUM_GPU_STAGE_MB", 512, 0, 1 << 20) << 20;
+            pool.limit = gpu_comm_env("CNUM_GPU_STAGE_MB", 4096, 0, 1 << 20) << 20;
         }
         if (cls > PinnedPool::kMaxClass || !pool.on)
             return nullptr;
