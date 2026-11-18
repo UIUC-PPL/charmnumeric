@@ -215,9 +215,7 @@ void ArrayDAGGroup::receive_get_request_now(int ndims, int epoch, int name, int6
                 n *= pg.grid[d];
             chares += n;
         }
-        partition_proxy_1.run();
-        partition_proxy_2.run();
-        partition_proxy_3.run();
+        wake_local_partitions();
         if (CkMyPe() == 0) {
             barrier_pending[epoch] += chares + 1; // early arrivals made it negative
             barrier_arrive(epoch);
@@ -234,9 +232,7 @@ void ArrayDAGGroup::receive_get_request_now(int ndims, int epoch, int name, int6
     }
 
     // Wake up all partition chares so they can check for new work.
-    partition_proxy_1.run();
-    partition_proxy_2.run();
-    partition_proxy_3.run();
+    wake_local_partitions();
 
     // Only PE 0 allocates the gather buffer for assembly
     // size is element count; convert to bytes using the wire dtype
