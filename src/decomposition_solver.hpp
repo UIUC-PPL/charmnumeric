@@ -2366,10 +2366,41 @@ void compute_decompositions(ArrayMetaMap& array_meta, DAG* dag, int odf, int num
                 meta.offset[d] = ((meta.offset[d] % meta.tile) + meta.tile) % meta.tile;
     }
 
+    // Global coordinates are ints: an offset that would put the array's end past 2**31-1
+    // is dropped (resolve_kernel_layouts() copies the kernel outputs this unties).
+    for (auto& [name, meta] : array_meta) {
+        if (meta.decomp_final)
+            continue;
+        for (int d = 0; d < meta.ndims; ++d)
+            if (int64_t(meta.offset[d]) + meta.global_shape[d] > std::numeric_limits<int>::max())
+                meta.offset[d] = 0;
+    }
+
     for (auto& [name, meta] : array_meta)
         meta.decomp_final = true;
 }
 
+/// Why no chare grid can hold an array laid out as m (nullptr: it can). Chares address
+/// elements by int global coordinates, offset + index, and are counted in int.
+template <typename Meta>
+const char* layout_error(Meta const& m) {
+    if (m.tile < 1)
+        return "the tile size is below 1";
+    int64_t chares = 1;
+    for (int d = 0; d < m.ndims && d < 3; ++d) {
+        if (m.global_shape[d] < 0)
+            return "an extent is negative";
+        if (m.offset[d] < 0)
+            return "an offset is negative";
+        int64_t stop = int64_t(m.offset[d]) + m.global_shape[d];
+        if (stop > std::numeric_limits<int>::max())
+            return "offset + extent is over 2**31-1";
+        chares *= std::max<int64_t>(1, (stop + m.tile - 1) / m.tile - m.offset[d] / m.tile);
+        if (chares > std::numeric_limits<int>::max())
+            return "it needs more than 2**31-1 chares";
+    }
+    return nullptr;
+}
 
 namespace detail {
 

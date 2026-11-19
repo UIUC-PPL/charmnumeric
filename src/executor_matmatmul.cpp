@@ -340,7 +340,7 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
                         target_ci.idx[1] = tj;
 
                         int dest_row_start = std::max(c_row_start, ti * c_tile);
-                        int dest_row_end = std::min(c_row_end, (ti + 1) * c_tile);
+                        int dest_row_end = tile_end(ti, c_tile, c_row_end);
                         int send_rows = dest_row_end - dest_row_start;
                         int send_row_offset = row_offset + (dest_row_start - c_row_start);
 
@@ -392,7 +392,7 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
                         target_ci.idx[1] = tj;
 
                         int dest_col_start = std::max(c_col_start, tj * c_tile);
-                        int dest_col_end = std::min(c_col_end, (tj + 1) * c_tile);
+                        int dest_col_end = tile_end(tj, c_tile, c_col_end);
                         int send_cols = dest_col_end - dest_col_start;
                         int send_col_offset = col_offset + (dest_col_start - c_col_start);
 

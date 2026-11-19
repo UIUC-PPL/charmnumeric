@@ -644,8 +644,8 @@ static void tile_send(PartitionImpl<N_src>* partition, DAGNode* node, int source
             int in_size = input_shape[src_d];
             for (int ci = 0; ci < num_chares_d; ++ci) {
                 int chare_lo = std::max(ci * result_tile, result_decomp.offset[d]);
-                int chare_hi = std::min((ci + 1) * result_tile,
-                                        result_decomp.offset[d] + out_shape[d]);
+                int chare_hi = tile_end(ci, result_tile,
+                                        int64_t(result_decomp.offset[d]) + out_shape[d]);
                 if (chare_lo >= chare_hi)
                     continue;
                 bool overlaps = false;
@@ -853,9 +853,9 @@ void ArrayDAGExecutorND<N>::execute_tile_node(DAGNode* node) {
                 int inp_pos = p % in_size;
                 int src_chare = (inp_pos + in_off) / input_tile;
                 needed_src_chares.insert(src_chare);
-                int next_boundary = (src_chare + 1) * input_tile - in_off - inp_pos + p;
-                int next_wrap = p + (in_size - inp_pos);
-                p = std::min({next_boundary, next_wrap, chare_hi});
+                int64_t next_boundary = int64_t(src_chare + 1) * input_tile - in_off - inp_pos + p;
+                int64_t next_wrap = int64_t(p) + (in_size - inp_pos);
+                p = static_cast<int>(std::min<int64_t>({next_boundary, next_wrap, chare_hi}));
             }
             expected_msgs *= (int)needed_src_chares.size();
         }
