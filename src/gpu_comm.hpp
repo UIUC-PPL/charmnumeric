@@ -341,7 +341,9 @@ inline char* gpu_ipc_peer_slab(int node, int slab, const char* handle) {
 /// Pinned host buffers by power-of-two size class. A block is released from the stream
 /// callback that follows its last async copy, so reuse never races a copy.
 struct PinnedPool {
-    static constexpr int kMinClass = 12, kMaxClass = 28; // 4 KB .. 256 MB
+    // 4 KB .. 1 GiB, the largest single message (ct_msg_max_bytes): without a pinned block a
+    // send falls to CkDeviceBuffer, which blocks the PE for about a second per GiB
+    static constexpr int kMinClass = 12, kMaxClass = 30;
     std::vector<void*> free_lists[kMaxClass + 1];
     std::unordered_map<void*, int> live;
     int64_t cached = 0, limit = -1;
