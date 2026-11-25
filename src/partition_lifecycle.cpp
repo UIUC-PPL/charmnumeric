@@ -66,11 +66,12 @@ PartitionImpl<N>::~PartitionImpl() {
     Kokkos::fence("ct_partition_exit"); // packs and copies on the comm stream
     for (auto& [id, ptr] : pending_sends) {
 #ifdef USE_NVIDIA
-        if (gpu_ipc_forget(ptr)) // a receiver may still be copying it
+        if (gpu_ipc_forget(ptr) || pinned_forget(ptr)) // a receiver may still be copying it
             continue;
 #endif
         comm_free(ptr);
     }
+    // payloads of pinned_recvs stay: a transfer may still be writing them
     for (auto& [key, bufs] : posted_recv_bufs)
         for (char* p : bufs)
             comm_free(p);

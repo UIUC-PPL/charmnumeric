@@ -92,6 +92,7 @@ struct DeferredSendParam {
     int64_t ipc_offset;
     void* host_buf = nullptr; // pinned copy of send_buf (another host)
     bool local = true;        // target in this process
+    int target_pe = -1;
 
     /// Same-dimension send constructor: target_proxy defaults to partition's own proxy.
     DeferredSendParam(PartitionImpl<N_sender>* p)
@@ -103,7 +104,7 @@ struct DeferredSendParam {
 };
 
 /// C callback invoked by HAPI when comm_stream packing completes.
-/// Performs the actual CkDeviceBuffer send.
+/// Performs the actual send: staged (zero-copy or marshalled), IPC or CkDeviceBuffer.
 template <int N_sender, int N_target = N_sender>
 static void deferred_send_cb(void* param, void* msg) {
     auto* p = static_cast<DeferredSendParam<N_sender, N_target>*>(param);
@@ -114,7 +115,31 @@ static void deferred_send_cb(void* param, void* msg) {
     CkCallback cb(PartitionTraits<N_sender>::CkIndexType::send_complete(nullptr),
                   proxy_at<N_sender>(p->partition->thisProxy, self_ci));
     cb.setRefnum(static_cast<CMK_REFNUM_TYPE>(p->send_id));
-    if (p->host_buf) {
+    StagedZc zc = StagedZc::kNone;
+    if (p->host_buf)
+        zc = staged_zc(CkMyPe(), p->target_pe, p->byte_size);
+    // RDMA without a kept registration (CNUM_GPU_ZC_REGS reached) would register per message
+    if (zc == StagedZc::kRdma && p->byte_size <= ct_msg_max_bytes() && !pinned_reg(p->host_buf))
+        zc = StagedZc::kNone;
+    if (zc != StagedZc::kNone) {
+        // Zero-copy: the message carries only a handle on the pinned block, which the
+        // receiver reads into a pinned block of its own (receive_pinned), in pieces of at
+        // most ct_msg_max_bytes(). The device copy is done with; the pinned block stays
+        // until every piece has been read (send_complete, once per piece).
+        auto target = proxy_at<N_target>(p->target_proxy, p->target_ci);
+        comm_free(p->send_buf);
+        p->partition->pending_sends[p->send_id] = p->host_buf;
+        const int64_t lim = ct_msg_max_bytes(), seq = ct_next_frag_seq();
+        if (p->byte_size > lim)
+            p->partition->staged_pieces_left[p->send_id] = (p->byte_size + lim - 1) / lim;
+        for (int64_t off = 0; off < p->byte_size; off += lim) {
+            CkNcpyBuffer src =
+                staged_zc_buffer(zc, p->host_buf, off, std::min(lim, p->byte_size - off));
+            src.cb = cb;
+            target.receive_pinned(p->node_id, p->input_index, p->inp_name, N_target,
+                                  p->region_data, p->byte_size, CkMyPe(), seq, off, src);
+        }
+    } else if (p->host_buf) {
         auto target = proxy_at<N_target>(p->target_proxy, p->target_ci);
         if (p->byte_size > ct_msg_max_bytes())
             ct_send_frags(target, MSG_STAGED, p->node_id,
@@ -228,6 +253,7 @@ static void device_pack_send(PartitionImpl<N_sender>* partition,
     auto target = proxy_at<N_target>(target_proxy, target_ci);
     // partitions do not migrate: lastKnown is the target's PE
     int target_pe = target.ckLocalBranch()->lastKnown(target.ckGetIndex());
+    ds->target_pe = target_pe;
     if (CmiNodeOf(target_pe) != CkMyNode()) {
         ds->local = false;
         if (gpu_ipc_peer(target_pe)) {

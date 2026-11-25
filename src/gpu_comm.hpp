@@ -5,8 +5,10 @@
 // - Same host: CUDA IPC. Each process carves send blocks out of a few cudaMalloc slabs whose
 //   IPC handles travel with the messages; the receiver maps a peer slab once and copies
 //   device to device. Used only for pairs that passed the startup probe (gpu_comm.cpp).
-// - Other hosts, failed pairs, or CNUM_GPU_IPC=0: staged through pooled pinned host buffers
-//   and sent as a plain message.
+// - Other hosts, failed pairs, or CNUM_GPU_IPC=0: staged through pooled pinned host buffers.
+//   The receiver fetches the sender's pinned block straight into a pinned block of its own
+//   (receive_pinned, Charm++ zero-copy get), so no host memcpy runs on either side where the
+//   transfer reads remote memory (staged_zc); elsewhere the block goes as a plain message.
 
 #include <algorithm>
 #include <atomic>
@@ -339,7 +341,10 @@ inline char* gpu_ipc_peer_slab(int node, int slab, const char* handle) {
 }
 
 /// Pinned host buffers by power-of-two size class. A block is released from the stream
-/// callback that follows its last async copy, so reuse never races a copy.
+/// callback that follows its last async copy, or once the receiver of a zero-copy send has
+/// read it, so reuse never races a copy. A block that was the end of an RDMA transfer keeps
+/// its network registration (`regs`) until it is unpinned: registering and deregistering per
+/// message costs milliseconds on cxi.
 struct PinnedPool {
     // 4 KB .. 1 GiB, the largest single message (ct_msg_max_bytes): without a pinned block a
     // send falls to CkDeviceBuffer, which blocks the PE for about a second per GiB
@@ -347,7 +352,8 @@ struct PinnedPool {
     std::vector<void*> free_lists[kMaxClass + 1];
     uint64_t last_use[kMaxClass + 1] = {}, clock = 0; // per class: order of the allocations
     std::unordered_map<void*, int> live;
-    int64_t cached = 0, limit = -1;
+    std::unordered_map<void*, CkNcpyBuffer> regs; // block -> registration of the whole block
+    int64_t cached = 0, limit = -1, max_regs = 0;
     bool on = true;
     std::mutex mu;
 };
@@ -355,6 +361,17 @@ struct PinnedPool {
 inline PinnedPool& pinned_pool() {
     static PinnedPool pool;
     return pool;
+}
+
+/// Unpins blocks that left the pool (not under pool.mu).
+inline void pinned_release(const std::vector<std::pair<void*, CkNcpyBuffer*>>& blocks) {
+    for (auto& [p, reg] : blocks) {
+        if (reg) {
+            reg->deregisterMem();
+            delete reg;
+        }
+        cudaFreeHost(p);
+    }
 }
 
 /// Staged sends on unless CNUM_GPU_STAGE=0. CNUM_GPU_STAGE_MB caps only the blocks cached
@@ -372,6 +389,7 @@ inline void* pinned_alloc(int64_t bytes) {
         if (pool.limit < 0) {
             pool.on = gpu_comm_env("CNUM_GPU_STAGE", 1, 0, 1) != 0;
             pool.limit = gpu_comm_env("CNUM_GPU_STAGE_MB", 4096, 0, 1 << 20) << 20;
+            pool.max_regs = gpu_comm_env("CNUM_GPU_ZC_REGS", 1024, 0, 1 << 20);
         }
         if (cls > PinnedPool::kMaxClass || !pool.on)
             return nullptr;
@@ -393,17 +411,23 @@ inline void* pinned_alloc(int64_t bytes) {
     return p;
 }
 
-/// Return a block to the pool. When the cache is full, blocks of the size classes that went
-/// unused the longest make room: a workload that moves on to other message sizes would
-/// otherwise pin and unpin a block per message.
-inline void pinned_free(void* p) {
+/// Return a block to the pool; false if `p` is not a pinned block. When the cache is full,
+/// blocks of the size classes that went unused the longest make room: a workload that moves
+/// on to other message sizes would otherwise pin and unpin a block per message.
+inline bool pinned_free(void* p) {
     auto& pool = pinned_pool();
-    std::vector<void*> out;
+    std::vector<std::pair<void*, CkNcpyBuffer*>> out;
+    auto unpin = [&](void* q) {
+        auto reg = pool.regs.find(q);
+        out.emplace_back(q, reg == pool.regs.end() ? nullptr : new CkNcpyBuffer(reg->second));
+        if (reg != pool.regs.end())
+            pool.regs.erase(reg);
+    };
     {
         std::lock_guard<std::mutex> lock(pool.mu);
         auto it = pool.live.find(p);
         if (it == pool.live.end())
-            return;
+            return false;
         const int cls = it->second;
         const int64_t size = int64_t(1) << cls;
         pool.live.erase(it);
@@ -415,7 +439,7 @@ inline void pinned_free(void* p) {
                     victim = c;
             if (victim < 0)
                 break;
-            out.push_back(pool.free_lists[victim].back());
+            unpin(pool.free_lists[victim].back());
             pool.free_lists[victim].pop_back();
             pool.cached -= int64_t(1) << victim;
         }
@@ -423,11 +447,80 @@ inline void pinned_free(void* p) {
             pool.free_lists[cls].push_back(p);
             pool.cached += size;
         } else {
-            out.push_back(p);
+            unpin(p);
         }
     }
-    for (void* q : out)
-        cudaFreeHost(q);
+    pinned_release(out);
+    return true;
+}
+
+/// Drop a pinned block without reusing it (a receiver may still be reading it); false if `p`
+/// is not a pinned block.
+inline bool pinned_forget(void* p) {
+    auto& pool = pinned_pool();
+    std::lock_guard<std::mutex> lock(pool.mu);
+    return pool.live.erase(p) > 0;
+}
+
+/// The network registration of pinned block `p`, made on first use and kept while the block
+/// is pinned; nullptr if `p` is not a pooled block or CNUM_GPU_ZC_REGS registrations
+/// (default 1024) exist already: the network card holds a limited number of them.
+inline const CkNcpyBuffer* pinned_reg(void* p) {
+    auto& pool = pinned_pool();
+    std::lock_guard<std::mutex> lock(pool.mu);
+    auto reg = pool.regs.find(p);
+    if (reg != pool.regs.end())
+        return &reg->second;
+    auto it = pool.live.find(p);
+    if (it == pool.live.end() || (int64_t)pool.regs.size() >= pool.max_regs)
+        return nullptr;
+    return &pool.regs
+                .emplace(p, CkNcpyBuffer(p, size_t(1) << it->second, CK_BUFFER_REG,
+                                         CK_BUFFER_NODEREG))
+                .first->second;
+}
+
+/// Staged messages of at least this many bytes go zero-copy where staged_zc() allows
+/// (CNUM_GPU_ZC_MIN, default 256 KB): below it the extra protocol messages of a zero-copy
+/// transfer cost about what the two copies do. CNUM_GPU_ZC=0 turns zero-copy staging off.
+inline int64_t staged_zc_min() {
+    static const int64_t v = gpu_comm_env("CNUM_GPU_ZC", 1, 0, 1) == 0
+                                 ? INT64_MAX
+                                 : gpu_comm_env("CNUM_GPU_ZC_MIN", 256 << 10, 1, INT64_MAX);
+    return v;
+}
+
+/// How a zero-copy transfer of at least CNUM_GPU_ZC_MIN bytes between PEs `src` and `dst`
+/// (in different processes) would run: kCma, the receiver reads the sender's block with one
+/// kernel copy (processes of one host); kRdma, the network card does (layers with one-sided
+/// operations, e.g. ofi); kNone, Charm++ would emulate it with two host copies and an extra
+/// round trip (netlrts between hosts), so the block goes as a plain marshalled message.
+enum class StagedZc { kNone, kCma, kRdma };
+inline StagedZc staged_zc(int src, int dst, int64_t bytes) {
+    if (bytes < staged_zc_min())
+        return StagedZc::kNone;
+    CkNcpyMode mode = findTransferMode(src, dst);
+    if (mode == CkNcpyMode::CMA)
+        return StagedZc::kCma;
+    return mode == CkNcpyMode::RDMA && CMK_ONESIDED_IMPL ? StagedZc::kRdma : StagedZc::kNone;
+}
+
+/// Zero-copy handle on bytes [offset, offset + bytes) of host block `block`, to be the source
+/// or the destination of a CkNcpyBuffer::get. kCma needs no registration. kRdma: a whole
+/// pinned block uses the registration kept with it (remote reads start at the registered
+/// address, so only for offset 0); pieces and other memory are registered for this one
+/// transfer, which Charm++ then deregisters.
+inline CkNcpyBuffer staged_zc_buffer(StagedZc how, void* block, int64_t offset, int64_t bytes) {
+    char* p = static_cast<char*>(block) + offset;
+    if (how == StagedZc::kCma)
+        return CkNcpyBuffer(p, bytes, CK_BUFFER_UNREG);
+    if (const CkNcpyBuffer* reg = offset == 0 ? pinned_reg(block) : nullptr) {
+        CkNcpyBuffer b = *reg;
+        b.cnt = bytes;
+        b.pe = CkMyPe();
+        return b;
+    }
+    return CkNcpyBuffer(p, bytes, CK_BUFFER_REG, CK_BUFFER_DEREG);
 }
 
 /// Process exit: no new IPC sends or mappings, and late frees become no-ops. Slabs, peer
