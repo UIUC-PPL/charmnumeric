@@ -1132,6 +1132,19 @@ bool MLIRJitCompiler::lowerToNVIDIAHost() {
         else if (auto d = dyn_cast<memref::DeallocOp>(op))
             deallocs.push_back(d);
     });
+    // fuseElementwiseLoops() hoisted every allocation above the first loop: allocate each
+    // temporary just before its first user, so unfused kernels hold only live temporaries.
+    for (Operation* op : allocs) {
+        Block* blk = op->getBlock();
+        Operation* first = nullptr;
+        for (Operation* u : op->getResult(0).getUsers()) {
+            Operation* a = blk->findAncestorOpInBlock(*u);
+            if (a && (!first || a->isBeforeInBlock(first)))
+                first = a;
+        }
+        if (first && op->isBeforeInBlock(first))
+            op->moveBefore(first);
+    }
     OpBuilder b(&context);
     Type tokTy = gpu::AsyncTokenType::get(&context);
     auto emitDealloc = [&](Location loc, Value mem) {
