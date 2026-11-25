@@ -126,6 +126,7 @@ static void deferred_send_cb(void* param, void* msg) {
         // receiver reads into a pinned block of its own (receive_pinned), in pieces of at
         // most ct_msg_max_bytes(). The device copy is done with; the pinned block stays
         // until every piece has been read (send_complete, once per piece).
+        StageStat stat(StageStat::kSend, p->byte_size, true);
         auto target = proxy_at<N_target>(p->target_proxy, p->target_ci);
         comm_free(p->send_buf);
         p->partition->pending_sends[p->send_id] = p->host_buf;
@@ -140,6 +141,7 @@ static void deferred_send_cb(void* param, void* msg) {
                                   p->region_data, p->byte_size, CkMyPe(), seq, off, src);
         }
     } else if (p->host_buf) {
+        StageStat stat(StageStat::kSend, p->byte_size);
         auto target = proxy_at<N_target>(p->target_proxy, p->target_ci);
         if (p->byte_size > ct_msg_max_bytes())
             ct_send_frags(target, MSG_STAGED, p->node_id,

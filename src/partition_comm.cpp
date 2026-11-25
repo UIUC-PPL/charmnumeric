@@ -109,6 +109,7 @@ template <int N>
 void PartitionImpl<N>::receive_staged(int node_id, int input_index, int name, int ndims,
                                       int* region_data, int64_t size, char* data) {
 #ifdef USE_NVIDIA
+    StageStat stat(StageStat::kRecv, size);
     auto* p = comm_recv_param(this, node_id, input_index, name, ndims, region_data, size);
     // pageable source: cudaMemcpyAsync returns once it has consumed the message
     const char* src = data;
@@ -129,6 +130,7 @@ void PartitionImpl<N>::receive_pinned(int node_id, int input_index, int name, in
                                       int* region_data, int64_t total, int src, int64_t seq,
                                       int64_t offset, CkNcpyBuffer& data) {
 #ifdef USE_NVIDIA
+    StageStat stat(StageStat::kRecv, 0);
     const int64_t size = static_cast<int64_t>(data.cnt);
     PinnedRecv*& r = pinned_recvs[{src, seq}];
     if (!r) {
@@ -171,6 +173,7 @@ template <int N>
 void PartitionImpl<N>::pinned_arrived(const CkNcpyBuffer& piece) {
 #ifdef USE_NVIDIA
     const int64_t size = static_cast<int64_t>(piece.cnt);
+    StageStat stat(StageStat::kRecv, size, true);
     auto* r = static_cast<PinnedRecv*>(const_cast<void*>(piece.ref));
     r->got += size;
     if (r->got < r->total)

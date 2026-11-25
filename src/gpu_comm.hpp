@@ -13,8 +13,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <functional>
 #include <map>
@@ -26,12 +28,65 @@
 
 #include "hapi.h"
 #include <cuda_runtime.h>
+#include <sys/resource.h>
+#include <unistd.h>
 
 /// Integer environment variable clamped to [lo, hi], or `def` when unset.
 inline int64_t gpu_comm_env(const char* name, int64_t def, int64_t lo, int64_t hi) {
     const char* v = std::getenv(name);
     return v ? std::min(std::max<int64_t>(std::atoll(v), lo), hi) : def;
 }
+
+/// CNUM_STAGE_STATS=1: PE-thread host time of the staged path, printed at most four times a second
+/// while staged messages flow. Kinds: send (from the stream callback to the return of the send
+/// call), recv (the receiving entries, up to the queued host-to-device copy), pinalloc (new
+/// pinned blocks). `zc` counts the bytes that went zero-copy; `sys` is the process's kernel
+/// time, which holds the cross-memory-attach copy of same-host zero-copy receives.
+struct StageStat {
+    enum Kind { kSend = 0, kRecv = 1, kPinAlloc = 2 };
+    int kind;
+    int64_t bytes;
+    double t0;
+    static bool on() {
+        static const bool b = std::getenv("CNUM_STAGE_STATS") != nullptr;
+        return b;
+    }
+    static double now() {
+        timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return ts.tv_sec + 1e-9 * ts.tv_nsec;
+    }
+    static int64_t& zc_bytes(int kind) {
+        static thread_local int64_t v[2];
+        return v[kind];
+    }
+    StageStat(Kind k, int64_t b, bool zc = false) : kind(k), bytes(b), t0(on() ? now() : 0) {
+        if (on() && zc)
+            zc_bytes(k) += b;
+    }
+    ~StageStat() {
+        if (!on())
+            return;
+        static thread_local double secs[3], last;
+        static thread_local int64_t total[3], count[3];
+        double t = now();
+        secs[kind] += t - t0;
+        total[kind] += bytes;
+        count[kind] += bytes > 0;
+        if (kind == kPinAlloc || t - last < 0.25)
+            return;
+        last = t;
+        rusage ru;
+        getrusage(RUSAGE_SELF, &ru);
+        printf("stagestat pid=%d t=%.3f send n=%lld bytes=%lld zc=%lld s=%.4f recv n=%lld bytes=%lld "
+               "zc=%lld s=%.4f pinalloc n=%lld bytes=%lld s=%.4f sys=%.3f\n",
+               (int)getpid(), t, (long long)count[0], (long long)total[0], (long long)zc_bytes(0),
+               secs[0], (long long)count[1], (long long)total[1], (long long)zc_bytes(1), secs[1],
+               (long long)count[2], (long long)total[2], secs[2],
+               ru.ru_stime.tv_sec + 1e-6 * ru.ru_stime.tv_usec);
+        fflush(stdout);
+    }
+};
 
 struct GpuIpcArena {
     static constexpr int kMinClass = 12, kSlabClass = 28; // 4 KB blocks .. 256 MB slabs
@@ -402,6 +457,7 @@ inline void* pinned_alloc(int64_t bytes) {
             return p;
         }
     }
+    StageStat stat(StageStat::kPinAlloc, int64_t(1) << cls);
     if (cudaMallocHost(&p, size_t(1) << cls) != cudaSuccess) {
         cudaGetLastError();
         return nullptr;
