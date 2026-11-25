@@ -751,7 +751,7 @@ class ArrayDAGGroup : public CBase_ArrayDAGGroup {
     std::unordered_map<int, int64_t> gather_counts; // bytes gathered so far
     std::unordered_map<int, int64_t> gather_total;  // total bytes expected
     struct GatherFragment {
-        int64_t offset;
+        std::vector<int64_t> meta;
         int64_t size;
         char* data; // owned copy (bytes)
     };
@@ -786,6 +786,12 @@ class ArrayDAGGroup : public CBase_ArrayDAGGroup {
     // This persists across epochs so later DAGs do not reinterpret old data
     // using freshly recomputed metadata unless the array is recreated.
     std::unordered_map<int, ArrayMetadata> live_array_meta;
+    // Names and node ids of the arrays and nodes resolve_kernel_layouts adds (count down).
+    int synth_name = 2147483646;
+    int synth_node_id = 2147483646;
+    // Each PE sends its layout_hash to the next PE, which checks it against its own.
+    std::map<int, int64_t> layout_hashes;
+    void check_layout_hash(int epoch, int64_t hash);
 
     // UPLOAD payloads (held by PE 0 only) cut into per-chare tiles by stage_uploads() and
     // sent to each chare's home PE, keyed by (array name, chare index). A chare takes (and
@@ -833,7 +839,7 @@ class ArrayDAGGroup : public CBase_ArrayDAGGroup {
     int next_epoch = 0;
     std::map<int, std::function<void()>> early_epochs;
     void epoch_arrived(int epoch, std::function<void()> run);
-    void gather(int epoch, int name, int64_t offset, int64_t size, char* data);
+    void gather(int epoch, int name, int nmeta, int64_t* meta, int64_t size, char* data);
     void barrier_arrive(int epoch);
 
     // Templated execute_node — dispatched by dtype at call site
