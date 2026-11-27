@@ -107,8 +107,10 @@ struct OutGeom {
     int off[3] = {0, 0, 0};
     int tile = 1;
 
-    int chare_start(int k, int c) const { return std::max(c * tile, off[k]); }
-    int chare_stop(int k, int c) const { return std::min((c + 1) * tile, off[k] + shape[k]); }
+    int chare_start(int k, int c) const {
+        return tile_start(c, tile, off[k], int64_t(off[k]) + shape[k]);
+    }
+    int chare_stop(int k, int c) const { return tile_end(c, tile, int64_t(off[k]) + shape[k]); }
 };
 
 ShapeSpec parse_shape(ASTNode* root) {
