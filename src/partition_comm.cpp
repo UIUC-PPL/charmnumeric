@@ -168,10 +168,13 @@ void PartitionImpl<N>::receive_data(int node_id, int input_index, int name, int 
                                 comm.node, region);
 
     comm.remote_buffers[input_index].push_back({buf, region, size});
-    if (input_index == RED_FINAL_INPUT) {
+    if (input_index == RED_FINAL_INPUT || input_index == BIN_DEV_INPUT) {
         executor->on_reduce_final(node_id);
         return;
     }
+
+    if (input_index == 1 && comm.conv_filter_left > 0 && --comm.conv_filter_left == 0)
+        executor->on_conv_filter(node_id);
 
     if (comm.incremental) {
         // Incremental mode: compute with this panel immediately

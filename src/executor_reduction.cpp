@@ -63,14 +63,13 @@ struct RedAcc {
 #define NRM_SBIG 0x1p-538
 
 enum RedMsgKind : int {
-    MSG_PARTIAL = 0,    // packed accumulators over [start, stop), each folding `depth` inputs
-    MSG_BIN_DENSE = 1,  // BINCOUNT: `count` bin values for bins [start, start + count)
-    MSG_BIN_SPARSE = 2, // BINCOUNT: `count` (int64 bin, value) pairs
-    MSG_WEIGHTS = 3     // BINCOUNT: `count` double weights for x's view indices [start, ...)
+    MSG_PARTIAL = 0,   // packed accumulators over [start, stop), each folding `depth` inputs
+    MSG_BIN_EMPTY = 1, // BINCOUNT: the sending PE's x has no bins in this output chare
+    MSG_WEIGHTS = 3,   // BINCOUNT: `count` double weights for x's view indices [start, ...)
+    MSG_BIN_RANGE = 4  // BINCOUNT, to itself: block's bins [start, stop]; count: pinned block
 };
 
-/// Wire header of a receive_reduce_partial message. Every BINCOUNT sender sends one
-/// MSG_BIN_* message (possibly empty) to every output chare; `depth` is its x count.
+/// Wire header of a receive_reduce_partial message.
 struct RedMsgHeader {
     int out_nd;
     int kind;
@@ -1096,112 +1095,6 @@ static void reduce_block_and_send(PartitionImpl<N>* partition, ArrayDAGGroup* da
     send_partial<A>(dag_group, node_id, s, start, stop, part.data(), depth);
 }
 
-/// Send a local histogram over bins [lo, lo + hist.size()) to every output chare, as
-/// dense values over the nonzero range of its piece or as (bin, value) pairs.
-template <typename A>
-static void send_bincount_pieces(ArrayDAGGroup* dag_group, int node_id, const RedSpec& s,
-                                 const std::vector<A>& hist, int64_t lo, int64_t depth) {
-    ArrayDecomp<1> out_decomp = dag_group->array_meta[s.out_name].template decomp<1>();
-    ArrayRegion<1> all({0}, {static_cast<int>(s.length)}, {1});
-    const int64_t hi = lo + static_cast<int64_t>(hist.size());
-    for (auto& [ci, piece_global] : decompose(out_decomp.to_global(all), out_decomp)) {
-        ArrayRegion<1> piece = out_decomp.to_local(piece_global);
-        if (piece.size() <= 0)
-            continue;
-        int64_t a = std::max<int64_t>(piece.start[0], lo);
-        int64_t b = std::max(a, std::min<int64_t>(piece.stop[0], hi));
-        while (a < b && hist[a - lo] == A(0))
-            ++a;
-        while (b > a && hist[b - 1 - lo] == A(0))
-            --b;
-        int64_t nz = 0;
-        for (int64_t i = a; i < b; ++i)
-            nz += hist[i - lo] != A(0);
-        bool sparse = nz * static_cast<int64_t>(8 + sizeof(A)) <
-                      (b - a) * static_cast<int64_t>(sizeof(A));
-        RedMsgHeader h = {};
-        h.out_nd = 1;
-        h.kind = sparse ? MSG_BIN_SPARSE : MSG_BIN_DENSE;
-        h.start[0] = a;
-        h.stop[0] = b;
-        h.depth = depth;
-        h.count = sparse ? nz : b - a;
-        std::vector<char> buf(sizeof(h) + h.count * (sparse ? 8 + sizeof(A) : sizeof(A)));
-        memcpy(buf.data(), &h, sizeof(h));
-        char* p = buf.data() + sizeof(h);
-        if (sparse) {
-            for (int64_t i = a; i < b; ++i) {
-                if (hist[i - lo] == A(0))
-                    continue;
-                memcpy(p, &i, 8);
-                memcpy(p + 8, &hist[i - lo], sizeof(A));
-                p += 8 + sizeof(A);
-            }
-        } else if (b > a) {
-            memcpy(p, hist.data() + (a - lo), (b - a) * sizeof(A));
-        }
-        send_reduce_msg<1>(dag_group, ci, node_id, buf);
-    }
-}
-
-/// Histogram of this chare's block of x over the bin range it hits; weight e of the
-/// block is w[w0 + e * wstep] (w == nullptr: counts).
-template <typename T, typename W, typename A>
-static void bincount_block_and_send(PartitionImpl<1>* partition, ArrayDAGGroup* dag_group,
-                                    int node_id, const RedSpec& s, CTArrayBase<1>* x_arr,
-                                    const W* w, int64_t w0, int64_t wstep, const RedGeom& g) {
-    const T* x = static_cast<const T*>(x_arr->device_data_ptr());
-    const int64_t len = s.length, nelem = g.bn[0], b0 = g.b0[0], bstep = g.bstep[0];
-    BinRangeFunctor<T> rf{x, b0, bstep, len};
-    BinRange r;
-#ifdef USE_KOKKOS
-    Kokkos::parallel_reduce("ct_bincount_range", CT_COMPUTE_POLICY(partition, nelem), rf, r);
-#else
-    rf.init(r);
-    for (int64_t e = 0; e < nelem; ++e)
-        rf(e, r);
-#endif
-    const int64_t lo = r.lo, nb = r.hi >= r.lo ? r.hi - r.lo + 1 : 0;
-    std::vector<A> hist(nb, A(0));
-    if (nb > 0) {
-#ifdef USE_KOKKOS
-        Kokkos::View<A*, DeviceSpace> d_hist("ct_bincount", nb);
-        BincountFunctor<T, W, A> f{x, w, d_hist.data(), b0, bstep, w0, wstep, lo, len};
-        Kokkos::parallel_for("ct_bincount", CT_COMPUTE_POLICY(partition, nelem), f);
-        Kokkos::View<A*, HostSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>> h_hist(hist.data(), nb);
-#ifdef USE_NVIDIA
-        Kokkos::deep_copy(partition->compute_exec, h_hist, d_hist);
-        partition->compute_exec.fence();
-#else
-        Kokkos::deep_copy(h_hist, d_hist);
-#endif
-#else
-        BincountFunctor<T, W, A> f{x, w, hist.data(), b0, bstep, w0, wstep, lo, len};
-        for (int64_t e = 0; e < nelem; ++e)
-            f(e);
-#endif
-    }
-    send_bincount_pieces<A>(dag_group, node_id, s, hist, lo, nelem);
-}
-
-template <int N, typename T, typename A>
-static void dispatch_bincount_weights(PartitionImpl<N>* partition, ArrayDAGGroup* dag_group,
-                                      int node_id, const RedSpec& s, CTArrayBase<N>* x_arr,
-                                      CTArrayBase<N>* w_arr, const RedGeom& g) {
-    if (w_arr == nullptr) {
-        bincount_block_and_send<T, T, A>(partition, dag_group, node_id, s, x_arr, nullptr, 0, 0,
-                                         g);
-        return;
-    }
-    cn_dispatch(w_arr->dtype, [&](auto tag) {
-        using W = decltype(tag);
-        if constexpr (!cn_is_complex_v<W>)
-            bincount_block_and_send<T, W, A>(partition, dag_group, node_id, s, x_arr,
-                                             static_cast<const W*>(w_arr->device_data_ptr()),
-                                             g.b0[0], g.bstep[0], g);
-    });
-}
-
 /// View start/step of a 1-D operand (global: the whole array).
 static void view_start_step(Region* r, int64_t& start, int64_t& step) {
     start = 0;
@@ -1211,6 +1104,288 @@ static void view_start_step(Region* r, int64_t& start, int64_t& step) {
         start = ar->start[0];
         step = ar->step[0];
     }
+}
+
+// ---- BINCOUNT: per-PE merge, then one piece per output chare ----
+//
+// Each chare holding a block of x histograms it on the device and hands the histogram to
+// its PE. Once all of the PE's x chares have, the PE adds them and sends each output chare
+// its slice as a device message (BIN_DEV_INPUT), or an empty host message if the PE's bins
+// miss it. An output chare is done after one message from every PE that holds x.
+
+/// Below this many bins a block histograms all of [0, length), without a range pass.
+constexpr int64_t kBinFullRange = int64_t(1) << 16;
+
+struct BinPiece {
+    char* hist; // n accumulators for bins [lo, lo + n); nullptr when n == 0
+    int64_t lo, n;
+#ifdef USE_NVIDIA
+    cudaEvent_t ready; // recorded on the depositing chare's compute stream
+#endif
+};
+
+struct BinPeState {
+    int expected = -1; // x chares on this PE
+    std::vector<BinPiece> pieces;
+};
+
+static std::unordered_map<int, BinPeState>& bin_pe_states() {
+    thread_local std::unordered_map<int, BinPeState> states;
+    return states;
+}
+
+/// x chares on this PE that hold a block of the view, and the number of PEs holding any.
+/// Depends only on the spec and the metadata (chares are placed by chare_home_pe).
+static void bin_sources(ArrayDAGGroup* dag_group, const RedSpec& s, int& local, int& pes) {
+    ArrayDecomp<1> xd = dag_group->array_meta[s.in_name].template decomp<1>();
+    int64_t xs, xst;
+    view_start_step(s.in_region, xs, xst);
+    const int vstart = static_cast<int>(xs) + xd.offset[0], vsize = s.view_shape[0];
+    const int first = xd.offset[0] / xd.tile;
+    const int last = (xd.offset[0] + xd.global_shape[0] - 1) / xd.tile;
+    std::vector<char> seen(CkNumPes(), 0);
+    local = pes = 0;
+    for (int c = first; c <= last && vsize > 0; ++c) {
+        int lo, hi;
+        if (!xd.view_block(0, c, vstart, static_cast<int>(xst), vsize, lo, hi))
+            continue;
+        int pe = chare_home_pe(1, &c, CkNumPes());
+        local += pe == CkMyPe();
+        pes += !seen[pe];
+        seen[pe] = 1;
+    }
+}
+
+template <typename A>
+struct BinAddFunctor {
+    A* dst;
+    const A* src;
+    CT_RED_FN void operator()(const int64_t i) const { dst[i] += src[i]; }
+};
+
+template <typename A>
+struct BinCopyFunctor {
+    A* dst;
+    const A* src;
+    CT_RED_FN void operator()(const int64_t i) const { dst[i] = src[i]; }
+};
+
+template <typename A>
+struct BinZeroFunctor {
+    A* dst;
+    CT_RED_FN void operator()(const int64_t i) const { dst[i] = A(0); }
+};
+
+static char* bin_alloc(int64_t bytes) {
+#ifdef USE_KOKKOS
+    return static_cast<char*>(comm_alloc(std::max<int64_t>(bytes, 1)));
+#else
+    return new char[std::max<int64_t>(bytes, 1)];
+#endif
+}
+
+/// Frees a bin buffer once the work queued so far on the chare's compute stream has run.
+static void bin_free(PartitionImpl<1>* partition, char* p) {
+    if (p == nullptr)
+        return;
+#if defined(USE_NVIDIA)
+    comm_free_after(partition->compute_stream_raw, p);
+#elif defined(USE_KOKKOS)
+    (void)partition;
+    Kokkos::fence("ct_bin_free");
+    comm_free(p);
+#else
+    (void)partition;
+    delete[] p;
+#endif
+}
+
+template <typename A, typename F>
+static void bin_for(PartitionImpl<1>* partition, int64_t n, const F& f) {
+    if (n <= 0)
+        return;
+#ifdef USE_KOKKOS
+    Kokkos::parallel_for("ct_bincount_merge", CT_COMPUTE_POLICY(partition, n), f);
+#else
+    (void)partition;
+    for (int64_t i = 0; i < n; ++i)
+        f(i);
+#endif
+}
+
+/// The last of the PE's x chares: add the PE's histograms and send the output chares their
+/// slices.
+template <typename A>
+static void bin_pe_send(PartitionImpl<1>* partition, ArrayDAGGroup* dag_group, int node_id,
+                        const RedSpec& s, std::vector<BinPiece>& pieces) {
+    int64_t lo = INT64_MAX, hi = 0;
+    for (auto& pc : pieces) {
+#ifdef USE_NVIDIA
+        if (pc.ready) {
+            hapiCheck(cudaStreamWaitEvent(partition->compute_stream_raw, pc.ready, 0));
+            hapiCheck(cudaEventDestroy(pc.ready));
+        }
+#endif
+        if (pc.n > 0) {
+            lo = std::min(lo, pc.lo);
+            hi = std::max(hi, pc.lo + pc.n);
+        }
+    }
+#if defined(USE_KOKKOS) && !defined(USE_NVIDIA)
+    Kokkos::fence("ct_bincount_pe"); // other chares' histograms
+#endif
+    A* sum = nullptr;
+    for (auto& pc : pieces) {
+        if (pc.n <= 0)
+            continue;
+        if (sum == nullptr && pc.lo == lo && pc.n == hi - lo) {
+            sum = reinterpret_cast<A*>(pc.hist);
+            pc.hist = nullptr;
+        }
+    }
+    if (sum == nullptr && hi > lo) {
+        sum = reinterpret_cast<A*>(bin_alloc((hi - lo) * (int64_t)sizeof(A)));
+        bin_for<A>(partition, hi - lo, BinZeroFunctor<A>{sum});
+    }
+    for (auto& pc : pieces) {
+        if (pc.hist != nullptr)
+            bin_for<A>(partition, pc.n,
+                       BinAddFunctor<A>{sum + (pc.lo - lo), reinterpret_cast<const A*>(pc.hist)});
+        bin_free(partition, pc.hist);
+    }
+
+    ArrayDecomp<1> out_decomp = dag_group->array_meta[s.out_name].template decomp<1>();
+    ArrayRegion<1> all({0}, {static_cast<int>(s.length)}, {1});
+    struct Piece {
+        ChareIndex<1> ci;
+        int region[3];
+        char* buf;
+        int64_t bytes;
+    };
+    std::vector<Piece> sends;
+    for (auto& [ci, piece_global] : decompose(out_decomp.to_global(all), out_decomp)) {
+        ArrayRegion<1> piece = out_decomp.to_local(piece_global);
+        if (piece.size() <= 0)
+            continue;
+        int64_t a = std::max<int64_t>(piece.start[0], lo), b = std::min<int64_t>(piece.stop[0], hi);
+        if (a >= b) {
+            RedMsgHeader h = {};
+            h.out_nd = 1;
+            h.kind = MSG_BIN_EMPTY;
+            std::vector<char> buf(sizeof(h));
+            memcpy(buf.data(), &h, sizeof(h));
+            send_reduce_msg<1>(dag_group, ci, node_id, buf);
+            continue;
+        }
+        Piece p{ci, {static_cast<int>(a), static_cast<int>(b), 1}, nullptr,
+                (b - a) * (int64_t)sizeof(A)};
+        p.buf = bin_alloc(p.bytes);
+        bin_for<A>(partition, b - a, BinCopyFunctor<A>{reinterpret_cast<A*>(p.buf), sum + (a - lo)});
+        sends.push_back(p);
+    }
+    bin_free(partition, reinterpret_cast<char*>(sum));
+#ifdef USE_KOKKOS
+#ifdef USE_NVIDIA
+    partition->join_streams(); // the sends start on the comm stream
+#endif
+    for (Piece& p : sends)
+        device_pack_send<1, 1>(partition, dag_group->partition_proxy_1, p.ci, node_id,
+                               BIN_DEV_INPUT, s.out_name, p.region, p.bytes, p.buf);
+#else
+    for (Piece& p : sends) {
+        ct_send_data(proxy_at<1>(dag_group->partition_proxy_1, p.ci), node_id, BIN_DEV_INPUT,
+                     s.out_name, 1, p.region, p.bytes, p.buf);
+        delete[] p.buf;
+    }
+#endif
+}
+
+/// Hands this chare's histogram to its PE; the PE's last x chare merges and sends.
+template <typename A>
+static void bin_pe_deposit(PartitionImpl<1>* partition, ArrayDAGGroup* dag_group, int node_id,
+                           const RedSpec& s, const BinPiece& pc) {
+    BinPeState& st = bin_pe_states()[node_id];
+    if (st.expected < 0) {
+        int pes;
+        bin_sources(dag_group, s, st.expected, pes);
+    }
+    st.pieces.push_back(pc);
+    if ((int)st.pieces.size() < st.expected)
+        return;
+    if ((int)st.pieces.size() > st.expected)
+        CkAbort("bincount: PE %d got %d histograms for node %d, expected %d", CkMyPe(),
+                (int)st.pieces.size(), node_id, st.expected);
+    std::vector<BinPiece> pieces = std::move(st.pieces);
+    bin_pe_states().erase(node_id);
+    bin_pe_send<A>(partition, dag_group, node_id, s, pieces);
+}
+
+/// Histogram of this chare's block of x on the device, handed to the PE merge; weight e of
+/// the block is w[w0 + e * wstep] (w == nullptr: counts).
+template <typename T, typename W, typename A>
+static void bincount_block_and_send(PartitionImpl<1>* partition, ArrayDAGGroup* dag_group,
+                                    int node_id, const RedSpec& s, CTArrayBase<1>* x_arr,
+                                    const W* w, int64_t w0, int64_t wstep, const RedGeom& g,
+                                    const BinRange* known) {
+    const T* x = static_cast<const T*>(x_arr->device_data_ptr());
+    const int64_t len = s.length, nelem = g.bn[0], b0 = g.b0[0], bstep = g.bstep[0];
+    int64_t lo = 0, nb = len;
+    if (known) {
+        lo = known->lo;
+        nb = known->hi >= known->lo ? known->hi - known->lo + 1 : 0;
+    } else if (len > kBinFullRange) {
+        BinRangeFunctor<T> rf{x, b0, bstep, len};
+        BinRange r;
+#ifdef USE_KOKKOS
+        Kokkos::parallel_reduce("ct_bincount_range", CT_COMPUTE_POLICY(partition, nelem), rf, r);
+#else
+        rf.init(r);
+        for (int64_t e = 0; e < nelem; ++e)
+            rf(e, r);
+#endif
+        lo = r.lo;
+        nb = r.hi >= r.lo ? r.hi - r.lo + 1 : 0;
+    }
+    BinPiece pc{nullptr, lo, nb};
+#ifdef USE_NVIDIA
+    pc.ready = nullptr;
+#endif
+    if (nb > 0) {
+        pc.hist = bin_alloc(nb * (int64_t)sizeof(A));
+        A* hist = reinterpret_cast<A*>(pc.hist);
+        bin_for<A>(partition, nb, BinZeroFunctor<A>{hist});
+        BincountFunctor<T, W, A> f{x, w, hist, b0, bstep, w0, wstep, lo, len};
+#ifdef USE_KOKKOS
+        Kokkos::parallel_for("ct_bincount", CT_COMPUTE_POLICY(partition, nelem), f);
+#else
+        for (int64_t e = 0; e < nelem; ++e)
+            f(e);
+#endif
+#ifdef USE_NVIDIA
+        hapiCheck(cudaEventCreateWithFlags(&pc.ready, cudaEventDisableTiming));
+        hapiCheck(cudaEventRecord(pc.ready, partition->compute_stream_raw));
+#endif
+    }
+    bin_pe_deposit<A>(partition, dag_group, node_id, s, pc);
+}
+
+template <int N, typename T, typename A>
+static void dispatch_bincount_weights(PartitionImpl<N>* partition, ArrayDAGGroup* dag_group,
+                                      int node_id, const RedSpec& s, CTArrayBase<N>* x_arr,
+                                      CTArrayBase<N>* w_arr, const RedGeom& g,
+                                      const BinRange* known) {
+    if (w_arr == nullptr) {
+        bincount_block_and_send<T, T, A>(partition, dag_group, node_id, s, x_arr, nullptr, 0, 0,
+                                         g, known);
+        return;
+    }
+    cn_dispatch(w_arr->dtype, [&](auto tag) {
+        using W = decltype(tag);
+        if constexpr (!cn_is_complex_v<W>)
+            bincount_block_and_send<T, W, A>(partition, dag_group, node_id, s, x_arr,
+                                             static_cast<const W*>(w_arr->device_data_ptr()),
+                                             g.b0[0], g.bstep[0], g, known);
+    });
 }
 
 /// True if the BINCOUNT weights can be read at x's local offsets (same tiles and view).
@@ -1300,15 +1475,72 @@ static void dispatch_bin_input(DType dt, F&& f) {
     });
 }
 
+#ifdef USE_NVIDIA
+struct BinRangeParam {
+    BinRange* host; // pinned
+    ArrayDAGGroup* dag_group;
+    int node_id;
+    ChareIndex<1> ci;
+};
+
+/// The block's bin range is in host memory: hand it to the chare as a message.
+static void bin_range_cb(void* param, void*) {
+    auto* p = static_cast<BinRangeParam*>(param);
+    RedMsgHeader h = {};
+    h.out_nd = 1;
+    h.kind = MSG_BIN_RANGE;
+    h.start[0] = p->host->lo;
+    h.stop[0] = p->host->hi;
+    h.count = reinterpret_cast<int64_t>(p->host);
+    std::vector<char> buf(sizeof(h));
+    memcpy(buf.data(), &h, sizeof(h));
+    send_reduce_msg<1>(p->dag_group, p->ci, p->node_id, buf);
+    delete p;
+}
+#endif
+
+/// Starts the bin range pass of this chare's block of x without a host wait; the range
+/// comes back as MSG_BIN_RANGE. False: not needed (few bins), or done in place later.
+static bool bin_range_start(PartitionImpl<1>* partition, ArrayDAGGroup* dag_group, int node_id,
+                            const RedSpec& s, CTArrayBase<1>* x_arr, const RedGeom& g) {
+#ifdef USE_NVIDIA
+    if (s.length <= kBinFullRange)
+        return false;
+    auto* host = static_cast<BinRange*>(pinned_alloc(sizeof(BinRange)));
+    if (host == nullptr)
+        return false;
+    auto* dev = static_cast<BinRange*>(comm_alloc(sizeof(BinRange)));
+    dispatch_bin_input(x_arr->dtype, [&](auto tag) {
+        using T = decltype(tag);
+        BinRangeFunctor<T> rf{static_cast<const T*>(x_arr->device_data_ptr()), g.b0[0],
+                              g.bstep[0], s.length};
+        Kokkos::View<BinRange, DeviceSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>> rv(dev);
+        Kokkos::parallel_reduce("ct_bincount_range", CT_COMPUTE_POLICY(partition, g.bn[0]), rf,
+                                rv);
+    });
+    cudaStream_t st = partition->compute_stream_raw;
+    hapiCheck(cudaMemcpyAsync(host, dev, sizeof(BinRange), cudaMemcpyDeviceToHost, st));
+    comm_free_after(st, dev);
+    auto* p = new BinRangeParam{host, dag_group, node_id, {}};
+    p->ci.idx[0] = partition->nd_index()[0];
+    CkCallback cb(bin_range_cb, p);
+    hapiAddCallback(st, &cb);
+    return true;
+#else
+    (void)partition, (void)dag_group, (void)node_id, (void)s, (void)x_arr, (void)g;
+    return false;
+#endif
+}
+
 template <int N, typename A>
 static void dispatch_send_side(PartitionImpl<N>* partition, ArrayDAGGroup* dag_group, int node_id,
                                const RedSpec& s, CTArrayBase<N>* arr, CTArrayBase<N>* w_arr,
-                               const RedGeom& g) {
+                               const RedGeom& g, const BinRange* known = nullptr) {
     if (s.opc == Opcode::BINCOUNT) {
         if constexpr (N == 1 && (std::is_same_v<A, int64_t> || std::is_same_v<A, double>)) {
             dispatch_bin_input(arr->dtype, [&](auto tag) {
                 dispatch_bincount_weights<N, decltype(tag), A>(partition, dag_group, node_id, s,
-                                                               arr, w_arr, g);
+                                                               arr, w_arr, g, known);
             });
         }
         return;
@@ -1322,7 +1554,8 @@ static void dispatch_send_side(PartitionImpl<N>* partition, ArrayDAGGroup* dag_g
 
 /// x's chare has all its moved weights: histogram its block with them.
 static void bincount_with_moved_weights(PartitionImpl<1>* partition, ArrayDAGGroup* dag_group,
-                                        int node_id, const RedSpec& s, std::vector<double>& wts) {
+                                        int node_id, const RedSpec& s, std::vector<double>& wts,
+                                        const BinRange* known) {
     auto it = partition->arrays.find(s.in_name);
     RedGeom g;
     if (it == partition->arrays.end() || !block_geometry<1>(partition, it->second, s.in_region, 0, g))
@@ -1342,7 +1575,34 @@ static void bincount_with_moved_weights(PartitionImpl<1>* partition, ArrayDAGGro
 #endif
     dispatch_bin_input(it->second->dtype, [&](auto tag) {
         bincount_block_and_send<decltype(tag), double, double>(partition, dag_group, node_id, s,
-                                                               it->second, w, 0, 1, g);
+                                                               it->second, w, 0, 1, g, known);
+    });
+}
+
+/// This chare's histogram, now that its moved weights and bin range (if any) are in.
+static void bin_histogram(PartitionImpl<1>* partition, ArrayDAGGroup* dag_group, int node_id,
+                          const RedSpec& s, ReductionState<1>& st) {
+    BinRange r{st.bin_lo, st.bin_hi};
+    const BinRange* known = st.bin_range ? &r : nullptr;
+    if (st.bin_moved) {
+        bincount_with_moved_weights(partition, dag_group, node_id, s, st.weights, known);
+        return;
+    }
+    auto it = partition->arrays.find(s.in_name);
+    RedGeom g;
+    if (it == partition->arrays.end() ||
+        !block_geometry<1>(partition, it->second, s.in_region, s.red_mask, g))
+        CkAbort("bincount: chare lost its block of x");
+    CTArrayBase<1>* w_arr = nullptr;
+    if (s.w_name >= 0) {
+        auto w_it = partition->arrays.find(s.w_name);
+        if (w_it == partition->arrays.end())
+            CkAbort("bincount: weights array %d is not on the chare that holds x", s.w_name);
+        w_arr = w_it->second;
+    }
+    with_acc(s.acc, [&](auto tag) {
+        dispatch_send_side<1, decltype(tag)>(partition, dag_group, node_id, s, it->second, w_arr,
+                                             g, known);
     });
 }
 
@@ -1351,19 +1611,8 @@ static void bincount_with_moved_weights(PartitionImpl<1>* partition, ArrayDAGGro
 template <int N, typename A>
 static void fold_partial(ReductionState<N>& st, int op, const RedMsgHeader& h, const char* p) {
     auto* acc = reinterpret_cast<RedAcc<A>*>(st.acc.data());
-    if (h.kind == MSG_BIN_DENSE || h.kind == MSG_BIN_SPARSE) {
-        for (int64_t k = 0; k < h.count; ++k) {
-            int64_t bin = h.start[0] + k;
-            if (h.kind == MSG_BIN_SPARSE) {
-                memcpy(&bin, p, 8);
-                p += 8;
-            }
-            A v;
-            memcpy(&v, p, sizeof(A));
-            p += sizeof(A);
-            acc[bin - st.mine.start[0]].v += v;
-        }
-        st.covered += st.mine.size() * h.depth;
+    if (h.kind == MSG_BIN_EMPTY) {
+        ++st.covered;
         return;
     }
 
@@ -1419,6 +1668,17 @@ static bool reduction_progress(PartitionImpl<N>* partition, ArrayDAGGroup* dag_g
         RedMsgHeader h;
         memcpy(&h, msg.data(), sizeof(h));
         const char* body = msg.data() + sizeof(h);
+        if (h.kind == MSG_BIN_RANGE) {
+#ifdef USE_NVIDIA
+            pinned_free(reinterpret_cast<void*>(h.count));
+#endif
+            if (!st.bin_range_wait)
+                CkAbort("bincount: unexpected bin range for node %d", node_id);
+            st.bin_range_wait = false;
+            st.bin_lo = h.start[0];
+            st.bin_hi = h.stop[0];
+            continue;
+        }
         if (h.kind == MSG_WEIGHTS) {
             int64_t off = h.start[0] - st.w_base;
             if (!st.sending || off < 0 || off + h.count > static_cast<int64_t>(st.weights.size()))
@@ -1432,10 +1692,11 @@ static bool reduction_progress(PartitionImpl<N>* partition, ArrayDAGGroup* dag_g
             CkAbort("reduction: partial for node %d on a chare that owns no result", node_id);
         with_acc(s.acc, [&](auto tag) { fold_partial<N, decltype(tag)>(st, s.op, h, body); });
     }
-    if (st.sending && st.w_got == static_cast<int64_t>(st.weights.size())) {
+    if (st.sending && !st.bin_range_wait &&
+        (!st.bin_moved || st.w_got == static_cast<int64_t>(st.weights.size()))) {
         st.sending = false;
         if constexpr (N == 1)
-            bincount_with_moved_weights(partition, dag_group, node_id, s, st.weights);
+            bin_histogram(partition, dag_group, node_id, s, st);
         std::vector<double>().swap(st.weights);
     }
     if (st.receiving && st.covered >= st.expected) {
@@ -1446,10 +1707,39 @@ static bool reduction_progress(PartitionImpl<N>* partition, ArrayDAGGroup* dag_g
     return !st.sending && !st.receiving;
 }
 
+/// Adds the BINCOUNT pieces received so far into this chare's part of the result.
+template <int N, typename Pending>
+static void drain_bins(PartitionImpl<N>* partition, Pending& pending, int node_id,
+                       ReductionState<N>& st, const RedSpec& s) {
+    auto pit = pending.find(node_id);
+    if (pit == pending.end())
+        return;
+    if constexpr (N == 1) {
+        char* out = static_cast<char*>(partition->arrays[s.out_name]->device_data_ptr());
+        for (auto& rb : pit->second.remote_buffers[BIN_DEV_INPUT]) {
+            with_acc(s.acc, [&](auto tag) {
+                using A = decltype(tag);
+                if constexpr (std::is_same_v<A, int64_t> || std::is_same_v<A, double>)
+                    bin_for<A>(partition, rb.region.size(),
+                               BinAddFunctor<A>{reinterpret_cast<A*>(out) +
+                                                    (rb.region.start[0] - st.mine.start[0]),
+                                                reinterpret_cast<const A*>(rb.data)});
+            });
+            ++st.covered;
+            bin_free(partition, rb.data);
+        }
+    }
+    pending.erase(pit);
+}
+
 /// Copies the finalized pieces received so far into this chare's part of the result.
 template <int N, typename Pending>
 static void drain_final(PartitionImpl<N>* partition, Pending& pending, int node_id,
                         ReductionState<N>& st, const RedSpec& s) {
+    if (s.opc == Opcode::BINCOUNT) {
+        drain_bins<N>(partition, pending, node_id, st, s);
+        return;
+    }
 #ifdef USE_NVIDIA
     auto pit = pending.find(node_id);
     if (pit == pending.end())
@@ -1492,23 +1782,22 @@ void ArrayDAGExecutorND<N>::execute_reduction_node(DAGNode* node) {
         RedGeom g;
         if (it != partition->arrays.end() &&
             block_geometry<N>(partition, it->second, s.in_region, s.red_mask, g)) {
-            if (move_weights) {
+            if (s.opc == Opcode::BINCOUNT) {
+                // the histogram runs in reduction_progress once these are in
                 st.sending = true;
-                st.w_base = g.vb0[0];
-                st.w_got = 0;
-                st.weights.assign(g.bn[0], 0.0);
-            } else {
-                CTArrayBase<N>* w_arr = nullptr;
-                if (s.w_name >= 0) {
-                    auto w_it = partition->arrays.find(s.w_name);
-                    if (w_it == partition->arrays.end())
-                        CkAbort("bincount: weights array %d is not on the chare that holds x",
-                                s.w_name);
-                    w_arr = w_it->second;
+                st.bin_moved = move_weights;
+                if (move_weights) {
+                    st.w_base = g.vb0[0];
+                    st.w_got = 0;
+                    st.weights.assign(g.bn[0], 0.0);
                 }
+                if constexpr (N == 1)
+                    st.bin_range = st.bin_range_wait =
+                        bin_range_start(partition, dag_group, node->id, s, it->second, g);
+            } else {
                 with_acc(s.acc, [&](auto tag) {
                     dispatch_send_side<N, decltype(tag)>(partition, dag_group, node->id, s,
-                                                         it->second, w_arr, g);
+                                                         it->second, nullptr, g);
                 });
             }
         }
@@ -1545,12 +1834,26 @@ void ArrayDAGExecutorND<N>::execute_reduction_node(DAGNode* node) {
                 ones[d] = 1;
             }
             ArrayRegion<N> local(zeros, sizes, ones);
-            partition->ensure_array(local, gs, s.out_name, s.out_dt, out_decomp);
+            const bool bins = s.opc == Opcode::BINCOUNT;
+            CTArrayBase<N>* out =
+                partition->ensure_array(local, gs, s.out_name, s.out_dt, out_decomp, !bins);
 
             st.receiving = true;
             st.mine = mine;
             st.expected = mine.size() * s.extent;
-            st.device = red_final_on_device(dag_group, s);
+            st.device = bins || red_final_on_device(dag_group, s);
+            if (bins) {
+                if (dtype_size(s.out_dt) != 8 || out->local_size() != mine.size())
+                    CkAbort("bincount: result %d has an unexpected dtype or tile", s.out_name);
+                if constexpr (N == 1)
+                    bin_for<int64_t>(partition, mine.size(),
+                                     BinZeroFunctor<int64_t>{
+                                         static_cast<int64_t*>(out->device_data_ptr())});
+                int local_x, pes;
+                bin_sources(dag_group, s, local_x, pes);
+                st.covered = 0;
+                st.expected = pes; // one message from each PE holding x
+            }
             if (st.device)
                 drain_final<N>(partition, pending, node->id, st, s);
             else

@@ -54,6 +54,7 @@ mainmodule charmnumeric
                                   int64_t size, char data[size]);
 #endif
         entry void comm_done(int node_id);
+        entry void conv_ready(int node_id);
         entry void reduce_result(int node_id, int64_t size, char data[size]);
         entry void receive_reduce_partial(int node_id, int64_t size, char data[size]);
         entry void receive_linalg(int node_id, int64_t size, char data[size]);
@@ -88,6 +89,7 @@ mainmodule charmnumeric
                                   int64_t size, char data[size]);
 #endif
         entry void comm_done(int node_id);
+        entry void conv_ready(int node_id);
         entry void reduce_result(int node_id, int64_t size, char data[size]);
         entry void receive_reduce_partial(int node_id, int64_t size, char data[size]);
         entry void receive_linalg(int node_id, int64_t size, char data[size]);
@@ -122,6 +124,7 @@ mainmodule charmnumeric
                                   int64_t size, char data[size]);
 #endif
         entry void comm_done(int node_id);
+        entry void conv_ready(int node_id);
         entry void reduce_result(int node_id, int64_t size, char data[size]);
         entry void receive_reduce_partial(int node_id, int64_t size, char data[size]);
         entry void receive_linalg(int node_id, int64_t size, char data[size]);
