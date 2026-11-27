@@ -2,6 +2,7 @@
 #include "dispatch.hpp"
 
 #include <cstring>
+#include <string>
 #include <unordered_set>
 
 template <int N, typename T>
@@ -33,8 +34,13 @@ static void send_remote_input(PartitionImpl<N>* partition, DAGNode* node, const 
                 break;
             }
         }
-        if (out_of_bounds)
+        if (out_of_bounds) {
+#ifndef NDEBUG
+            CkAbort("array %d: send of %s past the chare's buffer (node %d): the receiver "
+                    "would wait for it", inp_name, fmt_region(overlap).c_str(), node->id);
+#endif
             return;
+        }
     }
 
     std::array<int64_t, N> arr_strides;
@@ -153,6 +159,67 @@ static void dispatch_send(PartitionImpl<N>* partition, DAGNode* node, const Remo
     cn_dispatch(arr_it->second->dtype, [&](auto tag) {
         send_remote_input<N, decltype(tag)>(partition, node, send, inp_name, nd_idx);
     });
+}
+
+/// Senders plan with their buffer's decomposition, receivers without one with
+/// array_meta's; a difference leaves receivers waiting.
+template <int N>
+static void check_buffer_decomp(ArrayDAGGroup* group, int name, const ArrayDecomp<N>& decomp) {
+#ifndef NDEBUG
+    auto it = group->array_meta.find(name);
+    if (it == group->array_meta.end())
+        return;
+    auto const& m = it->second;
+    bool same = m.tile == decomp.tile;
+    for (int d = 0; d < N; ++d)
+        same &= m.offset[d] == decomp.offset[d] && m.global_shape[d] == decomp.global_shape[d];
+    if (same)
+        return;
+    std::string got, want;
+    for (int d = 0; d < N; ++d) {
+        got += " " + std::to_string(decomp.global_shape[d]) + "@" +
+               std::to_string(decomp.offset[d]);
+        want += " " + std::to_string(m.global_shape[d]) + "@" + std::to_string(m.offset[d]);
+    }
+    CkAbort("array %d: buffer decomposition (tile %d, shape@offset%s) != metadata (tile %d, "
+            "shape@offset%s)", name, decomp.tile, got.c_str(), m.tile, want.c_str());
+#endif
+}
+
+/// REDUCE of operands with different layouts: rhs moves to lhs's tiles like an
+/// elementwise input, then finish_realigned_dot takes the dot per lhs tile.
+template <int N>
+void ArrayDAGExecutorND<N>::start_realigned_dot(DAGNode* node, int lhs_name, int rhs_name) {
+    if constexpr (N == 1) {
+        auto& meta = static_cast<ArrayDAGGroup*>(group)->array_meta;
+        auto ld = meta[lhs_name].template decomp<1>();
+        auto rd = meta[rhs_name].template decomp<1>();
+        int n = std::min(ld.global_shape[0], rd.global_shape[0]);
+        ArrayRegion<1> full({0}, {n}, {1});
+        ArrayRegion<1> r_out = ld.to_global(full);
+        std::vector<ArrayRegion<1>> r_in = {rd.to_global(full)};
+        std::vector<ArrayDecomp<1>> in_decomps = {rd};
+        auto idx = partition->nd_index();
+        auto sends = send_remote_inputs<1>(r_out, r_in, idx, ld, in_decomps);
+        for (auto& send : sends)
+            dispatch_send<1>(partition, node, send, rhs_name, idx);
+#ifdef USE_NVIDIA
+        if (!sends.empty())
+            partition->compute_after_others();
+#endif
+        auto li = local_inputs<1>(r_out, r_in, idx, ld, in_decomps);
+        auto pre_it = pending.find(node->id);
+        int pre_arrived = 0;
+        std::unordered_map<int, std::vector<RemoteBuffer<1>>> pre_buffers;
+        if (pre_it != pending.end()) {
+            pre_arrived = -(pre_it->second.expected_msgs);
+            pre_buffers = std::move(pre_it->second.remote_buffers);
+        }
+        int remaining = li.expected_msgs - pre_arrived;
+        pending[node->id] = {node, remaining, std::move(li.my_inputs), std::move(pre_buffers)};
+        if (remaining <= 0)
+            on_comm_done(node->id);
+    }
 }
 
 template <int N>
@@ -832,6 +899,7 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
     for (int i = 0; i < (int)input_source_names.size(); ++i) {
         auto arr_it = partition->arrays.find(input_source_names[i]);
         if (arr_it != partition->arrays.end()) {
+            check_buffer_decomp<N>(dag_group, input_source_names[i], arr_it->second->decomp);
             input_decomps.push_back(arr_it->second->decomp);
         } else {
             auto meta_it = dag_group->array_meta.find(input_source_names[i]);
@@ -851,6 +919,7 @@ void ArrayDAGExecutorND<N>::execute_dag_node(DAGNode* node) {
         int result_name = fused_output_decomp_name(node);
         auto arr_it = partition->arrays.find(result_name);
         if (arr_it != partition->arrays.end()) {
+            check_buffer_decomp<N>(dag_group, result_name, arr_it->second->decomp);
             output_decomp = arr_it->second->decomp;
         } else {
             auto meta_it = dag_group->array_meta.find(result_name);
@@ -921,6 +990,13 @@ void ArrayDAGExecutorND<N>::on_comm_done(int node_id) {
 
     PendingComm<N>& comm = it->second;
     DAGNode* node = comm.node;
+    for (ASTNode* root : node->ast->roots)
+        if (static_cast<Opcode>(root->opcode) == Opcode::REDUCE) {
+            PendingComm<N> done = std::move(comm);
+            pending.erase(it);
+            finish_realigned_dot(done);
+            return;
+        }
 #ifdef USE_NVIDIA
     // packs queued since the node started (its halo sends) may read what it now writes
     partition->compute_after_others();
@@ -965,5 +1041,8 @@ template void ArrayDAGExecutorND<2>::execute_dag_node(DAGNode*);
 template void ArrayDAGExecutorND<3>::execute_dag_node(DAGNode*);
 
 template void ArrayDAGExecutorND<1>::on_comm_done(int);
+template void ArrayDAGExecutorND<1>::start_realigned_dot(DAGNode*, int, int);
+template void ArrayDAGExecutorND<2>::start_realigned_dot(DAGNode*, int, int);
+template void ArrayDAGExecutorND<3>::start_realigned_dot(DAGNode*, int, int);
 template void ArrayDAGExecutorND<2>::on_comm_done(int);
 template void ArrayDAGExecutorND<3>::on_comm_done(int);
