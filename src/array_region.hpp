@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <charmtyles/core/dag.hpp> // extract<T>
 #include <charmtyles/core/region.hpp>
+#include <cstdint>
 #include <cstdio>
 #include <limits>
 #include <string>
@@ -15,6 +16,12 @@
 /// overflowing int when the extent is near 2**31.
 inline int tile_end(int c, int tile, int64_t limit) {
     return static_cast<int>(std::min<int64_t>(int64_t(c + 1) * tile, limit));
+}
+
+/// max(c * tile, lo), the start of tile c clipped to [lo, limit]. Chare c of a grid made
+/// for another array can lie past this array's end, where c * tile overflows int.
+inline int tile_start(int c, int tile, int lo, int64_t limit) {
+    return static_cast<int>(std::max<int64_t>(lo, std::min<int64_t>(int64_t(c) * tile, limit)));
 }
 
 #ifndef DBG_PRINT
@@ -366,7 +373,7 @@ class ArrayDecomp {
     ArrayRegion<N> chare_region_global(std::array<int, N> const& ci) const {
         ArrayRegion<N> r;
         for (int d = 0; d < N; ++d) {
-            r.start[d] = std::max(ci[d] * tile, offset[d]);
+            r.start[d] = tile_start(ci[d], tile, offset[d], int64_t(offset[d]) + global_shape[d]);
             r.stop[d] = tile_end(ci[d], tile, int64_t(offset[d]) + global_shape[d]);
             r.step[d] = 1;
         }
@@ -380,7 +387,7 @@ class ArrayDecomp {
 
     /// Global start coordinate for chare ci along dimension d.
     int chare_start_global(int d, int ci_d) const {
-        return std::max(ci_d * tile, offset[d]);
+        return tile_start(ci_d, tile, offset[d], int64_t(offset[d]) + global_shape[d]);
     }
 
     /// Index range [lo, hi) along axis d of the view (vstart, vstep, vsize; vstart in
