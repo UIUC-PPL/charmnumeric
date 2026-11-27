@@ -2368,6 +2368,9 @@ static bool la_dev_progress(PartitionImpl<N>* p, ArrayDAGGroup* g, int node_id, 
     }
     std::vector<LaDevChunk> chunks;
     chunks.swap(st.dev_stash);
+    // a zero-copy TSQ can arrive after the root's later TSSIGN: apply the signs only after it
+    std::stable_partition(chunks.begin(), chunks.end(),
+                          [](const LaDevChunk& c) { return c.kind != LA_DK_TSSIGN; });
     for (auto& c : chunks)
         la_dispatch(s.dt, [&](auto tag) {
             if (c.kind == LA_DK_OUT) {
@@ -2382,7 +2385,10 @@ static bool la_dev_progress(PartitionImpl<N>* p, ArrayDAGGroup* g, int node_id, 
             } else if (c.kind == LA_DK_TSTOP) {
                 la_tsqr_signs<N, decltype(tag)>(p, g, node_id, s, st.dev, c);
             } else if (c.kind == LA_DK_TSSIGN) {
-                la_tsqr_finish<N, decltype(tag)>(p, g, node_id, s, st.dev, c);
+                if (st.dev->tau)
+                    st.dev_stash.push_back(c);
+                else
+                    la_tsqr_finish<N, decltype(tag)>(p, g, node_id, s, st.dev, c);
             } else {
                 la_dev_place<N, decltype(tag)>(p, s, st, c);
             }
