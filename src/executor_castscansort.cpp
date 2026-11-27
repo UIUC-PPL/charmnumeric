@@ -222,9 +222,10 @@ inline void pooled_free(char* p) {
 }
 
 // ---- SCAN ----
-// Each chare sends its line totals to the later chares along the axis, then scans
-// its tile once with the folded carry. The input may be a narrower integer type
-// than the result (cast on the fly).
+// The chares along the axis send their line totals to the first one (the coordinator),
+// which folds them in source order into every later chare's carry and sends it back; each
+// chare scans its tile once with its carry (2C - 3 messages for C chares). The input may be
+// a narrower integer type than the result (cast on the fly).
 
 template <typename Tout, typename Tin>
 struct ScanIn {
@@ -353,8 +354,7 @@ void lines_cub(PartitionImpl<N>* partition, const Tin* in, Tout* out, Tout* tota
                     bin, len, st));
         }
     }
-    compute_fence(partition);
-    pooled_free(tmp);
+    comm_free_after(st, tmp);
 }
 #endif
 
@@ -382,84 +382,108 @@ void scan_lines(PartitionImpl<N>* partition, const Tin* in, Tout* out, const Tou
     scan_per_thread<N, Tout, Tin>(partition, in, out, carry, g, op);
 }
 
-/// carry[l] = op(carry[l] or identity, totals[l]).
+/// carry[l] = op(prev[l] or identity, totals[l]).
 template <int N, typename T>
-void fold_totals(PartitionImpl<N>* partition, T* carry, const T* totals, int64_t lines,
-                 ScanOp<T> op, bool init) {
+void fold_totals(PartitionImpl<N>* partition, T* carry, const T* prev, const T* totals,
+                 int64_t lines, ScanOp<T> op) {
 #ifdef USE_KOKKOS
     Kokkos::parallel_for(
         CT_COMPUTE_POLICY(partition, lines), KOKKOS_LAMBDA(int64_t l) {
-            carry[l] = op.apply(init ? op.identity() : carry[l], totals[l]);
+            carry[l] = op.apply(prev ? prev[l] : op.identity(), totals[l]);
         });
 #else
     (void)partition;
     for (int64_t l = 0; l < lines; ++l)
-        carry[l] = op.apply(init ? op.identity() : carry[l], totals[l]);
+        carry[l] = op.apply(prev ? prev[l] : op.identity(), totals[l]);
 #endif
 }
 
-/// Send line totals to later chares. Returns messages to expect.
+/// Number of chares along the axis; `first`: the first one's index.
+template <int N>
+int scan_axis_chares(const ArrayDecomp<N>& dec, int axis, int& first) {
+    first = dec.offset[axis] / dec.tile;
+    return (dec.offset[axis] + dec.global_shape[axis] - 1) / dec.tile - first + 1;
+}
+
+/// Coordinator (first chare along the axis): scans its tile and keeps its line totals in
+/// `own`; the others send theirs to it. Returns messages to expect.
 template <int N, typename Tout, typename Tin>
 int scan_execute(PartitionImpl<N>* partition, DAGNode* node, int out_name, CTArrayBase<N>* in,
-                 int axis, int kind) {
+                 CTArrayBase<N>* out, int axis, int kind, std::vector<RemoteBuffer<N>>& own) {
     LineGeom<N> g = tile_geom<N>(in, axis);
     ScanOp<Tout> op{kind};
     const ArrayDecomp<N>& dec = in->decomp;
     auto me = partition->nd_index();
-    int first = dec.offset[axis] / dec.tile;
-    int last = (dec.offset[axis] + dec.global_shape[axis] - 1) / dec.tile;
-    int n_targets = last - me[axis];
-    if (n_targets > 0) {
-        int64_t bytes = g.lines * (int64_t)sizeof(Tout);
+    int first;
+    int n = scan_axis_chares<N>(dec, axis, first);
+    int pos = me[axis] - first;
+    if (pos == n - 1 && pos > 0)
+        return 1; // the last chare's totals are not needed
+    int64_t bytes = g.lines * (int64_t)sizeof(Tout);
+    const Tin* src = static_cast<const Tin*>(in->device_data_ptr());
+    ArrayRegion<N> my_region = chare_array_region<N>(dec, me);
+    if (pos > 0) {
         char* totals = pooled_alloc(bytes);
-        line_totals<N, Tout, Tin>(partition, static_cast<const Tin*>(in->device_data_ptr()),
-                                  reinterpret_cast<Tout*>(totals), g, op);
-        std::vector<char*> bufs(n_targets);
-        for (int t = 0; t < n_targets; ++t) {
-            bufs[t] = pooled_alloc(bytes);
-            copy_bytes<N>(partition, bufs[t], totals, bytes);
-        }
-        compute_fence(partition);
-        pooled_free(totals);
-        ArrayRegion<N> my_region = chare_array_region<N>(dec, me);
-        for (int t = 0; t < n_targets; ++t) {
-            auto target = me;
-            target[axis] = me[axis] + 1 + t;
-            send_buffer<N>(partition, target, node->id, 0, out_name, my_region, bufs[t], bytes);
-        }
+        line_totals<N, Tout, Tin>(partition, src, reinterpret_cast<Tout*>(totals), g, op);
+        comm_after_compute(partition);
+        auto coord = me;
+        coord[axis] = first;
+        send_buffer<N>(partition, coord, node->id, 0, out_name, my_region, totals, bytes);
+        return 1;
     }
-    return me[axis] - first;
+    scan_lines<N, Tout, Tin>(partition, src, static_cast<Tout*>(out->device_data_ptr()), nullptr,
+                             g, op);
+    if (n > 1) {
+        char* totals = pooled_alloc(bytes);
+        line_totals<N, Tout, Tin>(partition, src, reinterpret_cast<Tout*>(totals), g, op);
+        own.push_back({totals, my_region, bytes});
+    }
+    return std::max(n - 2, 0);
 }
 
-/// Fold the received totals into a carry and scan the tile with it.
+/// Other chares: scan the tile with the received carry. Coordinator: fold the totals in
+/// source order into each later chare's carry and send it.
 template <int N, typename Tout, typename Tin>
-void scan_finish(PartitionImpl<N>* partition, CTArrayBase<N>* in, CTArrayBase<N>* out, int axis,
-                 int kind, PendingComm<N>& comm) {
+void scan_finish(PartitionImpl<N>* partition, int node_id, int out_name, CTArrayBase<N>* in,
+                 CTArrayBase<N>* out, int axis, int kind, PendingComm<N>& comm) {
     LineGeom<N> g = tile_geom<N>(in, axis);
     ScanOp<Tout> op{kind};
-    char* carry_buf = nullptr;
+    const ArrayDecomp<N>& dec = in->decomp;
+    auto me = partition->nd_index();
+    int first;
+    int n = scan_axis_chares<N>(dec, axis, first);
     auto rb_it = comm.remote_buffers.find(0);
-    if (rb_it != comm.remote_buffers.end() && !rb_it->second.empty()) {
-        carry_buf = pooled_alloc(g.lines * (int64_t)sizeof(Tout));
-        // in source order along the axis: float carries do not depend on arrival order
-        auto& rbs = rb_it->second;
-        std::sort(rbs.begin(), rbs.end(),
-                  [axis](const RemoteBuffer<N>& x, const RemoteBuffer<N>& y) {
-                      return x.region.start[axis] < y.region.start[axis];
-                  });
-        bool init = true;
-        for (auto& rb : rbs) {
-            fold_totals<N, Tout>(partition, reinterpret_cast<Tout*>(carry_buf),
-                                 reinterpret_cast<const Tout*>(rb.data), g.lines, op, init);
-            init = false;
-        }
+    std::vector<RemoteBuffer<N>> none;
+    auto& rbs = rb_it != comm.remote_buffers.end() ? rb_it->second : none;
+    if (me[axis] != first) {
+        if (rbs.size() != 1)
+            CkAbort("SCAN: chare expects one carry, got %d", (int)rbs.size());
+        scan_lines<N, Tout, Tin>(partition, static_cast<const Tin*>(in->device_data_ptr()),
+                                 static_cast<Tout*>(out->device_data_ptr()),
+                                 reinterpret_cast<const Tout*>(rbs[0].data), g, op);
+        return;
     }
-    scan_lines<N, Tout, Tin>(partition, static_cast<const Tin*>(in->device_data_ptr()),
-                             static_cast<Tout*>(out->device_data_ptr()),
-                             reinterpret_cast<const Tout*>(carry_buf), g, op);
-    if (carry_buf) {
-        compute_fence(partition);
-        pooled_free(carry_buf);
+    if (n == 1)
+        return;
+    if ((int)rbs.size() != n - 1)
+        CkAbort("SCAN: coordinator has %d of %d line totals", (int)rbs.size(), n - 1);
+    std::sort(rbs.begin(), rbs.end(), [axis](const RemoteBuffer<N>& x, const RemoteBuffer<N>& y) {
+        return x.region.start[axis] < y.region.start[axis];
+    });
+    int64_t bytes = g.lines * (int64_t)sizeof(Tout);
+    std::vector<char*> carry(n - 1);
+    for (int k = 0; k < n - 1; ++k) {
+        carry[k] = pooled_alloc(bytes);
+        fold_totals<N, Tout>(partition, reinterpret_cast<Tout*>(carry[k]),
+                             k ? reinterpret_cast<const Tout*>(carry[k - 1]) : nullptr,
+                             reinterpret_cast<const Tout*>(rbs[k].data), g.lines, op);
+    }
+    comm_after_compute(partition);
+    ArrayRegion<N> my_region = chare_array_region<N>(dec, me);
+    for (int k = 0; k < n - 1; ++k) {
+        auto target = me;
+        target[axis] = first + 1 + k;
+        send_buffer<N>(partition, target, node_id, 0, out_name, my_region, carry[k], bytes);
     }
 }
 
@@ -674,12 +698,13 @@ void ArrayDAGExecutorND<N>::execute_castscansort_node(DAGNode* node) {
                                                   in->decomp, false);
 
     int expected = 0;
+    std::vector<RemoteBuffer<N>> own;
     if (op == Opcode::SCAN) {
         int axis = scalar_param(root, 1, 0);
         int kind = scalar_param(root, 2, 0);
         scan_dispatch(out_dt, in->dtype, [&](auto to, auto ti) {
             expected = scan_execute<N, decltype(to), decltype(ti)>(partition, node, out_name, in,
-                                                                   axis, kind);
+                                                                   out, axis, kind, own);
         });
     } else if (ds_axis_whole<N>(in, scalar_param(root, 1, 0))) {
         ds_axis_local<N>(partition, in, out, scalar_param(root, 1, 0), op == Opcode::ARGSORT);
@@ -715,6 +740,8 @@ void ArrayDAGExecutorND<N>::execute_castscansort_node(DAGNode* node) {
         pre_arrived = -(pre_it->second.expected_msgs);
         pre_buffers = std::move(pre_it->second.remote_buffers);
     }
+    for (auto& rb : own)
+        pre_buffers[0].push_back(rb);
     int remaining = expected - pre_arrived;
     pending[node->id] = {node, remaining, {}, std::move(pre_buffers)};
     if (remaining <= 0)
@@ -732,7 +759,8 @@ void ArrayDAGExecutorND<N>::finish_castscansort_node(PendingComm<N>& comm) {
     if (op == Opcode::SCAN) {
         int kind = scalar_param(root, 2, 0);
         scan_dispatch(out->dtype, in->dtype, [&](auto to, auto ti) {
-            scan_finish<N, decltype(to), decltype(ti)>(partition, in, out, axis, kind, comm);
+            scan_finish<N, decltype(to), decltype(ti)>(partition, comm.node->id, root->result_name,
+                                                       in, out, axis, kind, comm);
         });
         return;
     }
