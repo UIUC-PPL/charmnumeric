@@ -359,6 +359,14 @@ def _eval(obj):
         _store_result(obj, _fit(np.asarray(res), obj))
         return
 
+    if op == AO.batched_matmul:
+        from charmnumeric.einsum import bmm_reference
+
+        a, b = ops[:2]
+        dims = [int(d) for d in ops[2:8]]
+        _store_result(obj, _fit(bmm_reference(_value(a), _value(b), dims), obj))
+        return
+
     if op in (AO.reshape, AO.broadcast):
         x = ops[0]
         shape = tuple(int(n) for n in ops[1:])

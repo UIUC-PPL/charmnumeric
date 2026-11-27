@@ -19,6 +19,10 @@ void PartitionImpl<N>::process_get(int epoch) {
         for (int d = 0; d < N; ++d)
             if (nd_idx[d] >= grid.grid[d])
                 return;
+#ifdef USE_KOKKOS
+        // nodes finish once their GPU work is queued
+        Kokkos::fence("ct_barrier");
+#endif
         dag_proxy[0].barrier_arrive(epoch);
         return;
     }

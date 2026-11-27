@@ -270,6 +270,27 @@ def main():
               np.transpose(z, (2, 0, 3, 1)))
     chk.check("FoldedArray.T", cnp.array(z).T, z.T)
 
+    print("zero-size contraction")
+    import tracemalloc
+
+    for dt in ("float64", "int64"):
+        ea, eb = np.zeros((37, 0), dt), np.zeros((0, 29), dt)
+        chk.check(f"empty @ empty {dt}", cnp.array(ea) @ cnp.array(eb), ea @ eb)
+        chk.check(f"einsum empty {dt}", cnp.einsum("ij,jk->ik", cnp.array(ea), cnp.array(eb)),
+                  np.einsum("ij,jk->ik", ea, eb))
+    ea, eb = np.zeros((6, 0, 5)), np.zeros((6, 0, 4))
+    chk.check("einsum empty batched", cnp.einsum("bji,bjk->bik", cnp.array(ea), cnp.array(eb)),
+              np.einsum("bji,bjk->bik", ea, eb))
+    ea, eb = np.zeros((0, 7)), np.zeros((7, 5))
+    chk.check("empty rows", cnp.array(ea) @ cnp.array(eb), ea @ eb)
+    tracemalloc.start()
+    big = cnp.array(np.zeros((4000, 0))) @ cnp.array(np.zeros((0, 4000)))
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    chk.check("zero-size result is not built on the client", np.array([peak < (16 << 20)]),
+              np.array([True]))
+    chk.check("zero-size result values", big[:3, :3], np.zeros((3, 3)))
+
     chk.finish()
 
 

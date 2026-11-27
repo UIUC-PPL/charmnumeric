@@ -53,8 +53,15 @@ inline void local_gemm(const T* a, int lda, const T* b, int ldb, T* c, int ldc, 
 #ifdef USE_KOKKOS
 #ifdef USE_NVIDIA
     if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double>) {
-        // inputs may come from work on the default instance's stream
-        Kokkos::DefaultExecutionSpace().fence("ct_gemm inputs");
+        // inputs may come from work on the default instance's stream: order, don't wait
+        thread_local cudaEvent_t inputs_ready = nullptr;
+        if (inputs_ready == nullptr &&
+            cudaEventCreateWithFlags(&inputs_ready, cudaEventDisableTiming) != cudaSuccess)
+            CkAbort("cudaEventCreate failed");
+        if (cudaEventRecord(inputs_ready, Kokkos::DefaultExecutionSpace().cuda_stream()) !=
+                cudaSuccess ||
+            cudaStreamWaitEvent(stream, inputs_ready, 0) != cudaSuccess)
+            CkAbort("ct_gemm: ordering after the default instance failed");
         // column-major view of the row-major product: C^T = B^T * A^T
         cublasHandle_t h = ct_cublas();
         cublasSetStream(h, stream);
