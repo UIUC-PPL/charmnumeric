@@ -311,7 +311,7 @@ inline void* comm_alloc(int64_t bytes) {
 
 inline void comm_free(void* ptr) {
     auto& pool = comm_pool();
-    std::lock_guard<std::mutex> lock(pool.mu);
+    std::unique_lock<std::mutex> lock(pool.mu);
     auto it = pool.live.find(ptr);
     if (it == pool.live.end()) {
         auto lt = pool.live_large.find(ptr);
@@ -322,6 +322,7 @@ inline void comm_free(void* ptr) {
             return;
         }
 #ifdef USE_NVIDIA
+        lock.unlock(); // gpu_ipc_free may start waiting sends, which allocate here
         if (gpu_ipc_free(ptr))
             return;
 #endif
@@ -805,6 +806,7 @@ class ArrayDAGExecutorND : public DAGExecutor {
     void ds_select_msg(int node_id, char* data, int64_t size);
     void execute_signal_node(DAGNode* node);
     void finish_signal_node(PendingComm<N>& comm);
+    void on_signal_receive(int node_id, int input_index);
     void execute_index_node(DAGNode* node);
     void on_index_msg(int node_id, char* data, int64_t size);
     void index_progress(int node_id);
