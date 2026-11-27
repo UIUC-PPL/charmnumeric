@@ -26,9 +26,20 @@ void PartitionImpl<N>::receive_data(int& node_id, int& input_index, int& name, i
 
 template <int N>
 void PartitionImpl<N>::send_complete(int send_id) {
+#ifdef USE_NVIDIA
+    auto left = staged_pieces_left.find(send_id);
+    if (left != staged_pieces_left.end()) {
+        if (--left->second > 0)
+            return;
+        staged_pieces_left.erase(left);
+    }
+#endif
     auto it = pending_sends.find(send_id);
     if (it != pending_sends.end()) {
-        comm_free(it->second);
+#ifdef USE_NVIDIA
+        if (!pinned_free(it->second))
+#endif
+            comm_free(it->second);
         pending_sends.erase(it);
     }
 #ifdef USE_NVIDIA
@@ -98,6 +109,7 @@ template <int N>
 void PartitionImpl<N>::receive_staged(int node_id, int input_index, int name, int ndims,
                                       int* region_data, int64_t size, char* data) {
 #ifdef USE_NVIDIA
+    StageStat stat(StageStat::kRecv, size);
     auto* p = comm_recv_param(this, node_id, input_index, name, ndims, region_data, size);
     // pageable source: cudaMemcpyAsync returns once it has consumed the message
     const char* src = data;
@@ -110,6 +122,76 @@ void PartitionImpl<N>::receive_staged(int node_id, int input_index, int name, in
     hapiAddCallback(comm_stream_raw, &cb);
 #else
     CkAbort("receive_staged: needs an NVIDIA build");
+#endif
+}
+
+template <int N>
+void PartitionImpl<N>::receive_pinned(int node_id, int input_index, int name, int ndims,
+                                      int* region_data, int64_t total, int src, int64_t seq,
+                                      int64_t offset, CkNcpyBuffer& data) {
+#ifdef USE_NVIDIA
+    StageStat stat(StageStat::kRecv, 0);
+    const int64_t size = static_cast<int64_t>(data.cnt);
+    PinnedRecv*& r = pinned_recvs[{src, seq}];
+    if (!r) {
+        r = new PinnedRecv;
+        r->key = {src, seq};
+        r->node_id = node_id;
+        r->input_index = input_index;
+        r->name = name;
+        r->ndims = ndims;
+        r->region_data.assign(region_data, region_data + ndims * 3);
+        r->total = total;
+        r->host = static_cast<char*>(pinned_alloc(total));
+        r->pinned = r->host != nullptr;
+        if (!r->pinned)
+            r->host = new char[total];
+    }
+    if (r->total != total || offset < 0 || offset + size > total)
+        CkAbort("receive_pinned: piece [%lld, +%lld) of PE %d's payload %lld does not fit its "
+                "%lld bytes", (long long)offset, (long long)size, src, (long long)seq,
+                (long long)r->total);
+    // Charm++ picks the transfer by the two PEs, as the sender did: a kernel copy from a
+    // process of this host (done when get returns), else an RDMA read. Either way both
+    // callbacks arrive as messages: pinned_arrived here, send_complete on the sender.
+    StagedZc how = findTransferMode(data.pe, CkMyPe()) == CkNcpyMode::CMA ? StagedZc::kCma
+                                                                          : StagedZc::kRdma;
+    CkNcpyBuffer dest = staged_zc_buffer(how, r->host, offset, size);
+    ChareIndex<N> self_ci;
+    for (int d = 0; d < N; ++d)
+        self_ci.idx[d] = index[d];
+    dest.cb = CkCallback(PartitionTraits<N>::CkIndexType::pinned_arrived(nullptr),
+                         proxy_at<N>(thisProxy, self_ci));
+    dest.setRef(r);
+    dest.get(data);
+#else
+    CkAbort("receive_pinned: needs an NVIDIA build");
+#endif
+}
+
+template <int N>
+void PartitionImpl<N>::pinned_arrived(const CkNcpyBuffer& piece) {
+#ifdef USE_NVIDIA
+    const int64_t size = static_cast<int64_t>(piece.cnt);
+    StageStat stat(StageStat::kRecv, size, true);
+    auto* r = static_cast<PinnedRecv*>(const_cast<void*>(piece.ref));
+    r->got += size;
+    if (r->got < r->total)
+        return;
+    pinned_recvs.erase(r->key);
+    auto* p = comm_recv_param(this, r->node_id, r->input_index, r->name, r->ndims,
+                              r->region_data.data(), r->total);
+    if (r->pinned)
+        p->host = r->host;
+    hapiCheck(cudaMemcpyAsync(p->buf, r->host, r->total, cudaMemcpyHostToDevice,
+                              comm_stream_raw));
+    if (!r->pinned)
+        delete[] r->host; // pageable source: cudaMemcpyAsync returned once it had consumed it
+    delete r;
+    CkCallback cb(comm_recv_cb<N>, p);
+    hapiAddCallback(comm_stream_raw, &cb);
+#else
+    CkAbort("pinned_arrived: needs an NVIDIA build");
 #endif
 }
 #endif
@@ -286,6 +368,16 @@ template void PartitionImpl<3>::receive_ipc(int, int, int, int, int*, int64_t, i
 template void PartitionImpl<1>::receive_staged(int, int, int, int, int*, int64_t, char*);
 template void PartitionImpl<2>::receive_staged(int, int, int, int, int*, int64_t, char*);
 template void PartitionImpl<3>::receive_staged(int, int, int, int, int*, int64_t, char*);
+
+template void PartitionImpl<1>::receive_pinned(int, int, int, int, int*, int64_t, int, int64_t,
+                                               int64_t, CkNcpyBuffer&);
+template void PartitionImpl<2>::receive_pinned(int, int, int, int, int*, int64_t, int, int64_t,
+                                               int64_t, CkNcpyBuffer&);
+template void PartitionImpl<3>::receive_pinned(int, int, int, int, int*, int64_t, int, int64_t,
+                                               int64_t, CkNcpyBuffer&);
+template void PartitionImpl<1>::pinned_arrived(const CkNcpyBuffer&);
+template void PartitionImpl<2>::pinned_arrived(const CkNcpyBuffer&);
+template void PartitionImpl<3>::pinned_arrived(const CkNcpyBuffer&);
 
 template void PartitionImpl<1>::send_complete(int);
 template void PartitionImpl<2>::send_complete(int);

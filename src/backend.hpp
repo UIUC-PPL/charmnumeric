@@ -1220,7 +1220,8 @@ class PartitionImpl {
         return it->second;
     }
 #ifdef USE_KOKKOS
-    std::unordered_map<int, void*> pending_sends; // send_id → device ptr
+    // send_id → device ptr, or the pinned host block of a zero-copy staged send
+    std::unordered_map<int, void*> pending_sends;
     // Posted device recv buffers, keyed by message identity; nocopydevice passes a null data pointer.
     std::map<std::vector<int>, std::deque<char*>> posted_recv_bufs;
     unsigned next_send_id = 0;
@@ -1264,6 +1265,25 @@ class PartitionImpl {
                      const CkCallback& done);
     void receive_staged(int node_id, int input_index, int name, int ndims, int* region_data,
                         int64_t size, char* data);
+    /// Zero-copy staged receive: piece [offset, offset + data.cnt) of a `total`-byte payload
+    /// waits in the sender's pinned block `data`. receive_pinned starts fetching it into a
+    /// pinned block of this chare; pinned_arrived runs when a piece is there and queues the
+    /// host-to-device copy after the last one.
+    void receive_pinned(int node_id, int input_index, int name, int ndims, int* region_data,
+                        int64_t total, int src, int64_t seq, int64_t offset, CkNcpyBuffer& data);
+    void pinned_arrived(const CkNcpyBuffer& piece);
+    struct PinnedRecv {
+        std::pair<int, int64_t> key;
+        int node_id, input_index, name, ndims;
+        std::vector<int> region_data;
+        char* host = nullptr;
+        bool pinned = false; // else new[] (no pinned block to be had)
+        int64_t total = 0;
+        int64_t got = 0;
+    };
+    // (source PE, sequence number) -> payload being fetched
+    std::map<std::pair<int, int64_t>, PinnedRecv*> pinned_recvs;
+    std::unordered_map<int, int64_t> staged_pieces_left; // send_id -> unread pieces, if several
 #endif
     void comm_done(int node_id);
     void reduce_result(int node_id, int64_t size, char* data);
@@ -1443,6 +1463,16 @@ class Partition1D : public CBase_Partition1D {
                         int64_t size, char* data) {
         impl.receive_staged(node_id, input_index, name, ndims, region_data, size, data);
     }
+    void receive_pinned(int node_id, int input_index, int name, int ndims, int* region_data,
+                        int64_t total, int src, int64_t seq, int64_t offset,
+                        CkNcpyBuffer data) {
+        impl.receive_pinned(node_id, input_index, name, ndims, region_data, total, src, seq,
+                            offset, data);
+    }
+    void pinned_arrived(CkDataMsg* msg) {
+        impl.pinned_arrived(*static_cast<const CkNcpyBuffer*>(msg->getData()));
+        CkFreeMsg(msg);
+    }
 #endif
     void comm_done(int node_id) { impl.comm_done(node_id); }
     void reduce_result(int node_id, int64_t size, char* data) {
@@ -1509,6 +1539,16 @@ class Partition2D : public CBase_Partition2D {
                         int64_t size, char* data) {
         impl.receive_staged(node_id, input_index, name, ndims, region_data, size, data);
     }
+    void receive_pinned(int node_id, int input_index, int name, int ndims, int* region_data,
+                        int64_t total, int src, int64_t seq, int64_t offset,
+                        CkNcpyBuffer data) {
+        impl.receive_pinned(node_id, input_index, name, ndims, region_data, total, src, seq,
+                            offset, data);
+    }
+    void pinned_arrived(CkDataMsg* msg) {
+        impl.pinned_arrived(*static_cast<const CkNcpyBuffer*>(msg->getData()));
+        CkFreeMsg(msg);
+    }
 #endif
     void comm_done(int node_id) { impl.comm_done(node_id); }
     void reduce_result(int node_id, int64_t size, char* data) {
@@ -1574,6 +1614,16 @@ class Partition3D : public CBase_Partition3D {
     void receive_staged(int node_id, int input_index, int name, int ndims, int* region_data,
                         int64_t size, char* data) {
         impl.receive_staged(node_id, input_index, name, ndims, region_data, size, data);
+    }
+    void receive_pinned(int node_id, int input_index, int name, int ndims, int* region_data,
+                        int64_t total, int src, int64_t seq, int64_t offset,
+                        CkNcpyBuffer data) {
+        impl.receive_pinned(node_id, input_index, name, ndims, region_data, total, src, seq,
+                            offset, data);
+    }
+    void pinned_arrived(CkDataMsg* msg) {
+        impl.pinned_arrived(*static_cast<const CkNcpyBuffer*>(msg->getData()));
+        CkFreeMsg(msg);
     }
 #endif
     void comm_done(int node_id) { impl.comm_done(node_id); }

@@ -54,6 +54,11 @@ mainmodule charmnumeric
         entry void receive_staged(int node_id, int input_index, int name,
                                   int ndims, int region_data[ndims*3],
                                   int64_t size, char data[size]);
+        entry void receive_pinned(int node_id, int input_index, int name,
+                                  int ndims, int region_data[ndims*3],
+                                  int64_t total, int src, int64_t seq, int64_t offset,
+                                  CkNcpyBuffer data);
+        entry void pinned_arrived(CkDataMsg* msg);
 #endif
         entry void comm_done(int node_id);
         entry void reduce_result(int node_id, int64_t size, char data[size]);
@@ -88,6 +93,11 @@ mainmodule charmnumeric
         entry void receive_staged(int node_id, int input_index, int name,
                                   int ndims, int region_data[ndims*3],
                                   int64_t size, char data[size]);
+        entry void receive_pinned(int node_id, int input_index, int name,
+                                  int ndims, int region_data[ndims*3],
+                                  int64_t total, int src, int64_t seq, int64_t offset,
+                                  CkNcpyBuffer data);
+        entry void pinned_arrived(CkDataMsg* msg);
 #endif
         entry void comm_done(int node_id);
         entry void reduce_result(int node_id, int64_t size, char data[size]);
@@ -122,6 +132,11 @@ mainmodule charmnumeric
         entry void receive_staged(int node_id, int input_index, int name,
                                   int ndims, int region_data[ndims*3],
                                   int64_t size, char data[size]);
+        entry void receive_pinned(int node_id, int input_index, int name,
+                                  int ndims, int region_data[ndims*3],
+                                  int64_t total, int src, int64_t seq, int64_t offset,
+                                  CkNcpyBuffer data);
+        entry void pinned_arrived(CkDataMsg* msg);
 #endif
         entry void comm_done(int node_id);
         entry void reduce_result(int node_id, int64_t size, char data[size]);
