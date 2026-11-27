@@ -109,6 +109,10 @@ Distributed N-dimensional array DSL built on charmtyles. The backend stores 1-3D
 |--------|------|-------------|
 | `CharmNumericInterface(CCSInterface)` | 12 | Subclass with `from_bytes()` deserializer |
 | `LocalCluster` | 26 | Local server launcher — `_run_server()`:74, `_connect_with_retry()`:94, `close()`:111 |
+| `default_interface()` | 16 | Interface in use; without one, `launcher.auto_interface()` connects or starts a server |
+
+### `charmnumeric/launcher.py` — `cnp.start/stop/connect`, auto-start
+Launches under `_supervisor.py` (owns the server's process group; stops it when the client exits or dies), with a per-run CCS key (`++server-auth`) in a private run dir, and waits for `CCS server ready`. `_build.py`: finds `server.out` and infers arch/GPU. `_plan.py`: the command line (charmrun local/`++mpiexec`/srun, Reconverse, GPU binding). `__main__.py`: `python -m charmnumeric run|server|info`.
 
 ### `charmnumeric/random.py` — Native RNG (numpy.random subset)
 | Symbol | Description |

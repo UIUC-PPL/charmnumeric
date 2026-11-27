@@ -18,6 +18,9 @@ with `np` = charmnumeric through `_benchmark.py`, a stand-in for cuPyNumeric's
 # charmtyles and charmnumeric importable (PYTHONPATH or installed), Python >= 3.12
 cd examples/cupynumeric
 
+# starts a local backend automatically (charmnumeric.start(); stopped at exit)
+python stencil.py
+
 # against a running backend (server.out ++server ++server-port $CNUM_PORT)
 CNUM_HOST=127.0.0.1 CNUM_PORT=1234 CNUM_ODF=4 python cg.py --check
 CNUM_AUTO_FLUSH=0 python cfd.py             # no automatic async flushes (default: every 256 ops)
