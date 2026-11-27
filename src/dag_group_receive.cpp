@@ -708,6 +708,7 @@ void ArrayDAGGroup::receive_dag_now(int epoch, int size, char* serialized_dag) {
 
     compile(dag);
 
+    std::vector<int> deletions = dag->deletions;
     bool first = true;
     for (int nd : active_ndims) {
         if (first) {
@@ -723,7 +724,10 @@ void ArrayDAGGroup::receive_dag_now(int epoch, int size, char* serialized_dag) {
 
     for (auto& [nd, pg] : partition_grid) {
         if (pg.grid[0] > 0 && active_ndims.find(nd) == active_ndims.end()) {
-            add_dag(nd, epoch, new DAG());
+            // the deleted arrays may live in this partition
+            DAG* empty = new DAG();
+            empty->deletions = deletions;
+            add_dag(nd, epoch, empty);
             DBG_PRINT("[PE %d] receive_dag epoch=%d: stored empty DAG for ndims=%d\n", CkMyPe(),
                       epoch, nd);
         }

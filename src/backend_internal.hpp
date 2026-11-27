@@ -492,15 +492,17 @@ DType determine_dtype(DAGNode* node, std::unordered_map<int, CTArrayBase<N>*>& a
 inline char* alloc_buffer(int64_t bytes) {
     bytes = std::max<int64_t>(bytes, 1);
 #ifdef USE_KOKKOS
-    return static_cast<char*>(Kokkos::kokkos_malloc<DeviceSpace>(bytes));
+    return static_cast<char*>(comm_alloc(bytes));
 #else
     return new char[bytes];
 #endif
 }
 
+/// Waits for the device, like the cudaFree it replaces, before the block can be reused.
 inline void free_buffer(char* buf) {
 #ifdef USE_KOKKOS
-    Kokkos::kokkos_free<DeviceSpace>(buf);
+    Kokkos::fence("ct_free_buffer");
+    comm_free(buf);
 #else
     delete[] buf;
 #endif
