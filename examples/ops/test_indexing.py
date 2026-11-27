@@ -308,8 +308,8 @@ C.check("bool[bool]", b[b], bh[bh], dtype=np.bool_)
 C.check("where(bool mask)", cnp.where(m, 1, 2.5), np.where(hm, 1, 2.5))
 C.check("int8 mask value", cnp.arange(10)[cnp.asarray(np.arange(10, dtype=np.int8)) > 4],
         np.arange(10)[np.arange(10) > 4])
-C.raises("complex128 gather", NotImplementedError,
-         lambda: cnp.asarray(np.ones(4, np.complex128))[[1, 2]])
+c128 = np.arange(4) + 1j * np.arange(4)
+C.check("complex128 gather", cnp.asarray(c128)[[1, 2]], c128[[1, 2]], dtype=np.complex128)
 C.raises("float index rejected", IndexError, lambda: a[cnp.zeros((3,))])
 C.raises("out of bounds host index", IndexError, lambda: a[[10**6]])
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdlib>
+#include <memory>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -565,23 +566,18 @@ struct LinalgState {
     int64_t out_covered = 0, out_expected = 0;
 };
 
-/// GATHER/SCATTER/EXPAND state per chare; early messages wait in `stash`.
+/// Index op state per chare; early messages wait in `stash`.
 template <int N>
 struct IndexState {
     DAGNode* node = nullptr;
     bool started = false;
     std::vector<std::vector<char>> stash;
-    bool holder = false, flushed = false;
-    int req_left = 0;  // holder: request lists still expected
+    std::shared_ptr<void> ctx; // the node's decoded context (executor_indexing.cpp)
+    int64_t req_left = 0; // holder: requests still expected (GATHER/SCATTER: units)
     int val_left = 0;  // target: value lists still expected
     int seg_left = 0;  // EXPAND coordinator: segment lists still expected
     bool wait_offsets = false; // EXPAND driver: segment offsets not yet received
-    std::unordered_map<int64_t, std::vector<int64_t>> outgoing; // holder: value lists per target
-    std::vector<int64_t> updates; // target: received entries
-    int upd_width = 0;
     std::vector<std::vector<char>> segs; // coordinator: received segment lists
-    std::vector<int64_t> counts, seg_start; // EXPAND driver: element counts, row starts
-    int64_t row = 1;
     // COMPRESS / MASK_SCATTER
     bool mx_pending = false; // this chare holds a block of x that is not done yet
     bool mx_scanned = false;
@@ -591,6 +587,15 @@ struct IndexState {
     char* cbuf = nullptr;                  // compacted values (device memory in GPU builds)
     int64_t out_covered = 0, out_expected = 0;
     std::vector<std::vector<char>> reqs;   // v holder: requests, served once all arrived
+    // GATHER / SCATTER
+    bool gx_target = false, gx_issued = false;
+    int64_t lmsg_left = 0;                     // target: L elements / bucket units to come
+    int rep_left = 0;                          // target: direct copies to come
+    int64_t rep_elems = 0;                     // target: elements of replies to come
+    char* gx_lblk = nullptr;                   // target: L values of its b range (GATHER)
+    char* gx_ent = nullptr;                    // target: entry pairs grouped by holder
+    std::vector<std::vector<char>> gx_msgs;    // SCATTER target: received buckets
+    std::vector<std::vector<char>> gx_late;    // SCATTER target: values written after serving
 };
 
 /// RESHAPE/BROADCAST state per result chare; early messages wait in `stash`.
@@ -812,6 +817,8 @@ class ArrayDAGExecutorND : public DAGExecutor {
     void index_progress(int node_id);
     void execute_mask_node(DAGNode* node);
     void mask_progress(int node_id);
+    void gx_start(DAGNode* node);
+    void gx_progress(int node_id);
     void on_comm_done(int node_id);
     void on_matmatmul_receive(int node_id, int input_index);
     void on_matmul_partial(int node_id, RemoteBuffer<N>& partial_buf);

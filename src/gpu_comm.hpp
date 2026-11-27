@@ -106,7 +106,7 @@ inline void gpu_ipc_release(GpuIpcArena& a, int slab, int64_t offset, int cls) {
 
 /// gpu_ipc_alloc with a.mu held; `quiet`: no warning when the arena is full.
 inline void* gpu_ipc_alloc_locked(GpuIpcArena& a, int64_t bytes, int& slab, int64_t& offset,
-                                  bool quiet) {
+                                  bool quiet, bool held = false) {
     int cls = GpuIpcArena::kMinClass;
     while (cls <= GpuIpcArena::kSlabClass && (int64_t(1) << cls) < bytes)
         ++cls;
@@ -172,8 +172,10 @@ inline void* gpu_ipc_alloc_locked(GpuIpcArena& a, int64_t bytes, int& slab, int6
     }
     void* p = a.slabs[slab].base + offset;
     a.live[p] = {slab, cls};
-    a.owner[p] = CkMyPe();
-    ++a.in_flight[CkMyPe()];
+    if (!held) {
+        a.owner[p] = CkMyPe();
+        ++a.in_flight[CkMyPe()];
+    }
     return p;
 }
 
@@ -184,13 +186,15 @@ inline bool gpu_ipc_has_waiters_locked(GpuIpcArena& a, int pe) {
 
 /// Block of at least `bytes` in an exported slab, or nullptr (too large, arena full, or this
 /// PE has sends waiting: they go first). `quiet`: no warning when the arena is full (the
-/// caller may wait, gpu_ipc_wait).
-inline void* gpu_ipc_alloc(int64_t bytes, int& slab, int64_t& offset, bool quiet = false) {
+/// caller may wait, gpu_ipc_wait). `held`: a receiver keeps the block until its kernels have
+/// read it, so it is not counted in flight and waiting sends never wait for it.
+inline void* gpu_ipc_alloc(int64_t bytes, int& slab, int64_t& offset, bool quiet = false,
+                           bool held = false) {
     auto& a = gpu_ipc_arena();
     std::lock_guard<std::mutex> lock(a.mu);
     if (gpu_ipc_has_waiters_locked(a, CkMyPe()))
         return nullptr;
-    return gpu_ipc_alloc_locked(a, bytes, slab, offset, quiet);
+    return gpu_ipc_alloc_locked(a, bytes, slab, offset, quiet, held);
 }
 
 inline void gpu_ipc_release_locked(GpuIpcArena& a, void* ptr) {

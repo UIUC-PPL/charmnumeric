@@ -403,7 +403,7 @@ def _eval(obj):
         npre, npost, nde = (int(v) for v in ops[p:p + 3])
         E = tuple(int(v) for v in ops[p + 3:p + 3 + nde])
         offs = _index_offsets(np.asarray(_value(L)).astype(np.int64), E, npre, npost,
-                              [int(v) for v in ops[p + 3 + nde:]])
+                              [int(v) for v in ops[p + 3 + nde:p + 3 + nde + npre + npost]])
         tgt = _store[root.name]
         if offs.size and (offs.min() < 0 or offs.max() >= tgt.size):
             _error(f"index offsets out of bounds for array of size {tgt.size}")
