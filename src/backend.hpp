@@ -609,6 +609,9 @@ constexpr int RED_FINAL_INPUT = -100;
 /// data carry the sending chare.
 constexpr int SHAPE_DEV_INPUT = -101;
 
+/// receive_data input index of index-op device messages (moved mask blocks).
+constexpr int IX_DEV_INPUT = -110;
+
 /// REDUCE (dot) state on chare 0; partials are summed as they arrive.
 struct DotState {
     std::vector<char> acc;   // ReduceContrib: metadata of the first partial, summed value
@@ -656,14 +659,14 @@ struct IndexState {
     std::shared_ptr<void> ctx; // the node's decoded context (executor_indexing.cpp)
     int64_t req_left = 0; // holder: requests still expected (GATHER/SCATTER: units)
     int val_left = 0;  // target: value lists still expected
-    int seg_left = 0;  // EXPAND coordinator: segment lists still expected
-    bool wait_offsets = false; // EXPAND driver: segment offsets not yet received
-    std::vector<std::vector<char>> segs; // coordinator: received segment lists
+    bool wait_offsets = false; // EXPAND driver: row offsets not yet received
+    std::shared_ptr<void> rs;  // row offset scan over the x chares (executor_indexing.cpp)
     // COMPRESS / MASK_SCATTER
     bool mx_pending = false; // this chare holds a block of x that is not done yet
     bool mx_scanned = false;
     int64_t m_covered = 0, m_expected = 0; // mask elements moved onto x's block
-    std::vector<uint8_t> mblock;           // that mask block (row-major)
+    std::vector<uint8_t> mblock;           // that mask block (row-major; CPU builds)
+    char* dmblock = nullptr;               // that mask block in device memory (GPU builds)
     std::vector<int64_t> rowpos;           // compacted offset of each block row, then the total
     char* cbuf = nullptr;                  // compacted values (device memory in GPU builds)
     int64_t out_covered = 0, out_expected = 0;
@@ -916,6 +919,7 @@ class ArrayDAGExecutorND : public DAGExecutor {
     void on_signal_receive(int node_id, int input_index);
     void execute_index_node(DAGNode* node);
     void on_index_msg(int node_id, char* data, int64_t size);
+    void on_index_device(int node_id, const int* region, char* buf, int64_t size);
     void index_progress(int node_id);
     void execute_mask_node(DAGNode* node);
     void mask_progress(int node_id);
