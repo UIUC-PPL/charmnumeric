@@ -597,11 +597,13 @@ static void tile_send(PartitionImpl<N_src>* partition, DAGNode* node, int source
     auto nd_idx = partition->nd_index();
     auto src_decomp = src_it->second->decomp;
 
-    std::array<int, N_src> src_start, src_stop;
+    std::array<int, N_src> src_start, src_stop; // input array coords
     for (int d = 0; d < N_src; ++d) {
         src_start[d] = src_decomp.chare_start_global(d, nd_idx[d]);
         src_stop[d] = std::min(src_start[d] + src->region.size(d),
                                src_decomp.offset[d] + src_decomp.global_shape[d]);
+        src_start[d] -= src_decomp.offset[d];
+        src_stop[d] -= src_decomp.offset[d];
     }
 
     auto result_meta_it = dag_group->array_meta.find(result_name);
@@ -618,17 +620,19 @@ static void tile_send(PartitionImpl<N_src>* partition, DAGNode* node, int source
 
     std::array<std::vector<int>, N_tgt> chare_indices_per_dim;
     for (int d = 0; d < N_tgt; ++d) {
-        int num_chares_d = result_decomp.num_chares(d);
+        int off = result_decomp.offset[d];
+        int64_t limit = int64_t(off) + out_shape[d];
+        int c0 = off / result_tile, c1 = c0 + result_decomp.num_chares(d);
         if (d < delta) {
-            for (int ci = 0; ci < num_chares_d; ++ci)
+            for (int ci = c0; ci < c1; ++ci)
                 chare_indices_per_dim[d].push_back(ci);
         } else {
             int src_d = d - delta;
             int in_size = input_shape[src_d];
-            for (int ci = 0; ci < num_chares_d; ++ci) {
-                int chare_lo = std::max(ci * result_tile, result_decomp.offset[d]);
-                int chare_hi = std::min((ci + 1) * result_tile,
-                                        result_decomp.offset[d] + out_shape[d]);
+            for (int ci = c0; ci < c1; ++ci) {
+                // result array coords
+                int chare_lo = tile_start(ci, result_tile, off, limit) - off;
+                int chare_hi = tile_end(ci, result_tile, limit) - off;
                 if (chare_lo >= chare_hi)
                     continue;
                 bool overlaps = false;
@@ -823,20 +827,23 @@ void ArrayDAGExecutorND<N>::execute_tile_node(DAGNode* node) {
         int delta = out_ndims - input_ndims;
         auto input_decomp_meta = dag_group->array_meta.find(input_name);
         int input_tile = input_decomp_meta->second.tile;
+        auto const& input_off = input_decomp_meta->second.offset;
 
         int expected_msgs = 1;
         for (int src_d = 0; src_d < input_ndims; ++src_d) {
             int out_d = src_d + delta;
             int in_size = input_shape[src_d];
-            int chare_lo = result_chare.start[out_d];
-            int chare_hi = result_chare.stop[out_d];
+            int in_off = input_off[src_d];
+            // result array coords
+            int chare_lo = result_chare.start[out_d] - result_decomp.offset[out_d];
+            int chare_hi = result_chare.stop[out_d] - result_decomp.offset[out_d];
 
             std::set<int> needed_src_chares;
             for (int p = chare_lo; p < chare_hi;) {
                 int inp_pos = p % in_size;
-                int src_chare = inp_pos / input_tile;
+                int src_chare = (inp_pos + in_off) / input_tile;
                 needed_src_chares.insert(src_chare);
-                int next_boundary = (src_chare + 1) * input_tile - inp_pos + p;
+                int next_boundary = (src_chare + 1) * input_tile - in_off - inp_pos + p;
                 int next_wrap = p + (in_size - inp_pos);
                 p = std::min({next_boundary, next_wrap, chare_hi});
             }
