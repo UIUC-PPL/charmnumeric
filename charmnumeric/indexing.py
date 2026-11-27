@@ -315,7 +315,8 @@ def _items(x, key, newaxes=None):
         n = x.shape[d]
         if it[0] == "s":
             start, stop, step = it[1].indices(n)
-            out.append(("s", start, step, len(range(start, stop, step))))
+            count = len(range(start, stop, step))
+            out.append(("s", start, step if count > 1 else 1, count))
         elif it[0] == "i":
             i = it[1] + n if it[1] < 0 else it[1]
             if not 0 <= i < n:

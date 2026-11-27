@@ -31,7 +31,7 @@ static void cross_matmul_send_vector_slice_1d_to_2d(
     T* src_device = static_cast<T*>(vec->device_data_ptr()) + local_offset;
     Kokkos::parallel_for(
         CT_COMM_POLICY(partition, send_len),
-        KOKKOS_LAMBDA(int i) { send_buf[i] = src_device[i]; });
+        KOKKOS_LAMBDA(int64_t i) { send_buf[i] = src_device[i]; });
     device_pack_send<1, 2>(partition, proxy_2d, target_ci, node->id, 0, vec_name, region_data,
                            byte_size, send_buf);
 #else
@@ -75,7 +75,7 @@ static void cross_matmul_send_vector_slice_1d_to_3d(
     T* src_device = static_cast<T*>(vec->device_data_ptr()) + local_offset;
     Kokkos::parallel_for(
         CT_COMM_POLICY(partition, send_len),
-        KOKKOS_LAMBDA(int i) { send_buf[i] = src_device[i]; });
+        KOKKOS_LAMBDA(int64_t i) { send_buf[i] = src_device[i]; });
     device_pack_send<1, 3>(partition, proxy_3d, target_ci, node->id, 0, vec_name, region_data,
                            byte_size, send_buf);
 #else
@@ -165,6 +165,8 @@ void ArrayDAGExecutorND<N>::execute_matmul_node(DAGNode* node) {
 
         if (mat_ndims == 3) {
             // --- 3D matrix path (dimension-dropped matvec) ---
+            if (matmul_trans(matmul_root))
+                CkAbort("MATMUL: x @ A on a 3-D matrix view is not supported");
             int tile_3d = array_tile(dag_group->array_meta, mat_name, 3);
 
             // operand_regions[0] is a 3D region, operand_regions[1] is 1D vec region
@@ -223,7 +225,7 @@ void ArrayDAGExecutorND<N>::execute_matmul_node(DAGNode* node) {
 
                     for (int tc = fc; tc <= lc; tc++) {
                         int chare_col_start = std::max(mat_col_lo, tc * tile_3d);
-                        int chare_col_end = std::min(mat_col_hi, (tc + 1) * tile_3d);
+                        int chare_col_end = tile_end(tc, tile_3d, mat_col_hi);
                         int send_len = chare_col_end - chare_col_start;
                         int local_offset = (chare_col_start - cd_s + vec_s) - my_vec_start;
 
@@ -253,7 +255,7 @@ void ArrayDAGExecutorND<N>::execute_matmul_node(DAGNode* node) {
                     for (int tc = first_col_chare; tc <= last_col_chare; tc++) {
                         for (int tr = first_row_chare; tr <= last_row_chare; tr++) {
                             int global_row_lo = std::max(tr * tile_3d, rd_s);
-                            int global_row_hi = std::min((tr + 1) * tile_3d, rd_e);
+                            int global_row_hi = tile_end(tr, tile_3d, rd_e);
                             int result_lo = global_row_lo - rd_s;
                             int result_hi = global_row_hi - rd_s;
                             if (result_lo < my_result_end && result_hi > my_result_start)
@@ -284,13 +286,14 @@ void ArrayDAGExecutorND<N>::execute_matmul_node(DAGNode* node) {
             int mat_global_rows = meta_it->second.global_shape[0];
             int mat_global_cols = meta_it->second.global_shape[1];
 
-            int mat_rs = 0, mat_re = mat_global_rows;
+            int mat_rs = 0, mat_re = mat_global_rows, mat_rst = 1;
             int mat_cs = 0, mat_ce = mat_global_cols;
             if (matmul_root->operand_regions.size() >= 2) {
                 auto* mat_region = static_cast<ArrayRegion<2>*>(matmul_root->operand_regions[0]);
                 auto* vec_region = static_cast<ArrayRegion<1>*>(matmul_root->operand_regions[1]);
                 mat_rs = mat_region->start[0];
                 mat_re = mat_region->stop[0];
+                mat_rst = std::max(1, mat_region->step[0]);
                 mat_cs = mat_region->start[1];
                 mat_ce = mat_region->stop[1];
                 vec_s = vec_region->start[0];
@@ -306,12 +309,66 @@ void ArrayDAGExecutorND<N>::execute_matmul_node(DAGNode* node) {
             vec_s += vec_decomp.offset[0];
             vec_e += vec_decomp.offset[0];
 
-            int slice_rows = mat_re - mat_rs;
+            int slice_rows = (mat_re - mat_rs + mat_rst - 1) / mat_rst;
 
             int first_row_chare = mat_rs / tile_2d;
             int last_row_chare = (mat_re > 0) ? (mat_re - 1) / tile_2d : 0;
             int first_col_chare = mat_cs / tile_2d;
             int last_col_chare = (mat_ce > 0) ? (mat_ce - 1) / tile_2d : 0;
+            // result rows [k_lo, k_hi) computed by row chare tr (empty: tr has no selected row)
+            auto row_chare_results = [&](int tr, int& k_lo, int& k_hi) {
+                stepped_rows(mat_rs, mat_re, mat_rst, tr * tile_2d, tile_end(tr, tile_2d, mat_re),
+                             k_lo, k_hi);
+            };
+            if (matmul_trans(matmul_root)) {
+                // res[j] = sum_i mat[mat_rs + i, mat_cs + j] * vec[vec_s + i]: vector pieces go
+                // to the row chares, partial column sums come back from every row chare
+                int res_len = mat_ce - mat_cs;
+                if (has_vec) {
+                    int my_vec_start = vec_decomp.chare_start_global(0, k);
+                    int rel_start = std::max(my_vec_start, vec_s);
+                    int rel_end = std::min(my_vec_start + local_size, vec_e);
+                    if (rel_start < rel_end) {
+                        int row_lo = mat_rs + (rel_start - vec_s);
+                        int row_hi = mat_rs + (rel_end - vec_s);
+                        for (int tr = row_lo / tile_2d; tr <= (row_hi - 1) / tile_2d; tr++) {
+                            int rs = std::max(row_lo, tr * tile_2d);
+                            int re = tile_end(tr, tile_2d, row_hi);
+                            int local_offset = (rs - mat_rs + vec_s) - my_vec_start;
+                            for (int tc = first_col_chare; tc <= last_col_chare; tc++) {
+                                ChareIndex<2> target_ci;
+                                target_ci.idx[0] = tr;
+                                target_ci.idx[1] = tc;
+                                dispatch_cross_matmul_send_vector_slice(
+                                    dt, partition, node, vec_name, target_ci, local_offset,
+                                    re - rs, rs, re, dag_group->partition_proxy_2);
+                            }
+                        }
+                    }
+                }
+                auto r_local = result_decomp.chare_region_local(nd_idx);
+                int my_lo = r_local.start[0];
+                int my_hi = std::min(r_local.stop[0], res_len);
+                int total_expected = 0;
+                for (int tc = first_col_chare; my_lo < my_hi && tc <= last_col_chare; tc++) {
+                    int lo = std::max(tc * tile_2d, mat_cs) - mat_cs;
+                    int hi = tile_end(tc, tile_2d, mat_ce) - mat_cs;
+                    if (lo < my_hi && hi > my_lo)
+                        total_expected += last_row_chare - first_row_chare + 1;
+                }
+                auto pre_it = pending.find(node->id);
+                int pre_arrived = 0;
+                std::unordered_map<int, std::vector<RemoteBuffer<1>>> pre_buffers;
+                if (pre_it != pending.end()) {
+                    pre_arrived = -(pre_it->second.expected_msgs);
+                    pre_buffers = std::move(pre_it->second.remote_buffers);
+                }
+                int remaining = total_expected - pre_arrived;
+                pending[node->id] = {node, remaining, {}, std::move(pre_buffers)};
+                if (remaining <= 0)
+                    on_comm_done(node->id);
+                return;
+            }
 
             DBG_PRINT("[1D Chare %d] cross_matmul: node=%d vec=%d mat=%d result=%d "
                       "slice=[%d:%d,%d:%d] vec=[%d:%d] has_vec=%d\n",
@@ -331,11 +388,15 @@ void ArrayDAGExecutorND<N>::execute_matmul_node(DAGNode* node) {
                     int lc = (mat_col_hi - 1) / tile_2d;
                     for (int tc = fc; tc <= lc; tc++) {
                         int chare_col_start = std::max(mat_col_lo, tc * tile_2d);
-                        int chare_col_end = std::min(mat_col_hi, (tc + 1) * tile_2d);
+                        int chare_col_end = tile_end(tc, tile_2d, mat_col_hi);
                         int send_len = chare_col_end - chare_col_start;
                         int local_offset = (chare_col_start - mat_cs + vec_s) - my_vec_start;
 
                         for (int tr = first_row_chare; tr <= last_row_chare; tr++) {
+                            int k_lo, k_hi;
+                            row_chare_results(tr, k_lo, k_hi);
+                            if (k_lo >= k_hi)
+                                continue;
                             ChareIndex<2> target_ci;
                             target_ci.idx[0] = tr;
                             target_ci.idx[1] = tc;
@@ -355,11 +416,10 @@ void ArrayDAGExecutorND<N>::execute_matmul_node(DAGNode* node) {
             if (my_result_start < slice_rows) {
                 for (int tc = first_col_chare; tc <= last_col_chare; tc++) {
                     for (int tr = first_row_chare; tr <= last_row_chare; tr++) {
-                        int global_row_lo = std::max(tr * tile_2d, mat_rs);
-                        int global_row_hi = std::min((tr + 1) * tile_2d, mat_re);
-                        int result_lo = global_row_lo - mat_rs;
-                        int result_hi = global_row_hi - mat_rs;
-                        if (result_lo < my_result_end && result_hi > my_result_start)
+                        int result_lo, result_hi;
+                        row_chare_results(tr, result_lo, result_hi);
+                        if (result_lo < result_hi && result_lo < my_result_end &&
+                            result_hi > my_result_start)
                             total_expected++;
                     }
                 }
@@ -395,14 +455,15 @@ void ArrayDAGExecutorND<N>::execute_matmul_node(DAGNode* node) {
         int mat_global_cols = mat_it->second->global_shape[1];
 
         // Extract slice regions if present
-        int mat_rs = 0, mat_re = mat_global_rows;
+        int mat_rs = 0, mat_re = mat_global_rows, mat_rst = 1;
         int mat_cs = 0, mat_ce = mat_global_cols;
-        int vec_s = 0, vec_e = mat_ce - mat_cs; // default: full range
+        int vec_s = 0, vec_e = matmul_trans(matmul_root) ? mat_re - mat_rs : mat_ce - mat_cs;
         if (matmul_root->operand_regions.size() >= 2) {
             auto* mat_region = static_cast<ArrayRegion<2>*>(matmul_root->operand_regions[0]);
             auto* vec_region = static_cast<ArrayRegion<1>*>(matmul_root->operand_regions[1]);
             mat_rs = mat_region->start[0];
             mat_re = mat_region->stop[0];
+            mat_rst = std::max(1, mat_region->step[0]);
             mat_cs = mat_region->start[1];
             mat_ce = mat_region->stop[1];
             vec_s = vec_region->start[0];
@@ -425,14 +486,17 @@ void ArrayDAGExecutorND<N>::execute_matmul_node(DAGNode* node) {
         int row_hi = std::min(mat_chare.stop[0], mat_re);
         int col_lo = std::max(mat_chare.start[1], mat_cs);
         int col_hi = std::min(mat_chare.stop[1], mat_ce);
-        if (row_lo >= row_hi || col_lo >= col_hi) {
+        int k_lo, k_hi;
+        stepped_rows(mat_rs, mat_re, mat_rst, mat_chare.start[0], mat_chare.stop[0], k_lo, k_hi);
+        if (row_lo >= row_hi || col_lo >= col_hi || k_lo >= k_hi) {
             node_finished(node->id);
             return;
         }
 
-        // Count how many vector messages to expect.
-        int vec_idx_start = vec_s + (col_lo - mat_cs);
-        int vec_idx_end = vec_s + (col_hi - mat_cs);
+        // Count how many vector messages to expect (trans: the vector runs along the rows).
+        bool trans = matmul_trans(matmul_root);
+        int vec_idx_start = trans ? vec_s + (row_lo - mat_rs) : vec_s + (col_lo - mat_cs);
+        int vec_idx_end = trans ? vec_s + (row_hi - mat_rs) : vec_s + (col_hi - mat_cs);
         int first_vec_chare = vec_idx_start / tile_1d;
         int last_vec_chare = (vec_idx_end - 1) / tile_1d;
         int vec_msgs = last_vec_chare - first_vec_chare + 1;

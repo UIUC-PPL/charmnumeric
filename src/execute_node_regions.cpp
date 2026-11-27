@@ -45,7 +45,7 @@ bool extract_regions_nd(DAGNode* node, std::unordered_map<int, CTArrayBase<N>*>&
                 global_shape[d] = it->second.global_shape[d];
     }
     if (global_shape[0] == 0) {
-        int best_gs = 0;
+        int64_t best_gs = 0;
         for (auto& [name, arr] : arrays) {
             if (arr->global_size > best_gs) {
                 best_gs = arr->global_size;

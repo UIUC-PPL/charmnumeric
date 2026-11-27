@@ -1438,7 +1438,7 @@ bool la_use_tsqr(const LaSpec& s, ArrayDAGGroup* g) {
     ArrayDecomp<2> dec = meta.template decomp<2>();
     ArrayRegion<2> v = la_view<2>(s.in[0], meta.global_shape);
     int first = v.start[0] + dec.offset[0];
-    int end = (first / dec.tile + 1) * dec.tile;
+    int64_t end = (int64_t(first) / dec.tile + 1) * dec.tile;
     return (end - first + v.step[0] - 1) / v.step[0] >= n;
 }
 

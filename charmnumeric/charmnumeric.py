@@ -108,10 +108,14 @@ def _normalize_dtype(dtype, *, allow_none=False):
     return np_dtype
 
 
+# The backend keeps each dimension and region coordinate in 32 bits (element counts are 64-bit).
+_MAX_DIM = 2**31 - 1
+
+
 def _normalize_shape(shape):
     if shape.__class__ is tuple:
         for dim in shape:
-            if dim.__class__ is not int or dim < 0:
+            if dim.__class__ is not int or dim < 0 or dim > _MAX_DIM:
                 break
         else:
             return shape
@@ -123,6 +127,12 @@ def _normalize_shape(shape):
     for dim in normalized:
         if dim < 0:
             raise ValueError(f"negative dimensions are not allowed: {normalized}")
+        if dim > _MAX_DIM:
+            raise ValueError(
+                f"array dimension {dim} in shape {normalized} is too large: charmnumeric "
+                f"supports at most {_MAX_DIM} elements per dimension (over 3-D, per dim "
+                f"of the folded 3-D storage shape)"
+            )
     return normalized
 
 
@@ -333,10 +343,16 @@ class ArrayRegion(Region):
         payload.extend(to_bytes(1 if self.is_global else 0, "i"))
         if not self.is_global:
             payload.extend(to_bytes(len(self.start), "i"))
-            for i in range(len(self.start)):
-                payload.extend(to_bytes(self.start[i], "i"))
-                payload.extend(to_bytes(self.stop[i], "i"))
-                payload.extend(to_bytes(self.step[i], "i"))
+            try:
+                for i in range(len(self.start)):
+                    payload.extend(to_bytes(self.start[i], "i"))
+                    payload.extend(to_bytes(self.stop[i], "i"))
+                    payload.extend(to_bytes(self.step[i], "i"))
+            except struct.error:
+                raise ValueError(
+                    f"region {self} has a coordinate outside the backend's 32-bit range "
+                    f"(at most {_MAX_DIM} elements per dimension)"
+                ) from None
         self._serialized = bytes(payload)
         return self._serialized
 
@@ -361,6 +377,10 @@ class ArrayRegion(Region):
             new_start[d] = self.start[d] + inner.start[d] * self.step[d]
             new_stop[d] = self.start[d] + inner.stop[d] * self.step[d]
             new_step[d] = self.step[d] * inner.step[d]
+            if new_step[d] >= new_stop[d] - new_start[d]:
+                # at most one element: [start, start + 1) keeps region sizes small
+                new_stop[d] = new_start[d] + (new_stop[d] > new_start[d])
+                new_step[d] = 1
         return ArrayRegion(new_start, new_stop, new_step)
 
     def overlaps(self, other):
@@ -485,6 +505,10 @@ def _parse_key(key, shape, ndims):
                 raise NotImplementedError("negative slicing is not supported yet")
             if stop_i < start_i:
                 stop_i = start_i
+            if step_i >= stop_i - start_i:
+                # at most one element: [start, start + 1) keeps region sizes small
+                stop_i = start_i + (stop_i > start_i)
+                step_i = 1
         elif item.__class__ is int or isinstance(item, numbers.Integral):
             start_i = int(item)
             if start_i < 0:
@@ -1574,12 +1598,7 @@ def _matmul_blas(self, other):
         )
 
     if self.ndims == 1 and other.ndims == 2:
-        # vecmat: x @ A == A.T @ x
-        if self.shape[0] != other.shape[0]:
-            raise ValueError(
-                f"Shape mismatch for vecmat: ({self.shape[0]},) @ {other.shape}"
-            )
-        return _matvec(_cached_transpose(other), self)
+        return _vecmat(self, other)
 
     if self.ndims != 2:
         raise ValueError(f"matmul requires a 2D matrix, got {self.ndims}D")
@@ -1610,7 +1629,12 @@ def _matvec(mat_obj, vec):
 
     if not isinstance(vec, (Array, ArrayView)):
         raise ValueError("matvec requires an Array vector")
-    mat_obj, vec = _unstrided(mat_obj), _unstrided(vec)
+    # a 2-D row step is read in place (leading dimension * step); other steps copy
+    if not (isinstance(mat_obj, ArrayView) and mat_obj.ndims == 2
+            and mat_obj.region.step[1] == 1
+            and mat_obj._root_parent.shape[1] * mat_obj.region.step[0] <= _MAX_DIM):
+        mat_obj = _unstrided(mat_obj)
+    vec = _unstrided(vec)
 
     if vec.ndims == 2 and vec.shape[1] == 1:
         temp = create_array((vec.shape[0],), dtype=vec.dtype)
@@ -1646,6 +1670,23 @@ def _matvec(mat_obj, vec):
         operation=ArrayOperation.matmul,
         shape=(mat_rows,),
         dtype=_result_dtype(mat_obj, vec),
+    )
+
+
+def _vecmat(vec, mat):
+    """vec @ mat for a 2-D mat: MATMUL with the transpose flag, no transposed copy."""
+    if not (isinstance(mat, ArrayView) and all(st == 1 for st in mat.region.step)):
+        mat = _unstrided(mat)
+    vec = _unstrided(vec)
+    if mat.shape[0] != vec.shape[0]:
+        raise ValueError(f"Shape mismatch for vecmat: ({vec.shape[0]},) @ {mat.shape}")
+    return nonfusible_op(
+        mat,
+        vec,
+        1,
+        operation=ArrayOperation.matmul,
+        shape=(mat.shape[1],),
+        dtype=_result_dtype(mat, vec),
     )
 
 
@@ -1773,26 +1814,6 @@ def _transpose_method(self, *axes):
     if len(axes) == 1 and not isinstance(axes[0], numbers.Integral):
         return _transpose_view(self, axes[0])
     return _transpose_view(self, axes)
-
-
-_TRANSPOSE_CACHE_MAX = 4
-
-
-def _cached_transpose(x):
-    """Internal transpose for vecmat; cached until the root array is written."""
-
-    _fresh(x)  # a refresh clears the cache (_wrote)
-    root = x._root_parent if isinstance(x, ArrayView) else x
-    cache = root.__dict__.setdefault("_transpose_cache", {})
-    region = x.region
-    key = (tuple(region.start), tuple(region.stop), tuple(region.step))
-    hit = cache.get(key)
-    if hit is None:
-        hit = _transpose(x)
-        if len(cache) >= _TRANSPOSE_CACHE_MAX:
-            cache.pop(next(iter(cache)))
-        cache[key] = hit
-    return hit
 
 
 class _ArrayMethods(object):
@@ -2177,9 +2198,11 @@ def _array_from_host_data(values, dtype=None, copy=True, ndmin=0):
         return create_array(host.shape, dtype=host_dtype)
     # Constant data is cheaper as a scalar fill than as an upload, but scalars
     # travel as doubles: complex values and ints beyond 2**53 must be uploaded.
-    first = host.reshape(-1)[0]
+    flat = host.flat
+    first = flat[0]
     if (host.dtype.kind == "c" or (host.dtype.kind in "iu" and abs(int(first)) > 2**53)
-            or (host.size > 1 and not np.all(host == first))):
+            or (host.size > 1 and (flat[-1] != first or flat[host.size // 2] != first
+                                   or not np.all(host == first)))):
         return _upload(host)
     if host.dtype.kind == "f" and first == 0 and np.any(np.signbit(host) != np.signbit(first)):
         return _upload(host)
@@ -2388,7 +2411,6 @@ def _fresh_operands(operands):
 def _wrote(root):
     """Bookkeeping after an in-place write of the Array ``root``."""
     d = root.__dict__
-    d.pop("_transpose_cache", None)
     d.pop("_rank_cache", None)
     d.pop("_drop", None)
     d.pop("_iota_recipe", None)
@@ -2569,12 +2591,12 @@ def _infer_shape(newshape, size):
         newshape = tuple(size // known if d == -1 else d for d in newshape)
     if _shape_size(newshape) != size:
         raise ValueError(f"cannot reshape array of size {size} into shape {newshape}")
-    return newshape
+    return _normalize_shape(newshape)
 
 
 def _reshape3(x, shape):
     """Reshape a <=3-D array or view to a <=3-D shape (x itself if unchanged)."""
-    shape = tuple(shape)
+    shape = _normalize_shape(tuple(shape))
     if shape == tuple(x.shape):
         return x
     size = _shape_size(shape)
@@ -2840,14 +2862,12 @@ def full(shape, fill_value, dtype=None):
         return full(shape, host.item(), dtype=dtype)
 
     target_dtype = _normalize_dtype(host.dtype)
-    try:
-        host = np.broadcast_to(host, shape)
-    except ValueError as exc:
+    if not _broadcasts_to(tuple(host.shape), tuple(shape)):
         raise ValueError(
             f"could not broadcast fill_value from shape {host.shape} into shape {shape}"
-        ) from exc
-
-    return _array_from_host_data(host, dtype=target_dtype, copy=False)
+        )
+    # upload fill_value once and broadcast it on the device
+    return _broadcast_to(_array_from_host_data(host, dtype=target_dtype, copy=False), shape)
 
 
 def ones(shape, dtype=_DEFAULT_DTYPE):
@@ -2934,6 +2954,7 @@ _IOTA_INDICES = 2
 _IOTA_EYE = 3
 _LINSPACE_ENDPOINT = 1
 _LINSPACE_STEP_ZERO = 2
+_LINSPACE_FLOAT32 = 4
 
 
 def _iota(shape, dtype, mode, axis=0, flags=0, num=0, div=0, v=(0, 0, 0, 0)):
@@ -2976,44 +2997,87 @@ def arange(start, stop=None, step=1, dtype=None):
 
 
 def linspace(start, stop, num=50, endpoint=True, retstep=False, dtype=None, axis=0):
-    """numpy.linspace; scalar float64-compatible inputs are generated on the backend, others on the host."""
+    """numpy.linspace, generated on the backend (array endpoints are combined on the device)."""
     num = int(num)
     if num < 0:
         raise ValueError(f"Number of samples, {num}, must be non-negative.")
     out_dtype = _normalize_dtype(dtype, allow_none=True)
-    native = (
-        isinstance(start, (int, float, np.integer, np.float64))
-        and isinstance(stop, (int, float, np.integer, np.float64))
-        and not isinstance(start, bool)
-        and not isinstance(stop, bool)
-        and axis == 0
-    )
-    if not native or num == 0:
+    scalar = _is_scalar_like(start) and _is_scalar_like(stop)
+    # endpoints are one output slice: fetch device ones
+    start = np.asarray(start) if _is_array_nd(start) else start
+    stop = np.asarray(stop) if _is_array_nd(stop) else stop
+    # NumPy computes in the floating result type of the endpoints
+    dt = np.linspace(start, stop, 0).dtype
+    if num == 0 or dt not in (np.float32, np.float64) or (scalar and axis not in (0, -1)):
         host, step = np.linspace(start, stop, num=num, endpoint=endpoint, retstep=True,
                                  dtype=out_dtype, axis=axis)
         result = array(host) if host.size else create_array(host.shape, dtype=host.dtype)
         return (result, step) if retstep else result
+    if not scalar:
+        return _linspace_arrays(start, stop, num, endpoint, retstep, out_dtype, axis, dt)
 
     if out_dtype is None:
-        out_dtype = np.dtype(np.float64)
+        out_dtype = _normalize_dtype(dt)
     div = (num - 1) if endpoint else num
-    start64 = np.float64(start)
-    stop64 = np.float64(stop)
-    delta = np.subtract(stop, start, dtype=np.float64)
+    t = dt.type
+    start_t, stop_t = t(start), t(stop)
+    delta = np.subtract(stop_t, start_t, dtype=dt)
     flags = _LINSPACE_ENDPOINT if endpoint else 0
+    if dt == np.float32:
+        flags |= _LINSPACE_FLOAT32
     if div > 0:
-        step = delta / div
+        step = delta / t(div) if dt == np.float32 else delta / div
         if step == 0:
             flags |= _LINSPACE_STEP_ZERO
     else:
         step = np.nan
     result = _iota(
         (num,), out_dtype, _IOTA_LINSPACE, flags=flags, num=num, div=div,
-        v=(_u64_from_double(start64), _u64_from_double(stop64),
+        v=(_u64_from_double(start_t), _u64_from_double(stop_t),
            _u64_from_double(step), _u64_from_double(delta)),
     )
-    result._iota_recipe = ("linspace", flags, num, div, start64, stop64, step, delta)
-    return (result, float(step)) if retstep else result
+    result._iota_recipe = ("linspace", flags, num, div, start_t, stop_t, step, delta)
+    return (result, step if dt == np.float32 else float(step)) if retstep else result
+
+
+def _linspace_arrays(start, stop, num, endpoint, retstep, out_dtype, axis, dt):
+    """numpy.linspace for array endpoints: numpy's formula with device elementwise ops."""
+    start = np.asarray(start, dtype=dt)
+    stop = np.asarray(stop, dtype=dt)
+    bshape = np.broadcast_shapes(start.shape, stop.shape)
+    nd = len(bshape) + 1
+    if nd > 3:
+        host, step = np.linspace(start, stop, num=num, endpoint=endpoint, retstep=True,
+                                 dtype=out_dtype, axis=axis)
+        result = array(host)
+        return (result, step) if retstep else result
+    axis = int(_normalize_axis(axis, nd))
+    div = (num - 1) if endpoint else num
+    delta = np.subtract(stop, start, dtype=dt)
+    shape = (num,) + tuple(bshape)
+    y = _iota(shape, dt, _IOTA_ARANGE, axis=0,
+              v=(_u64_from_value(0, dt), _u64_from_value(1, dt), 0, 0))
+    if div > 0:
+        step = delta / dt.type(div)
+        if np.any(step == 0):
+            y = (y / dt.type(div)) * asarray(delta)
+        else:
+            y = y * asarray(step)
+    else:
+        step = np.nan
+        y = y * asarray(delta)
+    y = y + asarray(start)
+    if endpoint and num > 1:
+        y[-1] = asarray(np.broadcast_to(stop, bshape))
+    if axis != 0:
+        y = _transpose(y, tuple(range(1, axis + 1)) + (0,) + tuple(range(axis + 1, nd)))
+    if out_dtype is not None and out_dtype != y.dtype:
+        if out_dtype.kind in "iub":
+            from .operations import floor
+
+            y = floor(y)
+        y = _astype(y, out_dtype)
+    return (y, step) if retstep else y
 
 
 def indices(dimensions, dtype=int, sparse=False):
@@ -3066,7 +3130,11 @@ def _axis_range(shape, axis, n, dtype, recipe=None):
 
 
 def meshgrid(*xi, copy=True, sparse=False, indexing="xy"):
-    """numpy.meshgrid for up to three 1-D inputs; device inputs must come from arange/linspace."""
+    """numpy.meshgrid for up to three inputs (flattened like NumPy's).
+
+    Any input works: arange/linspace results are rebuilt on the device from their recipe,
+    and other arrays are broadcast from their 1-D values on the device.
+    """
     if indexing not in ("xy", "ij"):
         raise ValueError("Valid values for `indexing` are 'xy' and 'ij'.")
     ndim = len(xi)
@@ -3076,13 +3144,8 @@ def meshgrid(*xi, copy=True, sparse=False, indexing="xy"):
         raise NotImplementedError("meshgrid: at most 3 inputs (3-D outputs)")
     lengths = []
     for x in xi:
-        if isinstance(x, (Array, ArrayView)):
-            if getattr(x, "_iota_recipe", None) is None or x.ndims != 1:
-                raise NotImplementedError(
-                    "meshgrid of a device array needs general broadcasting; pass host "
-                    "data or an array made by cnp.arange/cnp.linspace"
-                )
-            lengths.append(x.shape[0])
+        if _is_array_nd(x):
+            lengths.append(int(x.size))
         else:
             lengths.append(int(np.asarray(x).size))
     axes = list(range(ndim))
@@ -3095,13 +3158,19 @@ def meshgrid(*xi, copy=True, sparse=False, indexing="xy"):
     for k, x in enumerate(xi):
         shape = tuple(full_shape) if not sparse else tuple(
             lengths[k] if d == axes[k] else 1 for d in range(ndim))
-        if isinstance(x, (Array, ArrayView)):
+        if (isinstance(x, (Array, ArrayView)) and x.ndims == 1
+                and getattr(x, "_iota_recipe", None) is not None):
             out.append(_axis_range(shape, axes[k], lengths[k], x.dtype, x._iota_recipe))
+            continue
+        # only the 1-D input crosses to the device; the grid is a device broadcast
+        view_shape = [1] * ndim
+        view_shape[axes[k]] = lengths[k]
+        if _is_array_nd(x):
+            line = _reshape(x, (lengths[k],))
         else:
-            host = np.asarray(x).reshape(-1)
-            view_shape = [1] * ndim
-            view_shape[axes[k]] = lengths[k]
-            out.append(array(np.broadcast_to(host.reshape(view_shape), shape)))
+            line = array(np.asarray(x).reshape(-1))
+        line = _reshape(line, tuple(view_shape))
+        out.append(_broadcast_to(line, shape) if shape != tuple(view_shape) else line.copy())
     return out
 
 

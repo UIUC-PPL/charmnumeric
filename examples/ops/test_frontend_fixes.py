@@ -105,7 +105,8 @@ for label, write in writes.items():
     for make in (lambda: cnp.arange(5), lambda: cnp.linspace(0.0, 1.0, 5)):
         t = make()
         write(t)
-        C.raises(f"meshgrid after {label}", NotImplementedError, lambda: cnp.meshgrid(t))
+        C.check(f"meshgrid after {label}", cnp.meshgrid(t, cnp.arange(2))[0],
+                np.meshgrid(C.fetch(t), np.arange(2))[0])
 rnd = cnp.random.random((3, 4))
 C.check("transposed random", cnp.random.transposed(rnd), C.fetch(rnd).T)
 for label, write in writes.items():

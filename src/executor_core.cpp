@@ -76,14 +76,13 @@ static void send_remote_input(PartitionImpl<N>* partition, DAGNode* node, const 
     }
 
     Kokkos::parallel_for(
-        CT_COMM_POLICY64(partition, total_size), KOKKOS_LAMBDA(int64_t flat_idx) {
+        CT_COMM_POLICY(partition, total_size), KOKKOS_LAMBDA(int64_t flat_idx) {
             int64_t remaining = flat_idx;
             int64_t src_flat = 0;
             for (int d = N - 1; d >= 0; --d) {
-                int coord_d = (int)(remaining % overlap_sizes[d]);
-                remaining /= overlap_sizes[d];
-                src_flat +=
-                    (int64_t)(local_starts[d] + coord_d * overlap_steps[d]) * src_strides_arr[d];
+                int coord_d = (int)ct_divmod(remaining, overlap_sizes[d]);
+                src_flat += (int64_t)(local_starts[d] + coord_d * overlap_steps[d]) *
+                            src_strides_arr[d];
             }
             send_buf[flat_idx] = src_device[src_flat];
         });

@@ -325,6 +325,10 @@ def _contract_pair(a, la, b, lb, keep, sizes, dtype, final=None):
             if len(vec.shape) == 1 and lm == free + con:
                 out = free
                 return _shaped(_arrange(mat, lm, [free, con]) @ vec, out, sizes), out
+            if len(vec.shape) == 1 and lm == con + free:
+                # vec @ mat: a transposed matvec, no n^2 temporary
+                out = free
+                return _shaped(vec @ _arrange(mat, lm, [con, free]), out, sizes), out
         if len(sa | sb) <= 3 or sa == sb:
             return _label_product(a, la, b, lb, keep, sizes, dtype, final)
         return _grouped_product(a, la, b, lb, batch, con, fa, fb, sizes, dtype)

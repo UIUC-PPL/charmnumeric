@@ -140,8 +140,14 @@ void ArrayDAGGroup::compute_decompositions(DAG* dag) {
         if (log && meta.decomp_final)
             was_final.insert(name);
     decomposition_solver::compute_decompositions(sub, dag, odf, CkNumPes());
-    for (auto& [name, meta] : sub)
+    for (auto& [name, meta] : sub) {
+        if (const char* why = decomposition_solver::layout_error(meta))
+            CkAbort("array %d of shape (%d,%d,%d) has no valid layout with tile %d at offset "
+                    "(%d,%d,%d): %s",
+                    name, meta.global_shape[0], meta.global_shape[1], meta.global_shape[2],
+                    meta.tile, meta.offset[0], meta.offset[1], meta.offset[2], why);
         array_meta[name] = meta;
+    }
 
     if (!log)
         return;

@@ -288,10 +288,11 @@ def _eval(obj):
         return
 
     if op == AO.matmul:
-        m, v = ops
+        m, v = ops[:2]
         mv = _squeeze_mat(_value(m), "matvec")
         vv = _value(v).reshape(-1)
-        _store_result(obj, _fit(mv @ vv, obj))
+        trans = len(ops) > 2 and ops[2] == 1
+        _store_result(obj, _fit(vv @ mv if trans else mv @ vv, obj))
         return
 
     if op == AO.matmatmul:
