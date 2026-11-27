@@ -33,6 +33,12 @@ def small_chunks(chk, iface):
             chk.check(f"chunked fetch {shape} {np.dtype(dt).name}", x, h)
             chk.check(f"chunked fetch of a view {shape}", x[1:, ...], h[1:, ...])
             chk.check("scalar fetch between chunked ones", cnp.sum(x[:1]), np.sum(h[:1]))
+        # a byte left over at the end of the pulls; chunk 1 (clients may raise it to 2)
+        h = (np.arange(1001) % 251 - 125).astype(np.int8)
+        for c in ("4", "1"):
+            os.environ["CHARMTYLES_FETCH_CHUNK"] = c
+            chk.check(f"chunked fetch of 1001 bytes, chunk {c}", cnp.array(h), h)
+        os.environ["CHARMTYLES_FETCH_CHUNK"] = "1000"
         x = cnp.arange(300000.0).reshape(1000, 300)
         y = x * 2.0 + 1.0
         chk.check("chunked fetch after ops", y, np.arange(300000.0).reshape(1000, 300) * 2.0 + 1.0)
@@ -84,8 +90,9 @@ def fetch_protocol(chk, iface):
               raw[4096:8192])
     iface._send(Handlers.get_release_handler, to_bytes(epoch, 'i'), advance=False)
     iface._receive(1)
-    chk.check("released fetch replies empty", np.array(len(_pull(iface, epoch, 0, 4096))),
-              np.array(0))
+    # one zero byte; an empty reply from servers before that (CCS on ofi drops empty replies)
+    chk.check("released fetch replies one zero byte",
+              np.array(_pull(iface, epoch, 0, 4096).tolist() in ([0], [])), np.array(True))
     # a barrier (non-data reply) in the chunked format, then chunked gets on later epochs
     cnp.sum(x).get(iface)
     epoch, total = _long_get(iface, 1, _BARRIER_NAME, 0, 4, 4096)
