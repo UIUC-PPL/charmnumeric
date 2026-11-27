@@ -12,6 +12,7 @@ mainmodule charmnumeric
         entry ArrayDAGGroup();
         entry void set_proxies(CkArrayID p1, CkArrayID p2, CkArrayID p3);
         entry [reductiontarget] void proxies_ready();
+        entry void prewarm();
         entry void receive_dag(int epoch, int size, char msg[size]);
         entry void receive_get_request(int ndims, int epoch, int name, int size, int dtype);
         entry void gather(int epoch, int name, int64_t offset, int64_t size, char data[size]);

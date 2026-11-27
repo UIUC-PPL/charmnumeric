@@ -151,6 +151,155 @@ for shape in [(3, 4, 5, 6), (2, 3, 4, 5, 6)]:
     xh[mh] = 3.0
     C.check("folded x[mask] = scalar" + s, x, xh)
 
+# reused masks: the cached nonzero count must follow every write to the mask
+import charmnumeric.indexing as _ix  # noqa: E402
+
+fetches = [0]
+_fetch = _ix._fetch_int
+
+
+def counting_fetch(x):
+    fetches[0] += 1
+    return _fetch(x)
+
+
+_ix._fetch_int = counting_fetch
+
+
+def reuse(label, mutate, mh, m):
+    """x[m], x[m] = v and y[m, m] = v before and after ``mutate`` changes mh/m."""
+    for step in ("", " after " + label):
+        if step:
+            mutate()
+        xh = host((600,), np.float64)
+        x = dev(xh)
+        C.check("reuse x[m]" + step, x[m], xh[mh])
+        vh = host((int(mh.sum()),), np.float64)
+        x[m] = dev(vh)
+        xh[mh] = vh
+        C.check("reuse x[m] = array" + step, x, xh)
+        yh = host((600, 600), np.int64)
+        y = dev(yh)
+        y[m, m] = 7
+        yh[mh, mh] = 7
+        C.check("reuse y[m, m] = 7" + step, y, yh)
+        C.check("reuse nonzero(m)" + step, cnp.nonzero(m)[0], np.nonzero(mh)[0])
+
+
+mh = hmask((600,))
+m = dev(mh)
+reuse("no write", lambda: None, mh, m)
+before = fetches[0]
+xh = host((600,), np.float64)
+x = dev(xh)
+for _ in range(3):
+    C.check("unchanged mask x[m]", x[m], xh[mh])
+C.check("unchanged mask: count is not fetched again", np.array(fetches[0]), np.array(before))
+
+
+def write(fn_dev, fn_host):
+    def go():
+        fn_dev()
+        fn_host()
+    return go
+
+
+nh = hmask((600,))
+reuse("m[...] = other", write(lambda: m.__setitem__(Ellipsis, dev(nh)),
+                              lambda: mh.__setitem__(Ellipsis, nh)), mh, m)
+reuse("m[10:300] = True", write(lambda: m.__setitem__(slice(10, 300), True),
+                                lambda: mh.__setitem__(slice(10, 300), True)), mh, m)
+nh = hmask((600,))
+reuse("m ^= other", write(lambda: m.__ixor__(dev(nh)), lambda: mh.__ixor__(nh)), mh, m)
+idx = rng.integers(0, 600, 50)
+reuse("m[idx] = False", write(lambda: m.__setitem__(dev(idx), False),
+                              lambda: mh.__setitem__(idx, False)), mh, m)
+sel = hmask((600,))
+reuse("m[sel] = array", write(lambda: m.__setitem__(dev(sel), dev(~mh[sel])),
+                              lambda: mh.__setitem__(sel, ~mh[sel])), mh, m)
+reuse("m.fill(True)", write(lambda: m.fill(True), lambda: mh.fill(True)), mh, m)
+nh = hmask((600,))
+reuse("copyto(m, other)", write(lambda: cnp.copyto(m, dev(nh)),
+                                lambda: np.copyto(mh, nh)), mh, m)
+nh = hmask((600,))
+reuse("logical_not(other, out=m)", write(lambda: cnp.logical_not(dev(nh), out=m),
+                                         lambda: np.logical_not(nh, out=mh)), mh, m)
+# a view of the mask, written through its root
+mv = m[100:]
+reuse("root m[...] = other (view mask)", write(lambda: m.__setitem__(Ellipsis, dev(~mh)),
+                                                lambda: mh.__setitem__(Ellipsis, ~mh)),
+      mh, m)
+xh = host((500,), np.float64)
+x = dev(xh)
+C.check("view mask x[m[100:]]", x[mv], xh[mh[100:]])
+m[150:250] = False
+mh[150:250] = False
+C.check("view mask after root write", x[mv], xh[mh[100:]])
+mv[400:][5:10] = True  # through a view of a view of the mask
+mh[100:][400:][5:10] = True
+C.check("view mask after write through a view of it", x[mv], xh[mh[100:]])
+reuse("m[100:][5:10] = True", write(lambda: m[100:].__setitem__(slice(5, 10), True),
+                                    lambda: mh[100:].__setitem__(slice(5, 10), True)), mh, m)
+# linked copies (integer index, transpose) refresh from their array
+Mh = hmask((4, 600))
+M = dev(Mh)
+row = M[2]
+C.check("linked row mask", x[row[:500]], xh[Mh[2, :500]])
+M[2] = dev(~Mh[2])
+Mh[2] = ~Mh[2]
+C.check("linked row mask after array write", x[row[:500]], xh[Mh[2, :500]])
+rv = row[:500]
+C.check("view of a linked row", x[rv], xh[Mh[2, :500]])
+row[100:200][...] = True  # through a view of the linked copy, back into M
+Mh[2, 100:200] = True
+C.check("view of a linked row after a write through a view", x[rv], xh[Mh[2, :500]])
+C.check("array row after a write through the linked copy", x[M[2][:500]], xh[Mh[2, :500]])
+Th = hmask((600, 4))
+T = dev(Th)
+col = T.T
+C.check("transposed mask", cnp.nonzero(col[1])[0], np.nonzero(Th.T[1])[0])
+T[:, 1] = dev(~Th[:, 1])
+Th[:, 1] = ~Th[:, 1]
+C.check("transposed mask after array write", cnp.nonzero(col[1])[0], np.nonzero(Th.T[1])[0])
+# a mask computed from an array keeps its value when that array changes
+bh = host((600,), np.float64)
+b = dev(bh)
+cm = b > 0
+cmh = bh > 0
+C.check("computed mask", x[cm[:500]], xh[cmh[:500]])
+b[...] = -b
+C.check("computed mask after its input changes", x[cm[:500]], xh[cmh[:500]])
+# a folded (>3-D) mask: its count is cached on the 3-D storage
+fh = hmask((3, 4, 5, 6))
+f = dev(fh)
+gh = host((3, 4, 5, 6), np.float64)
+g = dev(gh)
+C.check("folded mask reused", g[f], gh[fh])
+C.check("folded mask reused again", g[f], gh[fh])
+f[1] = dev(~fh[1])
+fh[1] = ~fh[1]
+C.check("folded mask after f[1] = ~f[1]", g[f], gh[fh])
+vh = host((int(fh.sum()),), np.float64)
+g[f] = dev(vh)
+gh[fh] = vh
+C.check("folded x[mask] = array after the write", g, gh)
+# repeat with device counts caches their sum the same way
+Rh = rng.integers(0, 4, 300)
+R = dev(Rh)
+xh = host((300,), np.float64)
+x = dev(xh)
+C.check("repeat(x, R)", cnp.repeat(x, R), np.repeat(xh, Rh))
+before = fetches[0]
+C.check("repeat(x, R) again", cnp.repeat(x, R), np.repeat(xh, Rh))
+C.check("repeat: sum is not fetched again", np.array(fetches[0]), np.array(before))
+R[5:50] = 3
+Rh[5:50] = 3
+C.check("repeat(x, R) after R[5:50] = 3", cnp.repeat(x, R), np.repeat(xh, Rh))
+R += 1
+Rh += 1
+C.check("repeat(x, R) after R += 1", cnp.repeat(x, R), np.repeat(xh, Rh))
+_ix._fetch_int = _fetch
+
 C.raises("mask shape mismatch", IndexError, lambda: dev(np.ones(5))[dev(np.ones(4, bool))])
 C.raises("value count mismatch", ValueError,
          lambda: dev(np.ones(5)).__setitem__(dev(np.ones(5, bool)), np.ones(3)))
