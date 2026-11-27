@@ -1,0 +1,241 @@
+# Copyright 2026 NVIDIA Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from __future__ import annotations
+
+from types import ModuleType
+from typing import TYPE_CHECKING, Callable, Protocol, Literal
+
+if TYPE_CHECKING:
+    from typing import Any
+
+__all__ = ["Timer", "CuPyTimer", "CuPyNumericTimer", "NumPyTimer"]
+
+NO_START_ERR_MSG: str = "Timer.stop() called without preceding Timer.start()"
+
+SyncMode = Literal["none", "fence", "block"]
+
+
+class Timer(Protocol):
+    def start(self) -> None: ...
+
+    def stop(self) -> float:
+        """
+        Blocks execution until everything before it has completed. Returns the
+        duration since the last call to start(), in milliseconds.
+        """
+        ...
+
+    def sync(self, sync_mode: SyncMode) -> None:
+        """
+        Perform a type of synchronization.
+
+        Parameters
+        ----------
+        sync_mode: 'none', 'fence', 'block'
+            - 'none': a no-op
+            - 'fence': all queued tasks prior to the call to ``sync()`` complete
+              before any subsequent tasks are scheduled
+            - 'block': same as fence, but ``sync()`` does not return until all
+              prior tasks have completed.
+        """
+        ...
+
+
+class CuPyNumericTimer(Timer):
+    _start_time: Any | None
+
+    def __init__(self, *, blocking: bool = False) -> None:
+        self._start_time = None
+        self._blocking = blocking
+
+    def start(self) -> None:
+        from legate.timing import time
+
+        s = time("us")
+
+        # casting to int blocks until the task computing `t` is complete,
+        # guaranteeing we record a time before subsequent tasks are launched
+        self._start_time = int(s) if self._blocking else s
+
+    def stop(self) -> float:
+        from legate.timing import time
+
+        assert self._start_time is not None, NO_START_ERR_MSG
+
+        e = time("us")
+        _end_time = int(e) if self._blocking else e
+        return float((_end_time - self._start_time) / 1000.0)
+
+    def sync(self, sync_mode: SyncMode) -> None:
+        if sync_mode != "none":
+            from legate.core import get_legate_runtime
+
+            get_legate_runtime().issue_execution_fence(
+                block=(sync_mode == "block")
+            )
+
+    def __repr__(self) -> str:
+        return f"CuPyNumericTimer(blocking={self._blocking})"
+
+
+class CuPyTimer(Timer):
+    # TODO(tisaac): Add correct annotation when cupy provides stubs
+    _start_event: Any
+
+    def __init__(self, *, blocking: bool = False) -> None:
+        self._start_event = None
+        self._blocking = blocking
+
+    def start(self) -> None:
+        from cupy import cuda  # type: ignore[import-untyped,import-not-found]
+
+        self._start_event = cuda.Event()
+        self._start_event.record()
+        if self._blocking:
+            # this thread blocks until the event is recorded,
+            # guaranteeing that it records a time before all
+            # subsequent kernel launches.
+            self._start_event.synchronize()
+
+    def stop(self) -> float:
+        from cupy import cuda  # type: ignore[import-untyped,import-not-found]
+
+        assert self._start_event is not None, NO_START_ERR_MSG
+
+        end_event = cuda.Event()
+        end_event.record()
+        end_event.synchronize()
+        out: float = cuda.get_elapsed_time(self._start_event, end_event)
+        return out
+
+    def sync(self, sync_mode: SyncMode) -> None:
+        # all cupy kernels launch on the same stream, so there is no need to
+        # enforce any ordering for the 'fence' case
+        if sync_mode == "block":
+            from cupy import cuda  # type: ignore[import-untyped,import-not-found]
+
+            # while an event can be created with cuda.Event(block=true), this
+            # controls whether the calling CPU thread is blocked with a
+            # busy-wait: the blocking semantics of the Timer() protocol
+            # are enforced by the call to .synchronize()
+            sync_event = cuda.Event()
+            sync_event.record()
+            sync_event.synchronize()
+
+    def __repr__(self) -> str:
+        return f"CuPyTimer(blocking={self._blocking})"
+
+
+class NumPyTimer(Timer):
+    _start_time: float | None
+
+    def __init__(self) -> None:
+        self._start_time = None
+
+    def start(self) -> None:
+        from time import perf_counter_ns
+
+        self._start_time = perf_counter_ns() / 1000.0
+
+    def stop(self) -> float:
+        from time import perf_counter_ns
+
+        assert self._start_time is not None, NO_START_ERR_MSG
+
+        end_time = perf_counter_ns() / 1000.0
+        return (end_time - self._start_time) / 1000.0
+
+    def sync(self, _: SyncMode) -> None:
+        pass
+
+    def __repr__(self) -> str:
+        return "NumPyTimer"
+
+
+def get_timer(np: ModuleType, *, blocking: bool = False) -> Timer:
+    """Get a timer appropriate for an array package.
+
+    The timer has :py:meth:`Timer.start` and :py:meth:`Timer.stop`.  ``stop()``
+    waits for the completion of work initiated by the array package since
+    ``start()`` before returning.
+
+    Parameters
+    ----------
+    np: ModuleType
+        The array package that needs a timer
+    blocking: bool=False
+        Whether the timer should time _execution time_ (its ``.start()`` time
+        is before subsequent operations _execute_, but not necessarily before
+        they are scheduled by the host thread) or _wall time_ (its
+        ``.start()`` time is before subsequent operations are scheduled by the
+        host thread, so that the time between ``.start()`` and ``.stop()`` will
+        also include the delay between the scheduling and execution of the
+        first operation after ``.start()``).
+    """
+    match np.__name__:
+        case "numpy":
+            return NumPyTimer()
+        case "cupy":
+            return CuPyTimer(blocking=blocking)
+        case "cupynumeric":
+            return CuPyNumericTimer(blocking=blocking)
+        case _:
+            raise RuntimeError(f"Unsupported array module {np.__name__}")
+
+
+def timed_loop(
+    f: Callable[..., Any],
+    timer: Timer,
+    runs: int,
+    warmup: int = 0,
+    *,
+    sync_mode: SyncMode = "fence",
+) -> float:
+    """Calls ``f()`` in a loop and reports the time for ``runs`` iterations.
+
+    ``f()`` is called ``warmup`` times before the timer starts.
+
+    Parameters
+    ----------
+    timer: Timer
+    runs: int
+        The number of calls to ``f()`` between ``timer.start()`` and ``timer.stop()``
+    warmup: int
+        The number of calls to ``f()`` before ``timer.start()``
+    sync_mode: 'none', 'fence', or 'block'
+        Synchronization between calls to ``f()``.  Make sure you know what
+        you're doing if you change this.
+
+    Returns
+    -------
+    float
+        The measure time to call ``f()`` ``runs`` times in a row.  The total
+        time is returned, not the average.
+    """
+    if runs < 0:
+        raise RuntimeError(f"Negative runs {runs} not allowed.")
+    if warmup < 0:
+        raise RuntimeError(f"Negative warmup {warmup} not allowed.")
+    if runs == 0:
+        return 0.0
+    total_iters = runs + warmup
+    for i in range(total_iters):
+        if i == warmup:
+            timer.start()
+        f()
+        if i + 1 < total_iters:
+            timer.sync(sync_mode)
+    return timer.stop()

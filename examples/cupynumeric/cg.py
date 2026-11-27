@@ -1,0 +1,358 @@
+#!/usr/bin/env python
+
+# Copyright 2024 NVIDIA Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+import argparse
+
+# charmnumeric port: _benchmark is the local shim (_benchmark.py). It connects,
+# runs with np = charmnumeric and checks the result against NumPy.
+from _benchmark import benchmark_info, parse_with_harness
+
+
+# This is technically dead code right now, but we'll keep it around in
+# case we want to generate a symmetrix positive definite matrix later
+def generate_random(np, N):
+    print("Generating %dx%d symmetric positive definite system..." % (N, N))
+    # Generate a random matrix
+    A = np.random.rand(N, N)
+    # Make sure the matrix is symmetric
+    A = 0.5 * (A + A.T)
+    # Now make sure that it is positive definite
+    A = A + N * np.eye(N)
+    b = np.random.rand(N)
+    return A, b
+
+
+def generate_2D(np, N, corners):
+    if corners:
+        print(
+            "Generating %dx%d 2-D adjacency system with corners..."
+            % (N**2, N**2)
+        )
+        A = np.zeros((N**2, N**2)) + 8 * np.eye(N**2)
+    else:
+        print(
+            "Generating %dx%d 2-D adjacency system without corners..."
+            % (N**2, N**2)
+        )
+        A = np.zeros((N**2, N**2)) + 4 * np.eye(N**2)
+    # These are the same for both cases
+    off_one = np.full(N**2 - 1, -1, dtype=np.float64)
+    A += np.diag(off_one, k=1)
+    A += np.diag(off_one, k=-1)
+    off_N = np.full(N * (N - 1), -1, dtype=np.float64)
+    A += np.diag(off_N, k=N)
+    A += np.diag(off_N, k=-N)
+    # If we have corners then we have four more cases
+    if corners:
+        off_N_plus = np.full(N * (N - 1) - 1, -1, dtype=np.float64)
+        A += np.diag(off_N_plus, k=N + 1)
+        A += np.diag(off_N_plus, k=-(N + 1))
+        off_N_minus = np.full(N * (N - 1) + 1, -1, dtype=np.float64)
+        A += np.diag(off_N_minus, k=N - 1)
+        A += np.diag(off_N_minus, k=-(N - 1))
+    # Then we can generate a random b matrix
+    b = np.random.rand(N**2)
+    return A, b
+
+
+def check(np, A, x, b):
+    print("Checking result...")
+    if np.allclose(A.dot(x), b):
+        print("PASS!")
+    else:
+        print("FAIL!")
+
+
+INPUT_NAMES = {
+    "N": "problem size",
+    "conv_iters": "convergence check interval",
+    "warmup": "warmup iterations",
+}
+
+OUTPUT_NAMES = (
+    "time (milliseconds)",
+    "iterations",
+    "initial residual norm",
+    "final residual norm",
+)
+
+
+@benchmark_info(
+    name="CG",
+    input_names=INPUT_NAMES,
+    output_names=OUTPUT_NAMES,
+    returns_time=0,  # N.B. time is output 0, not the same as `False`
+)
+def run_cg(
+    np,
+    N,
+    corners,
+    conv_iters,
+    warmup,
+    *,
+    timer,
+    max_iters=None,
+    conv_threshold=1.0e-10,
+    perform_check=False,
+    print_timing=False,
+    verbose=False,
+):
+    # A, b = generate_random(np, N)
+    A, b = generate_2D(np, N, corners)
+
+    print("Solving system...")
+    x = np.zeros(A.shape[1])
+    r = b - A.dot(x)
+    p = r
+    rsold = r.dot(r)
+    converged = -1
+    # Should always converge in fewer iterations than this
+    max_iters = (
+        min(max_iters, b.shape[0]) if max_iters is not None else b.shape[0]
+    )
+
+    r_start = -1.0
+    r_end = -1.0
+    if verbose:
+        print(f"Residual {-warmup}: {rsold}")
+    timer.start()
+    for i in range(-warmup, max_iters):
+        if i == 0:
+            r_start = np.sqrt(rsold)
+            timer.start()
+        Ap = A.dot(p)
+        alpha = rsold / (p.dot(Ap))
+        x = x + alpha * p
+        r = r - alpha * Ap
+        rsnew = r.dot(r)
+        if verbose:
+            print(f"Residual {i + 1}: {rsnew}")
+        # We only do the convergence test every conv_iters or on the last
+        # iteration
+        if (
+            i >= 0
+            and (i % conv_iters == 0 or i == (max_iters - 1))
+            and np.sqrt(rsnew) < conv_threshold
+        ):
+            converged = i
+            r_end = np.sqrt(rsnew)
+            break
+        beta = rsnew / rsold
+        p = r + beta * p
+        rsold = rsnew
+    total = timer.stop()
+
+    num_iters = 0
+    if converged < 0:
+        r_end = np.sqrt(rsold)
+        num_iters = max_iters
+        print("Convergence FAILURE!")
+    else:
+        num_iters = converged + 1
+        print("Converged in %d iterations" % (num_iters))
+    if perform_check:
+        check(np, A, x, b)
+
+    if print_timing:
+        print(f"Elapsed Time: {total} ms")
+    return (total, num_iters, r_start, r_end)
+
+
+def precondition(np, A, N, corners):
+    if corners:
+        d = 8 * (N**2)
+    else:
+        d = 4 * (N**2)
+    M = np.diag(np.full(N**2, 1.0 / d))
+    return M
+
+
+@benchmark_info(
+    name="PreCG",
+    input_names=INPUT_NAMES,
+    output_names=OUTPUT_NAMES,
+    returns_time=0,
+)
+def run_preconditioned_cg(
+    np,
+    N,
+    corners,
+    conv_iters,
+    warmup,
+    *,
+    timer,
+    max_iters=None,
+    conv_threshold=1.0e-10,
+    perform_check=False,
+    print_timing=False,
+    verbose=False,
+):
+    print("Solving system with preconditioner...")
+
+    # A, b = generate_random(np, N)
+    A, b = generate_2D(np, N, corners)
+    M = precondition(np, A, N, corners)
+
+    x = np.zeros(A.shape[1])
+    r = b - A.dot(x)
+    z = M.dot(r)
+    p = z
+    rzold = r.dot(z)
+    converged = -1
+    # Should always converge in fewer iterations than this
+    max_iters = (
+        min(max_iters, b.shape[0]) if max_iters is not None else b.shape[0]
+    )
+
+    r_start = -1.0
+    r_end = -1.0
+    timer.start()
+    for i in range(-warmup, max_iters):
+        if i == 0:
+            r_start = np.sqrt(rzold)
+            timer.start()
+        Ap = A.dot(p)
+        alpha = rzold / (p.dot(Ap))
+        x = x + alpha * p
+        r = r - alpha * Ap
+        rznew = r.dot(r)
+        # We only do the convergence test every conv_iters or on the
+        # last iteration
+        if (
+            i >= 0
+            and (i % conv_iters == 0 or i == (max_iters - 1))
+            and np.sqrt(rznew) < conv_threshold
+        ):
+            converged = i
+            break
+        if verbose:
+            print("Residual: " + str(rznew))
+        z = M.dot(r)
+        rznew = r.dot(z)
+        beta = rznew / rzold
+        p = z + beta * p
+        rzold = rznew
+    total = timer.stop()
+
+    num_iters = 0
+    if converged < 0:
+        r_end = np.sqrt(rzold)
+        num_iters = max_iters
+        print("Convergence FAILURE!")
+    else:
+        num_iters = converged + 1
+        print("Converged in %d iterations" % (num_iters))
+    if perform_check:
+        check(np, A, x, b)
+
+    if print_timing:
+        print(f"Elapsed Time: {total} ms")
+    return (total, num_iters, r_start, r_end)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--check",
+        dest="check",
+        action="store_true",
+        help="check the result of the solve",
+    )
+    parser.add_argument(
+        "-k",
+        "--corners",
+        dest="corners",
+        action="store_true",
+        help="include corners when generating the adjacency matrix",
+    )
+    parser.add_argument(
+        "-i",
+        "--iters",
+        type=int,
+        default=25,
+        dest="conv_iters",
+        help="iterations between convergence tests",
+    )
+    parser.add_argument(
+        "--pre",
+        dest="precondition",
+        action="store_true",
+        help="use a Jacobi preconditioner",
+    )
+    parser.add_argument(
+        "-m",
+        "--max",
+        type=int,
+        default=None,
+        dest="max_iters",
+        help="bound the maximum number of iterations",
+    )
+    parser.add_argument(
+        "-w",
+        "--warmup",
+        type=int,
+        default=5,
+        dest="warmup",
+        help="warm-up iterations",
+    )
+    parser.add_argument(
+        "-n",
+        "--num",
+        type=int,
+        nargs="+",
+        default=[10],
+        dest="N",
+        help="number of elements in one dimension",
+    )
+    parser.add_argument(
+        "-t",
+        "--time",
+        dest="timing",
+        action="store_true",
+        help="perform timing",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        dest="verbose",
+        action="store_true",
+        help="print verbose output",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=1e-10,
+        dest="conv_threshold",
+        help="convergence check threshold",
+    )
+
+    args, harness = parse_with_harness(parser)
+
+    harness.run_timed(
+        run_preconditioned_cg if args.precondition else run_cg,
+        harness.np,
+        args.N,
+        args.corners,
+        args.conv_iters,
+        args.warmup,
+        max_iters=args.max_iters,
+        conv_threshold=args.conv_threshold,
+        perform_check=args.check,
+        print_timing=args.timing,
+        verbose=args.verbose,
+        timer=harness.timer,
+    )
