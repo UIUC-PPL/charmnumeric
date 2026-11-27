@@ -316,12 +316,14 @@ void ArrayDAGGroup::send_upload_tile(const std::array<int, 4>& key, int nd, int 
                                      std::vector<char>& data) {
     int64_t size = static_cast<int64_t>(data.size());
     if (nd == 1)
-        partition_proxy_1(key[1]).receive_upload_tile(node_id, key[0], size, data.data());
+        ct_send_bytes(partition_proxy_1(key[1]), MSG_UPLOAD_TILE, node_id, size, data.data(),
+                      key[0]);
     else if (nd == 2)
-        partition_proxy_2(key[1], key[2]).receive_upload_tile(node_id, key[0], size, data.data());
+        ct_send_bytes(partition_proxy_2(key[1], key[2]), MSG_UPLOAD_TILE, node_id, size,
+                      data.data(), key[0]);
     else
-        partition_proxy_3(key[1], key[2], key[3])
-            .receive_upload_tile(node_id, key[0], size, data.data());
+        ct_send_bytes(partition_proxy_3(key[1], key[2], key[3]), MSG_UPLOAD_TILE, node_id, size,
+                      data.data(), key[0]);
 }
 
 template <int N>

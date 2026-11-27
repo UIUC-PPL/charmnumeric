@@ -38,9 +38,8 @@ static void cross_matmul_send_vector_slice_1d_to_2d(
     vec->copyToHost();
     T* send_buf = new T[send_len];
     memcpy(send_buf, static_cast<T*>(vec->data_ptr()) + local_offset, byte_size);
-    proxy_at<2>(proxy_2d, target_ci)
-        .receive_data(node->id, /*input_index=*/0, vec_name, 2, region_data, byte_size,
-                      reinterpret_cast<char*>(send_buf));
+    ct_send_data(proxy_at<2>(proxy_2d, target_ci), node->id, /*input_index=*/0, vec_name, 2,
+                 region_data, byte_size, reinterpret_cast<char*>(send_buf));
     delete[] send_buf;
 #endif
 }
@@ -83,9 +82,8 @@ static void cross_matmul_send_vector_slice_1d_to_3d(
     vec->copyToHost();
     T* send_buf = new T[send_len];
     memcpy(send_buf, static_cast<T*>(vec->data_ptr()) + local_offset, byte_size);
-    proxy_at<3>(proxy_3d, target_ci)
-        .receive_data(node->id, /*input_index=*/0, vec_name, 3, region_data, byte_size,
-                      reinterpret_cast<char*>(send_buf));
+    ct_send_data(proxy_at<3>(proxy_3d, target_ci), node->id, /*input_index=*/0, vec_name, 3,
+                 region_data, byte_size, reinterpret_cast<char*>(send_buf));
     delete[] send_buf;
 #endif
 }

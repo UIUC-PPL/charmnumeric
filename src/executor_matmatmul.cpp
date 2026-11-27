@@ -57,9 +57,8 @@ static void cross_matmatmul_send_panel_2d(
         memcpy(send_buf + r * sub_cols,
                local_data + (row_offset + r) * local_cols + col_offset,
                sub_cols * sizeof(T));
-    proxy_at<2>(proxy_2d, target_ci)
-        .receive_data(node->id, input_index, arr_name, 2, region_data, byte_size,
-                      reinterpret_cast<char*>(send_buf));
+    ct_send_data(proxy_at<2>(proxy_2d, target_ci), node->id, input_index, arr_name, 2, region_data,
+                 byte_size, reinterpret_cast<char*>(send_buf));
     delete[] send_buf;
 #else
     T* send_buf = static_cast<T*>(comm_alloc(byte_size));
@@ -701,10 +700,9 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
 #ifndef NDEBUG
                             partition->comm_bytes_sent += panel_bytes;
 #endif
-                            proxy_at<2>(dag_group->partition_proxy_2, target_ci)
-                                .receive_data(node->id, /*input_index=*/0, op_name, 2,
-                                              region_data, panel_bytes,
-                                              reinterpret_cast<char*>(panel_buf));
+                            ct_send_data(proxy_at<2>(dag_group->partition_proxy_2, target_ci),
+                                         node->id, /*input_index=*/0, op_name, 2, region_data,
+                                         panel_bytes, reinterpret_cast<char*>(panel_buf));
                             delete[] panel_buf;
                         }
                     }
@@ -811,10 +809,9 @@ void ArrayDAGExecutorND<N>::execute_matmatmul_node(DAGNode* node) {
 #ifndef NDEBUG
                             partition->comm_bytes_sent += panel_bytes;
 #endif
-                            proxy_at<2>(dag_group->partition_proxy_2, target_ci)
-                                .receive_data(node->id, /*input_index=*/1, op_name, 2,
-                                              region_data, panel_bytes,
-                                              reinterpret_cast<char*>(panel_buf));
+                            ct_send_data(proxy_at<2>(dag_group->partition_proxy_2, target_ci),
+                                         node->id, /*input_index=*/1, op_name, 2, region_data,
+                                         panel_bytes, reinterpret_cast<char*>(panel_buf));
                             delete[] panel_buf;
                         }
                     }

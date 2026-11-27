@@ -127,9 +127,8 @@ static void transpose_pack_send(PartitionImpl<N>* partition, Array<N, T>* src, D
                 dst[i] = src_data[s + i * inner_stride];
         }
     }
-    proxy_at<N>(partition->thisProxy, target)
-        .receive_data(node->id, /*input_index=*/0, input_name, N, region_data, byte_size,
-                      reinterpret_cast<char*>(send_buf));
+    ct_send_data(proxy_at<N>(partition->thisProxy, target), node->id, /*input_index=*/0, input_name,
+                 N, region_data, byte_size, reinterpret_cast<char*>(send_buf));
     delete[] send_buf;
 #endif
 }
