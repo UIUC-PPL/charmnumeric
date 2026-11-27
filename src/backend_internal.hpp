@@ -185,6 +185,34 @@ struct GemvJoinFunctor {
     }
 };
 
+/// One row per vector-lane group: lanes read consecutive columns (coalesced), double sums.
+template <typename T, typename Exec>
+struct GemvRowFunctor {
+    using member_type = typename Kokkos::TeamPolicy<Exec>::member_type;
+    const T* mat;
+    int64_t ld;
+    int rows, cols;
+    const T* vec;
+    T* res;
+
+    KOKKOS_INLINE_FUNCTION void operator()(const member_type& m) const {
+        Kokkos::parallel_for(Kokkos::TeamThreadRange(m, m.team_size()), [&](int t) {
+            int r = m.league_rank() * m.team_size() + t;
+            if (r >= rows)
+                return;
+            const T* row = mat + r * ld;
+            double s = 0.0;
+            Kokkos::parallel_reduce(
+                Kokkos::ThreadVectorRange(m, cols),
+                [&](int c, double& acc) {
+                    acc += static_cast<double>(row[c]) * static_cast<double>(vec[c]);
+                },
+                s);
+            Kokkos::single(Kokkos::PerThread(m), [&]() { res[r] = static_cast<T>(s); });
+        });
+    }
+};
+
 /// Row-major res[rows] = mat[rows x cols] * vec (device pointers, row stride ld), on `exec`.
 template <typename T, typename Exec>
 inline void local_gemv(const Exec& exec, const T* mat, int ld, int rows, int cols, const T* vec,
@@ -195,6 +223,16 @@ inline void local_gemv(const Exec& exec, const T* mat, int ld, int rows, int col
         // inputs may come from the default instance's stream; callers send the result
         // from other streams right after, so finish before returning
         Kokkos::DefaultExecutionSpace().fence("ct_gemv inputs");
+#ifdef USE_NVIDIA
+        if (rows >= 2048 && cols >= 256) {
+            constexpr int team = 8, lanes = 32;
+            Kokkos::parallel_for("ct_gemv_rows",
+                                 Kokkos::TeamPolicy<Exec>(exec, (rows + team - 1) / team, team, lanes),
+                                 GemvRowFunctor<T, Exec>{mat, ld, rows, cols, vec, res});
+            exec.fence("ct_gemv");
+            return;
+        }
+#endif
         int chunks = (int)std::min<int64_t>(
             {std::max<int64_t>(1, 65536 / rows), (cols + 255) / 256, 1024});
         chunks = std::max(chunks, 1);

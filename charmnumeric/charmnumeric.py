@@ -1964,6 +1964,7 @@ class Array(FrontendObject, _ArrayMethods, _ElementwiseMethods, _HostConversions
         if rhs.__class__ is Array or rhs.__class__ is ArrayView:
             _fresh(rhs)
         result = super().set_region(region, rhs, **kwargs)
+        result.__dict__["_write_only"] = True
         _wrote(self)
         return result
 
@@ -2292,6 +2293,11 @@ def _version(x):
 def _fresh(x):
     """Refresh a linked copy (see _basic_getitem), or the root of a view of one."""
     root = x._root_parent if x.__class__ is ArrayView else x
+    if root.__class__ is Array and root.__dict__.get("_write_only"):
+        raise RuntimeError(
+            "the object set_region() returns only stands for the write; the backend pools its "
+            "buffer, so it cannot be read"
+        )
     link = root.__dict__.get("_view_of") if root.__class__ is Array else None
     if link is None:
         return
