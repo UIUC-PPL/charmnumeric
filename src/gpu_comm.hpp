@@ -341,8 +341,11 @@ inline char* gpu_ipc_peer_slab(int node, int slab, const char* handle) {
 /// Pinned host buffers by power-of-two size class. A block is released from the stream
 /// callback that follows its last async copy, so reuse never races a copy.
 struct PinnedPool {
-    static constexpr int kMinClass = 12, kMaxClass = 28; // 4 KB .. 256 MB
+    // 4 KB .. 1 GiB, the largest single message (ct_msg_max_bytes): without a pinned block a
+    // send falls to CkDeviceBuffer, which blocks the PE for about a second per GiB
+    static constexpr int kMinClass = 12, kMaxClass = 30;
     std::vector<void*> free_lists[kMaxClass + 1];
+    uint64_t last_use[kMaxClass + 1] = {}, clock = 0; // per class: order of the allocations
     std::unordered_map<void*, int> live;
     int64_t cached = 0, limit = -1;
     bool on = true;
@@ -355,7 +358,9 @@ inline PinnedPool& pinned_pool() {
 }
 
 /// Staged sends on unless CNUM_GPU_STAGE=0. CNUM_GPU_STAGE_MB caps only the blocks cached
-/// for reuse (default 512), not those in flight. nullptr: use the CkDeviceBuffer path.
+/// for reuse (default 4096), not those in flight: it has to cover one operation's burst of
+/// messages, or every block past it costs a cudaMallocHost and a cudaFreeHost (~35 ms per
+/// 64 MB). nullptr: use the CkDeviceBuffer path.
 inline void* pinned_alloc(int64_t bytes) {
     auto& pool = pinned_pool();
     int cls = PinnedPool::kMinClass;
@@ -366,10 +371,11 @@ inline void* pinned_alloc(int64_t bytes) {
         std::lock_guard<std::mutex> lock(pool.mu);
         if (pool.limit < 0) {
             pool.on = gpu_comm_env("CNUM_GPU_STAGE", 1, 0, 1) != 0;
-            pool.limit = gpu_comm_env("CNUM_GPU_STAGE_MB", 512, 0, 1 << 20) << 20;
+            pool.limit = gpu_comm_env("CNUM_GPU_STAGE_MB", 4096, 0, 1 << 20) << 20;
         }
         if (cls > PinnedPool::kMaxClass || !pool.on)
             return nullptr;
+        pool.last_use[cls] = ++pool.clock;
         if (!pool.free_lists[cls].empty()) {
             p = pool.free_lists[cls].back();
             pool.free_lists[cls].pop_back();
@@ -387,22 +393,41 @@ inline void* pinned_alloc(int64_t bytes) {
     return p;
 }
 
+/// Return a block to the pool. When the cache is full, blocks of the size classes that went
+/// unused the longest make room: a workload that moves on to other message sizes would
+/// otherwise pin and unpin a block per message.
 inline void pinned_free(void* p) {
     auto& pool = pinned_pool();
+    std::vector<void*> out;
     {
         std::lock_guard<std::mutex> lock(pool.mu);
         auto it = pool.live.find(p);
         if (it == pool.live.end())
             return;
-        int cls = it->second;
+        const int cls = it->second;
+        const int64_t size = int64_t(1) << cls;
         pool.live.erase(it);
-        if (pool.cached + (int64_t(1) << cls) <= pool.limit) {
+        while (pool.cached + size > pool.limit) {
+            int victim = -1;
+            for (int c = PinnedPool::kMinClass; c <= PinnedPool::kMaxClass; ++c)
+                if (c != cls && !pool.free_lists[c].empty() &&
+                    (victim < 0 || pool.last_use[c] < pool.last_use[victim]))
+                    victim = c;
+            if (victim < 0)
+                break;
+            out.push_back(pool.free_lists[victim].back());
+            pool.free_lists[victim].pop_back();
+            pool.cached -= int64_t(1) << victim;
+        }
+        if (pool.cached + size <= pool.limit) {
             pool.free_lists[cls].push_back(p);
-            pool.cached += int64_t(1) << cls;
-            return;
+            pool.cached += size;
+        } else {
+            out.push_back(p);
         }
     }
-    cudaFreeHost(p);
+    for (void* q : out)
+        cudaFreeHost(q);
 }
 
 /// Process exit: no new IPC sends or mappings, and late frees become no-ops. Slabs, peer
