@@ -118,7 +118,8 @@ static void deferred_send_cb(void* param, void* msg) {
     StagedZc zc = StagedZc::kNone;
     if (p->host_buf)
         zc = staged_zc(CkMyPe(), p->target_pe, p->byte_size);
-    // RDMA without a kept registration (CNUM_GPU_ZC_REGS reached) would register per message
+    // RDMA without a kept registration (all CNUM_GPU_ZC_REGS on blocks in use) would register
+    // per message
     if (zc == StagedZc::kRdma && p->byte_size <= ct_msg_max_bytes() && !pinned_reg(p->host_buf))
         zc = StagedZc::kNone;
     if (zc != StagedZc::kNone) {

@@ -20,6 +20,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <unordered_map>
@@ -407,8 +408,13 @@ struct PinnedPool {
     std::vector<void*> free_lists[kMaxClass + 1];
     uint64_t last_use[kMaxClass + 1] = {}, clock = 0; // per class: order of the allocations
     std::unordered_map<void*, int> live;
-    std::unordered_map<void*, CkNcpyBuffer> regs; // block -> registration of the whole block
-    int64_t cached = 0, limit = -1, max_regs = 0;
+    struct Reg {
+        CkNcpyBuffer buf; // registration of the whole block
+        uint64_t used;    // clock of its last use
+    };
+    std::unordered_map<void*, Reg> regs;
+    // registrations being made, and those left open on forgotten blocks: both count
+    int64_t cached = 0, limit = -1, max_regs = 0, registering = 0, forgotten = 0;
     bool on = true;
     std::mutex mu;
 };
@@ -475,7 +481,7 @@ inline bool pinned_free(void* p) {
     std::vector<std::pair<void*, CkNcpyBuffer*>> out;
     auto unpin = [&](void* q) {
         auto reg = pool.regs.find(q);
-        out.emplace_back(q, reg == pool.regs.end() ? nullptr : new CkNcpyBuffer(reg->second));
+        out.emplace_back(q, reg == pool.regs.end() ? nullptr : new CkNcpyBuffer(reg->second.buf));
         if (reg != pool.regs.end())
             pool.regs.erase(reg);
     };
@@ -511,29 +517,71 @@ inline bool pinned_free(void* p) {
 }
 
 /// Drop a pinned block without reusing it (a receiver may still be reading it); false if `p`
-/// is not a pinned block.
+/// is not a pinned block. Its registration, if any, stays open for the rest of the run and
+/// keeps counting against CNUM_GPU_ZC_REGS.
 inline bool pinned_forget(void* p) {
     auto& pool = pinned_pool();
     std::lock_guard<std::mutex> lock(pool.mu);
+    pool.forgotten += pool.regs.erase(p);
     return pool.live.erase(p) > 0;
 }
 
 /// The network registration of pinned block `p`, made on first use and kept while the block
-/// is pinned; nullptr if `p` is not a pooled block or CNUM_GPU_ZC_REGS registrations
-/// (default 1024) exist already: the network card holds a limited number of them.
+/// is pinned; nullptr if `p` is not a pooled block. The network card holds a limited number:
+/// past CNUM_GPU_ZC_REGS (default 1024), the registration of the cached block used longest
+/// ago is dropped; nullptr if every one is on a block in use.
 inline const CkNcpyBuffer* pinned_reg(void* p) {
     auto& pool = pinned_pool();
-    std::lock_guard<std::mutex> lock(pool.mu);
+    std::unique_lock<std::mutex> lock(pool.mu);
     auto reg = pool.regs.find(p);
-    if (reg != pool.regs.end())
-        return &reg->second;
+    if (reg != pool.regs.end()) {
+        reg->second.used = ++pool.clock;
+        return &reg->second.buf;
+    }
     auto it = pool.live.find(p);
-    if (it == pool.live.end() || (int64_t)pool.regs.size() >= pool.max_regs)
+    if (it == pool.live.end())
         return nullptr;
-    return &pool.regs
-                .emplace(p, CkNcpyBuffer(p, size_t(1) << it->second, CK_BUFFER_REG,
-                                         CK_BUFFER_NODEREG))
-                .first->second;
+    const size_t bytes = size_t(1) << it->second;
+    void* victim = nullptr;
+    std::unique_ptr<CkNcpyBuffer> victim_reg;
+    if ((int64_t)pool.regs.size() + pool.registering + pool.forgotten >= pool.max_regs) {
+        auto old = pool.regs.end();
+        for (auto r = pool.regs.begin(); r != pool.regs.end(); ++r)
+            if (!pool.live.count(r->first) &&
+                (old == pool.regs.end() || r->second.used < old->second.used))
+                old = r;
+        if (old == pool.regs.end())
+            return nullptr;
+        victim = old->first;
+        victim_reg.reset(new CkNcpyBuffer(old->second.buf));
+        pool.regs.erase(old);
+        // in use until its registration is closed: not reallocated or unpinned meanwhile
+        int cls = PinnedPool::kMinClass;
+        while ((size_t(1) << cls) < victim_reg->cnt)
+            ++cls;
+        auto& list = pool.free_lists[cls];
+        auto at = std::find(list.begin(), list.end(), victim);
+        if (at == list.end())
+            CkAbort("pinned_reg: registered block %p is neither in use nor cached", victim);
+        list.erase(at);
+        pool.cached -= int64_t(1) << cls;
+        pool.live[victim] = cls;
+    }
+    ++pool.registering;
+    lock.unlock();
+    if (victim) {
+        victim_reg->deregisterMem();
+        pinned_free(victim);
+    }
+    CkNcpyBuffer buf(p, bytes, CK_BUFFER_REG, CK_BUFFER_NODEREG); // milliseconds on cxi
+    lock.lock();
+    --pool.registering;
+    auto [kept, fresh] = pool.regs.emplace(p, PinnedPool::Reg{buf, ++pool.clock});
+    if (!fresh) { // registered meanwhile by another thread
+        lock.unlock();
+        buf.deregisterMem();
+    }
+    return &kept->second.buf;
 }
 
 /// Staged messages of at least this many bytes go zero-copy where staged_zc() allows
