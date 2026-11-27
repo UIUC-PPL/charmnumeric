@@ -49,3 +49,8 @@ cmake-build-*/
 src/build-*/
 *.log
 core.*
+
+# Build products of the CMake/pip builds and dependencies from scripts/install.sh
+.deps/
+charmnumeric/_bin/
+charmnumeric/_build_info.py
