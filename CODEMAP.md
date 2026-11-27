@@ -110,6 +110,13 @@ Distributed N-dimensional array DSL built on charmtyles. The backend stores 1-3D
 | `CharmNumericInterface(CCSInterface)` | 12 | Subclass with `from_bytes()` deserializer |
 | `LocalCluster` | 26 | Local server launcher — `_run_server()`:74, `_connect_with_retry()`:94, `close()`:111 |
 
+### `charmnumeric/_display.py` — Notebook display
+| Symbol | Description |
+|--------|-------------|
+| `set_display()` | Preview on/off, `threshold`/`edgeitems` (default: NumPy's print options) |
+| `mimebundle()` / `values_str()` | `_repr_mimebundle_` (text + HTML) and `__str__` of arrays; `_fetch()` gets only the corners NumPy prints |
+| `register_ipython()` | `post_run_cell` hook that sends each cell's pending operations (`CNUM_FLUSH_AFTER_CELL`) |
+
 ### `charmnumeric/random.py` — Native RNG (numpy.random subset)
 | Symbol | Description |
 |--------|-------------|
