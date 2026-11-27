@@ -24,9 +24,9 @@
 #endif
 
 // SCAN / SORT / ARGSORT executors (opcodes 81-83). The result has the
-// input's decomposition (pinned in dag_group_receive.cpp). 1-D sorts of real
-// types and SELECT run in executor_sort.cpp; the other sorts gather to the
-// chare holding element 0.
+// input's decomposition (pinned in dag_group_receive.cpp). Sorts and SELECT run in
+// executor_sort.cpp, except small arrays split along the sort axis, which gather to
+// the chare holding element 0 (sort_root).
 
 // Named namespace: these types are captured by device lambdas.
 namespace castscansort_detail {
@@ -644,6 +644,8 @@ bool ds_handles(ASTNode* root, DType dt, int ndims);
 template <int N>
 bool ds_axis_whole(CTArrayBase<N>* in, int axis);
 template <int N>
+bool ds_axis_gather(CTArrayBase<N>* in);
+template <int N>
 void ds_axis_local(PartitionImpl<N>* p, CTArrayBase<N>* in, CTArrayBase<N>* out, int axis,
                    bool arg);
 
@@ -681,6 +683,9 @@ void ArrayDAGExecutorND<N>::execute_castscansort_node(DAGNode* node) {
         });
     } else if (ds_axis_whole<N>(in, scalar_param(root, 1, 0))) {
         ds_axis_local<N>(partition, in, out, scalar_param(root, 1, 0), op == Opcode::ARGSORT);
+    } else if (N > 1 && !ds_axis_gather<N>(in)) {
+        execute_ax_node(node, in_name, out_name, scalar_param(root, 1, 0), op == Opcode::ARGSORT);
+        return;
     } else if (op == Opcode::SORT || op == Opcode::ARGSORT) {
         const ArrayDecomp<N>& dec = in->decomp;
         auto me = partition->nd_index();
