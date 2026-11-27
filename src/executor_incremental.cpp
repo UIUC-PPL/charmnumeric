@@ -98,7 +98,7 @@ void ArrayDAGExecutorND<N>::on_matmatmul_receive(int node_id, int input_index) {
                                      sub_rows, sub_cols, c_local_row, c_local_col
 #ifdef USE_NVIDIA
                                      ,
-                                     partition->compute_stream_raw
+                                     partition->compute_exec
 #endif
             );
         }
