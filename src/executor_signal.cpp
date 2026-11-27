@@ -119,8 +119,9 @@ void chare_span(const ArrayDecomp<N>& dec, int d, int& first, int& last) {
 /// Result index range [lo, hi) (array coords) of result chare c along d.
 template <int N>
 void out_range_1d(const ArrayDecomp<N>& dec, int d, int c, int& lo, int& hi) {
-    lo = std::max(c * dec.tile, dec.offset[d]) - dec.offset[d];
-    hi = std::min((c + 1) * dec.tile, dec.offset[d] + dec.global_shape[d]) - dec.offset[d];
+    int64_t limit = int64_t(dec.offset[d]) + dec.global_shape[d];
+    lo = tile_start(c, dec.tile, dec.offset[d], limit) - dec.offset[d];
+    hi = tile_end(c, dec.tile, limit) - dec.offset[d];
 }
 
 /// Box of source view i (view-index coords, may exceed it) that the result
