@@ -27,9 +27,8 @@ void PartitionImpl<N>::init(typename PartitionTraits<N>::ProxyType proxy, std::a
     executor = new ArrayDAGExecutorND<N>(dag_group, this);
     local_partitions<N>().push_back(this);
     {
-        auto& reg = process_partitions<N>();
-        std::lock_guard<std::mutex> lock(reg.mu);
-        reg.parts.push_back(this);
+        std::lock_guard<std::mutex> lock(free_lists_mutex());
+        process_partitions<N>().push_back(this);
     }
     // Skip to the epoch where this partition was first created.
     // start_epoch - 1 so that next_epoch() advances to start_epoch.
@@ -46,19 +45,20 @@ template <int N>
 PartitionImpl<N>::~PartitionImpl() {
     auto& parts = local_partitions<N>();
     parts.erase(std::remove(parts.begin(), parts.end(), this), parts.end());
-    {
-        auto& reg = process_partitions<N>();
-        std::lock_guard<std::mutex> lock(reg.mu);
-        reg.parts.erase(std::remove(reg.parts.begin(), reg.parts.end(), this), reg.parts.end());
-    }
     delete executor;
     for (auto& [name, arr] : arrays)
         delete arr;
-    for (auto& [key, bucket] : free_arrays)
-        for (auto* arr : bucket) {
-            retired_bytes() -= arr->local_size() * arr->elem_size();
-            delete arr;
-        }
+    {
+        std::lock_guard<std::mutex> lock(free_lists_mutex());
+        auto& all = process_partitions<N>();
+        all.erase(std::remove(all.begin(), all.end(), this), all.end());
+        for (auto& [key, bucket] : free_arrays)
+            for (auto* arr : bucket) {
+                retired_bytes() -= arr->local_size() * arr->elem_size();
+                delete arr;
+            }
+        free_arrays.clear();
+    }
 #ifdef USE_NVIDIA
     gpu_ipc_cancel(this); // sends waiting for an IPC block; their buffers are in pending_sends
 #endif

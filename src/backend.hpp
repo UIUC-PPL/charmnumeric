@@ -116,6 +116,12 @@ inline int matmul_drop_dim(ASTNode* root, int idx) {
     return drop_dim_3d(*r, want_rows, want_cols);
 }
 
+/// Order of the frees into the caches (least recently freed is evicted first).
+inline std::atomic<uint64_t>& cache_clock() {
+    static std::atomic<uint64_t> c{0};
+    return c;
+}
+
 #ifdef USE_KOKKOS
 #include <Kokkos_Core.hpp>
 using DeviceSpace = Kokkos::DefaultExecutionSpace::memory_space;
@@ -132,6 +138,17 @@ inline std::atomic<int>& gpu_sharers() {
     return n;
 }
 
+inline int64_t device_total() {
+    static const int64_t total = [] {
+        size_t fr = 0, tot = 0;
+#ifdef USE_NVIDIA
+        cudaMemGetInfo(&fr, &tot);
+#endif
+        return tot ? static_cast<int64_t>(tot) : int64_t(8) << 30;
+    }();
+    return total;
+}
+
 /// A cache budget: `env` MB if set (read once), else 1/`div` of the device split among the
 /// processes that share it (read at each use: the startup probe changes the sharers).
 struct BudgetKnob {
@@ -141,13 +158,6 @@ struct BudgetKnob {
 };
 
 inline int64_t device_budget(BudgetKnob& k) {
-    static const int64_t total = [] {
-        size_t fr = 0, tot = 0;
-#ifdef USE_NVIDIA
-        cudaMemGetInfo(&fr, &tot);
-#endif
-        return tot ? static_cast<int64_t>(tot) : int64_t(8) << 30;
-    }();
     int64_t mb = k.env_mb.load(std::memory_order_relaxed);
     if (mb == -2) {
         const char* v = std::getenv(k.env);
@@ -156,7 +166,7 @@ inline int64_t device_budget(BudgetKnob& k) {
     }
     if (mb >= 0)
         return mb << 20;
-    return total / k.div / std::max(1, gpu_sharers().load(std::memory_order_relaxed));
+    return device_total() / k.div / std::max(1, gpu_sharers().load(std::memory_order_relaxed));
 }
 
 inline BudgetKnob& comm_cache_knob() {
@@ -164,15 +174,49 @@ inline BudgetKnob& comm_cache_knob() {
     return k;
 }
 inline BudgetKnob& large_cache_knob() {
-    static BudgetKnob k{"CNUM_DEVICE_CACHE_MB", 8};
+    static BudgetKnob k{"CNUM_DEVICE_CACHE_MB", 2};
     return k;
 }
 inline BudgetKnob& free_list_knob() {
-    static BudgetKnob k{"CNUM_FREE_LIST_MB", 8};
+    static BudgetKnob k{"CNUM_FREE_LIST_MB", 2};
     return k;
 }
 
-/// Frees the cached message buffers and this PE's retired arrays (defined below).
+inline int64_t device_free() {
+#ifdef USE_NVIDIA
+    size_t fr = 0, tot = 0;
+    if (cudaMemGetInfo(&fr, &tot) == cudaSuccess)
+        return static_cast<int64_t>(fr);
+#endif
+    return std::numeric_limits<int64_t>::max();
+}
+
+/// Caches keep a freed block only while this much of the device stays free
+/// (CNUM_DEVICE_RESERVE_MB, default 1/4 of the device).
+inline int64_t device_reserve() {
+    static const int64_t r = [] {
+        const char* v = std::getenv("CNUM_DEVICE_RESERVE_MB");
+        return v ? std::atoll(v) << 20 : device_total() / 4;
+    }();
+    return r;
+}
+
+/// Bytes a cache may always hold: 1/8 of the device per sharing process.
+inline int64_t device_cache_floor() {
+    return device_total() / 8 / std::max(1, gpu_sharers().load(std::memory_order_relaxed));
+}
+
+/// Whether a cache holding `cached` bytes may keep another block: always up to
+/// device_cache_floor(), beyond that while device_reserve() stays free.
+inline bool device_cache_room(int64_t cached) {
+    return cached <= device_cache_floor() || device_free() >= device_reserve();
+}
+
+/// Evicts cached blocks and retired arrays, oldest first, while the caches hold more than
+/// device_cache_floor() and `bytes` plus device_reserve() do not fit (defined below).
+inline void device_make_room(int64_t bytes);
+
+/// Frees the cached message buffers and the retired arrays of this process (defined below).
 inline void release_device_caches();
 
 [[noreturn]] inline void device_oom(int64_t bytes) {
@@ -204,10 +248,10 @@ inline void* device_malloc(int64_t bytes) {
 /// freed after their last GPU use (send_complete, compute-done callbacks). Larger blocks
 /// are cached by size in 2 MB steps: cudaMalloc of hundreds of MB gets slower the more
 /// such blocks a process has freed. Small and large blocks have separate budgets
-/// (CNUM_COMM_CACHE_MB, default 1/16 of the device; CNUM_DEVICE_CACHE_MB, default 1/8),
-/// split among the processes on the GPU; the least recently freed large blocks are evicted
-/// first. The IPC slabs (gpu_comm.hpp) are separate: in-flight messages, capped by
-/// CNUM_GPU_IPC_MB.
+/// (CNUM_COMM_CACHE_MB, default 1/16 of the device; CNUM_DEVICE_CACHE_MB, default 1/2),
+/// split among the processes on the GPU. A large block is kept only while device_reserve()
+/// stays free, and the least recently freed ones are evicted first. The IPC slabs
+/// (gpu_comm.hpp) are separate: in-flight messages, capped by CNUM_GPU_IPC_MB.
 struct CommPool {
     static constexpr int kMinClass = 8, kMaxClass = 26; // 256 B .. 64 MB
     static constexpr int64_t kLargeStep = int64_t(2) << 20;
@@ -222,7 +266,6 @@ struct CommPool {
     std::multimap<int64_t, FreeBlock> free_large;
     std::map<uint64_t, std::multimap<int64_t, FreeBlock>::iterator> by_age; // stamp -> block
     int64_t large_cached = 0;
-    uint64_t clock = 0;
     std::mutex mu; // shared by the PEs of a process (SMP)
 };
 
@@ -246,26 +289,32 @@ inline void comm_release_all(CommPool& pool) {
     pool.cached = 0;
 }
 
+/// The least recently freed large block, or end(); the caller holds pool.mu.
+inline std::multimap<int64_t, CommPool::FreeBlock>::iterator comm_oldest_large(CommPool& pool) {
+    return pool.by_age.empty() ? pool.free_large.end() : pool.by_age.begin()->second;
+}
+
+inline void comm_evict_large(CommPool& pool, std::multimap<int64_t, CommPool::FreeBlock>::iterator it) {
+    Kokkos::kokkos_free<DeviceSpace>(it->second.ptr);
+    pool.large_cached -= it->first;
+    pool.by_age.erase(it->second.stamp);
+    pool.free_large.erase(it);
+}
+
 /// Evicts the least recently freed large blocks until at most `keep` bytes stay cached.
 inline void comm_trim_large(CommPool& pool, int64_t keep) {
-    while (pool.large_cached > keep && !pool.by_age.empty()) {
-        auto oldest = pool.by_age.begin();
-        auto blk = oldest->second;
-        Kokkos::kokkos_free<DeviceSpace>(blk->second.ptr);
-        pool.large_cached -= blk->first;
-        pool.free_large.erase(blk);
-        pool.by_age.erase(oldest);
-    }
+    while (pool.large_cached > keep && !pool.by_age.empty())
+        comm_evict_large(pool, pool.by_age.begin()->second);
 }
 
 inline void comm_free_large(CommPool& pool, void* ptr, int64_t bytes) {
     int64_t limit = device_budget(large_cache_knob());
-    if (bytes > limit) {
+    if (bytes > limit || !device_cache_room(pool.large_cached + bytes)) {
         Kokkos::kokkos_free<DeviceSpace>(ptr);
         return;
     }
     comm_trim_large(pool, limit - bytes);
-    uint64_t stamp = ++pool.clock;
+    uint64_t stamp = ++cache_clock();
     pool.by_age.emplace(stamp, pool.free_large.emplace(bytes, CommPool::FreeBlock{ptr, stamp}));
     pool.large_cached += bytes;
 }
@@ -300,6 +349,8 @@ inline void* comm_alloc(int64_t bytes) {
             return ptr;
         }
     }
+    if (large)
+        device_make_room(bytes);
     void* ptr = device_malloc(bytes); // not under pool.mu: a failure releases the pool
     std::lock_guard<std::mutex> lock(pool.mu);
     if (large)
@@ -348,6 +399,13 @@ inline std::atomic<int64_t>& retired_device_bytes() {
     return bytes;
 }
 
+/// Guards the retired-array free lists of every partition in this process (SMP: the PEs
+/// share one device budget, so eviction must reach all of them). Taken before the comm pool's.
+inline std::mutex& free_lists_mutex() {
+    static std::mutex mu;
+    return mu;
+}
+
 /// Type-erased base class for N-D arrays.
 template <int N>
 class CTArrayBase {
@@ -359,6 +417,7 @@ class CTArrayBase {
     int global_size; // total elements across all dimensions
     bool owner;
     DType dtype;
+    uint64_t retired_at = 0; // cache_clock() when it entered a free list
 
     virtual ~CTArrayBase() = default;
     int64_t local_size() const { return region.size(); }
@@ -869,11 +928,11 @@ class PartitionImpl {
     int64_t comm_bytes_sent = 0; // cumulative communication volume (bytes) sent from this chare
 #endif
 
-    // Free list for array reuse: retired arrays keyed by exact buffer metadata.
-    // A buffer is only reusable when dtype, shape, and decomposition match.
+    // Free list for array reuse: retired arrays keyed by dtype and local size; a reused
+    // array takes the new region, shape and decomposition.
 #ifdef USE_NVIDIA
-    // Bounded by retired bytes per PE: freeing the surplus costs a cudaFree (a device sync)
-    // and a later cudaMalloc per array.
+    // Bounded by retired bytes per process and by free device memory: freeing the surplus
+    // costs a cudaFree (a device sync) and a later cudaMalloc per array.
     static constexpr int FREE_LIST_MAX = 64; // max entries per key
 #else
     static constexpr int FREE_LIST_MAX = 4; // max entries per key
@@ -881,7 +940,9 @@ class PartitionImpl {
     static std::atomic<int64_t>& retired_bytes() {
         return retired_device_bytes();
     }
-    /// 1/8 of the device, split among the processes on it (CNUM_FREE_LIST_MB).
+    /// 1/2 of the device, split among the processes on it (CNUM_FREE_LIST_MB). The large
+    /// comm block cache has its own 1/2, so together the caches stay below about 3/4 of the
+    /// device (device_cache_room keeps device_reserve() free beyond the floor).
     static int64_t retired_limit() {
 #ifdef USE_NVIDIA
         return device_budget(free_list_knob());
@@ -892,64 +953,33 @@ class PartitionImpl {
 
     struct FreeKey {
         DType dtype;
-        std::array<int, N> local_shape;
-        std::array<int, N> global_shape;
-        std::array<int, N> decomp_offset;
-        std::array<int, N> decomp_global_shape;
-        int decomp_tile;
-
-        bool operator==(const FreeKey& o) const {
-            return dtype == o.dtype &&
-                   local_shape == o.local_shape &&
-                   global_shape == o.global_shape &&
-                   decomp_offset == o.decomp_offset &&
-                   decomp_global_shape == o.decomp_global_shape &&
-                   decomp_tile == o.decomp_tile;
-        }
+        int64_t size;
+        bool operator==(const FreeKey& o) const { return dtype == o.dtype && size == o.size; }
     };
     struct FreeKeyHash {
-        static inline void hash_combine(std::size_t& seed, std::size_t value) {
-            seed ^= value + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-        }
-
-        static inline void hash_int_array(std::size_t& seed, const std::array<int, N>& values) {
-            for (int value : values)
-                hash_combine(seed, std::hash<int>()(value));
-        }
-
         std::size_t operator()(const FreeKey& k) const {
-            std::size_t seed = std::hash<int>()(static_cast<int>(k.dtype));
-            hash_int_array(seed, k.local_shape);
-            hash_int_array(seed, k.global_shape);
-            hash_int_array(seed, k.decomp_offset);
-            hash_int_array(seed, k.decomp_global_shape);
-            hash_combine(seed, std::hash<int>()(k.decomp_tile));
-            return seed;
+            return std::hash<int64_t>()(k.size) * 31 + static_cast<int>(k.dtype);
         }
     };
     std::unordered_map<FreeKey, std::vector<CTArrayBase<N>*>, FreeKeyHash> free_arrays;
-    std::mutex free_mu; // free_arrays: another PE's out-of-memory release may empty it (SMP)
 
-    static FreeKey make_free_key(DType dtype,
-                                 const ArrayRegion<N>& region,
-                                 const std::array<int, N>& global_shape,
-                                 const ArrayDecomp<N>& decomp) {
-        std::array<int, N> local_shape{};
-        for (int d = 0; d < N; ++d)
-            local_shape[d] = region.size(d);
-        return FreeKey{
-            dtype,
-            local_shape,
-            global_shape,
-            decomp.offset,
-            decomp.global_shape,
-            decomp.tile,
-        };
+    static bool device_has_room(int64_t cached) {
+#ifdef USE_NVIDIA
+        return device_cache_room(cached);
+#else
+        (void)cached;
+        return true;
+#endif
+    }
+
+    static FreeKey make_free_key(DType dtype, const ArrayRegion<N>& region) {
+        return FreeKey{dtype, region.size()};
     }
 
     /// Move an array from `arrays` into the free list (or delete it if the
     /// free list for its key is full).
     void retire_array(int name) {
+        std::lock_guard<std::mutex> lock(free_lists_mutex());
         auto it = arrays.find(name);
         if (it == arrays.end()) {
             DBG_PRINT("[PE %d] Partition<%d> retire_array name=%d: no local buffer\n",
@@ -958,41 +988,32 @@ class PartitionImpl {
         }
         CTArrayBase<N>* arr = it->second;
         arrays.erase(it);
-        FreeKey key = make_free_key(arr->dtype, arr->region, arr->global_shape, arr->decomp);
+        FreeKey key = make_free_key(arr->dtype, arr->region);
+        auto& bucket = free_arrays[key];
         int64_t bytes = arr->local_size() * arr->elem_size();
-        bool kept = false;
-        {
-            std::lock_guard<std::mutex> lock(free_mu);
-            auto& bucket = free_arrays[key];
-            // reserve the bytes first: the cap is per process and the PEs retire concurrently
-            if (static_cast<int>(bucket.size()) < FREE_LIST_MAX &&
-                retired_bytes().fetch_add(bytes) + bytes <= retired_limit()) {
-                arr->drop_host();
-                bucket.push_back(arr);
-                kept = true;
-                DBG_PRINT("[PE %d] Partition<%d> retire_array name=%d: moved to freelist "
-                          "(dtype=%d local_size=%lld bucket=%d/%d)\n",
-                          CkMyPe(), N, name, static_cast<int>(arr->dtype),
-                          (long long)arr->local_size(), static_cast<int>(bucket.size()),
-                          FREE_LIST_MAX);
-            } else if (static_cast<int>(bucket.size()) < FREE_LIST_MAX) {
-                retired_bytes() -= bytes;
-            }
-            if (!kept && bucket.empty())
-                free_arrays.erase(key);
-        }
-        if (!kept) {
+        if (static_cast<int>(bucket.size()) < FREE_LIST_MAX &&
+            retired_bytes() + bytes <= retired_limit() && device_has_room(retired_bytes() + bytes)) {
+            arr->drop_host();
+            arr->retired_at = ++cache_clock();
+            bucket.push_back(arr);
+            retired_bytes() += bytes;
+            DBG_PRINT("[PE %d] Partition<%d> retire_array name=%d: moved to freelist "
+                      "(dtype=%d local_size=%lld bucket=%d/%d)\n",
+                      CkMyPe(), N, name, static_cast<int>(arr->dtype), (long long)arr->local_size(),
+                      static_cast<int>(bucket.size()), FREE_LIST_MAX);
+        } else {
             DBG_PRINT("[PE %d] Partition<%d> retire_array name=%d: deleting local buffer "
                       "(dtype=%d local_size=%lld freelist_full=%d)\n",
                       CkMyPe(), N, name, static_cast<int>(arr->dtype), (long long)arr->local_size(),
                       FREE_LIST_MAX);
+            if (bucket.empty())
+                free_arrays.erase(key);
             delete arr;
         }
     }
 
-    /// Free the retired arrays (release_device_caches).
+    /// Free the retired arrays (release_device_caches); free_lists_mutex held.
     void release_retired() {
-        std::lock_guard<std::mutex> lock(free_mu);
         for (auto& [key, bucket] : free_arrays)
             for (auto* arr : bucket) {
                 retired_bytes() -= arr->local_size() * arr->elem_size();
@@ -1001,15 +1022,37 @@ class PartitionImpl {
         free_arrays.clear();
     }
 
+    /// cache_clock() of this chare's least recently retired array (max if none);
+    /// free_lists_mutex held.
+    uint64_t oldest_retired() const {
+        uint64_t s = std::numeric_limits<uint64_t>::max();
+        for (auto& [key, bucket] : free_arrays)
+            if (!bucket.empty())
+                s = std::min(s, bucket.front()->retired_at);
+        return s;
+    }
+
+    void evict_oldest_retired() {
+        uint64_t s = oldest_retired();
+        for (auto it = free_arrays.begin(); it != free_arrays.end(); ++it) {
+            auto& bucket = it->second;
+            if (bucket.empty() || bucket.front()->retired_at != s)
+                continue;
+            CTArrayBase<N>* arr = bucket.front();
+            bucket.erase(bucket.begin());
+            retired_bytes() -= arr->local_size() * arr->elem_size();
+            delete arr;
+            if (bucket.empty())
+                free_arrays.erase(it);
+            return;
+        }
+    }
+
     /// Try to pop a reusable buffer from the free list.
     /// Returns nullptr if none available.
-    CTArrayBase<N>* try_reuse(DType dtype,
-                              const ArrayRegion<N>& region,
-                              const std::array<int, N>& global_shape,
-                              const ArrayDecomp<N>& decomp) {
-        FreeKey key = make_free_key(dtype, region, global_shape, decomp);
-        std::lock_guard<std::mutex> lock(free_mu);
-        auto it = free_arrays.find(key);
+    CTArrayBase<N>* try_reuse(DType dtype, const ArrayRegion<N>& region) {
+        std::lock_guard<std::mutex> lock(free_lists_mutex());
+        auto it = free_arrays.find(make_free_key(dtype, region));
         if (it == free_arrays.end() || it->second.empty())
             return nullptr;
         CTArrayBase<N>* arr = it->second.back();
@@ -1050,11 +1093,12 @@ class PartitionImpl {
                                          int name,
                                          const ArrayDecomp<N>& decomp,
                                          bool zero = true) {
-        CTArrayBase<N>* reused = try_reuse(dtype_of<T>(), region, global_shape, decomp);
+        CTArrayBase<N>* reused = try_reuse(dtype_of<T>(), region);
         if (reused == nullptr) {
             Array<N, T>* arr;
 #ifdef USE_NVIDIA
             // zero-filled on the compute stream below, not by a blocking Kokkos init
+            device_make_room(region.size() * (int64_t)sizeof(T));
             try {
                 arr = new Array<N, T>(region, global_shape, name, decomp, false);
             } catch (const std::exception&) {
@@ -1220,28 +1264,25 @@ std::vector<PartitionImpl<N>*>& local_partitions() {
     return parts;
 }
 
+/// Every PE's chares of each rank in this process (the device budget is per process);
+/// guarded by free_lists_mutex().
+template <int N>
+std::vector<PartitionImpl<N>*>& process_partitions() {
+    static std::vector<PartitionImpl<N>*> parts;
+    return parts;
+}
+
 /// CNUM_MEM_STATS=1: one line of memory use per PE at each barrier (partition_get.cpp).
 void mem_stats_report(ArrayDAGGroup* g, int epoch);
 bool mem_stats_on();
 
-/// Every chare of this process, whichever PE it lives on: the device budget is per process.
-template <int N>
-struct ProcessPartitions {
-    std::mutex mu;
-    std::vector<PartitionImpl<N>*> parts;
-};
-
-template <int N>
-ProcessPartitions<N>& process_partitions() {
-    static ProcessPartitions<N> p;
-    return p;
-}
-
-template <int N>
-void release_retired_all() {
-    auto& reg = process_partitions<N>();
-    std::lock_guard<std::mutex> lock(reg.mu);
-    for (auto* p : reg.parts)
+/// Frees the retired arrays of every chare of this process; free_lists_mutex held.
+inline void release_retired_all() {
+    for (auto* p : process_partitions<1>())
+        p->release_retired();
+    for (auto* p : process_partitions<2>())
+        p->release_retired();
+    for (auto* p : process_partitions<3>())
         p->release_retired();
 }
 
@@ -1263,20 +1304,72 @@ inline void trim_device_caches() {
     }
     if (retired_device_bytes().load() > device_budget(free_list_knob())) {
         Kokkos::fence("ct_trim_device_caches");
-        release_retired_all<1>();
-        release_retired_all<2>();
-        release_retired_all<3>();
+        std::lock_guard<std::mutex> free_lock(free_lists_mutex());
+        release_retired_all();
     }
 }
 
 inline void release_device_caches() {
     Kokkos::fence("ct_release_device_caches");
-    release_retired_all<1>();
-    release_retired_all<2>();
-    release_retired_all<3>();
+    std::lock_guard<std::mutex> free_lock(free_lists_mutex());
+    release_retired_all();
     auto& pool = comm_pool();
     std::lock_guard<std::mutex> lock(pool.mu);
     comm_release_all(pool);
+#ifdef USE_NVIDIA
+    int dev = 0;
+    cudaMemPool_t mp;
+    if (cudaGetDevice(&dev) == cudaSuccess && cudaDeviceGetDefaultMemPool(&mp, dev) == cudaSuccess)
+        cudaMemPoolTrimTo(mp, 0);
+#endif
+}
+
+/// Frees the least recently freed large block or retired array of this process.
+inline bool evict_oldest_cached() {
+    uint64_t best = std::numeric_limits<uint64_t>::max();
+    std::function<void()> evict;
+    auto scan = [&](auto& parts) {
+        for (auto* p : parts) {
+            uint64_t s = p->oldest_retired();
+            if (s < best) {
+                best = s;
+                evict = [p] { p->evict_oldest_retired(); };
+            }
+        }
+    };
+    std::lock_guard<std::mutex> free_lock(free_lists_mutex());
+    scan(process_partitions<1>());
+    scan(process_partitions<2>());
+    scan(process_partitions<3>());
+    auto& pool = comm_pool();
+    std::lock_guard<std::mutex> lock(pool.mu);
+    auto it = comm_oldest_large(pool);
+    if (it != pool.free_large.end() && it->second.stamp < best) {
+        comm_evict_large(pool, it);
+        return true;
+    }
+    if (!evict)
+        return false;
+    evict();
+    return true;
+}
+
+/// Retired arrays and cached large blocks of this process.
+inline int64_t device_cached() {
+    auto& pool = comm_pool();
+    std::lock_guard<std::mutex> lock(pool.mu);
+    return retired_device_bytes() + pool.large_cached;
+}
+
+inline void device_make_room(int64_t bytes) {
+#ifdef USE_NVIDIA
+    int64_t need = bytes + device_reserve();
+    while (device_cached() > device_cache_floor() && device_free() < need &&
+           evict_oldest_cached()) {
+    }
+#else
+    (void)bytes;
+#endif
 }
 #endif
 

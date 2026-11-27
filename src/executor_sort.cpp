@@ -202,6 +202,20 @@ inline void ds_pool_init() {
     cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &keep);
 }
 
+/// Makes room for what the pool cannot serve from the memory it holds.
+inline void ds_make_room(int64_t bytes) {
+    int dev = 0;
+    cudaMemPool_t pool;
+    uint64_t reserved = 0, used = 0;
+    if (cudaGetDevice(&dev) == cudaSuccess && cudaDeviceGetDefaultMemPool(&pool, dev) == cudaSuccess) {
+        cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &reserved);
+        cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent, &used);
+    }
+    int64_t held = reserved > used ? static_cast<int64_t>(reserved - used) : 0;
+    if (bytes > held)
+        device_make_room(bytes - held);
+}
+
 /// Device attribute of the current device, cached per device.
 inline int ds_dev_attr(cudaDeviceAttr attr) {
     static std::mutex mu;
@@ -241,8 +255,14 @@ inline char* ds_alloc(int64_t bytes, bool comm = false) {
 #if defined(USE_NVIDIA)
     if (!comm) {
         ds_pool_init();
+        ds_make_room(bytes);
         void* p = nullptr;
-        hapiCheck(cudaMallocAsync(&p, bytes, ds_cur_stream));
+        if (cudaMallocAsync(&p, bytes, ds_cur_stream) != cudaSuccess) {
+            cudaGetLastError();
+            release_device_caches();
+            if (cudaMallocAsync(&p, bytes, ds_cur_stream) != cudaSuccess)
+                device_oom(bytes);
+        }
         auto& pool = ds_pool();
         std::lock_guard<std::mutex> lock(pool.mu);
         pool.live.insert(p);
