@@ -23,8 +23,9 @@ def tol(dt):
 
 
 def rel_err(got, exp):
-    got = np.asarray(got, dtype=np.float64)
-    exp = np.asarray(exp, dtype=np.float64)
+    got, exp = np.asarray(got), np.asarray(exp)
+    dt = np.complex128 if "c" in (got.dtype.kind, exp.dtype.kind) else np.float64
+    got, exp = got.astype(dt), exp.astype(dt)
     return np.abs(got - exp).max() / max(1.0, np.abs(exp).max())
 
 
@@ -83,6 +84,36 @@ def check_cholesky(chk, n, dt):
     close(chk, f"cholesky n={n} {dt}", get(L), np.linalg.cholesky(ah.astype(np.float64)), tol(dt))
     close(chk, f"cholesky upper n={n} {dt}", get(U),
           np.linalg.cholesky(ah.astype(np.float64), upper=True), tol(dt))
+
+
+def check_cholesky_complex(chk, n):
+    r1, r2 = cnp.random.rand(n, n), cnp.random.rand(n, n)
+    rh = cnp.random.transposed(r1) - 1j * cnp.random.transposed(r2)
+    a = (r1 + 1j * r2) @ rh + float(n) * cnp.eye(n, dtype=np.complex128)
+    ah = get(a)
+    close(chk, f"cholesky n={n} complex128", get(cnp.linalg.cholesky(a)),
+          np.linalg.cholesky(ah), 1e-9)
+    close(chk, f"cholesky upper n={n} complex128", get(cnp.linalg.cholesky(a, upper=True)),
+          np.linalg.cholesky(ah, upper=True), 1e-9)
+
+
+def check_cholesky_triangle(chk, n, dt):
+    """Only the lower (upper=False) or upper (upper=True) triangle is read."""
+    rng = np.random.default_rng(n)
+    r = rng.random((n, n))
+    junk = 5.0 * rng.random((n, n))
+    if np.dtype(dt).kind == "c":
+        r = r + 1j * rng.random((n, n))
+        junk = junk - 3j * rng.random((n, n))
+    s = (r @ r.conj().T + n * np.eye(n)).astype(dt)
+    t = 1e-9 if np.dtype(dt) in (np.float64, np.complex128) else tol(np.float32)
+    up = cnp.asarray(np.triu(s) + np.tril(junk, -1).astype(dt))
+    lo = cnp.asarray(np.tril(s) + np.triu(junk, 1).astype(dt))
+    sh = s.astype(np.complex128 if np.dtype(dt).kind == "c" else np.float64)
+    close(chk, f"cholesky upper n={n} {np.dtype(dt)} reads the upper triangle",
+          get(cnp.linalg.cholesky(up, upper=True)), np.linalg.cholesky(sh, upper=True), t)
+    close(chk, f"cholesky n={n} {np.dtype(dt)} reads the lower triangle",
+          get(cnp.linalg.cholesky(lo)), np.linalg.cholesky(sh), t)
 
 
 def check_notpd(chk, n, k):
@@ -326,6 +357,10 @@ def main():
     # GPU builds (2-D tile 1024): tiled cholesky on several chares; tssvd columns in two tiles
     for dt in (np.float64, np.float32):
         check_cholesky(chk, 2600, dt)
+    check_cholesky_complex(chk, 1100)
+    for n, dt in ((300, np.float64), (1100, np.complex128), (2600, np.float64),
+                  (2600, np.float32)):
+        check_cholesky_triangle(chk, n, dt)
     for k in (0, 1500, 2599):
         check_notpd(chk, 2600, k)
     check_tssvd(chk, 3000, 1100, np.float64)
