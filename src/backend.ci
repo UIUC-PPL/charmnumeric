@@ -28,6 +28,7 @@ mainmodule charmnumeric
         entry void gather(int epoch, int name, int nmeta, int64_t meta[nmeta], int64_t size,
                           char data[size]);
         entry void barrier_arrive(int epoch);
+        entry void check_layout_hash(int epoch, int64_t hash);
         entry void fetch_upload_tile(int node_id, int name, int nd, int i0, int i1, int i2);
         entry void stage_upload_tile(int name, int nd, int i0, int i1, int i2, int nmeta,
                                      int meta[nmeta], int64_t size, char data[size]);

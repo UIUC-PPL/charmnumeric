@@ -538,6 +538,22 @@ void ArrayDAGGroup::receive_dag_now(int epoch, int size, char* serialized_dag) {
         }
     });
 
+    {
+        auto fix = decomposition_solver::resolve_kernel_layouts(array_meta, dag, synth_name,
+                                                                synth_node_id);
+        if (!fix.error.empty())
+            CkAbort("receive_dag epoch=%d: %s", epoch, fix.error.c_str());
+        if (CkNumPes() > 1) {
+            auto h = (int64_t)decomposition_solver::layout_hash(array_meta, dag, synth_name,
+                                                                synth_node_id);
+            thisProxy[(CkMyPe() + 1) % CkNumPes()].check_layout_hash(epoch, h);
+            check_layout_hash(epoch, h);
+        }
+        if (fix.follow_up_nodes > 0 && CkMyPe() == 0 && getenv("CNUM_DECOMP_LOG") != nullptr)
+            CkPrintf("decomp: epoch %d: %d layout follow-up node(s)\n", epoch,
+                     fix.follow_up_nodes);
+    }
+
     // Pass 2: expand partitions now that tile sizes have been assigned. Shifted results
     // need chares over [0, offset + shape).
     dag_group_for_each_node_topo(dag, [&](DAGNode* dag_node) {
