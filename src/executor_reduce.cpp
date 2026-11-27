@@ -14,6 +14,17 @@ static T device_dot_nc(const T* x, const T* y, int64_t n) {
         KOKKOS_LAMBDA(int64_t i, T& acc) { acc += x[i] * y[i]; }, sum);
     return sum;
 }
+
+#ifdef USE_NVIDIA
+/// *out = sum(x * y), queued on `exec` (no host wait).
+template <typename T>
+static void device_dot_into(const Kokkos::Cuda& exec, const T* x, const T* y, int n, T* out) {
+    Kokkos::View<T, DeviceSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>> r(out);
+    Kokkos::parallel_reduce(
+        "ct_dot", Kokkos::RangePolicy<Kokkos::Cuda>(exec, 0, n),
+        KOKKOS_LAMBDA(int i, T& acc) { acc += x[i] * y[i]; }, r);
+}
+#endif
 #endif
 
 /// Both dot paths read the operands as the node's dtype; the frontend promotes them first.
@@ -79,8 +90,32 @@ void ArrayDAGExecutorND<N>::execute_reduce_node(DAGNode* node) {
 
 #ifdef USE_KOKKOS
 #ifdef USE_NVIDIA
+            ArrayDecomp<1> in_decomp =
+                static_cast<ArrayDAGGroup*>(group)->array_meta[lhs_name].decomp<1>();
+            if (partition->nd_index()[0] == 0 && in_decomp.offset[0] < in_decomp.tile &&
+                in_decomp.num_chares(0) == 1) {
+                // aligned operands, both on this one chare: the dot stays on the device
+                auto& arrays = partition->arrays;
+                if (arrays.find(result_name) == arrays.end()) {
+                    ArrayDecomp<1> out_decomp =
+                        static_cast<ArrayDAGGroup*>(group)->array_meta[result_name].decomp<1>();
+                    ArrayRegion<1> out_region({0}, {1}, {1});
+                    arrays[result_name] = partition->allocate_or_reuse(out_region, {1}, result_name,
+                                                                       dt, out_decomp, false);
+                }
+                void* out = arrays[result_name]->device_data_ptr();
+                cn_dispatch_blas(dt, [&](auto tag) {
+                    using VT = decltype(tag);
+                    device_dot_into<VT>(partition->compute_exec,
+                                        static_cast<VT*>(lhs_it->second->device_data_ptr()),
+                                        static_cast<VT*>(rhs_it->second->device_data_ptr()),
+                                        local_size, static_cast<VT*>(out));
+                });
+                node_finished(node->id);
+                return;
+            }
             // the dot runs on the default instance
-            partition->compute_exec.fence("ct_dot inputs");
+            partition->default_after_compute();
 #endif
             auto kokkos_dot = [&](auto dummy) {
                 using VT = decltype(dummy);
@@ -202,7 +237,9 @@ void ArrayDAGExecutorND<N>::finish_realigned_dot(PendingComm<N>& comm) {
             }
             for (auto& rb : comm.remote_buffers[0])
                 parts.push_back({rb.region, rb.data});
-#ifdef USE_KOKKOS
+#ifdef USE_NVIDIA
+            partition->default_after_compute(); // the dots run on the default instance
+#elif defined(USE_KOKKOS)
             Kokkos::fence("ct_realigned_dot");
 #else
             lhs_it->second->copyToHost();

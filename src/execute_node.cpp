@@ -1,6 +1,7 @@
 #include "backend_internal.hpp"
 #include "dispatch.hpp"
 
+#include <climits>
 #include <cstring>
 
 #ifdef USE_KOKKOS
@@ -290,7 +291,16 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                                        sub_rows, actual_cols,
                                        vec_data, static_cast<T*>(result->data_ptr()));
 #endif
+#ifdef USE_NVIDIA
+                        // the result is packed on the comm stream; the vector is freed
+                        // with the received buffers, after the compute stream
+                        partition->join_streams();
+                        if (assembled_vec)
+                            comm->remote_buffers[-1].push_back(
+                                {reinterpret_cast<char*>(assembled_vec), {}, 0});
+#else
                         free_vector_pieces(assembled_vec);
+#endif
 
                         // Send partial result to 1D partition(s)
                         {
@@ -427,8 +437,19 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                                           sub_rows, actual_cols,
                                           vec_data, static_cast<T*>(result->data_ptr()));
 #else
-                        // Kokkos: use 3D subview then reshape to 2D for gemv
-                        {
+                        // rows of the slice are contiguous unless the dropped dim is the last
+                        int64_t ld3 = dd == 0 ? local_d2 : (int64_t)local_d1 * local_d2;
+                        if (dd != 2 && ld3 <= INT_MAX) {
+                            int64_t off = dd == 0 ? (int64_t)dd_local_offset * local_d1 * local_d2 +
+                                                        (int64_t)row_offset * local_d2 + col_offset
+                                                  : (int64_t)row_offset * ld3 +
+                                                        (int64_t)dd_local_offset * local_d2 + col_offset;
+                            local_gemv<T>(CT_COMPUTE_EXEC(partition),
+                                          static_cast<T*>(mat->device_data_ptr()) + off, (int)ld3,
+                                          sub_rows, actual_cols, vec_data,
+                                          static_cast<T*>(result->device_data_ptr()));
+                            CT_KOKKOS_FENCE();
+                        } else {
                             Kokkos::View<T***, Kokkos::LayoutRight, DeviceSpace,
                                          Kokkos::MemoryTraits<Kokkos::Unmanaged>>
                                 d_mat(static_cast<T*>(mat->device_data_ptr()),
@@ -465,9 +486,13 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                             // Flatten the 3D subview to 2D for KokkosBlas
                             // For dd==0: subview is (1, sub_rows, actual_cols) -> reshape to (sub_rows, actual_cols)
                             // For other cases, strides may differ; use manual parallel_for
+#ifdef USE_NVIDIA
+                            ct_after_default(partition->compute_stream_raw);
+#else
                             Kokkos::fence("ct_gemv_3d inputs");
+#endif
                             Kokkos::parallel_for(
-                                Kokkos::RangePolicy<>(0, sub_rows),
+                                CT_COMPUTE_POLICY(partition, sub_rows),
                                 KOKKOS_LAMBDA(int i) {
                                     T sum = T(0);
                                     for (int j = 0; j < actual_cols; j++) {
@@ -480,10 +505,17 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                                     }
                                     d_res(i) = sum;
                                 });
-                            Kokkos::fence("ct_gemv_3d");
+                            CT_KOKKOS_FENCE();
                         }
 #endif
+#ifdef USE_NVIDIA
+                        partition->join_streams();
+                        if (assembled_vec)
+                            comm->remote_buffers[-1].push_back(
+                                {reinterpret_cast<char*>(assembled_vec), {}, 0});
+#else
                         free_vector_pieces(assembled_vec);
+#endif
 
                         // Send partial result to 1D partition(s)
                         {
