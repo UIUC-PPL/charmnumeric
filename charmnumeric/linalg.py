@@ -2,7 +2,10 @@
 
 Factorizations and solves are LINALG nodes (opcode 100, ``src/executor_linalg.cpp``):
 operands are gathered to one chare, factored there (Eigen on CPU, cuSOLVER/cuBLAS on
-NVIDIA), and scattered back. The problem must fit on one chare.
+NVIDIA), and scattered back. On NVIDIA the operands stay in device memory (CUDA IPC
+between processes), so the operands and result must fit on one GPU. ``tssvd`` of a
+matrix whose columns lie in one tile column needs no gather: the chares sum their
+Gram matrices.
 
 Deviations from NumPy:
 
@@ -271,8 +274,12 @@ def solve_triangular(a, b, trans=0, lower=False, unit_diagonal=False, overwrite_
 
 
 def tssvd(a):
-    """Tall-skinny SVD (cuPyNumeric): eigh of A^T A on one chare, then U = A @ (V S^-1)
-    as a distributed matmul. Returns u (M, N), s (N,), vh (N, N)."""
+    """Tall-skinny SVD (cuPyNumeric): eigh of A^T A (summed per-chare Gram matrices),
+    then U = A @ (V S^-1) as a distributed matmul. Returns u (M, N), s (N,), vh (N, N).
+
+    Not for rank-deficient or ill-conditioned input: squaring the condition number makes the
+    smallest singular values vanish (s = 0, then inf/NaN columns in u) once kappa(A) is about
+    7e7 for float64 or 3e3 for float32. Use svd for such matrices."""
     a = asarray(a)
     if a.ndim != 2 or a.size <= 1:
         raise ValueError(f"Invalid input shape for tssvd: {a.shape}")

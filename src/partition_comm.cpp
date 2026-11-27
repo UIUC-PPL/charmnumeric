@@ -126,6 +126,12 @@ void PartitionImpl<N>::receive_data(int node_id, int input_index, int name, int 
         if (it->second.empty())
             posted_recv_bufs.erase(it);
     }
+    // before any other tag test: other tag ranges must stay below LA_DEV_INPUT (1 << 24)
+    static_assert(LA_DEV_INPUT == (1 << 24), "LINALG device chunk tags start at 1 << 24");
+    if (input_index >= LA_DEV_INPUT) {
+        executor->on_linalg_device(node_id, input_index - LA_DEV_INPUT, region_data, buf);
+        return;
+    }
 #else
     char* buf = new char[size];
     memcpy(buf, data, size);

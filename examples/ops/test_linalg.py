@@ -85,27 +85,41 @@ def check_cholesky(chk, n, dt):
           np.linalg.cholesky(ah.astype(np.float64), upper=True), tol(dt))
 
 
-def check_qr(chk, m, n, dt):
-    a = rand(m, n, dt)
+def check_notpd(chk, n, k):
+    """cholesky of eye(n) with a[k, k] = -1 is all NaN, wherever the failing tile is."""
+    a = cnp.eye(n)
+    a[k, k] = -1.0
+    chk.count += 1
+    if np.isnan(get(cnp.linalg.cholesky(a))).all():
+        print(f"  PASS cholesky not-PD n={n} k={k} -> NaN")
+    else:
+        print(f"  FAIL cholesky not-PD n={n} k={k} -> NaN")
+        chk.failures.append(f"cholesky not-PD n={n} k={k}")
+
+
+def check_qr(chk, m, n, dt, modes=("reduced", "complete")):
+    check_qr_of(chk, rand(m, n, dt), f"{m}x{n} {dt}", modes)
+
+
+def check_qr_of(chk, a, name, modes=("reduced", "complete")):
+    """Q and R exactly as NumPy (LAPACK's signs), not just up to signs."""
     ah = get(a).astype(np.float64)
-    k = min(m, n)
-    t = tol(dt) * 10
-    for mode in ("reduced", "complete"):
+    m, n = ah.shape
+    t = tol(a.dtype) * 10
+    for mode in modes:
         q, r = cnp.linalg.qr(a, mode=mode)
         qh, rh = get(q), get(r)
         qn, rn = np.linalg.qr(ah, mode=mode)
-        lbl = f"qr {mode} {m}x{n} {dt}"
+        lbl = f"qr {mode} {name}"
         if qh.shape != qn.shape or rh.shape != rn.shape:
             close(chk, lbl + " shapes", np.zeros(qh.shape + rh.shape), np.zeros(qn.shape + rn.shape), 0)
             continue
         close(chk, lbl + " Q@R", qh @ rh, ah, t)
         close(chk, lbl + " Q^TQ", qh.T @ qh, np.eye(qh.shape[1]), t)
-        d = np.sign(np.diag(rh)[:k]) * np.sign(np.diag(rn)[:k])
-        dd = np.ones(rh.shape[0])
-        dd[:k] = d
-        close(chk, lbl + " R (up to row signs)", rh, dd[:, None] * rn, t)
+        close(chk, lbl + " Q", qh, qn, t)
+        close(chk, lbl + " R", rh, rn, t)
     r_only = cnp.linalg.qr(a, mode="r")
-    close(chk, f"qr r {m}x{n} {dt}", np.abs(get(r_only)), np.abs(np.linalg.qr(ah, mode="r")), t)
+    close(chk, f"qr r {name}", get(r_only), np.linalg.qr(ah, mode="r"), t)
 
 
 def check_solve(chk, n, dt):
@@ -213,12 +227,16 @@ def check_solve_triangular(chk, n, dt):
 
 
 def check_tssvd(chk, m, n, dt):
-    a = rand(m, n, dt, shift=float(n))
+    check_tssvd_of(chk, rand(m, n, dt, shift=float(n)), f"{m}x{n} {dt}")
+
+
+def check_tssvd_of(chk, a, name):
     ah = get(a).astype(np.float64)
+    n = ah.shape[1]
     u, s, vh = cnp.linalg.tssvd(a)
     uh, sh, vhh = get(u), get(s), get(vh)
-    t = tol(dt) * 100
-    lbl = f"tssvd {m}x{n} {dt}"
+    t = tol(a.dtype) * 100
+    lbl = f"tssvd {name}"
     close(chk, lbl + " s", sh, np.linalg.svd(ah, compute_uv=False), t)
     close(chk, lbl + " (u*s)@vh", (uh * sh) @ vhh, ah, t)
     close(chk, lbl + " U^TU", uh.T @ uh, np.eye(n), t)
@@ -305,6 +323,24 @@ def main():
     check_eigh(chk, 700, np.float64)
     check_solve_triangular(chk, 900, np.float32)
     check_tssvd(chk, 2000, 40, np.float64)
+    # GPU builds (2-D tile 1024): tiled cholesky on several chares; tssvd columns in two tiles
+    for dt in (np.float64, np.float32):
+        check_cholesky(chk, 2600, dt)
+    for k in (0, 1500, 2599):
+        check_notpd(chk, 2600, k)
+    check_tssvd(chk, 3000, 1100, np.float64)
+    for dt in (np.float64, np.float32):
+        check_qr(chk, 20000, 64, dt, ("reduced",))  # several row tiles: TSQR on GPU builds
+    # last row tile shorter than n; strided and offset views (TSQR, Gram, gathered cholesky)
+    check_qr(chk, 16414, 64, np.float64, ("reduced",))
+    check_tssvd(chk, 16414, 64, np.float64)
+    tall = rand(40000, 64, np.float64, shift=64.0)
+    check_qr_of(chk, tall[5::2, :], "strided rows of 40000x64", ("reduced",))
+    check_qr_of(chk, tall[1000:39000, 3:60], "offset view of 40000x64", ("reduced",))
+    check_tssvd_of(chk, tall[7::3, 2:45], "strided view of 40000x64")
+    big = spd(2600, np.float64)
+    close(chk, "cholesky offset view 2600", get(cnp.linalg.cholesky(big[100:2500, 100:2500])),
+          np.linalg.cholesky(get(big)[100:2500, 100:2500]), 1e-9)
     # Size-1 operands use constant inputs only; random 1x1 inputs hit backend hangs.
     check_views_and_ints(chk)
     chk.finish()
