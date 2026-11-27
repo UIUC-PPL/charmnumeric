@@ -8,7 +8,7 @@ grounded in the current code.
 **Status (2026-10-09):** the ports are now the unmodified cuPyNumeric programs
 and everything they use is native (`README.md`, "Library changes"); this file
 remains the design record and the cost estimates for what is still open
-(distributed sort/scan/factorizations, a fused transposed-operand SUMMA, public
+(distributed factorizations, N-D sorts along a split axis, a fused transposed-operand SUMMA, public
 `cnp.fft`).
 
 Paths below are relative to `charmtyles/`. `E/` means `example/charmnumeric/`.

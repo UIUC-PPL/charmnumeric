@@ -611,7 +611,7 @@ def nancumprod(a, axis=None, dtype=None, out=None):
 
 
 def sort(a, axis=-1, kind=None, order=None):
-    """Sorted copy along ``axis`` (NaNs last, stable; gathers to one chare)."""
+    """Sorted copy along ``axis`` (NaNs last, stable)."""
     return _sort(a, axis, kind, order)
 
 
