@@ -369,12 +369,14 @@ class ArrayDecomp {
         return static_cast<int>((gstop + tile - 1) / tile - gstart / tile);
     }
 
-    /// Global-space region owned by chare ci (clipped to this array's extent).
+    /// Global-space region owned by chare ci (clipped to this array's extent; empty,
+    /// never negative, for a chare outside it).
     ArrayRegion<N> chare_region_global(std::array<int, N> const& ci) const {
         ArrayRegion<N> r;
         for (int d = 0; d < N; ++d) {
             r.start[d] = tile_start(ci[d], tile, offset[d], int64_t(offset[d]) + global_shape[d]);
-            r.stop[d] = tile_end(ci[d], tile, int64_t(offset[d]) + global_shape[d]);
+            r.stop[d] = std::max(r.start[d],
+                                 tile_end(ci[d], tile, int64_t(offset[d]) + global_shape[d]));
             r.step[d] = 1;
         }
         return r;
