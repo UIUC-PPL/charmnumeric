@@ -625,7 +625,5 @@ void ArrayDAGGroup::receive_dag_now(int epoch, int size, char* serialized_dag) {
         }
     }
 
-    partition_proxy_1.run();
-    partition_proxy_2.run();
-    partition_proxy_3.run();
+    wake_local_partitions();
 }

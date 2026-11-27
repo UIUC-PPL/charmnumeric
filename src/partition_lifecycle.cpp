@@ -235,6 +235,22 @@ void PartitionImpl<N>::run() {
     }
 }
 
+template <int N>
+static void wake_local() {
+    for (PartitionImpl<N>* p : local_partitions<N>()) {
+        ChareIndex<N> ci;
+        for (int d = 0; d < N; ++d)
+            ci.idx[d] = p->index[d];
+        proxy_at<N>(p->thisProxy, ci).run();
+    }
+}
+
+void wake_local_partitions() {
+    wake_local<1>();
+    wake_local<2>();
+    wake_local<3>();
+}
+
 template void PartitionImpl<1>::init(CProxy_Partition1D, std::array<int, 1>, CProxy_ArrayDAGGroup);
 template void PartitionImpl<2>::init(CProxy_Partition2D, std::array<int, 2>, CProxy_ArrayDAGGroup);
 template void PartitionImpl<3>::init(CProxy_Partition3D, std::array<int, 3>, CProxy_ArrayDAGGroup);

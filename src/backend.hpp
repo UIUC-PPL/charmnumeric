@@ -1299,6 +1299,10 @@ std::vector<PartitionImpl<N>*>& process_partitions() {
     return parts;
 }
 
+/// Sends run() to this PE's chares so they look for the next epoch. Each PE wakes its own
+/// chares: Charm++ keeps every array broadcast on every PE for a minute or more.
+void wake_local_partitions();
+
 /// CNUM_MEM_STATS=1: one line of memory use per PE at each barrier (partition_get.cpp).
 void mem_stats_report(ArrayDAGGroup* g, int epoch);
 bool mem_stats_on();
