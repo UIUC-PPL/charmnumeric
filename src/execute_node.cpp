@@ -857,10 +857,12 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                                             rem /= local_sizes[d];
                                         }
 
-                                        // Convert to global output coords
+                                        // Convert to result array coords
                                         std::array<int, N> global_out;
                                         for (int d = 0; d < N; ++d)
-                                            global_out[d] = result_chare.start[d] + local_idx[d];
+                                            global_out[d] = result_chare.start[d] -
+                                                            result_decomp.offset[d] +
+                                                            local_idx[d];
 
                                         // Map to input coords via mod
                                         bool from_this_src = true;
@@ -918,7 +920,7 @@ void ArrayDAGGroup::execute_node_nd(DAGNode* node, PartitionImpl<N>* partition, 
                                         lsz[d] = local_sizes[d];
                                         ssz[d] = src_size_arr[d];
                                         sst[d] = src_start_arr[d];
-                                        rcs[d] = result_chare.start[d];
+                                        rcs[d] = result_chare.start[d] - result_decomp.offset[d];
                                     }
                                     for (int d = 0; d < 3; ++d)
                                         ishp[d] = input_shape[d];
