@@ -44,6 +44,18 @@ def main(chk):
     t = np.asarray(v[n - 16:].get(iface))
     chk.true("v[n - 16:]", t.shape == (16,) and bool((t == 1).all()))
 
+    yh = 3 + np.arange(k) % 7
+    y = v[n - k:] * 3 + cnp.arange(k) % 7
+    chk.close("v[n - k:] * 3 + arange(k) % 7", np.asarray(y.get(iface)), yh)
+    chk.close("sort(y)", np.asarray(cnp.sort(y).get(iface)), np.sort(yh))
+    chk.close("cumsum(y)", np.asarray(cnp.cumsum(y).get(iface)), np.cumsum(yh))
+    t = np.asarray((v[n - k::2] * 2).get(iface))
+    chk.true("v[n - k::2] * 2", t.shape == (k // 2,) and bool((t == 2).all()))
+    s = 4096
+    b = cnp.ones((s, s), dtype=np.int8)
+    total(chk, iface, "sum(b[s - 10:, s - 10:] * 2)", b[s - 10:, s - 10:] * 2, 200)
+    total(chk, iface, "sum(b)", b, s * s)
+
 
 if __name__ == "__main__":
     U.run("test_grid_past_end", main)
